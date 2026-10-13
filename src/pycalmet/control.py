@@ -195,20 +195,24 @@ def calwrf_config(path: str | Path, **overrides) -> CalwrfConfig:
     if len(lines)<8: raise ValueError("CALWRF control file is truncated")
     count=int(lines[6]); files=lines[7:7+count]
     if len(files)!=count: raise ValueError("CALWRF file count exceeds supplied paths")
-    raw_output=_path(source.parent,lines[2])
+    configured_output=_path(source.parent,lines[2])
+    canonical_output=(configured_output if configured_output.suffix.casefold()=='.nc'
+                      else configured_output.with_suffix('.nc'))
+    legacy_output=(None if configured_output.suffix.casefold()=='.nc'
+                   else configured_output)
     bounds=[int(item.strip()) for item in lines[3].split(',')]
     if len(bounds)!=6: raise ValueError('CALWRF I/J/K selection must contain six integers')
     def selected(first,last): return None if first<1 or last<1 else (first,last)
     create_surface=True
-    surface_output=raw_output.with_suffix('.m2d')
+    surface_output=configured_output.with_suffix('.m2d')
     if len(lines)>7+count:
         create_surface=int(_number(lines[7+count]))==1
         if create_surface and len(lines)>8+count:
             surface_output=_path(source.parent,lines[8+count])
     data=dict(wrf_files=[_path(source.parent,item) for item in files],start=lines[4],end=lines[5],
-              output=raw_output.with_suffix(".nc"),create_surface=create_surface,
+              output=canonical_output,create_surface=create_surface,
               title=title,listing_output=_path(source.parent,lines[1]),
-              legacy_output=raw_output,surface_output=(surface_output if create_surface else None),
+              legacy_output=legacy_output,surface_output=(surface_output if create_surface else None),
               i_range=selected(*bounds[0:2]),j_range=selected(*bounds[2:4]),
               k_range=selected(*bounds[4:6]))
     if 'output' in overrides:

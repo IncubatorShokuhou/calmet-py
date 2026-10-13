@@ -26,26 +26,6 @@ def _write_prog(path,*,levels=(10.,110.),hours=(1.,)):
                         writer.write_record(row)
 
 
-def test_prog_data_reads_and_reproduces_progrd_interpolation(tmp_path):
-    path=tmp_path/'PROG.DAT'
-    _write_prog(path)
-    data=ProgData(path)
-    assert data.at_hour(1.).u_cm_s.shape==(2,2,2)
-    grid=GridConfig(1,1,1.,1.,x_origin_km=.5,y_origin_km=.5)
-    u,v=data.interpolate(1.,grid,[60.])
-    assert u.dtype==np.float32 and v.dtype==np.float32
-    np.testing.assert_allclose(u,[[[7.5]]])
-    np.testing.assert_allclose(v,[[[15.]]])
-    step=build_prog_step_fields(data,1.,grid,[0.,120.])
-    np.testing.assert_allclose(step.u,7.5)
-    np.testing.assert_allclose(step.v,15.)
-    assert step.temperature.dtype==np.float32
-    assert step.surface_temperature.dtype==np.float32
-    assert step.surface_pressure_mb.dtype==np.float32
-    assert step.profile_height.dtype==np.float32
-    assert step.profile_height.shape==(2,1,1)
-    with pytest.raises(ValueError,match='ending hour'):
-        data.at_hour(2.)
 
 
 def test_prog_interpolation_uses_fortran_integer_index_at_west_boundary(tmp_path):

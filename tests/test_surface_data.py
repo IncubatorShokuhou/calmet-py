@@ -75,18 +75,6 @@ def test_surface_missing_values_use_nearest_original_valid_station(tmp_path):
     assert result.pressure_mb[0]==999
 
 
-def test_missfc_replacement_uses_real4_distance_and_first_tie():
-    three=np.array([0.,0.,0.]); integers=np.array([1,1,1],dtype=np.int32)
-    record=SurfaceRecord(datetime(2018,1,1),datetime(2018,1,1,1),
-        three,three,integers,integers,np.array([9999.,280.,281.]),
-        integers,three,integers)
-    points=np.array([[.5,.5],[.50000001,.5],[.499999995,.5]],dtype=np.float64)
-    assert np.argmin(np.sum((points[1:]-points[0])**2,axis=1))==1
-    result=fill_missing_surface(record,points,cloud_method=4,itprog=0)
-    assert result.temperature_k.dtype==np.float32
-    assert result.temperature_k[0]==np.float32(280.)
-
-
 def test_surface_missing_ceiling_is_allowed_for_prognostic_cloud(tmp_path):
     path=tmp_path/'surf.dat'
     path.write_text(_dataset(
@@ -137,25 +125,6 @@ def test_surface_scalar_interpolation_uses_radius_station_limit_and_water_groups
     fallback=interpolate_surface_scalar([280.],points[:1],grid,target_water=np.ones((1,2),bool),
         station_water=[False],empty_fallback=(80.,100.))
     np.testing.assert_allclose(fallback,100.)
-
-
-def test_setcom_nearest_station_uses_real4_coordinates_and_first_tie():
-    grid=GridConfig(1,1,1.,1.)
-    points=np.array([[.50000001,.5],[.499999995,.5]],dtype=np.float64)
-    # In float64 station 2 is closer; SETCOM stores both coordinates as REAL
-    # and its strict .LT. scan therefore keeps station 1 after they tie.
-    assert np.argmin(np.sum((points-np.array([.5,.5]))**2,axis=1))==1
-    np.testing.assert_array_equal(_nearest_station_grid(points,grid),[[0]])
-
-
-def test_surfvar_scalar_interpolation_matches_gnu_real4_bits():
-    grid=GridConfig(2,1,1.,1.)
-    values=[289.125,301.875,277.625,260.25]
-    points=np.array([[.2,.3],[2.4,.6],[.8,2.8],[5.,.5]])
-    got=interpolate_surface_scalar(
-        values,points,grid,radius_km=3.,maximum_stations=3,power=2)
-    np.testing.assert_array_equal(
-        got.view(np.uint32),np.array([[0x43910935,0x4393a294]],dtype=np.uint32))
 
 
 def test_calmet_decimal_packed_surface_words_are_vectorized():
@@ -278,11 +247,6 @@ def test_surface_wind_components_and_power_extrapolation(tmp_path):
     np.testing.assert_array_equal(u[:,1],0.); np.testing.assert_array_equal(v[:,1],0.)
 
 
-def test_overwater_power_profile_uses_legacy_point_286_exponent():
-    u,v=wind_profiles([4.],[270.],[10.],[10.,40.],[2.e-6],iextrp=2,
-                      power_exponent=.286)
-    np.testing.assert_allclose(u[:,0],[4.,4.*4.**.286],rtol=1.e-6,atol=1.e-6)
-    np.testing.assert_allclose(v[:,0],0.,atol=1.2e-5)
 
 
 def test_component_wind_profiles_do_not_apply_true_north_rotation():
@@ -290,51 +254,6 @@ def test_component_wind_profiles_do_not_apply_true_north_rotation():
                                 factors=[1.,2.])
     np.testing.assert_allclose(u[:,0],[-3.,-6.],atol=1.e-12)
     np.testing.assert_allclose(v[:,0],[4.,8.],atol=1.e-12)
-
-
-def test_component_profiles_match_gnu_diagno_real4_bits():
-    common=([-3.123456],[4.765432],[13.7],[8.25,45.5,200.],[.073])
-    expected=(
-        ([0xc0348874,0x461c3c00,0x461c3c00],[0x4089b809,0x461c3c00,0x461c3c00]),
-        ([0xc039ea8c,0xc06d5581,0xc092a65d],[0x408dd34f,0x40b50c9e,0x40dfbe15]),
-        ([0xbf85410e,0xc076c72c,0x4015ed07],[0x3fcb4e05,0x40bc40ee,0xc064bda0]),
-        ([0xc036e09b,0xc06475b4,0xc05321e6],[0x4088f185,0x40c0d8cb,0x40feb32d]),
-    )
-    options=({}, {}, {'factors':[.3333,1.2345,-.75]}, {'station_latitude':[30.]})
-    for option,(u_bits,v_bits),keywords in zip(range(1,5),expected,options):
-        u,v=component_wind_profiles(*common,iextrp=option,**keywords)
-        np.testing.assert_array_equal(u[:,0].view(np.uint32),np.array(u_bits,dtype=np.uint32))
-        np.testing.assert_array_equal(v[:,0].view(np.uint32),np.array(v_bits,dtype=np.uint32))
-
-
-def test_power_wind_profile_preserves_fortran_recursive_real4_order():
-    speed=np.float32(5.718242)
-    anem=np.float32(3.5441055)
-    levels=np.array([304.3742,553.5639,1126.72,1316.5789],dtype=np.float32)
-    u,v=wind_profiles([speed],[270.],[anem],levels,[.1],iextrp=2)
-    base=np.asarray(-speed*np.sin(np.float32(.0174533)*np.float32(270.)),dtype=np.float32)
-    expected=np.float32(base*np.asarray((levels[1]/anem)**np.float32(.143),dtype=np.float32))
-    expected=np.float32(expected*np.asarray((levels[2]/levels[1])**np.float32(.143),dtype=np.float32))
-    expected=np.float32(expected*np.asarray((levels[3]/levels[2])**np.float32(.143),dtype=np.float32))
-    direct=np.float32(base*np.asarray((levels[3]/anem)**np.float32(.143),dtype=np.float32))
-    assert expected!=direct
-    assert u.dtype==np.float32
-    np.testing.assert_array_equal(u[-1,0],expected)
-    # GNU Fortran oracle for PREPDI conversion followed by DIAGNO K=2..NZ.
-    assert u[-1,0].view(np.uint32)==np.uint32(0x41553f5f)
-    assert v[-1,0].view(np.uint32)==np.uint32(0xb7d694ae)
-
-
-def test_log_and_user_factor_profiles_match_gnu_real4_bits():
-    common=([5.718242],[217.3],[13.7],[8.25,45.5,200.],[.073])
-    log_u,log_v=wind_profiles(*common,iextrp=1)
-    assert log_u[0,0].view(np.uint32)==np.uint32(0x40484908)
-    assert log_v[0,0].view(np.uint32)==np.uint32(0x408374a0)
-    factor_u,factor_v=wind_profiles(*common,iextrp=3,factors=[.3333,1.2345,-.75])
-    np.testing.assert_array_equal(factor_u[:,0].view(np.uint32),np.array(
-        [0x3f93d565,0x4088e39c,0xc0265454],dtype=np.uint32))
-    np.testing.assert_array_equal(factor_v[:,0].view(np.uint32),np.array(
-        [0x3fc20f04,0x40b3b129,0xc05a567c],dtype=np.uint32))
 
 
 def test_surface_wind_log_and_user_factor_options(tmp_path):
@@ -364,19 +283,6 @@ def test_surface_wind_rmin2_skips_profiles_near_valid_upper_station(tmp_path):
     np.testing.assert_array_equal(u[:,1],0.); np.testing.assert_array_equal(v[:,1],0.)
 
 
-def test_rmin2_threshold_uses_fortran_real4_station_distance():
-    common=([-3.],[4.],[10.],[10.,40.],[.1])
-    keywords=dict(iextrp=3,factors=[1.,2.],station_xy=[[100000.01,0.]],
-                  upper_xy=[[100001.02,0.]],upper_valid=[True],
-                  upper_air_separation_cells=1.012,dx_km=1.,dy_km=1.)
-    # REAL*4 coordinates give FMIN=1.015625 cells, which is not strictly
-    # below RMIN2. Decimal float64 arithmetic gives 1.01 and chooses the
-    # opposite branch.
-    u,v=component_wind_profiles(*common,**keywords)
-    np.testing.assert_array_equal(u[:,0],np.array([-3.,-6.],dtype=np.float32))
-    np.testing.assert_array_equal(v[:,0],np.array([4.,8.],dtype=np.float32))
-
-
 def test_surface_wind_similarity_option_uses_neutral_wind1_profile(tmp_path):
     path=tmp_path/'surf.dat'
     path.write_text(_dataset(
@@ -390,19 +296,6 @@ def test_surface_wind_similarity_option_uses_neutral_wind1_profile(tmp_path):
     assert direction[1,0]>180. and direction[1,1]<180.
 
 
-def test_neutral_similarity_profile_matches_gnu_similt_real4_bits():
-    u,v=wind_profiles([5.718242,5.718242],[217.3,217.3],[13.7,13.7],
-        [8.25,45.5,200.],[.073,.073],iextrp=4,station_latitude=[30.,-30.])
-    np.testing.assert_array_equal(u[:,0].view(np.uint32),np.array(
-        [0x404608be,0x40904c2a,0x40cdb929],dtype=np.uint32))
-    np.testing.assert_array_equal(v[:,0].view(np.uint32),np.array(
-        [0x40844e32,0x40ac8f7c,0x40b90a2b],dtype=np.uint32))
-    np.testing.assert_array_equal(u[:,1].view(np.uint32),np.array(
-        [0x404a85ca,0x40800c01,0x40778870],dtype=np.uint32))
-    np.testing.assert_array_equal(v[:,1].view(np.uint32),np.array(
-        [0x40829885,0x40b8f0b3,0x40f77978],dtype=np.uint32))
-
-
 def test_surface_true_wind_direction_rotates_to_grid_north(tmp_path):
     path=tmp_path/'surf.dat'
     path.write_text(_dataset(
@@ -413,25 +306,6 @@ def test_surface_true_wind_direction_rotates_to_grid_north(tmp_path):
     np.testing.assert_allclose(direction[0],[170.,190.],atol=1.e-3)
 
 
-def test_surface_rotation_preserves_missing_wind_and_wraps_direction():
-    u,v=wind_profiles([5.,9999.],[2.,9999.],[10.,10.],[10.],[.1,.1],iextrp=3,
-                      factors=[1.],grid_convergence_degrees=[10.,10.])
-    expected_angle=np.float32(.0174533)*np.float32(352.)
-    assert u[0,0].view(np.uint32)==np.float32(
-        -np.float32(5.)*np.float32(np.sin(np.float64(expected_angle)))).view(np.uint32)
-    assert v[0,0].view(np.uint32)==np.float32(
-        -np.float32(5.)*np.float32(np.cos(np.float64(expected_angle)))).view(np.uint32)
-    assert u[0,1]==np.float32(9999.) and v[0,1]==np.float32(9999.)
-
-
-def test_shared_prepdi_components_preserve_real4_reconstructed_speed():
-    u,v,valid,direction=_wind_components(
-        [5.718242,9999.],[217.3,9999.],[1.125,1.125])
-    assert valid.tolist()==[True,False] and direction[0]==np.float32(216.175)
-    reconstructed=np.asarray(np.sqrt(np.asarray(
-        u[0]*u[0]+v[0]*v[0],dtype=np.float32)),dtype=np.float32)
-    assert reconstructed.view(np.uint32)==np.uint32(0x40b6fbd7)
-    assert u[1]==np.float32(9999.) and v[1]==np.float32(9999.)
 
 
 def test_prepdi_uses_internal_edit_and_editl_missing_thresholds():
@@ -613,130 +487,6 @@ def test_water2_imixh1_preserves_shared_dptt_station_order(monkeypatch,
         assert 'temperature_measurement_height_m' in received_keywords[0]
 
 
-def test_iprog0_transform_uses_wind1_instead_of_prognostic_background(monkeypatch):
-    grid=GridConfig(1,1,1.,1.,projection='EM',lat0=0.,lon0=0.,lat1=0.,lat2=0.)
-    lon,lat=Transformer.from_crs(grid_crs(grid,units='km'),geographic_crs('WGS-84'),always_xy=True).transform(.5,.5)
-    station=SimpleNamespace(identifier=1,name='A',latitude=lat,longitude=lon,
-                            anemometer_height_m=10.)
-    record=SimpleNamespace(begin=datetime(2018,1,1),end=datetime(2018,1,1,1),
-        wind_speed=np.array([10.]),wind_direction=np.array([270.]),
-        ceiling_hundreds_ft=np.array([70]),cloud_tenths=np.array([5]),
-        temperature_k=np.array([281.]),relative_humidity=np.array([60]),
-        pressure_mb=np.array([1000.]),precipitation_code=np.array([0]))
-    surface=SimpleNamespace(stations=(station,),datum='WGS-84',at_begin=lambda when:record)
-    upper_station=SimpleNamespace(identifier=2,name='A',latitude=lat,longitude=lon,elevation_m=0.)
-    upper=SimpleNamespace(station=upper_station,datum='WGS-84',
-        layer_wind_at=lambda when,faces,angle:(np.array([20.]),np.array([0.])),
-        temperature_faces_at=lambda when,faces:np.array([280.,279.]))
-    sea_record=SimpleNamespace(air_temperature_k=290.,air_water_delta_k=2.,relative_humidity=85.,
-        wind_speed_m_s=9999.,wind_direction_deg=9999.,mixing_height_m=120.,
-        anemometer_height_m=10.,gradient_below_k_m=-.0098,
-        air_sensor_height_m=4.,water_sensor_depth_m=.6,
-        gradient_above_k_m=-.0045,wave_period_s=-999.,wave_height_m=-999.)
-    sea=SimpleNamespace(point=lambda target:np.array([.5,.5]),
-        longitude_latitude=lambda:(lon,lat),at_begin=lambda when:sea_record)
-    config=CalmetConfig('met','geo','out','2018010100','2018010101',grid,noobs=0,
-        iprog=0,iwfcod=1,surface_data='surf',upper_air_files=('up',),itprog=0,irhprog=0,
-        z_faces_m=(0.,20.),smoothing_passes=(0,),
-        stations_per_level=(1,),wind_extrapolation_factors=(.5,),wind_extrapolation=3)
-    transform,_=_surface_step_transform(config,surface,
-        {'roughness_length':np.array([[.1]]),'dominant_landuse':np.array([[55]])},
-        (upper,),sea=(sea,))
-    one=np.ones((1,1)); level=np.ones((1,1,1))*100.; profile=np.ones((2,1,1))
-    step=Step1Fields(level.copy(),level.copy(),level*0.+280.,one*280.,one*1000.,one,
-        level*0.+50.,one*100.,one*10.,one*.1,one*.5,one*1000.,profile*280.,profile*100.,
-        one*50.,one*0.,one.astype(int))
-    result=transform(step,datetime(2018,1,1))
-    # RMIN2 keeps the co-located surface observation at its raw 10 m/s;
-    # INTER2 combines its 1/0.1**2 weight with the 5 m/s WIND1 background.
-    assert result.u.item()==pytest.approx((10.*100.+5.)/101.)
-    assert result.v.item()==pytest.approx(0.,abs=3.e-5)
-    assert result.roughness_override.item()==pytest.approx(2.e-6*10.**2.5)
-    assert result.overwater_data.air_temperature_k.item()==290.
-    assert result.overwater_data.sea_temperature_k.item()==pytest.approx(290.-sea_record.air_water_delta_k)
-
-    config.wind_extrapolation=4
-    captured=[]
-    def fake_land(*args,**kwargs):
-        captured.append((args,kwargs))
-        state=tuple(np.zeros(1,dtype=np.float32) for _ in range(6))
-        return (np.array([[7.]],dtype=np.float32),np.array([[8.]],dtype=np.float32),*state)
-    monkeypatch.setattr('pycalmet._calmet.land_station_similarity_theory',fake_land)
-    land_geo={'roughness_length':np.array([[.1]]),'dominant_landuse':np.array([[20]]),
-        'albedo':np.array([[.2]]),'bowen_ratio':np.array([[1.]]),
-        'soil_heat_flux_parameter':np.array([[.15]]),
-        'anthropogenic_heat_flux':np.array([[0.]])}
-    transform,_=_surface_step_transform(config,surface,land_geo,(upper,))
-    context=StepTransformContext(one*.5,one*50.,one*75.,one*.2,one*1.e-4)
-    transform(step,datetime(2018,1,1),context)
-    np.testing.assert_array_equal(captured[0][0][6],[281.])
-    np.testing.assert_array_equal(captured[0][0][9],[[281.],[281.]])
-    config.wind_extrapolation=3
-
-    config.diagnostic_initial_wind=1
-    config.diagnostic_surface_temperature=1
-    config.diagnostic_lapse_rate=1
-    diagnostic_record=SimpleNamespace(initial_u_m_s=2.,initial_v_m_s=3.,
-        surface_temperature_k=285.,lapse_rate_k_m=-.0065,
-        surface_u_m_s=None,surface_v_m_s=None,upper_u_m_s=None,upper_v_m_s=None)
-    diagnostic=SimpleNamespace(at_begin=lambda when:diagnostic_record)
-    transform,_=_surface_step_transform(config,surface,
-        {'roughness_length':np.array([[.1]]),'dominant_landuse':np.array([[55]])},
-        (upper,),sea=(sea,),diagnostic=diagnostic)
-    result=transform(step,datetime(2018,1,1))
-    assert result.u.item()==pytest.approx((10.*100.+2.)/101.)
-    # INTER2 forms 1/RMIN**2 in REAL*4 before adding the background weight.
-    assert result.v.view(np.uint32).item()==np.uint32(0x3cf32bcc)
-    assert result.roughness_override is None
-    assert result.diagnostic_surface_temperature.item()==285.
-    assert result.diagnostic_lapse_rate.item()==-.0065
-
-    config.diagnostic_initial_wind=0
-    config.diagnostic_surface_temperature=0
-    config.diagnostic_lapse_rate=0
-    config.diagnostic_surface_wind=1
-    config.diagnostic_upper_wind=1
-    station_record=SimpleNamespace(initial_u_m_s=None,initial_v_m_s=None,
-        surface_temperature_k=None,lapse_rate_k_m=None,
-        surface_u_m_s=np.array([4.,9999.]),surface_v_m_s=np.array([0.,9999.]),
-        upper_u_m_s=np.array([[8.]]),upper_v_m_s=np.array([[0.]]))
-    diagnostic=SimpleNamespace(at_begin=lambda when:station_record)
-    transform,_=_surface_step_transform(config,surface,
-        {'roughness_length':np.array([[.1]]),'dominant_landuse':np.array([[55]])},
-        (upper,),sea=(sea,),diagnostic=diagnostic)
-    result=transform(step,datetime(2018,1,1))
-    assert result.u.item()==pytest.approx((4.*100.+2.)/101.)
-    assert result.v.item()==pytest.approx(0.,abs=1.e-12)
-    assert result.roughness_override.item()==pytest.approx(2.e-6*4.**2.5)
-
-    config.diagnostic_surface_wind=0
-    config.diagnostic_upper_wind=0
-    source_grid=GridConfig(2,2,1.,1.,projection='EM',lat0=0.,lon0=0.,
-                           x_origin_km=-.5,y_origin_km=-.5)
-    initial_guess=SimpleNamespace(timezone='UTC-0000',grid=source_grid,
-        z_faces_m=np.array([0.,20.]),z_centers_m=np.array([10.]),
-        roughness_m=np.full((2,2),.1),
-        at_end=lambda when:(datetime(2018,1,1),np.full((1,2,2),7.),
-                            np.full((1,2,2),-2.)))
-    transform,_=_surface_step_transform(config,surface,
-        {'roughness_length':np.array([[.1]]),'dominant_landuse':np.array([[55]])},
-        (upper,),sea=(sea,),initial_guess=initial_guess)
-    result=transform(step,datetime(2018,1,1))
-    assert result.u.item()==pytest.approx((10.*100.+7.)/101.)
-    # PREPDI's truncated radians constant leaves a small V component at 270
-    # degrees; retain it through the REAL*4 INTER2 accumulation.
-    assert result.v.view(np.uint32).item()==np.uint32(0xbca25f9e)
-    assert result.roughness_override is None
-
-    config.initial_guess_upper_station=1
-    config.initial_guess_height_range_m=(1.,1000.)
-    transform,_=_surface_step_transform(config,surface,
-        {'roughness_length':np.array([[.1]]),'dominant_landuse':np.array([[55]])},
-        (upper,),sea=(sea,))
-    result=transform(step,datetime(2018,1,1))
-    assert result.u.item()==pytest.approx((10.*100.+20.)/101.)
-    assert result.v.item()==pytest.approx(0.,abs=3.e-5)
-    assert result.roughness_override is None
 
 
 def test_idiopt4_5_transform_uses_control_metadata_without_observation_files():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from .datetime_utils import parse_timestamp
 from pathlib import Path
 
 import netCDF4 as nc
@@ -56,7 +57,7 @@ def _relative_humidity(qvapor,pressure_hpa,temperature_k):
 
 
 def _date_number(text):
-    return int(datetime.strptime(text,'%Y-%m-%d_%H:%M:%S').strftime('%Y%m%d%H'))
+    return int(parse_timestamp(text).strftime('%Y%m%d%H'))
 
 
 def _compressed_water(values):

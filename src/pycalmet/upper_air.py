@@ -8,18 +8,16 @@ import re
 import numpy as np
 
 from .surface_data import _coordinate
+from .datetime_utils import expand_year,parse_ordinal
 
 
 def _instant(year,day,hour,seconds=0):
-    year=int(year); day=int(day); hour=int(hour); seconds=int(seconds)
-    if year<100: year+=2000 if year<50 else 1900
-    if not 1<=day<=366 or hour<0 or seconds<0: raise ValueError('invalid UP.DAT timestamp')
-    return datetime(year,1,1)+timedelta(days=day-1,hours=hour,seconds=seconds)
+    try: return parse_ordinal(year,day,hour,seconds)
+    except ValueError as error: raise ValueError('invalid UP.DAT timestamp') from error
 
 
 def _year(value):
-    value=int(value)
-    return value+2000 if value<50 else (value+1900 if value<100 else value)
+    return expand_year(value)
 
 
 def _sounding_header(line):
@@ -68,7 +66,7 @@ class Sounding:
 
     def converted(self,convergence_degrees=0.):
         """Apply RDUP MSL-to-LGL and meteorological wind conversion."""
-        f32=np.float32
+        f32=np.float64
         if self.height_msl.size==0: raise ValueError('cannot convert an empty upper-air sounding')
         if np.any(self.height_msl>=9998.): raise ValueError('upper-air sounding contains missing heights')
         height=np.asarray(np.asarray(self.height_msl,dtype=f32)-
@@ -94,7 +92,7 @@ class Sounding:
 
 def layer_average(sounding,z_faces_m,convergence_degrees=0.):
     """Reproduce VERTAV's piecewise-linear layer wind integration."""
-    f32=np.float32
+    f32=np.float64
     faces=np.asarray(z_faces_m,dtype=f32)
     if faces.ndim!=1 or faces.size<2 or faces[0]!=0. or np.any(np.diff(faces)<=0.):
         raise ValueError('upper-air layer faces must increase strictly from zero')
@@ -104,8 +102,6 @@ def layer_average(sounding,z_faces_m,convergence_degrees=0.):
     if height.size<2 or np.any(np.diff(height)<=0.):
         raise ValueError('upper-air sounding needs two strictly increasing valid wind levels')
     if faces[-1]>height[-1]: raise ValueError('CALMET cell face is above top sounding level')
-    # VERTAV makes all components positive, inserts each face in order, and
-    # accumulates trapezoids sequentially in REAL*4.
     u=np.asarray(u+f32(1000.),dtype=f32); v=np.asarray(v+f32(1000.),dtype=f32)
     z=np.asarray(height,dtype=f32)
     for face in faces:
@@ -143,7 +139,7 @@ def layer_average(sounding,z_faces_m,convergence_degrees=0.):
 
 def temperature_faces(sounding,z_faces_m):
     """Reproduce FACET/INTP temperature interpolation at CALMET faces."""
-    f32=np.float32
+    f32=np.float64
     faces=np.asarray(z_faces_m,dtype=f32)
     if faces.ndim!=1 or faces.size<2 or faces[0]!=0. or np.any(np.diff(faces)<=0.):
         raise ValueError('upper-air temperature faces must increase strictly from zero')
@@ -173,7 +169,7 @@ def temperature_faces(sounding,z_faces_m):
 
 def grid_temperature_faces(station_faces,station_xy,grid,power=1,block_size=65536):
     """Horizontally interpolate TEMP3D upper-air faces from every station."""
-    f32=np.float32
+    f32=np.float64
     values=np.asarray(station_faces,dtype=f32)
     points=np.asarray(station_xy,dtype=f32)
     if values.ndim!=2 or points.shape!=(values.shape[0],2) or values.shape[0]<1:
@@ -206,8 +202,8 @@ def grid_temperature_faces(station_faces,station_xy,grid,power=1,block_size=6553
 
 
 def _prepdi_time_interpolate(left,right,seconds_to_right,total_seconds):
-    """PREPDI's ``BB-(BB-AA)*XFACT`` REAL*4 interpolation."""
-    f32=np.float32
+    """PREPDI's ``BB-(BB-AA)*XFACT`` floating-point interpolation."""
+    f32=np.float64
     first=np.asarray(left,dtype=f32); second=np.asarray(right,dtype=f32)
     remaining=np.asarray(f32(seconds_to_right)/f32(total_seconds),dtype=f32)
     delta=np.asarray(second-first,dtype=f32)
@@ -347,7 +343,7 @@ class UpperAirData:
 
     def lapse_rate_at(self,timestamp,height_m,last_convective_time=None):
         """CGAMMA lapse rate, including its saved last-convective-hour correction."""
-        f32=np.float32
+        f32=np.float64
         height=f32(height_m)
         if height<=0.: raise ValueError('CGAMMA height must be positive')
         current=self.temperature_faces_at(timestamp,(0.,height))

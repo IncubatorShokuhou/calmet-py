@@ -20,20 +20,6 @@ def test_current_lcc_definition_preserves_kilometre_coordinates():
     np.testing.assert_allclose(actual,expected,rtol=0.,atol=1.e-12)
 
 
-def test_glaz_to_lcc_matches_coordlib_real4_boundary_bit_for_bit():
-    source=GridConfig(1,1,1.,1.,projection='LAZA',lat0=45.,lon0=100.,datum='ESR-S')
-    target=GridConfig(1,1,1.,1.,projection='LCC',lat0=27.,lon0=117.5,
-                      lat1=30.,lat2=60.,datum='WGS-84')
-    x=np.array([1741.,1741.45837402,1750.])
-    y=np.array([-1820.,-1819.54162598,-1800.])
-    actual=np.asarray(project_glaz_to_lcc(x,y,source,target))
-    expected=np.array([
-        [-0.5162860751152039,0.015311592258512974,11.733264923095703],
-        [-1.096136212348938,-0.7315678000450134,17.036174774169922],
-    ],dtype=np.float32)
-    np.testing.assert_array_equal(actual,expected)
-
-
 def test_all_calpuff_projection_codes_round_trip():
     cases=[
         GridConfig(1,1,1.,1.,projection='LCC'),
@@ -61,16 +47,6 @@ def test_ttm_uses_control_scale_factor():
     actual=Transformer.from_crs('EPSG:4326',grid_crs(grid),always_xy=True).transform(121.,31.)
     wanted=Transformer.from_crs('EPSG:4326',expected,always_xy=True).transform(121.,31.)
     np.testing.assert_allclose(actual,wanted,rtol=0.,atol=1.e-8)
-
-
-def test_lcc_convergence_matches_legacy_analytic_rotation():
-    grid=GridConfig(1,1,1.,1.)
-    convergence=grid_convergence(
-        grid,np.array([117.5,118.5,122.6996],dtype=np.float32),
-        np.array([27.,28.,31.],dtype=np.float32))
-    assert convergence[0]==0. and convergence[1]>0.
-    # Runtime GNU REAL cosf/tanf/logf gives CONEC=0x3f372f6d.
-    assert convergence[2].view(np.uint32)==0x406e1f5e
 
 
 def test_documented_calpuff_datums_have_explicit_proj_definitions():

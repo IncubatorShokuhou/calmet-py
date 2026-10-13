@@ -9,17 +9,14 @@ import numpy as np
 
 from .config import GridConfig
 from .legacy_io import FortranSequentialReader
+from .datetime_utils import parse_ordinal_code
 from .projections import (grid_convergence,grid_crs,transform_grid,
                           unproject_geographic)
 
 
 def _coded_time(code: int, seconds: int) -> datetime:
-    text=str(int(code))
-    if len(text)!=9: raise ValueError(f'invalid CALMET.DAT time code {code!r}')
-    year=int(text[:4]); day=int(text[4:7]); hour=int(text[7:])
-    if not 1<=day<=366 or not 0<=hour<=23 or not 0<=seconds<=3600:
-        raise ValueError(f'invalid CALMET.DAT timestamp {code}/{seconds}')
-    return datetime(year,1,1)+timedelta(days=day-1,hours=hour,seconds=seconds)
+    try: return parse_ordinal_code(code,seconds)
+    except ValueError as error: raise ValueError(f'invalid CALMET.DAT timestamp {code}/{seconds}') from error
 
 
 def _field(payload: bytes, size: int, *, mtver=1, integer=False):
@@ -315,93 +312,91 @@ class InitialGuessCalmetSeries:
 
 
 def _r2interpi_four(source_points,target_points,values,*,block_size=32768):
-    """Vectorized target blocks with R2INTERPI's ordered REAL*4 sums."""
-    source=np.asarray(source_points,dtype=np.float32)
-    targets=np.asarray(target_points,dtype=np.float32)
-    fields=np.asarray(values,dtype=np.float32)
+    """Vectorized target blocks with R2INTERPI's ordered floating-point sums."""
+    source=np.asarray(source_points,dtype=np.float64)
+    targets=np.asarray(target_points,dtype=np.float64)
+    fields=np.asarray(values,dtype=np.float64)
     if source.ndim!=2 or source.shape[1]!=2 or targets.ndim!=2 or targets.shape[1]!=2:
         raise ValueError('R2INTERPI coordinates must be (point,2) arrays')
     if fields.ndim!=2 or fields.shape[1]!=source.shape[0]:
         raise ValueError('R2INTERPI values must be (field,source point)')
     if source.shape[0]<4: raise ValueError('R2INTERPI requires at least four source cells')
-    output=np.empty((fields.shape[0],targets.shape[0]),dtype=np.float32)
+    output=np.empty((fields.shape[0],targets.shape[0]),dtype=np.float64)
     for start in range(0,targets.shape[0],block_size):
         stop=min(start+block_size,targets.shape[0])
-        delta=np.asarray(source[None,:,:]-targets[start:stop,None,:],dtype=np.float32)
+        delta=np.asarray(source[None,:,:]-targets[start:stop,None,:],dtype=np.float64)
         squared=np.asarray(delta[:,:,0]*delta[:,:,0]+delta[:,:,1]*delta[:,:,1],
-                           dtype=np.float32)
-        # RDHDMET ranks sqrt(PDIST2), using strict '<' insertion.  Stable
-        # sorting of the same REAL*4 distances preserves its II/JJ tie order.
-        distance=np.asarray(np.sqrt(squared),dtype=np.float32)
+                           dtype=np.float64)
+        distance=np.asarray(np.sqrt(squared),dtype=np.float64)
         nearest=np.argsort(distance,axis=1,kind='stable')[:,:4]
-        numerator=np.zeros((stop-start,fields.shape[0]),dtype=np.float32)
-        denominator=np.zeros(stop-start,dtype=np.float32)
+        numerator=np.zeros((stop-start,fields.shape[0]),dtype=np.float64)
+        denominator=np.zeros(stop-start,dtype=np.float64)
         for rank in range(4):
             index=nearest[:,rank]
             chosen=np.take_along_axis(squared,index[:,None],axis=1)[:,0]
-            chosen=np.maximum(chosen,np.float32(.001))
-            inverse=np.asarray(np.float32(1.)/chosen,dtype=np.float32)
+            chosen=np.maximum(chosen,np.float64(.001))
+            inverse=np.asarray(np.float64(1.)/chosen,dtype=np.float64)
             numerator=np.asarray(
-                numerator+fields[:,index].T*inverse[:,None],dtype=np.float32)
-            denominator=np.asarray(denominator+inverse,dtype=np.float32)
+                numerator+fields[:,index].T*inverse[:,None],dtype=np.float64)
+            denominator=np.asarray(denominator+inverse,dtype=np.float64)
         output[:,start:stop]=np.asarray(numerator/denominator[:,None],
-                                        dtype=np.float32).T
+                                        dtype=np.float64).T
     return output
 
 
 def _rdcalmet_vertical(values,source_centers_m,target_centers_m,roughness_m):
-    """RDCALMET vertical persistence/interpolation in default REAL*4."""
-    field=np.asarray(values,dtype=np.float32)
-    source=np.asarray(source_centers_m,dtype=np.float32)
-    target=np.asarray(target_centers_m,dtype=np.float32)
-    roughness=np.asarray(roughness_m,dtype=np.float32)
+    """RDCALMET vertical persistence/interpolation in default floating-point."""
+    field=np.asarray(values,dtype=np.float64)
+    source=np.asarray(source_centers_m,dtype=np.float64)
+    target=np.asarray(target_centers_m,dtype=np.float64)
+    roughness=np.asarray(roughness_m,dtype=np.float64)
     if field.ndim!=3 or field.shape[0]!=source.size:
         raise ValueError('RDCALMET values must be (source level,y,x)')
     if roughness.shape!=field.shape[1:]:
         raise ValueError('RDCALMET roughness must match the horizontal grid')
-    if target.ndim!=1 or np.any(target<=np.float32(0.)):
+    if target.ndim!=1 or np.any(target<=np.float64(0.)):
         raise ValueError('IGFMET target layer centers must be a positive vector')
-    if source.ndim!=1 or np.any(np.diff(source)<=np.float32(0.)):
+    if source.ndim!=1 or np.any(np.diff(source)<=np.float64(0.)):
         raise ValueError('IGFMET source levels are not increasing')
-    if np.any(roughness<=np.float32(0.)) or np.any(roughness==source[0]):
+    if np.any(roughness<=np.float64(0.)) or np.any(roughness==source[0]):
         raise ValueError('IGFMET roughness is invalid for logarithmic extrapolation')
-    result=np.empty((target.size,*field.shape[1:]),dtype=np.float32)
+    result=np.empty((target.size,*field.shape[1:]),dtype=np.float64)
     below=target<source[0]
     if np.any(below):
-        log_z0=np.asarray(np.log(roughness),dtype=np.float32)
-        log_source=np.float32(np.log(source[0]))
+        log_z0=np.asarray(np.log(roughness),dtype=np.float64)
+        log_source=np.float64(np.log(source[0]))
         for index in np.flatnonzero(below):
-            log_target=np.float32(np.log(target[index]))
-            ratio=np.asarray((log_target-log_z0)/(log_source-log_z0),dtype=np.float32)
-            result[index]=np.asarray(ratio*field[0],dtype=np.float32)
+            log_target=np.float64(np.log(target[index]))
+            ratio=np.asarray((log_target-log_z0)/(log_source-log_z0),dtype=np.float64)
+            result[index]=np.asarray(ratio*field[0],dtype=np.float64)
     above=target>=source[-1]
     result[above]=field[-1]
     middle=~(below|above)
     for index in np.flatnonzero(middle):
         upper=int(np.searchsorted(source,target[index],side='right'))
         lower=upper-1
-        ratio=np.float32((target[index]-source[lower])/
+        ratio=np.float64((target[index]-source[lower])/
                          (source[upper]-source[lower]))
         result[index]=np.asarray(
-            field[lower]+(field[upper]-field[lower])*ratio,dtype=np.float32)
+            field[lower]+(field[upper]-field[lower])*ratio,dtype=np.float64)
     return result
 
 
 def _rdcalmet_rotate(u,v,direction_adjustment_degrees):
-    """Apply RDCALMET's REAL*4 speed/direction wind rotation."""
+    """Apply RDCALMET's floating-point speed/direction wind rotation."""
     east,north,adjustment=np.broadcast_arrays(
-        np.asarray(u,dtype=np.float32),np.asarray(v,dtype=np.float32),
-        np.asarray(direction_adjustment_degrees,dtype=np.float32))
-    speed=np.sqrt(np.asarray(east*east+north*north,dtype=np.float32))
-    active=speed>np.float32(1.e-9)
+        np.asarray(u,dtype=np.float64),np.asarray(v,dtype=np.float64),
+        np.asarray(direction_adjustment_degrees,dtype=np.float64))
+    speed=np.sqrt(np.asarray(east*east+north*north,dtype=np.float64))
+    active=speed>np.float64(1.e-9)
     direction=np.asarray(
-        np.float32(270.)-np.float32(57.295778)*np.arctan2(north,east),
-        dtype=np.float32)
-    direction=np.asarray(np.fmod(direction,np.float32(360.))+adjustment,
-                         dtype=np.float32)
-    radians=np.asarray(np.float32(.0174533)*direction,dtype=np.float32)
-    rotated_u=np.where(active,-speed*np.sin(radians),east).astype(np.float32)
-    rotated_v=np.where(active,-speed*np.cos(radians),north).astype(np.float32)
+        np.float64(270.)-np.float64(57.295778)*np.arctan2(north,east),
+        dtype=np.float64)
+    direction=np.asarray(np.fmod(direction,np.float64(360.))+adjustment,
+                         dtype=np.float64)
+    radians=np.asarray(np.float64(.0174533)*direction,dtype=np.float64)
+    rotated_u=np.where(active,-speed*np.sin(radians),east).astype(np.float64)
+    rotated_v=np.where(active,-speed*np.cos(radians),north).astype(np.float64)
     return rotated_u,rotated_v
 
 
@@ -411,23 +406,20 @@ def interpolate_initial_guess(data, when: datetime,
     lookup=getattr(data,'at_covering',data.at_end)
     _,source_u,source_v=lookup(when)
     source_grid=data.grid
-    r=np.float32
+    r=np.float64
     sx=np.asarray(r(source_grid.x_origin_km)+
-                  (np.arange(source_grid.nx,dtype=np.float32)+r(.5))*r(source_grid.dx_km),
-                  dtype=np.float32)
+                  (np.arange(source_grid.nx,dtype=np.float64)+r(.5))*r(source_grid.dx_km),
+                  dtype=np.float64)
     sy=np.asarray(r(source_grid.y_origin_km)+
-                  (np.arange(source_grid.ny,dtype=np.float32)+r(.5))*r(source_grid.dy_km),
-                  dtype=np.float32)
+                  (np.arange(source_grid.ny,dtype=np.float64)+r(.5))*r(source_grid.dy_km),
+                  dtype=np.float64)
     source_x,source_y=np.meshgrid(sx,sy)
     source_crs=grid_crs(source_grid,units='km')
     target_crs=grid_crs(target_grid,units='km')
     if source_crs==target_crs:
-        # RDHDMET's .NOT.LREMAPIGF branch copies XIGF0/YIGF0 directly.
-        # A mathematically redundant projection round trip can move a REAL*4
-        # point across a nearest-neighbor tie or change R2INTERPI weights.
         transformed_x,transformed_y=source_x,source_y
     else:
-        transformed_x,transformed_y=(np.asarray(value,dtype=np.float32) for value in
+        transformed_x,transformed_y=(np.asarray(value,dtype=np.float64) for value in
             transform_grid(source_x,source_y,source_grid,target_grid,units='km'))
 
     if source_crs!=target_crs and ({source_grid.projection.upper(),
@@ -443,8 +435,8 @@ def interpolate_initial_guess(data, when: datetime,
     else:
         rotated_u=source_u; rotated_v=source_v
 
-    source_levels=np.asarray(data.z_centers_m,dtype=np.float32)
-    target_levels=np.asarray(target_centers_m,dtype=np.float32)
+    source_levels=np.asarray(data.z_centers_m,dtype=np.float64)
+    target_levels=np.asarray(target_centers_m,dtype=np.float64)
     vertical_u=_rdcalmet_vertical(rotated_u,source_levels,target_levels,
                                   data.roughness_m)
     vertical_v=_rdcalmet_vertical(rotated_v,source_levels,target_levels,
@@ -452,11 +444,11 @@ def interpolate_initial_guess(data, when: datetime,
 
     source_points=np.column_stack((transformed_x.T.ravel(),transformed_y.T.ravel()))
     tx=np.asarray(r(target_grid.x_origin_km)+
-                  (np.arange(target_grid.nx,dtype=np.float32)+r(.5))*r(target_grid.dx_km),
-                  dtype=np.float32)
+                  (np.arange(target_grid.nx,dtype=np.float64)+r(.5))*r(target_grid.dx_km),
+                  dtype=np.float64)
     ty=np.asarray(r(target_grid.y_origin_km)+
-                  (np.arange(target_grid.ny,dtype=np.float32)+r(.5))*r(target_grid.dy_km),
-                  dtype=np.float32)
+                  (np.arange(target_grid.ny,dtype=np.float64)+r(.5))*r(target_grid.dy_km),
+                  dtype=np.float64)
     target_x,target_y=np.meshgrid(tx,ty)
     targets=np.column_stack((target_x.ravel(),target_y.ravel()))
     source_u_flat=vertical_u.swapaxes(1,2).reshape(target_levels.size,-1)

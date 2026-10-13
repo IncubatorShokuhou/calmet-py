@@ -201,7 +201,7 @@ def load_precipitation(path,format=2,*,station_metadata=None,datum=None):
 
 def grid_precipitation(values,station_xy,grid,method=2,radius_km=50.,cutoff=.01):
     """Vectorized/blockwise CALMET GRIDE methods 1, 2 and 3."""
-    f32=np.float32
+    f32=np.float64
     rates=np.asarray(values,dtype=f32)
     points=np.asarray(np.asarray(station_xy,dtype=f32)*f32(1000.),dtype=f32)
     if points.shape!=(rates.size,2): raise ValueError('precipitation station coordinates have wrong shape')

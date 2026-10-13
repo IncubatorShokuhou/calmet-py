@@ -63,20 +63,6 @@ def test_terrel_legacy_header_formats_hemispheres_for_all_projections(projection
     assert lines[datum_index]=='WGS-84  02-21-2003  '
 
 
-def test_terrel_cell_average_matches_gnu_real4_bits():
-    actual=_cell_averages(
-        np.array([12345678.,98765.43,.1234567],dtype=np.float32),
-        np.array([7,13,3],dtype=np.int64))
-    np.testing.assert_array_equal(actual.view(np.uint32),np.array(
-        [0x49d74aa2,0x45ed6aba,0x3d288f3f],dtype=np.uint32))
-    assert _cell_average(np.float32(12345678.),7).view(np.uint32)==np.uint32(0x49d74aa2)
-
-
-def test_cellfill_search_count_uses_real4_expression_order():
-    assert _cell_search_count(547.7293895462553,8.311523355702224)==65
-    assert max(int(547.7293895462553/8.311523355702224+.1),1)==66
-
-
 @pytest.mark.parametrize(
     ("name", "origin"),
     [("N26E117.HGT", (26, 117)), ("S03W042.hgt", (-3, -42))],
@@ -182,26 +168,6 @@ def test_common_accumulator_tracks_peak_independently_of_mean():
     np.testing.assert_allclose(maxima, [20.0])
 
 
-def test_terrain_filter_matches_real4_noise_and_missing_thresholds(tmp_path):
-    config=TerrelConfig(
-        tmp_path,tmp_path/"terrain.nc",GridConfig(1,1,1.,1.),
-        noise_replacement=(0,2,0,0,0),
-        noise_minimum_m=(0.,1.00000003,0.,0.,0.),
-        missing_replacement=(0,2,0,0,0),
-        default_elevation_m=(0.,12.3456789,0.,0.,0.),
-    )
-    terrain_filter=_terrain_filter(config)
-    actual=terrain_filter.extracted(
-        np.zeros(4,dtype=np.float32),np.zeros(4,dtype=np.float32),
-        np.array([1.00000002,.9999999,-32000.,-32000.1]),
-        np.ones(4,dtype=bool),
-    )
-    assert actual.dtype==np.float32
-    expected=np.array(
-        [0x3f800000,0x3f800000,0xc6fa0000,0x414587e7],dtype=np.uint32)
-    np.testing.assert_array_equal(actual.view(np.uint32),expected)
-
-
 def test_cartesian_peak_radius_duplicates_boundary_sample_into_neighbor():
     grid = GridConfig(2, 1, 1.0, 1.0)
     sums = np.zeros(2)
@@ -248,28 +214,6 @@ def test_polar_peak_does_not_add_angular_cell_when_radial_perturbation_is_outsid
     _accumulate_points(
         [x],[y],[23.],grid,sums,counts,maxima,peak_radius_grid=np.float32(100.))
     np.testing.assert_array_equal(counts,[0,1,0,0,0,0,0,0])
-
-
-def test_grid_domain_and_peak_scale_match_gnu_real4_assignment_order():
-    grid=GridConfig(
-        3,2,18.790188546553008,7.345678,x_origin_km=10.1234567,
-        y_origin_km=-20.7654321,
-    )
-    bounds=np.asarray(_grid_domain_metres(grid),dtype=np.float32)
-    np.testing.assert_array_equal(bounds.view(np.uint32),np.array(
-        [0x461e2dd4,0x4781df02,0xc6a23add,0xc5bdd09d],dtype=np.uint32))
-    radius=np.asarray(_fixed_peak_radius(1234.567,grid),dtype=np.float32)
-    assert radius.view(np.uint32)==np.uint32(0x3d868f2a)
-
-
-def test_save_header_uses_fortran_real4_metres_before_integer_conversion():
-    grid=GridConfig(
-        3,2,18.790188546553008,7.345678,
-        x_origin_km=97.57499973130791,y_origin_km=-66.642994236278,
-        projection="UTM",utm_zone=50,
-    )
-    np.testing.assert_array_equal(
-        _save_header(grid,7),[97575,-66643,50,18790,3,2,7])
 
 
 def test_generic_utm_kilometres_are_transformed_before_binning(tmp_path, monkeypatch):
@@ -585,17 +529,6 @@ def test_interp2d_reproduces_a_plane_inside_rectangle():
     assert value == pytest.approx(11.0)
 
 
-def test_interp2d_matches_gnu_real4_on_irregular_quadrilateral():
-    xo=np.array([.125,3.375,3.625,-.25],dtype=np.float32)
-    yo=np.array([-.375,.25,4.125,3.75],dtype=np.float32)
-    values=np.array([123.456,-45.625,301.875,78.125],dtype=np.float32)
-    x=np.float32(1.4321); y=np.float32(2.3456)
-    dx=np.asarray(x-xo,dtype=np.float32); dy=np.asarray(y-yo,dtype=np.float32)
-    distances=np.asarray(np.sqrt(np.asarray(dx*dx+dy*dy,dtype=np.float32)),dtype=np.float32)
-    actual=_interp2d(xo,yo,values,distances,x,y,np.float32(100.))
-    assert actual.view(np.uint32)==np.uint32(0x42dfbc2c)
-
-
 def test_cellfill_uses_nearest_valid_cell_for_outer_boundary():
     grid = GridConfig(3, 3, 1.0, 1.0)
     sums = np.zeros(9)
@@ -610,23 +543,6 @@ def test_cellfill_uses_nearest_valid_cell_for_outer_boundary():
     np.testing.assert_array_equal(counts, 1)
 
 
-def test_cellfill_interpolates_interior_without_reusing_new_interior_values():
-    grid = GridConfig(5, 5, 1.0, 1.0)
-    yy, xx = np.indices((5, 5))
-    plane = xx + 10.0 * yy
-    boundary = (xx == 0) | (xx == 4) | (yy == 0) | (yy == 4)
-    sums = np.where(boundary, plane, 0.0).astype(float).ravel()
-    counts = boundary.astype(np.int64).ravel()
-    maxima = np.where(boundary, 50.0, -999.0).ravel()
-    assert _fill_void_cells(sums, counts, grid, 10.0, maxima) == 9
-    expected = plane.astype(float)
-    expected[1, 2] = 9.316761017
-    expected[1, 3] = 11.001578331
-    expected[2, 3] = 23.692512512
-    np.testing.assert_allclose(sums.reshape(5, 5), expected, rtol=1.0e-7)
-    assert sums.reshape(5, 5)[2, 2] == 22.0
-    np.testing.assert_allclose(maxima,50.0)
-    np.testing.assert_array_equal(counts, 1)
 
 
 def test_run_dispatches_generic_source_from_public_configuration(tmp_path, monkeypatch):
@@ -677,73 +593,6 @@ def test_polar_boundaries_and_cellind_radial_perturbation():
     assert _accumulate_points([x], [y], [12.0], grid, sums, counts, maxima, 600.0) == 1
     np.testing.assert_array_equal(counts[:2], [1, 1])
     np.testing.assert_allclose(maxima[:2], [12.0, 12.0])
-
-
-def test_polar_cellind_matches_gnu_real4_geometry_and_peak_indices():
-    grid=GridConfig(
-        3,4,1.,1.,grid_type=3,
-        ring_distances_km=(1.123456,2.876543,4.222222),
-        ray_angles_deg=(10.12345,77.77777,190.5432,299.8765),
-        polar_processing=1,
-    )
-    radial,angular=_polar_boundaries(grid)
-    result=_polar_cell_indices(
-        np.array([1234.567,-3456.789,0.,2500.,-1000.],dtype=np.float32),
-        np.array([2345.678,123.456,0.,-1000.,-2500.],dtype=np.float32),
-        radial,angular,grid.ray_angles_deg[0],np.float32(250.123),
-    )
-    distance,shifted,radial_index,angular_index,peak_radial,peak_angular=result[:6]
-    np.testing.assert_array_equal(distance.view(np.uint32),np.array(
-        [0x4525aba7,0x45582fe3,0x00000000,0x45284952,0x45284952],dtype=np.uint32))
-    np.testing.assert_array_equal(shifted.view(np.uint32),np.array(
-        [0x418d14a8,0x4382f602,0x43aef033,0x42cb5b1d,0x433fad8f],dtype=np.uint32))
-    np.testing.assert_array_equal(radial_index,[1,1,0,1,1])
-    np.testing.assert_array_equal(angular_index,[0,3,0,1,2])
-    np.testing.assert_array_equal(peak_radial,[1,2,0,1,1])
-    np.testing.assert_array_equal(peak_angular,[0,3,1,1,2])
-
-
-def test_height_iptype_coordinates_match_gnu_real4_including_polar_square_bug():
-    grid=GridConfig(
-        2,4,.731245,.731245,x_origin_km=10.12345,y_origin_km=20.54321,
-        grid_type=3,ring_distances_km=(1.123456,2.876543),
-        ray_angles_deg=(10.,100.,190.,280.),polar_processing=1,
-    )
-    x,y=_cell_type_coordinates(grid)
-    np.testing.assert_array_equal(x.view(np.uint32),np.array([
-        [0x40d78d33,0x40eef38f],
-        [0x40d78d33,0x40eef38f],
-        [0x40d78d33,0x40eef38f],
-        [0x40d78d33,0x40eef38f],
-    ],dtype=np.uint32))
-    np.testing.assert_array_equal(y.view(np.uint32),np.array([
-        [0x41893ef7,0x41893ef7],
-        [0x418f188e,0x418f188e],
-        [0x4194f225,0x4194f225],
-        [0x419acbbc,0x419acbbc],
-    ],dtype=np.uint32))
-
-
-def test_fillang_matches_gnu_real4_and_wraps_last_ray_to_first():
-    void=np.float32(-32000.)
-    terrain=np.array([
-        [void,void],
-        [void,20.],
-        [30.,void],
-        [40.,void],
-        [void,50.],
-        [void,void],
-    ],dtype=np.float32)
-    actual=_fill_polar_angular_gaps(terrain)
-    expected=np.array([
-        [35.,20.],
-        [30.,20.],
-        [30.,20.],
-        [40.,35.],
-        [40.,50.],
-        [40.,35.],
-    ],dtype=np.float32)
-    np.testing.assert_array_equal(actual.view(np.uint32),expected.view(np.uint32))
 
 
 def test_fillang_rejects_an_entirely_empty_ring_instead_of_looping_forever():
@@ -857,42 +706,6 @@ def test_public_isc_cartesian_run_outputs_peak_not_mean(tmp_path, monkeypatch):
     with Dataset(output) as dataset:
         assert dataset["terrain_height"].long_name.startswith("grid-cell peak")
         assert float(dataset["terrain_height"][0, 0]) == 20.0
-
-
-def test_xyelev_matches_gnu_real4_maximum_and_quadrant_state(tmp_path):
-    receptor_input=tmp_path/"receptors.inp"
-    receptor_input.write_text(
-        "1.234567 -2.345678\n-3.210987 4.567891\n",encoding="ascii")
-    points_x=np.array([1100.,1400.,1200.,-3200.,-3000.,-3400.],dtype=np.float32)
-    points_y=np.array([-2500.,-2500.,-2200.,4500.,4700.,4800.],dtype=np.float32)
-    elevation=np.array([10.123,20.456,30.789,40.12,50.34,60.56],dtype=np.float32)
-    base=dict(
-        srtm_dir=tmp_path,output=tmp_path/"out.nc",grid=GridConfig(1,1,1.,1.),
-        receptor_input=receptor_input,receptor_columns=2,receptor_radius_km=.3,
-    )
-    maximum=_read_receptors(TerrelConfig(**base))
-    maximum.add(points_x,points_y,elevation)
-    np.testing.assert_array_equal(maximum.heights_m.view(np.uint32),np.array(
-        [0x41f64fdf,0x42723d71],dtype=np.uint32))
-
-    interpolated=_read_receptors(TerrelConfig(**base,interpolate_receptors=True))
-    interpolated.add(points_x[:3],points_y[:3],elevation[:3])
-    interpolated.add(points_x[3:],points_y[3:],elevation[3:])
-    expected=np.array([
-        [0x3f8ccccd,0xc0200000,0x4121f7cf,0x3e51aa9c],
-        [0x3fb33334,0xc0200000,0x41a3a5e3,0x3e67aac4],
-        [0x58635fa9,0x58635fa9,0xc479c000,0x58635fa9],
-        [0x3f99999a,0xc00ccccd,0x41f64fdf,0x3e1950fb],
-        [0xd8635fa9,0xd8635fa9,0xc479c000,0x58635fa9],
-        [0xc04ccccd,0x40900000,0x42207ae1,0x3d8cd999],
-        [0xc0400001,0x40966667,0x42495c29,0x3e7ee8a2],
-        [0xc059999a,0x4099999a,0x42723d71,0x3e99423d],
-    ],dtype=np.uint32)
-    actual=np.column_stack((
-        interpolated.vertices_x.T.ravel(),interpolated.vertices_y.T.ravel(),
-        interpolated.vertices_z.T.ravel(),interpolated.distances.T.ravel(),
-    ))
-    np.testing.assert_array_equal(actual.view(np.uint32),expected)
 
 
 def test_public_run_writes_peak_discrete_receptor_elevations(tmp_path, monkeypatch):

@@ -18,7 +18,7 @@ Python 主流程无需编译 Fortran。
 - 兼容传统 CALWRF、TERREL、CTGPROC、MAKEGEO 和 CALMET 文件。
 - WRF 数据按时次流式处理，可处理超过内存容量的数据集。
 - 提供经过无损压缩的浙江真实 WRF 示例。
-- 保留 Fortran 参考源码，并用数值回归测试验证 Python 实现。
+- 提供独立的 legacy API，供确实需要复现旧 Fortran 计算路径的工作流显式调用。
 
 ## 安装
 
@@ -75,6 +75,15 @@ pycalmet.calmet(...)
 pycalmet.readlst(...)
 ```
 
+默认 API 使用常规 NumPy 计算、`pyproj`、`datetime`，并让 CALWRF 通过 NetCDF
+直接向 CALMET 传递数据。只有确实需要旧单精度运算顺序或 M3D 中转时，才使用冻结
+的兼容实现：
+
+```python
+pycalmet.legacy.calwrf(...)
+pycalmet.legacy.calmet(...)
+```
+
 ## 浙江示例
 
 仓库内置三个连续 WRF 时次、42 个原始 SRTM3 `.hgt` 瓦片和分类土地利用点数据。
@@ -94,12 +103,12 @@ cd terrain/srtm3 && sha256sum -c SHA256SUMS && cd ../..
 ## 仓库结构
 
 ```text
-src/pycalmet/          Python 软件包
-tests/                 单元、集成和数值回归测试
+src/pycalmet/          Python 软件包和可选 legacy 命名空间
+tests/                 单元测试和集成测试
 examples/zhejiang/     可运行的真实数据示例及控制文件
 terrain/srtm3/         浙江区域使用的 SRTM3 瓦片
 fortran/               仅供参考的 Fortran 源码，运行时不使用
-tools/                 Python 诊断与回归工具
+tools/                 维护工具
 ```
 
 `fortran/` 仅保留源码和必要的包含文件。旧 NCL 程序、区域 C-shell 运行脚本、构建
@@ -123,11 +132,9 @@ tools/                 Python 诊断与回归工具
 python -m pytest -q
 ```
 
-绝大多数回归结果与平台无关。少量测试会检查 GNU `REAL*4` 超越函数的精确位模式；
-不同 glibc 版本可能产生 1–2 ULP 差异，但物理结果等价。
-
-`tools/` 中的脚本可逐字段比较 NetCDF 或传统输出。`fortran/` 中的源码用于审计和
-数值参考，不是安装依赖。
+默认测试检查数值行为和完整数据流，不绑定特定编译器或 C 数学库。单独的 legacy
+测试用于确认兼容命名空间与默认实现隔离，并验证其旧单精度路径。`fortran/` 中的
+源码仅用于审计，不是安装依赖。
 
 ## 参与贡献
 

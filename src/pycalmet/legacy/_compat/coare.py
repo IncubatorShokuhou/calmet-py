@@ -1,0 +1,327 @@
+"""Vectorized CALMET 6.5 COARE 2.6 overwater surface fluxes."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from scipy.ndimage import distance_transform_edt
+
+
+@dataclass(frozen=True, slots=True)
+class CoareFlux:
+    """Fields returned by CALMET's ``COARE -> BULK_FLUX -> ASL`` chain."""
+
+    roughness_m: np.ndarray
+    monin_obukhov_m: np.ndarray
+    friction_velocity_m_s: np.ndarray
+    temperature_scale_k: np.ndarray
+    humidity_scale_kg_kg: np.ndarray
+    sensible_heat_flux_w_m2: np.ndarray
+    latent_heat_flux_w_m2: np.ndarray
+    buoyancy_flux_k_m_s: np.ndarray
+    cool_skin_delta_k: np.ndarray
+    gustiness_m_s: np.ndarray
+    stress_n_m2: np.ndarray
+    rain_heat_flux_w_m2: np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
+class WarmLayerState:
+    """Per-grid state carried by CALMET's COARE ``IWARM=1`` option."""
+
+    time_old_s: np.ndarray
+    heat_column_j_m2: np.ndarray
+    stress_integral_n_s_m2: np.ndarray
+    stress_old_n_m2: np.ndarray
+    rain_heat_old_w_m2: np.ndarray
+    sensible_old_w_m2: np.ndarray
+    latent_old_w_m2: np.ndarray
+    morning_started: np.ndarray
+    absorption_fraction: np.ndarray
+    layer_thickness_m: np.ndarray
+    initialized: np.ndarray
+
+
+def initial_warm_layer_state(shape):
+    """Return COARE's first-call values for an output-grid shape."""
+    zeros=np.zeros(shape,dtype=float)
+    return WarmLayerState(
+        zeros.copy(),zeros.copy(),zeros.copy(),zeros.copy(),zeros.copy(),
+        zeros.copy(),zeros.copy(),np.zeros(shape,dtype=bool),
+        np.full(shape,.5),np.full(shape,19.),np.zeros(shape,dtype=bool))
+
+
+def advance_warm_layer(state,solar_time_s,sea_temperature_k,sensor_depth_m,
+                       shortwave_down_w_m2,longwave_down_w_m2):
+    """Advance the vectorized COARE PWP warm layer before the ASL solve."""
+    time,temperature,depth,shortwave,longwave=np.broadcast_arrays(
+        np.asarray(solar_time_s,dtype=float),np.asarray(sea_temperature_k,dtype=float),
+        np.asarray(sensor_depth_m,dtype=float),np.asarray(shortwave_down_w_m2,dtype=float),
+        np.asarray(longwave_down_w_m2,dtype=float))
+    initialized=np.asarray(state.initialized,dtype=bool)
+    midnight=initialized&(time<state.time_old_s)
+    normal=initialized&~midnight
+    heat=np.where(midnight,0.,state.heat_column_j_m2).copy()
+    stress_integral=np.where(midnight,0.,state.stress_integral_n_s_m2).copy()
+    started=np.where(midnight,False,state.morning_started).copy()
+    fraction=np.where(midnight,.5,state.absorption_fraction).copy()
+    thickness=np.where(midnight,19.,state.layer_thickness_m).copy()
+    rns=.945*shortwave
+    rnl=.97*(5.67e-8*(temperature-273.15+273.16)**4-longwave)
+    heat_out=rnl+state.sensible_old_w_m2+state.latent_old_w_m2+state.rain_heat_old_w_m2
+    effective=fraction*rns-heat_out
+    integrate=normal&((effective>=50.)|started)
+    started|=integrate
+    elapsed=time-state.time_old_s
+    stress_integral=np.where(
+        integrate,stress_integral+np.maximum(state.stress_old_n_m2,.002)*elapsed,
+        stress_integral)
+    expansion=2.1e-5*np.power(temperature-273.15+3.2,.79)
+    ctd1=np.sqrt(2.*.65*4000./(expansion*9.81*1022.))
+    for _ in range(5):
+        fraction_candidate=(1.-(.28*.014*(1.-np.exp(-thickness/.014))+
+                                  .27*.357*(1.-np.exp(-thickness/.357))+
+                                  .45*12.82*(1.-np.exp(-thickness/12.82)))/thickness)
+        joule=(fraction_candidate*rns-heat_out)*elapsed
+        positive=heat+joule>0.
+        thickness_candidate=np.minimum(
+            19.,ctd1*stress_integral/np.sqrt(np.maximum(heat+joule,np.finfo(float).tiny)))
+        fraction=np.where(integrate,fraction_candidate,fraction)
+        thickness=np.where(integrate&positive,thickness_candidate,thickness)
+    joule=(fraction*rns-heat_out)*elapsed
+    nonpositive=integrate&((heat+joule)<=0.)
+    fraction=np.where(nonpositive,.76,fraction)
+    thickness=np.where(nonpositive,19.,thickness)
+    joule=np.where(nonpositive,(fraction*rns-heat_out)*elapsed,joule)
+    heat=np.where(integrate,heat+joule,heat)
+    ctd2=np.sqrt(2.*expansion*9.81/(.65*1022.))/(4000.**1.5)
+    warming=np.where(integrate&(heat>0.),ctd2*np.maximum(heat,0.)**1.5/
+                     np.maximum(stress_integral,np.finfo(float).tiny),0.)
+    sensor_increment=np.where(thickness<depth,warming,warming*depth/thickness)
+    adjusted=np.where(normal,temperature+sensor_increment,temperature)
+    next_state=WarmLayerState(
+        time,heat,stress_integral,state.stress_old_n_m2,state.rain_heat_old_w_m2,
+        state.sensible_old_w_m2,state.latent_old_w_m2,started,fraction,thickness,
+        np.ones(time.shape,dtype=bool))
+    return adjusted,next_state,warming
+
+
+def update_warm_layer_fluxes(state,flux):
+    """Store fluxes consumed at the next COARE warm-layer timestep."""
+    return WarmLayerState(
+        state.time_old_s,state.heat_column_j_m2,state.stress_integral_n_s_m2,
+        np.asarray(flux.stress_n_m2),np.asarray(flux.rain_heat_flux_w_m2),
+        np.asarray(flux.sensible_heat_flux_w_m2),np.asarray(flux.latent_heat_flux_w_m2),
+        state.morning_started,state.absorption_fraction,state.layer_thickness_m,
+        state.initialized)
+
+
+def distance_to_coast(landuse,water_range,dx_km,dy_km):
+    """CALMET SETCOAST distance from each water cell to a land-cell centre."""
+    categories=np.asarray(landuse)
+    water=(categories>=water_range[0])&(categories<=water_range[1])
+    if water.all():
+        return np.where(water,1.e6,0.)
+    distance=distance_transform_edt(water,sampling=(dy_km,dx_km))
+    return np.where(water,distance,0.)
+
+
+def _humidity_vapor_pressure(temperature_c, pressure_mb):
+    """CALMET HUMIDITY: Buck/Tetens saturation vapor pressure in mb."""
+    temperature=np.asarray(temperature_c,dtype=float)
+    pressure=np.asarray(pressure_mb,dtype=float)
+    return ((1.0007+3.46e-6*pressure)*6.1121*
+            np.exp(17.502*temperature/(240.97+temperature)))
+
+
+def _psiu(z_over_l):
+    """COARE PSIU, including CALMET's 0.3333 exponent literal."""
+    value=np.asarray(z_over_l,dtype=float)
+    unstable=value<0.
+    x=np.power(np.maximum(1.-15.*value,0.),.25)
+    kansas=(2.*np.log((1.+x)/2.)+np.log((1.+x*x)/2.)-
+            2.*np.arctan(x)+2.*np.arctan(1.))
+    y=np.power(np.maximum(1.-10.15*value,0.),.3333)
+    convective=(1.5*np.log((1.+y+y*y)/3.)-
+                np.sqrt(3.)*np.arctan((1.+2.*y)/np.sqrt(3.))+
+                4.*np.arctan(1.)/np.sqrt(3.))
+    weight=value*value/(1.+value*value)
+    stable=-((1.+value)+.6667*(value-14.28)/np.exp(np.minimum(50.,.35*value))+8.525)
+    return np.where(unstable,(1.-weight)*kansas+weight*convective,stable)
+
+
+def _psit(z_over_l):
+    """COARE PSIT, including CALMET's 0.3333 exponent literal."""
+    value=np.asarray(z_over_l,dtype=float)
+    unstable=value<0.
+    x=np.sqrt(np.maximum(1.-15.*value,0.))
+    kansas=2.*np.log((1.+x)/2.)
+    y=np.power(np.maximum(1.-34.15*value,0.),.3333)
+    convective=(1.5*np.log((1.+y+y*y)/3.)-
+                np.sqrt(3.)*np.arctan((1.+2.*y)/np.sqrt(3.))+
+                4.*np.arctan(1.)/np.sqrt(3.))
+    weight=value*value/(1.+value*value)
+    stable=-(np.maximum(1.+2.*value/3.,0.)**1.5+
+             .6667*(value-14.28)/np.exp(np.minimum(50.,.35*value))+8.525)
+    return np.where(unstable,(1.-weight)*kansas+weight*convective,stable)
+
+
+def downward_longwave(temperature_k,relative_humidity_percent,cloud_fraction,
+                      ceiling_height_m):
+    """Vectorized CALMET ``RADFLX`` downward longwave radiation."""
+    temperature,humidity,cloud,ceiling=np.broadcast_arrays(
+        np.asarray(temperature_k,dtype=float),
+        np.asarray(relative_humidity_percent,dtype=float),
+        np.asarray(cloud_fraction,dtype=float),
+        np.asarray(ceiling_height_m,dtype=float))
+    water=np.clip(.439*(humidity*.01)*np.exp(26.23-5416./temperature)/temperature,.1,5.)
+    clear=(.725+.17*np.log10(water))*5.67e-8*temperature**4
+    hundreds_ft=ceiling/30.48
+    enhancement=np.where(hundreds_ft<64.,.26,
+                         np.where(hundreds_ft<=210.,.22,.006))*cloud
+    return clear*(1.+enhancement)
+
+
+def surface_flux(
+    wind_speed_m_s,
+    air_temperature_k,
+    sea_temperature_k,
+    humidity,
+    *,
+    wind_height_m=10.,
+    temperature_height_m=10.,
+    pressure_mb=1008.,
+    boundary_layer_height_m=600.,
+    shortwave_down_w_m2=0.,
+    longwave_down_w_m2=0.,
+    rainfall_mm_h=0.,
+    wave_method=0,
+    wave_period_s=-999.,
+    wave_height_m=-999.,
+    coastal_shelf_length_km=0.,
+    distance_to_coast_km=0.,
+    cool_skin=False,
+):
+    """Evaluate the stateless part of CALMET's COARE 2.6 implementation.
+
+    ``humidity`` follows the legacy interface: values below 2 are relative
+    humidity fractions, while larger values are specific humidity in g/kg.
+    Warm-layer storage is intentionally separate because it carries state
+    between timesteps; this function exactly covers ``IWARM=0``.
+    """
+    if wave_method not in {0,1,2}:
+        raise ValueError('COARE wave_method must be 0, 1, or 2')
+    u,t_k,ts_k,q_input=np.broadcast_arrays(
+        np.asarray(wind_speed_m_s,dtype=float),
+        np.asarray(air_temperature_k,dtype=float),
+        np.asarray(sea_temperature_k,dtype=float),
+        np.asarray(humidity,dtype=float))
+    zu,zt,p,zi,rs,rl,rain=np.broadcast_arrays(
+        np.asarray(wind_height_m,dtype=float),np.asarray(temperature_height_m,dtype=float),
+        np.asarray(pressure_mb,dtype=float),np.asarray(boundary_layer_height_m,dtype=float),
+        np.asarray(shortwave_down_w_m2,dtype=float),np.asarray(longwave_down_w_m2,dtype=float),
+        np.asarray(rainfall_mm_h,dtype=float),
+        subok=True)
+    if np.any(zu<=0.) or np.any(zt<=0.) or np.any(p<=0.) or np.any(zi<=0.):
+        raise ValueError('COARE heights and pressure must be positive')
+    t=t_k-273.15; ts=ts_k-273.15
+    to_k=273.16; gravity=9.81; von=.4; fdg=1.; beta=1.2
+    cpa=1004.67; cpw=4000.; rhow=1022.; rgas=287.1; visw=1.e-6
+    expansion=2.1e-5*np.power(ts+3.2,.79)
+    latent=(2.501-.00237*ts)*1.e6
+    viscosity=1.326e-5*(1.+6.542e-3*t+8.301e-6*t*t-4.84e-9*t*t*t)
+    saturated_air=_humidity_vapor_pressure(t,p)
+    vapor=np.where(q_input<2.,saturated_air*q_input,np.nan)
+    q=np.where(q_input<2.,.62197*vapor/(p-.378*vapor),q_input/1000.)
+    # ASL recomputes density after humidity has been converted.
+    rho_air=p*100./(rgas*(t+to_k)*(1.+.61*q))
+    saturated_sea=.98*_humidity_vapor_pressure(ts,p)
+    qs=.62197*saturated_sea/(p-.378*saturated_sea)
+    rnl=.97*(5.67e-8*(ts+to_k)**4-rl)
+    rns=.945*rs
+    salinity=.026
+    conductivity=.6
+    big_c=(16.*gravity*cpw*(rhow*visw)**3/
+           (conductivity*conductivity*rho_air*rho_air))
+    wet_c=.622*latent*qs/(rgas*(ts+to_k)**2)
+    dter=np.where(cool_skin,.3,0.)
+    gust=np.full_like(u,.5)
+    speed=np.sqrt(u*u+gust*gust)
+    delta_t=ts-t-.0098*zt
+    delta_q=qs-q
+    roughness=np.full_like(u,1.e-4)
+    u10=speed*np.log(10./roughness)/np.log(zu/roughness)
+    ustar=.035*u10
+    zo10=.011*ustar*ustar/gravity+.11*viscosity/ustar
+    cd10=(von/np.log(10./zo10))**2
+    ct10=.00115/np.sqrt(cd10)
+    zot10=10./np.exp(von/ct10)
+    cd=(von/np.log(zu/zo10))**2
+    ct=von/np.log(zt/zot10)
+    coefficient=von*ct/cd
+    rib_critical=-zu/(zi*.004*beta**3)
+    rib=-gravity*zu*((delta_t-dter)+.61*(t+to_k)*delta_q)/(
+        (t+to_k)*speed*speed)
+    zetu=np.where(rib<0.,coefficient*rib/(1.+rib/rib_critical),
+                  coefficient*rib*(1.+3.*rib/coefficient))
+    # The original performs one stability iteration for all cases.
+    tscale=-(delta_t-dter)*von*fdg/(np.log(zt/zot10)-_psit(zetu))
+    qscale=-(delta_q-wet_c*dter)*von*fdg/(np.log(zt/zot10)-_psit(zetu))
+    ustar=speed*von/(np.log(zu/zo10)-_psiu(zetu))
+    charn=np.where(speed>18.,.018,
+                   np.where(speed>10.,.011+(.018-.011)*(speed-10.)/8.,.011))
+    shelf=np.asarray(coastal_shelf_length_km,dtype=float)
+    coast=np.asarray(distance_to_coast_km,dtype=float)
+    shelf_safe=np.where(shelf<.1,1.,shelf)
+    factor=np.where(shelf<.1,1.,1.-(1.-.032/charn)*np.exp(-(coast/shelf_safe)**4))
+    charn=charn*factor
+    ta=t+to_k
+    zet=von*gravity*zu/ta*(tscale+.61*ta*qscale)/(ustar*ustar)
+    if wave_method==0:
+        roughness=charn*ustar*ustar/gravity+.11*viscosity/ustar
+    else:
+        period=np.where(np.asarray(wave_period_s)<0.,.729*u,wave_period_s)
+        height=np.where(np.asarray(wave_height_m)<0.,.018*u*u*(1.+.015*u),wave_height_m)
+        cwave=gravity*period/(2.*3.14159); lwave=cwave*period
+        if wave_method==1:
+            roughness=(50./(2.*3.14159))*lwave*(ustar/cwave)**4.5+.11*viscosity/ustar
+        else:
+            roughness=1200.*height*(height/lwave)**4.5+.11*viscosity/ustar
+    reynolds=roughness*ustar/viscosity
+    scalar_roughness=np.minimum(1.15e-4,5.5e-5/reynolds**.6)
+    ustar=speed*von/(np.log(zu/roughness)-_psiu(zet))
+    tscale=-(delta_t-dter*bool(cool_skin))*von*fdg/(
+        np.log(zt/scalar_roughness)-_psit(zet))
+    qscale=-(delta_q-wet_c*dter*bool(cool_skin))*von*fdg/(
+        np.log(zt/scalar_roughness)-_psit(zet))
+    buoyancy=-gravity/ta*ustar*(tscale+.61*ta*qscale)
+    gust=np.where(buoyancy>0.,beta*np.power(np.maximum(buoyancy*zi,0.),.333),.2)
+    sensible=-cpa*rho_air*ustar*tscale
+    latent_flux=-latent*rho_air*ustar*qscale
+    # ASL computes the cool-skin correction after the returned scales.  Keep
+    # that state for completeness even though it affects the next call only.
+    heat_out=rnl+sensible+latent_flux
+    thickness=np.full_like(u,.001)
+    absorbed=rns*(.060+11.*thickness-6.6e-5/thickness*(1.-np.exp(-thickness/8.e-4)))
+    column=heat_out-absorbed
+    alpha_q=expansion*column+salinity*latent_flux*cpw/latent
+    ratio=big_c*np.abs(alpha_q)/ustar**4
+    positive=np.maximum(big_c*alpha_q/ustar**4,0.)
+    lam=np.where(alpha_q>0.,6./(1.+positive**.75)**.333,
+                 np.where(ratio<1.,6./np.maximum(1.-ratio**.75,1.e-30)**.333,6.))
+    thickness=lam*visw/(np.sqrt(rho_air/rhow)*ustar)
+    dter=column*thickness/conductivity
+    total_speed=np.sqrt(u*u+gust*gust)
+    stress=rho_air*ustar*ustar*u/total_speed
+    saturated_specific=.62197*saturated_air/(p-.378*saturated_air)
+    water_diffusivity=2.11e-5*((t+to_k)/to_k)**1.94
+    heat_diffusivity=(1.+3.309e-3*t-1.44e-6*t*t)*.02411/(rho_air*cpa)
+    saturation_slope=saturated_specific*latent/(rgas*(t+to_k)**2)
+    wet_bulb=1./(1.+.622*saturation_slope*latent*water_diffusivity/(cpa*heat_diffusivity))
+    rain_heat=(rain*wet_bulb*cpw*((ts-t-dter*bool(cool_skin))+
+               (qs-q-wet_c*dter*bool(cool_skin))*latent/cpa)/3600.)
+    z_over_l=zet
+    monin=np.where(np.abs(z_over_l)<1.e-4,10000.,zu/z_over_l)
+    buoyancy_flux=-ustar*(tscale+.61*qscale*t_k)
+    return CoareFlux(roughness,monin,ustar,tscale,qscale,sensible,latent_flux,
+                     buoyancy_flux,dter,gust,stress,rain_heat)

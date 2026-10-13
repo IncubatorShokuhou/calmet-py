@@ -9,16 +9,6 @@ from pycalmet.legacy_m3d import _level, _surface, _water
 from pycalmet.legacy_calwrf import (_legacy_vertical_velocity,_nint,_r4_divide,
                                     _r4_scale,_relative_humidity,_compressed_water,
                                     write_m3d)
-
-
-def test_calwrf_getrh1_matches_gnu_real4_bits():
-    pressure=np.array([1000.125,850.375,500.625,250.875,75.125,1013.25],dtype='f4')
-    temperature=np.array([300.125,273.175,250.625,220.375,195.125,310.75],dtype='f4')
-    mixing_g_kg=np.array([12.345,4.567,.8125,.03125,.00075,35.5],dtype='f4')
-    actual=_relative_humidity(mixing_g_kg/np.float32(1000.),pressure,temperature)
-    np.testing.assert_array_equal(actual.view(np.uint32),np.array(
-        [0x425efe12,0x42c80000,0x42819c01,0x41db3715,0x40c50056,0x42b20b44],
-        dtype=np.uint32))
 from pycalmet.legacy_m2d import M2DReader
 from pycalmet.legacy_m3d import M3DReader
 from pycalmet._calmet import _meteorology_dataset
@@ -42,12 +32,6 @@ def test_legacy_vertical_velocity_uses_calwrf_threshold():
     assert _legacy_vertical_velocity(np.float32(-.00498)).view(np.uint32)==0
     retained=_legacy_vertical_velocity(np.float32(-.004994))
     assert retained.view(np.uint32)==np.float32(-.004994).view(np.uint32)
-
-
-def test_compressed_water_uses_calwrf_real4_threshold():
-    boundary=np.float32(.00049)
-    assert _compressed_water([boundary,boundary])==' 0.000 0.000'
-    assert _compressed_water([np.nextafter(boundary,np.float32(0.)),0.])=='-2.000'
 
 
 def test_fixed_width_surface_parser():

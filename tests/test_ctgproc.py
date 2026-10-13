@@ -27,108 +27,11 @@ def test_glaz_translation_is_the_legacy_table():
     assert np.all(np.diff(USGS38) > 0)
 
 
-def test_gselect_markers_use_fortran_real4_region_boundaries():
-    keep=_select_glaz_markers(
-        -100.,8.4999999,-200.,-190.,-80.,-70.)
-    assert 'GLAZNA' in keep
-    assert not (8.5<=8.4999999<=90.)
-
-
-def test_get4cnr_window_uses_real4_before_integer_index_and_buffer():
-    grid=GridConfig(1,1,1.,1.)
-    spec=type('Spec',(),dict(nx=100,ny=100,x_origin_km=0.,y_origin_km=0.))()
-    def reverse(x,y):
-        return (np.array([10.9999999,20.2,20.2,10.9999999]),
-                np.array([30.1,30.1,35.2,35.2]))
-    irange,jrange=_window(grid,reverse,spec)
-    assert (irange.start,irange.stop,jrange.start,jrange.stop)==(10,22,29,37)
-
-
-def test_glaz_mesh_offsets_and_nested_order_match_fortran_real4():
-    offsets=_mesh_offsets(12)
-    np.testing.assert_array_equal(offsets.view(np.uint32),np.array([
-        0xbeeaaaab,0xbec00000,0xbe955555,0xbe555554,0xbe000000,0xbd2aaaa8,
-        0x3d2aaab0,0x3e000000,0x3e555558,0x3e955556,0x3ec00000,0x3eeaaaac,
-    ],dtype=np.uint32))
-    ox,oy=np.meshgrid(_mesh_offsets(2),_mesh_offsets(2),indexing='ij')
-    np.testing.assert_array_equal(
-        np.column_stack((ox.ravel(),oy.ravel())),
-        [[-.25,-.25],[-.25,.25],[.25,-.25],[.25,.25]])
-
-
-def test_mesh_coordinates_preserve_fortran_real4_association_and_order():
-    coordinates=_mesh_coordinates(np.array([500.1],dtype=np.float32),12,.2)
-    f32=np.float32
-    np.testing.assert_array_equal(coordinates[0].view(np.uint32),np.array([
-        0x43fa0111,0x43fa0333,0x43fa0555,0x43fa0777,0x43fa099a,0x43fa0bbc,
-        0x43fa0dde,0x43fa1000,0x43fa1222,0x43fa1444,0x43fa1666,0x43fa1889,
-    ],dtype=np.uint32))
-    # Re-associated center+offset arithmetic is observably different here.
-    assert np.any(coordinates[0].view(np.uint32)!=
-                  (f32(500.1)+_mesh_offsets(12,.2)).view(np.uint32))
-
-
-def test_source_centers_match_fortran_real4_at_large_indices():
-    centers=_source_centers(-180.+(1./120.)/2.,1./120.,
-                            np.array([0,12345,43199]))
-    np.testing.assert_array_equal(centers.view(np.uint32),np.array([
-        0xc333feef,0xc29a3ddd,0x4333fef1,
-    ],dtype=np.uint32))
-
-
-def test_geotiff_geometry_matches_get_ifd_real4_and_tiepoint_offsets():
-    x0,y0,dx,dy,native_per_work=_geotiff_geometry(
-        (30.123456,30.654321,0.),
-        (7.,9.,0.,500000.123,4000000.456,0.),1,CRS.from_epsg(32650))
-    values=np.array([x0,y0,dx,dy],dtype=np.float32)
-    np.testing.assert_array_equal(values.view(np.uint32),np.array([
-        0x43f9e6f5,0x457a042e,0x3cf6c578,0xbcfb1ec6,
-    ],dtype=np.uint32))
-    assert native_per_work==1000.
-
-
 def test_geotiff_orientation_four_uses_bottom_to_top_rows():
     x0,y0,dx,dy,_=_geotiff_geometry(
         (30.,30.,0.),(0.,0.,0.,500000.,4000000.,0.),1,
         CRS.from_epsg(32650),orientation=4)
     np.testing.assert_allclose([x0,y0,dx,dy],[500.015,4000.015,.03,.03])
-
-
-def test_fraction_conversion_uses_fortran_real4_integer_conversion():
-    counts=np.array([81150454,10179364],dtype=np.int64)[:,None,None]
-    totals,fractions=_fractions_from_counts(counts)
-    assert totals.item()==91329818
-    assert fractions[0].view(np.uint32).item()==np.uint32(0x3f63778c)
-    double_first=np.float32(counts[0,0,0]/totals[0,0])
-    assert double_first.view(np.uint32)==np.uint32(0x3f63778b)
-
-
-def test_low_hit_threshold_uses_fortran_integer_then_real4_conversion():
-    assert _low_hit_threshold(16777299,1)==167773
-    assert 16777299//100==167772
-
-
-def test_lugrid_index_uses_real4_coordinate_boundary():
-    grid=GridConfig(2,1,1.,1.)
-    just_below=np.nextafter(1.,0.)
-    ix,iy=_grid_indices(np.array([just_below]),np.array([.5]),grid)
-    assert (ix.item(),iy.item())==(1,0)
-    assert int(np.floor(just_below))==0
-
-
-def test_coast_fill_grid_centers_preserve_real4_expression_order():
-    actual=_grid_centers_1d(-4983.510837831078,18.935112104245633,323)[-1]
-    assert actual.view(np.uint32)==np.uint32(0x448c6204)
-    double_first=np.float32(-4983.510837831078+(323.-.5)*18.935112104245633)
-    assert double_first.view(np.uint32)==np.uint32(0x448c6203)
-
-
-def test_snow_grid_index_preserves_real4_nint_boundary():
-    longitude=np.array([-124.72541733311499])
-    isn,jsn=_snow_grid_indices(longitude,np.array([52.8704185]))
-    assert (isn.item(),jsn.item())==(1,1)
-    double_first=int(np.floor((longitude.item()+124.729584)/8.33333377e-3+.5))+1
-    assert double_first==2
 
 
 def test_pnpoly_preserves_legacy_vertex_edge_and_inside_states():

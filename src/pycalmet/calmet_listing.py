@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from .datetime_utils import format_ordinal_code
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +11,7 @@ from .calmet_numerics import convective_velocity_scale, pgt_stability
 
 
 def _coded_time(value: datetime) -> int:
-    return value.year*100000+value.timetuple().tm_yday*100+value.hour
+    return format_ordinal_code(value)
 
 
 def format_surface_input_debug(record,stations) -> str:

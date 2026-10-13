@@ -20,7 +20,7 @@ numerical references are kept in separate, clearly scoped directories.
 - Compatibility with legacy CALWRF, TERREL, CTGPROC, MAKEGEO, and CALMET files.
 - Streaming WRF processing for datasets larger than memory.
 - A real-data Zhejiang example with losslessly compressed WRF inputs.
-- Numerical regression tests derived from the retained Fortran reference code.
+- A separate opt-in legacy API for reproducing historical Fortran-oriented runs.
 
 ## Installation
 
@@ -80,6 +80,16 @@ pycalmet.calmet(...)
 pycalmet.readlst(...)
 ```
 
+The default API uses regular NumPy calculations, `pyproj`, `datetime`, and a
+direct NetCDF flow from CALWRF to CALMET. Workflows that specifically require
+the former single-precision operation order or M3D staging can opt in to the
+frozen compatibility implementation:
+
+```python
+pycalmet.legacy.calwrf(...)
+pycalmet.legacy.calmet(...)
+```
+
 ## Zhejiang example
 
 The bundled example contains three consecutive WRF records, 42 original SRTM3
@@ -100,12 +110,12 @@ input boundaries, source data, and generated products.
 ## Repository layout
 
 ```text
-src/pycalmet/          Python package
-tests/                 Unit, integration, and numerical regression tests
+src/pycalmet/          Python package and opt-in legacy namespace
+tests/                 Unit and integration tests
 examples/zhejiang/     Runnable real-data example and control files
 terrain/srtm3/         SRTM3 tiles used by the Zhejiang domain
 fortran/               Reference Fortran sources; not used at runtime
-tools/                 Python diagnostics and regression utilities
+tools/                 Maintainer utilities
 ```
 
 The `fortran/` tree contains source material only. Legacy NCL programs,
@@ -132,14 +142,11 @@ Run the complete Python suite with:
 python -m pytest -q
 ```
 
-Most regression expectations are platform-independent. A small group of tests
-checks exact GNU `REAL*4` transcendental-function bit patterns; different glibc
-versions can differ by one or two ULP while producing equivalent physical
-results.
-
-The scripts in `tools/` compare canonical or legacy outputs field by field.
-Fortran sources under `fortran/` are retained for audit and numerical reference
-and are not an installation dependency.
+The default suite checks numerical behavior and complete data flow without
+requiring a particular compiler or C math library. A focused legacy test keeps
+the compatibility namespace separate and verifies its historical
+single-precision path. Fortran sources under `fortran/` remain available for
+audit and are not an installation dependency.
 
 ## Contributing
 

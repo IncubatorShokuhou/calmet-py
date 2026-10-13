@@ -24,6 +24,7 @@ from .config import (CalmetConfig,CalwrfConfig,CtgprocConfig,CtgprocSource,
 from .readlst import readlst
 from .datums import DATUMS,DatumDefinition,datum_definition,datum_shift
 from .prog_data import ProgData,ProgRecord
+from . import legacy
 
 __all__ = [
     "calwrf", "terrel", "ctrproc", "ctgproc", "makegeo", "calmet", "readlst",
@@ -31,7 +32,7 @@ __all__ = [
     "MakegeoConfig", "CalmetConfig",
     "DATUMS", "DatumDefinition", "datum_definition", "datum_shift",
     "ProgData", "ProgRecord",
-    "AuxiliaryData", "AuxiliaryHeader", "AuxiliaryCloudHour",
+    "AuxiliaryData", "AuxiliaryHeader", "AuxiliaryCloudHour", "legacy",
 ]
 
 __version__ = "0.1.1"

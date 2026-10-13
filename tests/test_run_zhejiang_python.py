@@ -38,7 +38,7 @@ def test_example_controls_form_a_complete_source_to_output_chain():
     assert geo.terrain == terrain.output
     assert geo.landuse == landuse.output
     assert calmet.geophysical == geo.output
-    assert calmet.meteorology == calwrf.legacy_output
+    assert calmet.meteorology == calwrf.output
 
 
 def test_runner_calls_each_stage_with_only_its_control_file(tmp_path):

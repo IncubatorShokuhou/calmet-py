@@ -66,7 +66,7 @@ class ProgData:
 
     @classmethod
     def _read_component(cls,reader,nx,ny,nz,label):
-        result=np.empty((nz,ny,nx),dtype=np.float32)
+        result=np.empty((nz,ny,nx),dtype=np.float64)
         for level in range(nz):
             for row in range(ny):
                 result[level,row]=_array(
@@ -76,9 +76,9 @@ class ProgData:
 
     def at_hour(self,hour):
         """Apply PROGRD's forward scan for one legacy ending-hour label."""
-        wanted=int(np.float32(hour)*np.float32(100.))%2400
+        wanted=int(np.float64(hour)*np.float64(100.))%2400
         for record in self.records:
-            label=int(np.float32(record.hour)*np.float32(100.))
+            label=int(np.float64(record.hour)*np.float64(100.))
             if label<wanted: continue
             if label==wanted: return record
             break
@@ -91,7 +91,7 @@ class ProgData:
     @staticmethod
     def interpolate_record(record,grid: GridConfig,target_height_m):
         """Interpolate one explicitly selected record without hour ambiguity."""
-        f32=np.float32
+        f32=np.float64
         target_height=np.asarray(target_height_m,dtype=f32)
         if target_height.ndim!=1 or target_height.size<1:
             raise ValueError('target PROG.DAT heights must be a non-empty vector')
@@ -161,8 +161,8 @@ class ProgData:
 
     def records_for_hours(self,hours):
         """Reproduce PROGRD's stateful scan, skipping earlier extra records."""
-        wanted=[int(np.float32(hour)*np.float32(100.))%2400 for hour in hours]
-        labels=[int(np.float32(record.hour)*np.float32(100.)) for record in self.records]
+        wanted=[int(np.float64(hour)*np.float64(100.))%2400 for hour in hours]
+        labels=[int(np.float64(record.hour)*np.float64(100.)) for record in self.records]
         selected=[]; cursor=0
         for target in wanted:
             while cursor<len(labels) and labels[cursor]<target:

@@ -105,8 +105,8 @@ class CoastPolygon:
 
 
 def _grid_indices(x, y, grid):
-    """Vectorized LUGRID indices with default-REAL subtraction/division."""
-    f32=np.float32
+    """Vectorized LUGRID indices with floating-point subtraction/division."""
+    f32=np.float64
     x=np.asarray(x,dtype=f32); y=np.asarray(y,dtype=f32)
     delx=np.asarray(x-f32(grid.x_origin_km),dtype=f32)
     dely=np.asarray(y-f32(grid.y_origin_km),dtype=f32)
@@ -126,8 +126,8 @@ def _inside_grid(x, y, grid):
 
 def _grid_centers_1d(origin, spacing, count):
     """Construct CTGPROC cell centers in its left-associated REAL arithmetic."""
-    f32=np.float32
-    index=np.arange(1,int(count)+1,dtype=np.float32)
+    f32=np.float64
+    index=np.arange(1,int(count)+1,dtype=np.float64)
     offset=np.asarray(index-f32(.5),dtype=f32)
     distance=np.asarray(f32(spacing)*offset,dtype=f32)
     return np.asarray(f32(origin)+distance,dtype=f32)
@@ -135,7 +135,7 @@ def _grid_centers_1d(origin, spacing, count):
 
 def _snow_grid_indices(longitude, latitude):
     """Map GLOBE's REAL coordinates to CTGPROC's fixed SNODAS grid."""
-    f32=np.float32
+    f32=np.float64
     longitude=np.asarray(longitude,dtype=f32); latitude=np.asarray(latitude,dtype=f32)
     lon_delta=np.asarray(longitude-f32(-124.729584),dtype=f32)
     lat_delta=np.asarray(latitude-f32(52.8704185),dtype=f32)
@@ -270,7 +270,7 @@ def _read_coastline_bln(path,grid,*,allow_empty=False):
             if len(point)!=2: raise ValueError(f'invalid coastline point at {source}:{number}')
             points.append(point)
         index+=count
-        coordinates=np.asarray(points,dtype=np.float32)
+        coordinates=np.asarray(points,dtype=np.float64)
         polygons.append(CoastPolygon(identifiers[0],coordinates[:,0],coordinates[:,1]))
     if not polygons:
         if allow_empty: return ()
@@ -286,7 +286,7 @@ def _read_coastline_bln(path,grid,*,allow_empty=False):
 
 def _polygon_membership(px,py,polygon):
     """Vectorized PNPOLY result: -1 outside, 0 edge, 1 inside."""
-    f32=np.float32
+    f32=np.float64
     px=np.asarray(px,dtype=f32); py=np.asarray(py,dtype=f32)
     x=np.asarray(polygon.x,dtype=f32); y=np.asarray(polygon.y,dtype=f32)
     x2=np.roll(x,-1); y2=np.roll(y,-1)
@@ -412,7 +412,7 @@ def _merge_global_counts(accumulated,current,categories,excluded_water=52):
 def _select_glaz_markers(center_lon,center_lat,left_lon,right_lon,
                          lower_lat,upper_lat):
     """GSELECT overlap tests after its longitude-branch normalization."""
-    f32=np.float32
+    f32=np.float64
     center_lon=f32(center_lon); center_lat=f32(center_lat)
     left_lon=f32(left_lon); right_lon=f32(right_lon)
     lower_lat=f32(lower_lat); upper_lat=f32(upper_lat)
@@ -435,7 +435,7 @@ def _select_glaz_markers(center_lon,center_lat,left_lon,right_lon,
 
 def _select_glaz_regions(grid):
     """Transform target markers and reproduce GSELECT's regional screen."""
-    f32=np.float32
+    f32=np.float64
     x0=f32(grid.x_origin_km); y0=f32(grid.y_origin_km)
     x_width=np.asarray(f32(grid.nx)*f32(grid.dx_km),dtype=f32)
     y_width=np.asarray(f32(grid.ny)*f32(grid.dy_km),dtype=f32)
@@ -469,7 +469,7 @@ def _glaz_crs(spec: GlazSpec) -> CRS:
     return CRS.from_proj4(f"+proj=laea +lat_0={spec.latitude_origin:g} +lon_0={spec.longitude_origin:g} +R=6370997 +units=km +no_defs")
 
 def _window(g, reverse, spec):
-    f32=np.float32
+    f32=np.float64
     x0=f32(g.x_origin_km); y0=f32(g.y_origin_km)
     x_width=np.asarray(f32(g.nx)*f32(g.dx_km),dtype=f32)
     y_width=np.asarray(f32(g.ny)*f32(g.dy_km),dtype=f32)
@@ -488,7 +488,7 @@ def _window(g, reverse, spec):
 
 def _mesh_offsets(mesh,cell_size=1.):
     """Return LOADOTHER's REAL mesh offsets in IMESH order."""
-    f32=np.float32
+    f32=np.float64
     step=np.asarray(f32(cell_size)/f32(mesh),dtype=f32)
     half=np.asarray(f32(cell_size)/f32(2.),dtype=f32)
     index=np.arange(1,int(mesh)+1,dtype=f32)
@@ -498,7 +498,7 @@ def _mesh_offsets(mesh,cell_size=1.):
 
 def _mesh_coordinates(centers,mesh,cell_size=1.):
     """Vectorize Fortran ``(center-half)+(index-.5)*step`` arithmetic."""
-    f32=np.float32
+    f32=np.float64
     center=np.asarray(centers,dtype=f32)
     step=np.asarray(f32(cell_size)/f32(mesh),dtype=f32)
     half=np.asarray(f32(cell_size)/f32(2.),dtype=f32)
@@ -510,7 +510,7 @@ def _mesh_coordinates(centers,mesh,cell_size=1.):
 
 def _source_centers(origin,spacing,indices):
     """Evaluate Fortran ``origin+spacing*(index-1)`` in default REAL."""
-    f32=np.float32
+    f32=np.float64
     index=np.asarray(indices,dtype=f32)
     product=np.asarray(f32(spacing)*index,dtype=f32)
     return np.asarray(f32(origin)+product,dtype=f32)
@@ -519,7 +519,7 @@ def _source_centers(origin,spacing,indices):
 def _geotiff_geometry(scale,tie,raster_type,crs,*,orientation=1,
                       extra_half_pixel=False):
     """Decode GET_IFD's origin and spacing in its REAL working units."""
-    f32=np.float32
+    f32=np.float64
     source_crs=CRS.from_user_input(crs)
     if source_crs.is_geographic:
         unit_scale=f32(1.)
@@ -570,14 +570,14 @@ def _accumulate_glazas(path, config, snow=None):
     columns={int(v):i for i,v in enumerate(USGS38)}
     polygons=_coastline_polygons(config)
     read=inside=0
-    source_index=np.arange(irange.start,irange.stop,dtype=np.float32)
-    xs=np.asarray(np.float32(spec.x_origin_km)+source_index,dtype=np.float32)
+    source_index=np.arange(irange.start,irange.stop,dtype=np.float64)
+    xs=np.asarray(np.float64(spec.x_origin_km)+source_index,dtype=np.float64)
     for j in jrange:
         raw=np.asarray(source[spec.ny-1-j,irange.start:irange.stop])
         valid=(raw>=1)&(raw<GLAZ_TO_USGS.size)
         if not valid.any(): continue
         base_x=xs[valid]; classes=GLAZ_TO_USGS[raw[valid]]
-        source_y=np.asarray(np.float32(spec.y_origin_km)+np.float32(j),dtype=np.float32)
+        source_y=np.asarray(np.float64(spec.y_origin_km)+np.float64(j),dtype=np.float64)
         mesh_x=_mesh_coordinates(base_x,mesh)
         mesh_y=_mesh_coordinates(source_y,mesh)
         # Fortran loops IMESH outside JMESH, which matters to SETSNOW's
@@ -586,7 +586,7 @@ def _accumulate_glazas(path, config, snow=None):
         sy=np.broadcast_to(mesh_y[None,None,:],(base_x.size,mesh,mesh)).ravel()
         gx,gy=project_glaz_to_lcc(sx,sy,source_grid,g,units='km')
         center_x,center_y=project_glaz_to_lcc(
-            base_x,np.full(base_x.size,source_y,dtype=np.float32),
+            base_x,np.full(base_x.size,source_y,dtype=np.float64),
             source_grid,g,units='km')
         _qa_write(config,'qaglaz.dat',center_x,center_y)
         _qa_write(config,'qamesh.dat',gx,gy)
@@ -639,10 +639,10 @@ def _accumulate_ctg(path,config,snow=None):
         if not 1<=category<=92: continue
         if category not in columns:
             raise ValueError(f'CTG category {category} is not in the USGS-38 table at {path}:{number}')
-        centers_x=np.asarray(np.asarray(x_m,dtype=np.float32)*np.float32(.001),dtype=np.float32)
-        center_y=np.asarray(np.float32(y_anchor)*np.float32(.001),dtype=np.float32)
-        mesh_x=_mesh_coordinates(centers_x,mesh,np.float32(.2))
-        mesh_y=_mesh_coordinates(center_y,mesh,np.float32(.2))
+        centers_x=np.asarray(np.asarray(x_m,dtype=np.float64)*np.float64(.001),dtype=np.float64)
+        center_y=np.asarray(np.float64(y_anchor)*np.float64(.001),dtype=np.float64)
+        mesh_x=_mesh_coordinates(centers_x,mesh,np.float64(.2))
+        mesh_y=_mesh_coordinates(center_y,mesh,np.float64(.2))
         # IMESH is the outer loop and JMESH the inner loop in LOADOTHER.
         sx=np.broadcast_to(mesh_x[:,:,None],(run,mesh,mesh)).ravel()
         sy=np.broadcast_to(mesh_y[None,None,:],(run,mesh,mesh)).ravel()
@@ -655,7 +655,7 @@ def _accumulate_ctg(path,config,snow=None):
         used=good.reshape(run,mesh*mesh).any(axis=1)
         if used.any():
             center_x,center_y=transform_grid(centers_x[used],
-                np.full(np.count_nonzero(used),center_y,dtype=np.float32),source_grid,
+                np.full(np.count_nonzero(used),center_y,dtype=np.float64),source_grid,
                 config.grid,units='km')
             _qa_write(config,'qactg.dat',center_x,center_y,
                       np.full(np.count_nonzero(used),category))
@@ -821,7 +821,7 @@ def _accumulate_nlcd_geotiff(path,config,translation,snow=None):
             raise ValueError(f'NLCD category maps outside the USGS-38 table: {int(translated[nonstandard][0])}')
         y=_source_centers(y0,dy,row)
         gx,gy=transformer.transform(
-            x*native_per_work,np.full(x.size,y,dtype=np.float32)*native_per_work)
+            x*native_per_work,np.full(x.size,y,dtype=np.float64)*native_per_work)
         _qa_write(config,'qanlcd.dat',gx,gy)
         ix,iy,in_grid=_inside_grid(gx,gy,config.grid)
         translated,coastal=_swap_coastline_categories(translated,gx,gy,config,polygons)
@@ -902,7 +902,7 @@ def _accumulate_corine(path,config,snow=None):
         gx,gy=transformer.transform(sx*native_per_work,sy*native_per_work)
         qa_x,qa_y=transformer.transform(
             centers*native_per_work,
-            np.full(centers.size,center_y,dtype=np.float32)*native_per_work)
+            np.full(centers.size,center_y,dtype=np.float64)*native_per_work)
         _qa_write(config,'qacorine.dat',qa_x,qa_y)
         _qa_write(config,'qamesh.dat',gx,gy)
         ix,iy,in_grid=_inside_grid(gx,gy,config.grid)
@@ -963,7 +963,7 @@ def _accumulate_global_geotiff(path,config,translation,*,offset=0,missing=(),
         gx,gy=transformer.transform(sx*native_per_work,sy*native_per_work)
         center_x,center_y=transformer.transform(
             centers*native_per_work,
-            np.full(centers.size,center_y,dtype=np.float32)*native_per_work)
+            np.full(centers.size,center_y,dtype=np.float64)*native_per_work)
         qa_name='qagcl2k.dat' if config.input_type.upper()=='GLC2K' else 'qaumdglc.dat'
         _qa_write(config,qa_name,center_x,center_y)
         _qa_write(config,'qamesh.dat',gx,gy)
@@ -1006,14 +1006,14 @@ def _accumulate_modis(path,config,spec: ModisSpec | None=None,snow=None):
     for row in range(iy0,iy1+1):
         raw=np.asarray(source[row,ix0:ix1+1]); valid=(raw>=1)&(raw<=18)
         translated=np.zeros(raw.shape,dtype=np.int16); translated[valid]=GLAZ_TO_USGS[raw[valid]]
-        mesh_x=_mesh_coordinates(centers,mesh,np.float32(spec.spacing))
+        mesh_x=_mesh_coordinates(centers,mesh,np.float64(spec.spacing))
         center_y=_source_centers(spec.y_origin,-spec.spacing,row)
-        mesh_y=_mesh_coordinates(center_y,mesh,np.float32(-spec.spacing))
+        mesh_y=_mesh_coordinates(center_y,mesh,np.float64(-spec.spacing))
         sx=np.broadcast_to(mesh_x[:,:,None],(centers.size,mesh,mesh)).ravel()
         sy=np.broadcast_to(mesh_y[None,None,:],(centers.size,mesh,mesh)).ravel()
         gx,gy=project_geographic(sx,sy,config.grid,config.input_datum,units='km')
         center_x,center_y=project_geographic(
-            centers,np.full(centers.size,center_y,dtype=np.float32),
+            centers,np.full(centers.size,center_y,dtype=np.float64),
             config.grid,config.input_datum,units='km')
         # CTGPROC 7.0 writes MODIS centers to unit 42 (qaglaz.dat), while
         # qamodis.dat is opened but remains empty.
@@ -1105,7 +1105,7 @@ def _snow_rows(snow,categories):
     rows=[]
     for (cell,land),items in sorted(grouped.items()):
         for snow_grid,count in items:
-            fraction=np.asarray(np.float32(count)/np.float32(totals[cell]),dtype=np.float32)
+            fraction=np.asarray(np.float64(count)/np.float64(totals[cell]),dtype=np.float64)
             rows.append((cell,land,snow_grid,fraction))
     return rows,totals
 
@@ -1189,12 +1189,12 @@ def _write_legacy(path,fractions,counts,g,categories=USGS38,*,final_output=True,
 
 
 def _fractions_from_counts(counts):
-    """Reproduce CTGPROC's NGRID/FLOAT(ISUM) default-REAL division."""
+    """Reproduce CTGPROC's NGRID/FLOAT(ISUM) floating-point division."""
     hits=np.asarray(counts,dtype=np.int64)
     totals=hits.sum(axis=0,dtype=np.int64)
-    numerator=np.asarray(hits,dtype=np.float32)
-    denominator=np.asarray(totals,dtype=np.float32)
-    fractions=np.zeros(hits.shape,dtype=np.float32)
+    numerator=np.asarray(hits,dtype=np.float64)
+    denominator=np.asarray(totals,dtype=np.float64)
+    fractions=np.zeros(hits.shape,dtype=np.float64)
     np.divide(numerator,denominator,out=fractions,where=totals>0)
     return totals,fractions
 
@@ -1203,7 +1203,7 @@ def _low_hit_threshold(average_hits,threshold_percent):
     """Reproduce ``MAX(1,INT(REAL(IAVG*ITHRESH)/100.))``."""
     product=int(average_hits)*int(threshold_percent)
     fraction=np.asarray(
-        np.float32(product)/np.float32(100.),dtype=np.float32)
+        np.float64(product)/np.float64(100.),dtype=np.float64)
     return max(1,int(fraction))
 
 

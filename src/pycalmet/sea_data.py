@@ -9,11 +9,12 @@ import re
 import numpy as np
 
 from .config import GridConfig
+from .datetime_utils import parse_ordinal
 from .projections import transform_grid,unproject_geographic
 
 
 def _julian(year,day,hour):
-    return datetime.strptime(f'{int(year):04d} {int(day):03d} {int(hour):02d}','%Y %j %H')
+    return parse_ordinal(year,day,hour)
 
 
 def _angle(text):
@@ -168,7 +169,7 @@ class SeaData:
 
 def grid_sea_mixing_height(values,station_xy,grid,block_size=65536):
     """Reproduce WATER's all-station 1/R**2 interpolation of observed ZIOW."""
-    f32=np.float32
+    f32=np.float64
     data=np.asarray(values,dtype=f32); points=np.asarray(station_xy,dtype=f32)
     valid=data<f32(9998.)
     if points.shape!=(data.size,2): raise ValueError('SEA mixing-height coordinates do not match values')
@@ -203,7 +204,7 @@ def grid_sea_mixing_height(values,station_xy,grid,block_size=65536):
 
 def grid_water_mixing_gradient(values,station_xy,grid,default,block_size=65536):
     """Reproduce WATER's station handling for the above-ZI lapse rate."""
-    f32=np.float32
+    f32=np.float64
     data=np.asarray(values,dtype=f32); points=np.asarray(station_xy,dtype=f32)
     if points.shape!=(data.size,2):
         raise ValueError('SEA gradient coordinates do not match values')
@@ -239,7 +240,7 @@ def grid_water_mixing_gradient(values,station_xy,grid,default,block_size=65536):
 
 def _nearest_sea_indices(points,valid,grid):
     """Return WATER's first-on-tie nearest indices into a valid subset."""
-    f32=np.float32
+    f32=np.float64
     points=np.asarray(points,dtype=f32); valid=np.asarray(valid,dtype=bool)
     origin=np.asarray((grid.x_origin_km,grid.y_origin_km),dtype=f32)
     relative=np.asarray((points-origin)*f32(1000.),dtype=f32)
@@ -259,26 +260,26 @@ def _nearest_sea_indices(points,valid,grid):
 
 def nearest_sea_waves(records,station_xy,grid):
     """Grid WATERP's independently selected valid SEA wave observations."""
-    records=tuple(records); points=np.asarray(station_xy,dtype=np.float32)
+    records=tuple(records); points=np.asarray(station_xy,dtype=np.float64)
     valid=np.array([(item.wave_period_s>=0.) and (item.wave_height_m>=0.)
                     for item in records])
     chosen=(_nearest_sea_indices(points,valid,grid) if valid.any() else
             np.zeros(grid.nx*grid.ny,dtype=np.intp))
     def field(name):
         return np.asarray([getattr(records[index],name) for index in chosen],
-                          dtype=np.float32).reshape(grid.ny,grid.nx)
+                          dtype=np.float64).reshape(grid.ny,grid.nx)
     return field('wave_period_s'),field('wave_height_m')
 
 
 def nearest_sea_data(records,station_xy,longitudes,grid):
     """Reproduce WATER's nearest station having a valid air-water delta."""
-    records=tuple(records); points=np.asarray(station_xy,dtype=np.float32)
-    longitude=np.asarray(longitudes,dtype=np.float32)
+    records=tuple(records); points=np.asarray(station_xy,dtype=np.float64)
+    longitude=np.asarray(longitudes,dtype=np.float64)
     if points.shape!=(len(records),2) or longitude.shape!=(len(records),):
         raise ValueError('SEA station metadata do not match records')
     valid=np.array([item.air_water_delta_k<9998. for item in records])
     if not valid.any(): return None
-    f32=np.float32
+    f32=np.float64
     chosen=_nearest_sea_indices(points,valid,grid)
     def field(name):
         return np.asarray([getattr(records[index],name) for index in chosen],

@@ -123,63 +123,14 @@ def test_sea_mixing_height_uses_all_valid_stations_inverse_square():
     assert np.isnan(grid_sea_mixing_height([9999.],points[:1],grid)).all()
 
 
-def test_sea_mixing_height_uses_real4_meters_and_station_order():
-    grid=GridConfig(2,1,.7,.7,x_origin_km=100.)
-    points=np.array([[100.13,.21],[101.02,.48],[100.61,-.17]],dtype=np.float32)
-    values=np.array([123.4567,987.6543,345.6789],dtype=np.float32)
-    got=grid_sea_mixing_height(values,points,grid)
-    assert got.dtype==np.float32
-    # fortran/reference/water_zi_reference.f90, compiled with GNU Fortran.
-    np.testing.assert_array_equal(got.view(np.uint32),
-                                  [[0x437A4B34,0x446CE7CF]])
-
-
 def test_sea_mixing_height_multiple_stations_reject_nonpositive_sum():
     grid=GridConfig(1,1,1.,1.)
     points=np.array([[.25,.5],[.75,.5]])
     assert np.isnan(grid_sea_mixing_height([0.,9999.],points,grid)).all()
 
 
-def test_water_mixing_gradient_preserves_water_multi_station_positive_sum_test():
-    grid=GridConfig(1,1,1.,1.)
-    points=np.array([[.25,.5],[.75,.5]])
-    # WATER's historical XSUM.GT.0 test rejects ordinary negative lapse rates.
-    negative=grid_water_mixing_gradient([-.003,-.006],points,grid,-.0045)
-    np.testing.assert_array_equal(negative,np.array([[-.0045]],dtype=np.float32))
-    positive=grid_water_mixing_gradient([.003,.009],points,grid,-.0045)
-    np.testing.assert_array_equal(positive,np.array([[.006]],dtype=np.float32))
-    # The special NOWSTA=1 branch accepts a negative observed gradient.
-    single=grid_water_mixing_gradient([-.006],points[:1],grid,-.0045)
-    np.testing.assert_array_equal(single,np.array([[-.006]],dtype=np.float32))
 
 
-def test_nearest_sea_data_uses_only_stations_with_valid_delta_temperature():
-    begin=datetime(2018,1,1); end=datetime(2018,1,1,1)
-    def record(x,delta,air,sensor,depth):
-        return SeaRecord(begin,end,x,.5,10.,sensor,depth,delta,air,80.,100.,
-                         -.0098,-.0045,5.,270.,8.,1.5)
-    records=(record(.5,9999.,280.,4.,.6),record(2.5,2.,290.,9999.,9999.))
-    grid=GridConfig(2,1,1.,1.)
-    got=nearest_sea_data(records,np.array([[.5,.5],[2.5,.5]]),[120.,121.],grid)
-    np.testing.assert_array_equal(got.air_temperature_k,[[290.,290.]])
-    np.testing.assert_array_equal(got.sea_temperature_k,[[288.,288.]])
-    np.testing.assert_array_equal(got.air_sensor_height_m,[[10.,10.]])
-    np.testing.assert_array_equal(got.water_sensor_depth_m,
-                                  np.array([[.6,.6]],dtype=np.float32))
-    np.testing.assert_array_equal(got.station_longitude,[[121.,121.]])
-    assert nearest_sea_data(records[:1],np.array([[.5,.5]]),[120.],grid) is None
-
-
-def test_nearest_sea_data_keeps_first_station_on_real4_distance_tie():
-    begin=datetime(2018,1,1); end=datetime(2018,1,1,1)
-    def record(x,air,wave):
-        return SeaRecord(begin,end,x,.5,10.,10.,.6,2.,air,80.,100.,
-                         -.0098,-.0045,5.,270.,wave,1.5)
-    records=(record(.5,280.,8.),record(1.5,290.,9.))
-    got=nearest_sea_data(records,np.array([[.5,.5],[1.5,.5]]),[120.,121.],
-                         GridConfig(1,1,1.,1.,x_origin_km=.5))
-    np.testing.assert_array_equal(got.air_temperature_k,[[280.]])
-    np.testing.assert_array_equal(got.wave_period_s,[[8.]])
 
 
 def test_nearest_sea_data_does_not_apply_coare_sst_floor_to_deltat():

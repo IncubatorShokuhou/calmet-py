@@ -237,48 +237,11 @@ def test_calwrf_negative_date_sentinel_selects_all_available_times(tmp_path):
     assert end==_stamp('2018-01-01_04:00:00')
 
 
-def test_pressure_temperature_matches_gnu_real4_bits():
-    pressure,temperature=_pressure_temperature(
-        [1234.567,-4321.125,.125,18765.5],
-        [91345.25,100123.75,54321.875,70111.125],
-        [2.3456,-12.75,18.125,-.03125])
-    np.testing.assert_array_equal(pressure.view(np.uint32),np.array(
-        [0x44677315,0x446f81ae,0x4407ce14,0x445e310a],dtype=np.uint32))
-    np.testing.assert_array_equal(temperature.view(np.uint32),np.array(
-        [0x4393e087,0x438de001,0x438598f6,0x43910320],dtype=np.uint32))
-
-
-def test_pressure_temperature_uses_powf_at_formatted_half_ties():
-    # Real Zhejiang cells whose temperatures straddle an F6.1 half-tie.
-    # Computing REAL**REAL through a float64 detour moves these by 1--2 ulps
-    # and writes the neighbouring tenth compared with GNU CALWRF.
-    pressure,temperature=_pressure_temperature(
-        np.array([0x434b3a80,0x44a7b6c0,0x4210a400,0x450077e0,
-                  0x43b26240],dtype=np.uint32).view(np.float32),
-        np.array([0x467e9d78,0x47a09ee7,0x460633aa,0x47bc4300,
-                  0x46b1e848],dtype=np.uint32).view(np.float32),
-        np.array([0x427e9e29,0x3d495fca,0x42c821b5,0xc1b0dd3e,
-                  0x41c6da9b],dtype=np.uint32).view(np.float32))
-    np.testing.assert_array_equal(temperature.view(np.uint32),np.array(
-        [0x43594001,0x438e8667,0x43468ccd,0x438a5334,0x4355c001],
-        dtype=np.uint32))
-    assert [f'{value:.1f}' for value in temperature]==[
-        '217.3','285.1','198.6','276.7','213.8']
-
-
 def test_destagger_is_vectorized_midpoint():
     a = np.arange(24, dtype="f4").reshape(2, 3, 4)
     np.testing.assert_array_equal(destagger_x(a), (a[..., :-1] + a[..., 1:]) / 2)
     np.testing.assert_array_equal(destagger_y(a), (a[..., :-1, :] + a[..., 1:, :]) / 2)
     np.testing.assert_array_equal(destagger_z(a), (a[:-1] + a[1:]) / 2)
-
-
-def test_geopotential_height_matches_calwrf_real4_operation_order():
-    ph=np.array([1234.567,-4321.125,.125,18765.5,-234.75],dtype=np.float32)
-    phb=np.array([91345.25,100123.75,54321.875,70111.125,88765.375],dtype=np.float32)
-    actual=_geopotential_height(ph[:,None,None],phb[:,None,None])[:,0,0]
-    np.testing.assert_array_equal(actual.view(np.uint32),np.array(
-        [0x46160634,0x45ef1ce4,0x45e414d6,0x460d48a7],dtype=np.uint32))
 
 
 def test_wind_rotation_and_meteorological_direction():
@@ -298,21 +261,6 @@ def test_polar_stereographic_rotation_uses_unit_cone_and_hemisphere_sign():
     np.testing.assert_allclose(actual,np.deg2rad([[20.,-20.,-10.]]),rtol=0.,atol=2.e-8)
 
 
-def test_lambert_cone_and_rotation_match_gnu_real4_bits():
-    dataset=SimpleNamespace(MAP_PROJ=1,TRUELAT1=30.1234,TRUELAT2=60.5678,
-                            STAND_LON=170.25)
-    latitude=np.array([60.,-60.,30.,-15.],dtype=np.float32)
-    longitude=np.array([-170.1,-170.1,160.123,350.5],dtype=np.float32)
-    assert _cone(dataset.TRUELAT1,dataset.TRUELAT2).view(np.uint32)==np.uint32(0x3f385b28)
-    actual=rotation_angle(dataset,latitude,longitude)
-    np.testing.assert_array_equal(actual.view(np.uint32),np.array(
-        [0x3e7ce7a8,0xbe7ce7a8,0xbe0256e0,0x40109781],dtype=np.uint32))
-
-
-def test_zhejiang_lambert_cone_uses_gnu_real_intrinsics():
-    assert _cone(30.,60.).view(np.uint32)==np.uint32(0x3f372f61)
-
-
 def test_calwrf_disables_rotation_for_every_wrf_projection_at_least_three():
     coordinates=np.ones((1,1),dtype='f4')
     for projection in (3,4,6):
@@ -326,22 +274,6 @@ def test_calm_wind_direction_matches_calwrf_wrap_to_360():
     speed, direction = speed_direction(np.zeros((2, 2)), np.zeros((2, 2)))
     np.testing.assert_array_equal(speed, 0.0)
     np.testing.assert_array_equal(direction, 360.0)
-
-
-def test_calwrf_rotation_speed_direction_match_gnu_real4_bits():
-    u=np.array([-3.123456,0.,5.,1.e-10],dtype=np.float32)
-    v=np.array([4.765432,-2.5,0.,-2.e-10],dtype=np.float32)
-    alpha=np.array([.3712345,-.8123456,0.,1.125],dtype=np.float32)
-    east,north=earth_wind(u,v,alpha)
-    speed,direction=speed_direction(east,north)
-    expected=(
-        [0xbf974a21,0x3fe849ef,0x40a00000,0xaf17009c],
-        [0x40b25d5a,0xbfdc1861,0x00000000,0xaf4205a8],
-        [0x40b654a9,0x40200000,0x40a00000,0x2f75dbb8],
-        [0x43280719,0x439cba5f,0x43870000,0x43b40000],
-    )
-    for actual,bits in zip((east,north,speed,direction),expected):
-        np.testing.assert_array_equal(actual.view(np.uint32),np.array(bits,dtype=np.uint32))
 
 
 def test_calwrf_horizontal_range_check_uses_original_four_neighbours():

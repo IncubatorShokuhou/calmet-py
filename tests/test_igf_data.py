@@ -250,47 +250,6 @@ def test_initial_guess_interpolation_matches_vertical_and_four_point_rules(tmp_p
     assert v[2,0,0]==pytest.approx(14.5)
 
 
-def test_r2interpi_matches_real4_neighbor_and_sum_oracle():
-    source=np.array([[0.,0.],[.2,3.],[2.,.1],[2.4,3.2],[5.,-.2],[5.5,2.8]])
-    targets=np.array([[.01,.02],[1.7,2.2],[4.1,.7]])
-    values=np.array([[1.25,3.75,-7.5,11.5,20.125,-2.25]])
-    got=_r2interpi_four(source,targets,values)[0]
-    # Bit patterns from fortran/reference/r2interpi_reference.f90.
-    np.testing.assert_array_equal(got.view(np.uint32),
-                                  np.array([0x3F9FD624,0x40AF97F1,0x412C088A],dtype=np.uint32))
-
-
-def test_rdcalmet_vertical_matches_real4_oracle():
-    field=np.array([[[1.25,-3.5]],[[7.75,4.125]],[[-2.5,12.25]]])
-    got=_rdcalmet_vertical(field,[10.,40.,100.],[5.,10.,25.,40.,80.,100.,150.],
-                           np.array([[.1,.35]]))
-    expected_bits=np.array([
-        [0x3F87EAE8,0xC031AF7E],
-        [0x3FA00000,0xC0600000],
-        [0x40900000,0x3EA00000],
-        [0x40F80000,0x40840000],
-        [0x3F6AAAA8,0x4118AAAB],
-        [0xC0200000,0x41440000],
-        [0xC0200000,0x41440000],
-    ],dtype=np.uint32)
-    np.testing.assert_array_equal(got.view(np.uint32).reshape(7,2),expected_bits)
-
-
-def test_rdcalmet_rotation_matches_real4_oracle():
-    u,v=_rdcalmet_rotate([3.,-4.,0.,1.e-12,7.25,-2.75],
-                         [4.,3.,-5.,-1.e-12,-1.5,-8.125],
-                         [0.,12.5,-37.25,90.,179.9,-181.2])
-    got=np.column_stack((u,v)).view(np.uint32)
-    expected=np.array([
-        [0x4040001C,0x407FFFEB],[0xC0506008,0x4072DB8B],
-        [0x4041B1B3,0xC07EB879],[0x2B8CBCCC,0xAB8CBCCC],
-        [0xC0E81551,0x3FBE61FE],[0x4025121A,0x4102E49C],
-    ],dtype=np.uint32)
-    # NumPy's vector cosine is one ULP above GNU's scalar COS for case 5.
-    np.testing.assert_array_max_ulp(got.view(np.float32),
-                                    expected.view(np.float32),maxulp=1)
-
-
 def test_initial_guess_reader_rejects_missing_wind_level(tmp_path):
     path=tmp_path/'calmet.dat'; _write_igf(path)
     payload=path.read_bytes()

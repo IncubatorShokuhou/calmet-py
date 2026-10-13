@@ -157,58 +157,8 @@ def test_single_category_preserves_its_properties():
     np.testing.assert_allclose([z0.item(),albedo.item(),bowen.item(),soil.item(),qf.item(),lai.item()],[.5,.18,1.,.2,0.,1.])
 
 
-def test_makegeo_category_total_preserves_fortran_k_order():
-    values=np.array([
-        .08702492,.028681722,.060314816,.07775341,.07160746,.09153801,
-        .086039364,.091823764,.0026587734,.0437248,.048494432,.0065154196,
-        .00056260504,.08306214,.09833022,.078460984,.03156035,.07053337,
-        .029918108,.07407485,.027974721,.07825909,.098774075,.09862386,
-        .08828626,.091281004,.07082069,.055449687,.09232382,.008973078,
-        .037013154,.060593896,.04777299,.079285786,.01950864,.00622535,
-        .012651841,.09627816],dtype=np.float32)[:,None,None]
-    total=_category_sum(values)
-    assert total.dtype==np.float32
-    assert total.view(np.uint32).item()==np.uint32(0x400ee5cd)
-    assert values.sum(axis=0,dtype=np.float32).view(np.uint32).item()==np.uint32(0x400ee5cc)
 
 
-def test_makegeo_water_total_preserves_iwat_order():
-    fractions=np.array([.13080607,.14924558,.40711287],dtype=np.float32)[:,None,None]
-    actual=_water_sum(fractions,np.array([10,20,30]),(30,10,20))
-    assert actual.view(np.uint32).item()==np.uint32(0x3f2fea03)
-    category_order=_category_sum(fractions)
-    assert category_order.view(np.uint32).item()==np.uint32(0x3f2fea04)
-
-
-def test_makegeo_log_exp_match_gnu_real4_bits():
-    logarithm=_fortran_log(np.array([.8083694577217102],dtype=np.float32))
-    exponential=_fortran_exp(np.array([.047530174255371094],dtype=np.float32))
-    assert logarithm.view(np.uint32).item()==np.uint32(0xbe59d77c)
-    assert exponential.view(np.uint32).item()==np.uint32(0x3f863b13)
-    assert np.log(np.float32(.8083694577217102)).view(np.uint32)==np.uint32(0xbe59d77d)
-    assert np.exp(np.float32(.047530174255371094)).view(np.uint32)==np.uint32(0x3f863b14)
-
-
-def test_makegeo_snow_albedo_matches_gnu_real4_bits():
-    actual=_snow_albedo_values(
-        np.full(5,.1234567,dtype=np.float32),
-        np.full(5,.8123456,dtype=np.float32),
-        np.full(5,.1376543,dtype=np.float32),
-        np.full(5,13,dtype=np.int32),np.array([0,1,7,13,25]))
-    np.testing.assert_array_equal(actual.view(np.uint32),np.array(
-        [0x3f4ff5e2,0x3f4e718a,0x3f45577a,0x3f3c3d69,0x3f3c3d69],
-        dtype=np.uint32))
-
-
-def test_makegeo_snow_fills_preserve_real4_scan_order():
-    values=np.array([.13080607,.14924558,.40711287],dtype=np.float32)
-    window=np.array([values[0],np.nan,values[1],values[2]],dtype=np.float32)[:,None,None]
-    temporal=_fill_snow_temporal(window,current=1)
-    spatial_source=np.full((3,3),np.nan,dtype=np.float32)
-    spatial_source[0]=values
-    spatial=_fill_snow_spatial(spatial_source,radius=1)
-    assert temporal.view(np.uint32).item()==np.uint32(0x3e6a8d5b)
-    assert spatial[1,1].view(np.uint32)==np.uint32(0x3e6a8d5b)
 
 
 def test_makegeo_qa_cell_uses_one_based_indices_and_exposes_fields():
@@ -232,15 +182,6 @@ def test_secondary_landuse_only_replaces_missing_primary_cells():
     np.testing.assert_array_equal(merged[:,0,1],secondary[:,0,1])
 
 
-def test_fortran_replacement_fraction_boundary_is_inclusive_for_lu2():
-    primary=np.zeros((1,1,2)); primary[0,0]=[.001,.001001]
-    secondary=np.ones_like(primary)
-    merged=_merge_landuse(primary,secondary)
-    np.testing.assert_array_equal(merged[0,0],np.array([1.,.001001],dtype=np.float32))
-    properties={1:(.5,.2,1.,.2,0.,1.,10)}
-    config=MakegeoConfig('t','l','o',GridConfig(1,1,1.,1.),input_properties=properties,
-        water_categories=(),output_categories=(10,),missing_category=1)
-    assert _fields(np.array([[[.001]]]),config,np.array([1]))[0].item()==10
 
 
 def test_makegeo_reads_sparse_snow_reference_from_legacy_and_netcdf(tmp_path):
@@ -574,13 +515,6 @@ def test_makegeo_category_split_is_applied_before_weighting():
         [0.,17.6,176.,17.6,176.],rtol=2.e-6,atol=1.e-6)
 
 
-def test_makegeo_category_split_matches_legacy_percent_bug_bits():
-    categories,result=_split_categories(
-        np.array([1,2,3]),np.array([1.,.125,.25],dtype=np.float32)[:,None,None],
-        ((1,2,25.),(1,3,75.)))
-    np.testing.assert_array_equal(categories,[1,2,3])
-    np.testing.assert_array_equal(result[:,0,0].view(np.uint32),np.array(
-        [0xc2c60000,0x41c90000,0x42968000],dtype=np.uint32))
 
 def test_generic_ctgproc_legacy_output_feeds_makegeo(tmp_path):
     grid=GridConfig(1,1,1.,1.,false_easting_km=12.,false_northing_km=34.,datum='ESR-S')

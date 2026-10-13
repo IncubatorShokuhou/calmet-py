@@ -1,6 +1,6 @@
 Create CALWRF data for the Zhejiang example
 ../../../output/zhejiang/calwrf.lst
-../../../output/zhejiang/calwrf.m3d
+../../../output/zhejiang/calwrf.nc
 -9,-9,-9,-9,-9,-9
 2018031800
 2018031802

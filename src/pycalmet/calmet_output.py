@@ -10,6 +10,7 @@ from datetime import timedelta
 import struct
 import numpy as np
 from netCDF4 import Dataset,date2num
+from .datetime_utils import format_ordinal_code
 from .calmet_numerics import convective_velocity_scale,mesopac_layer_average,pgt_stability
 from .calmet_solver import HourFields,target_latitude_longitude
 from .config import GridConfig
@@ -194,7 +195,7 @@ class AuxiliaryCalmetWriter:
 
     @staticmethod
     def _stamp(value):
-        return value.year*100000+value.timetuple().tm_yday*100+value.hour
+        return format_ordinal_code(value)
 
     @staticmethod
     def _date_parts(value):
@@ -327,7 +328,7 @@ class LegacyCalmetWriter:
     @staticmethod
     def _date_parts(value): return (value.year,value.month,value.day,value.hour,value.minute*60+value.second)
     @staticmethod
-    def _stamp(value): return value.year*100000+value.timetuple().tm_yday*100+value.hour
+    def _stamp(value): return format_ordinal_code(value)
     @staticmethod
     def _i(*values): return struct.pack('<'+'i'*len(values),*values)
     @staticmethod

@@ -8,6 +8,7 @@ import re
 import tempfile
 import numpy as np
 from netCDF4 import Dataset
+from .datetime_utils import parse_timestamp
 from .config import CalmetConfig,GridConfig
 from .datums import normalize_datum
 from .calmet_numerics import (coare_water_station_profiles,
@@ -306,10 +307,8 @@ def _geophysical_dataset(path,temporary_directory):
         with Dataset(path) as dataset: yield dataset
 
 def _stamp(value: str) -> datetime:
-    for form in ('%Y-%m-%d_%H:%M:%S','%Y%m%d%H'):
-        try: return datetime.strptime(value,form)
-        except ValueError: pass
-    raise ValueError(f'invalid CALMET timestamp: {value!r}')
+    try: return parse_timestamp(value)
+    except ValueError as error: raise ValueError(f'invalid CALMET timestamp: {value!r}') from error
 
 def _timezone_label(offset: int) -> str:
     """Return CALMET's eight-character UTC offset label."""

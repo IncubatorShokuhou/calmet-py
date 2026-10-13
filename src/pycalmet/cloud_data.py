@@ -9,20 +9,12 @@ import numpy as np
 
 from .legacy_io import FortranSequentialReader
 from .legacy_io import FortranSequentialWriter,fixed_string
+from .datetime_utils import format_ordinal_code,parse_ordinal_code
 
 
 def _datetime(code: int, seconds: int) -> datetime:
-    text=str(int(code))
-    if len(text)==7:  # legacy YYJJJHH; YR4 uses a 50-year pivot
-        year=int(text[:2]); year+=2000 if year<50 else 1900
-        day=int(text[2:5]); hour=int(text[5:])
-    elif len(text)==9:
-        year=int(text[:4]); day=int(text[4:7]); hour=int(text[7:])
-    else:
-        raise ValueError(f'invalid CLOUD.DAT date/hour {code!r}')
-    if not 1<=day<=366 or not 0<=hour<=23 or not 0<=seconds<=3600:
-        raise ValueError(f'invalid CLOUD.DAT timestamp {code}/{seconds}')
-    return datetime(year,1,1)+timedelta(days=day-1,hours=hour,seconds=seconds)
+    try: return parse_ordinal_code(code,seconds)
+    except ValueError as error: raise ValueError(f'invalid CLOUD.DAT timestamp {code}/{seconds}') from error
 
 
 class CloudData:
@@ -83,7 +75,7 @@ class CloudDataWriter:
 
     @staticmethod
     def _code(value):
-        return value.year*100000+value.timetuple().tm_yday*100+value.hour,value.minute*60+value.second
+        return format_ordinal_code(value),value.minute*60+value.second
 
     def append(self,begin,end,field):
         values=np.asarray(field,dtype='<f4')

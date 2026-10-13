@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import ctypes
-import math
 from collections.abc import Sequence
 from datetime import datetime,timedelta
 from pathlib import Path
@@ -15,54 +13,7 @@ from ._common import fortran_inclusive_slice
 
 from .config import CalwrfConfig
 from .legacy_calwrf import write_m3d
-
-_PROCESS_LIBRARY=ctypes.CDLL(None)
-
-
-def _real4_unary(name,value):
-    """GNU default-REAL scalar intrinsic used by CALWRF setup maths."""
-    argument=np.float32(value)
-    try:
-        function=getattr(_PROCESS_LIBRARY,name)
-    except AttributeError:
-        return np.float32(getattr(math,name[:-1])(float(argument)))
-    function.argtypes=(ctypes.c_float,)
-    function.restype=ctypes.c_float
-    return np.float32(function(ctypes.c_float(argument)))
-
-
-def _real4_atan2(y,x):
-    """Elementwise GNU ``ATAN2`` for default REAL arrays."""
-    left,right=np.broadcast_arrays(np.asarray(y,dtype=np.float32),
-                                   np.asarray(x,dtype=np.float32))
-    try:
-        function=_PROCESS_LIBRARY.atan2f
-    except AttributeError:
-        scalar=lambda a,b: math.atan2(float(a),float(b))
-    else:
-        function.argtypes=(ctypes.c_float,ctypes.c_float)
-        function.restype=ctypes.c_float
-        scalar=lambda a,b: function(ctypes.c_float(a),ctypes.c_float(b))
-    if left.ndim==0:
-        return np.float32(scalar(left,right))
-    return np.frompyfunc(scalar,2,1)(left,right).astype(np.float32)
-
-
-def _real4_power(base, exponent):
-    """Elementwise GNU ``REAL ** REAL`` through the runtime ``powf``."""
-    left,right=np.broadcast_arrays(np.asarray(base,dtype=np.float32),
-                                   np.asarray(exponent,dtype=np.float32))
-    try:
-        function=_PROCESS_LIBRARY.powf
-    except AttributeError:
-        scalar=lambda a,b: math.pow(float(a),float(b))
-    else:
-        function.argtypes=(ctypes.c_float,ctypes.c_float)
-        function.restype=ctypes.c_float
-        scalar=lambda a,b: function(ctypes.c_float(a),ctypes.c_float(b))
-    if left.ndim==0:
-        return np.float32(scalar(left,right))
-    return np.frompyfunc(scalar,2,1)(left,right).astype(np.float32)
+from .datetime_utils import parse_timestamp
 
 _LIMITS_3D = {
     "pressure": (10.0, 1100.0), "temperature": (150.0, 330.0),
@@ -130,10 +81,8 @@ def _times(ds: nc.Dataset) -> list[str]:
 
 
 def _stamp(value: str) -> datetime:
-    for form in ("%Y-%m-%d_%H:%M:%S","%Y%m%d%H"):
-        try: return datetime.strptime(value,form)
-        except ValueError: pass
-    raise ValueError(f"invalid CALWRF timestamp: {value!r}")
+    try: return parse_timestamp(value)
+    except ValueError as error: raise ValueError(f"invalid CALWRF timestamp: {value!r}") from error
 
 
 def _write_time_text(variable,index,text):
@@ -149,48 +98,32 @@ def _selection(value,size,label):
 
 
 def destagger_x(a: np.ndarray) -> np.ndarray:
-    return np.float32(0.5) * (a[..., :-1] + a[..., 1:])
+    return np.float64(0.5) * (a[..., :-1] + a[..., 1:])
 
 
 def destagger_y(a: np.ndarray) -> np.ndarray:
-    return np.float32(0.5) * (a[..., :-1, :] + a[..., 1:, :])
+    return np.float64(0.5) * (a[..., :-1, :] + a[..., 1:, :])
 
 
 def destagger_z(a: np.ndarray) -> np.ndarray:
-    return np.float32(0.5) * (a[:-1, ...] + a[1:, ...])
+    return np.float64(0.5) * (a[:-1, ...] + a[1:, ...])
 
 
 def _geopotential_height(ph: np.ndarray, phb: np.ndarray) -> np.ndarray:
-    """Reproduce CALWRF's REAL*4 PH/PHB conversion before destaggering."""
-    f32 = np.float32
-    geopotential = np.asarray(
-        np.asarray(ph, dtype=f32) + np.asarray(phb, dtype=f32), dtype=f32
-    )
-    height_staggered = np.asarray(geopotential / f32(9.81), dtype=f32)
-    return destagger_z(height_staggered)
+    """Convert staggered geopotential to mass-level height."""
+    return destagger_z((np.asarray(ph)+np.asarray(phb))/9.81)
 
 
-def _cone(truelat1: float, truelat2: float) -> np.float32:
-    """CALWRF's implicitly REAL Lambert cone parameter."""
-    f32=np.float32
-    first=f32(truelat1); second=f32(truelat2)
-    pi=f32(3.141592653589793); rpd=np.asarray(pi/f32(180.),dtype=f32)
-    if abs(np.asarray(first-second,dtype=f32))<=f32(.1):
-        argument=np.asarray(np.abs(first)*rpd,dtype=f32)
-        return _real4_unary('sinf',argument)
-    first_argument=np.asarray(first*rpd,dtype=f32)
-    second_argument=np.asarray(second*rpd,dtype=f32)
-    first_cos=_real4_unary('cosf',first_argument)
-    second_cos=_real4_unary('cosf',second_argument)
-    numerator=np.asarray(_real4_unary('logf',first_cos)-
-                         _real4_unary('logf',second_cos),dtype=f32)
-    def tangent_log(latitude):
-        half=np.asarray(np.abs(latitude)/f32(2.),dtype=f32)
-        argument=np.asarray(np.asarray(f32(45.)-half,dtype=f32)*rpd,dtype=f32)
-        tangent=_real4_unary('tanf',argument)
-        return _real4_unary('logf',tangent)
-    denominator=np.asarray(tangent_log(first)-tangent_log(second),dtype=f32)
-    return np.asarray(numerator/denominator,dtype=f32)
+def _cone(truelat1: float, truelat2: float) -> float:
+    """Return the Lambert conformal cone parameter."""
+    first=float(truelat1); second=float(truelat2)
+    if abs(first-second)<=0.1:
+        return float(np.sin(np.deg2rad(abs(first))))
+    numerator=np.log(np.cos(np.deg2rad(first))/np.cos(np.deg2rad(second)))
+    denominator=np.log(
+        np.tan(np.deg2rad(45.-abs(first)/2.)) /
+        np.tan(np.deg2rad(45.-abs(second)/2.)))
+    return float(numerator/denominator)
 
 
 def rotation_angle(ds: nc.Dataset, lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
@@ -203,7 +136,7 @@ def rotation_angle(ds: nc.Dataset, lat: np.ndarray, lon: np.ndarray) -> np.ndarr
         return np.zeros_like(lon, dtype="f4")
     if map_projection not in {1,2}:
         raise ValueError(f"CALWRF does not support WRF MAP_PROJ={map_projection}")
-    f32=np.float32
+    f32=np.float64
     latitude=np.asarray(lat,dtype=f32); longitude=np.asarray(lon,dtype=f32)
     stand_lon=f32(getattr(ds,"STAND_LON"))
     cone=(f32(1.) if map_projection==2 else
@@ -218,7 +151,7 @@ def rotation_angle(ds: nc.Dataset, lat: np.ndarray, lon: np.ndarray) -> np.ndarr
 
 def earth_wind(u: np.ndarray, v: np.ndarray, alpha: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Rotate WRF grid-relative U/V to eastward/northward components."""
-    f32=np.float32
+    f32=np.float64
     u=np.asarray(u,dtype=f32); v=np.asarray(v,dtype=f32); angle=np.asarray(alpha,dtype=f32)
     ca=np.asarray(np.cos(angle.astype(np.float64)),dtype=f32)
     sa=np.asarray(np.sin(angle.astype(np.float64)),dtype=f32)
@@ -228,12 +161,12 @@ def earth_wind(u: np.ndarray, v: np.ndarray, alpha: np.ndarray) -> tuple[np.ndar
 
 
 def speed_direction(u: np.ndarray, v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    f32=np.float32
+    f32=np.float64
     u=np.asarray(u,dtype=f32); v=np.asarray(v,dtype=f32)
     speed=np.asarray(np.sqrt(np.asarray(
         np.asarray(u*u,dtype=f32)+np.asarray(v*v,dtype=f32),dtype=f32)),dtype=f32)
     pi=f32(3.141592653589793); degrees_per_radian=np.asarray(f32(180.)/pi,dtype=f32)
-    angle=_real4_atan2(v,u)
+    angle=np.arctan2(v,u)
     calculated=np.asarray(f32(270.)-np.asarray(degrees_per_radian*angle,dtype=f32),dtype=f32)
     direction=np.where(speed>=f32(1.e-9),calculated,f32(0.)).astype(f32)
     direction=np.where(direction>f32(360.),np.asarray(direction-f32(360.),dtype=f32),direction)
@@ -325,16 +258,13 @@ def _surface_wind(source,index,shape,alpha):
 
 def _pressure_temperature(perturbation_pressure,base_pressure,perturbation_theta):
     """CALWRF pressure (hPa) and potential-temperature conversion."""
-    f32=np.float32
+    f32=np.float64
     pressure=np.asarray(np.asarray(perturbation_pressure,dtype=f32)+
                         np.asarray(base_pressure,dtype=f32),dtype=f32)
     pressure=np.asarray(pressure*f32(.01),dtype=f32)
     ratio=np.asarray(pressure/f32(1000.),dtype=f32)
     exponent=np.asarray(f32(287.04)/f32(1004.),dtype=f32)
-    # CALWRF evaluates this default-REAL exponentiation through libm powf.
-    # A float64 detour differs by one or two ulps at rare F6.1 half-decimal
-    # boundaries; GETRH1 can then also round to the neighbouring integer.
-    factor=np.asarray(_real4_power(ratio,exponent),dtype=f32)
+    factor=np.power(ratio,exponent)
     theta=np.asarray(np.asarray(perturbation_theta,dtype=f32)+f32(300.),dtype=f32)
     temperature=np.asarray(theta*factor,dtype=f32)
     return pressure,temperature
@@ -426,8 +356,8 @@ def _create_output(path: Path,src: nc.Dataset,nt: int,ny: int,nx: int,nz: int,ys
         _var(dst,name,("time","y","x"),units,compression)
     dst.source_format = "WRF NetCDF"
     dst.pycalmet_stage = "calwrf"
-    dst.wrf_dx_m = np.float32(getattr(src, "DX"))
-    dst.wrf_dy_m = np.float32(getattr(src, "DY"))
+    dst.wrf_dx_m = np.float64(getattr(src, "DX"))
+    dst.wrf_dy_m = np.float64(getattr(src, "DY"))
     dst.source_i_start=xs.start+1; dst.source_i_end=xs.stop
     dst.source_j_start=ys.start+1; dst.source_j_end=ys.stop
     dst.source_k_start=zs.start+1; dst.source_k_end=zs.stop
@@ -436,8 +366,8 @@ def _create_output(path: Path,src: nc.Dataset,nt: int,ny: int,nx: int,nz: int,ys
     dst.source_grid_nz=len(src.dimensions["bottom_top"])
     source_latitude=_mass_coordinate(src,"XLAT")
     source_longitude=_mass_coordinate(src,"XLONG")
-    dst.source_latitude_1_1=np.float32(source_latitude[0,0])
-    dst.source_longitude_1_1=np.float32(source_longitude[0,0])
+    dst.source_latitude_1_1=np.float64(source_latitude[0,0])
+    dst.source_longitude_1_1=np.float64(source_longitude[0,0])
     for attr in ("MAP_PROJ", "TRUELAT1", "TRUELAT2", "STAND_LON", "CEN_LAT", "CEN_LON",
                  "MOAD_CEN_LAT"):
         if hasattr(src, attr):

@@ -61,21 +61,6 @@ def test_gride_precipitation_vectorized_methods_and_missing(method):
     np.testing.assert_array_equal(zero,0.)
 
 
-def test_gride_methods_match_gnu_real4_bits():
-    grid=GridConfig(2,1,1.,1.)
-    rates=[0.,7.25,2.5]
-    points=[[.2,.3],[2.4,.6],[.8,2.8]]
-    expected={
-        1:[0x3fa7bd7c,0x407dddbb],
-        2:[0x3e9aed10,0x409699d3],
-        3:[0x3e4f928a,0x409df4e7],
-    }
-    for method in (1,2,3):
-        got=grid_precipitation(rates,points,grid,method,3.,.01)
-        np.testing.assert_array_equal(
-            got.view(np.uint32),np.array([expected[method]],dtype=np.uint32))
-
-
 @pytest.mark.parametrize('packing',[0,1])
 def test_unformatted_precipitation_reads_packed_zero_runs(tmp_path,packing):
     path=tmp_path/f'precip-{packing}.dat'

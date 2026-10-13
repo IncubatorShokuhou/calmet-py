@@ -11,6 +11,7 @@ import numpy as np
 
 from .projections import project_geographic
 from .legacy_io import FortranSequentialReader
+from .datetime_utils import parse_ordinal,parse_ordinal_code
 
 
 @dataclass(frozen=True,slots=True)
@@ -63,16 +64,13 @@ def unpack_surface(words):
 
 
 def _instant(year,day,hour,seconds):
-    year=int(year); year=year+2000 if year<50 else (year+1900 if year<100 else year)
-    day,hour,seconds=int(day),int(hour),int(seconds)
-    if not 1<=day<=366 or hour<0 or seconds<0: raise ValueError('invalid SURF.DAT timestamp')
-    return datetime(year,1,1)+timedelta(days=day-1,hours=hour,seconds=seconds)
+    try: return parse_ordinal(year,day,hour,seconds)
+    except ValueError as error: raise ValueError('invalid SURF.DAT timestamp') from error
 
 
 def _coded_instant(code,seconds=0):
-    text=str(int(code)); year_digits=len(text)-5
-    if year_digits not in {2,4}: raise ValueError(f'invalid SURF.DAT coded time {code!r}')
-    return _instant(text[:year_digits],text[year_digits:year_digits+3],text[-2:],seconds)
+    try: return parse_ordinal_code(code,seconds)
+    except ValueError as error: raise ValueError(f'invalid SURF.DAT coded time {code!r}') from error
 
 
 def _coordinate(text,latitude):
@@ -278,13 +276,13 @@ def station_grid_mapping(stations,grid,datum):
     """Return station map coordinates and CALMET's nearest-station grid."""
     sx,sy=project_geographic([item.longitude for item in stations],
                              [item.latitude for item in stations],grid,datum,units='km')
-    points=np.asarray(np.column_stack((sx,sy)),dtype=np.float32)
+    points=np.asarray(np.column_stack((sx,sy)),dtype=np.float64)
     return points,_nearest_station_grid(points,grid)
 
 
 def _nearest_station_grid(points,grid,block_size=65536):
-    """SETCOM's REAL*4 nearest-station scan, returned as zero-based IDs."""
-    f32=np.float32
+    """SETCOM's floating-point nearest-station scan, returned as zero-based IDs."""
+    f32=np.float64
     points=np.asarray(points,dtype=f32)
     if points.ndim!=2 or points.shape[1]!=2 or points.shape[0]<1:
         raise ValueError('nearest-station coordinates must have shape (station, 2)')
@@ -304,7 +302,7 @@ def _nearest_station_grid(points,grid,block_size=65536):
 
 def fill_missing_surface(record,station_xy,*,cloud_method=1,itprog=0):
     """Vectorized MISSFC nearest-valid-station replacement."""
-    f32=np.float32
+    f32=np.float64
     coordinates=np.asarray(station_xy,dtype=f32)
     count=record.wind_speed.size
     if coordinates.shape!=(count,2): raise ValueError('surface station coordinates have wrong shape')
@@ -337,7 +335,7 @@ def surface_cloud_fields(record,nearest_station,external_cloud=None):
         raise ValueError('nearest surface-station index is invalid')
     ceiling=np.asarray(record.ceiling_hundreds_ft)[nearest]
     if external_cloud is None:
-        cloud=np.float32(.1)*np.asarray(record.cloud_tenths,dtype='f4')[nearest]
+        cloud=np.float64(.1)*np.asarray(record.cloud_tenths,dtype='f4')[nearest]
     else:
         cloud=np.asarray(external_cloud,dtype='f4')
         if cloud.shape!=nearest.shape: raise ValueError('external cloud field does not match CALMET grid')
@@ -347,7 +345,7 @@ def surface_cloud_fields(record,nearest_station,external_cloud=None):
 def interpolate_surface_scalar(values,station_xy,grid,*,radius_km=500.,maximum_stations=5,
                                power=1,target_water=None,station_water=None,empty_fallback=None):
     """Vectorized SURFVAR radius/nearest interpolation for T and RH."""
-    f32=np.float32
+    f32=np.float64
     values=np.asarray(values,dtype=f32); points=np.asarray(station_xy,dtype=f32)
     if points.shape!=(values.size,2): raise ValueError('surface scalar station coordinates have wrong shape')
     if power not in {1,2} or radius_km<0. or maximum_stations<1:
@@ -404,8 +402,8 @@ def interpolate_surface_scalar(values,station_xy,grid,*,radius_km=500.,maximum_s
 
 def _near_upper_air(station_count,station_xy,upper_xy,upper_valid,
                     separation_cells,dx_km,dy_km):
-    """Vectorized DIAGNO RMIN2 test with legacy REAL*4 arithmetic."""
-    f32=np.float32
+    """Vectorized DIAGNO RMIN2 test with legacy floating-point arithmetic."""
+    f32=np.float64
     skip=np.zeros(station_count,dtype=bool)
     if separation_cells<0. or upper_xy is None:
         return skip
@@ -430,8 +428,8 @@ def _near_upper_air(station_count,station_xy,upper_xy,upper_valid,
 
 
 def _wind_components(wind_speed,wind_direction,grid_convergence_degrees=None):
-    """PREPDI/RDS true-north wind conversion in legacy REAL*4 order."""
-    f32=np.float32
+    """PREPDI/RDS true-north wind conversion in legacy floating-point order."""
+    f32=np.float64
     speed=np.asarray(wind_speed,dtype=f32)
     direction=np.asarray(wind_direction,dtype=f32)
     if speed.shape!=direction.shape:
@@ -459,7 +457,7 @@ def wind_profiles(wind_speed,wind_direction,anemometer_height_m,z_centers_m,roug
                   upper_valid=None,upper_air_separation_cells=-1.,dx_km=1.,dy_km=1.,
                   power_exponent=.143):
     """Convert land/overwater wind observations and apply IEXTRP 1--4."""
-    f32=np.float32
+    f32=np.float64
     speed=np.asarray(wind_speed,dtype=f32)
     anem=np.asarray(anemometer_height_m,dtype=f32)
     roughness=np.asarray(roughness_m,dtype=f32); levels=np.asarray(z_centers_m,dtype=f32)
@@ -508,9 +506,6 @@ def wind_profiles(wind_speed,wind_direction,anemometer_height_m,z_centers_m,roug
     elif option==4:
         latitude=np.asarray(station_latitude,dtype=f32)
         if latitude.shape!=speed.shape: raise ValueError('IEXTRP=4 requires one latitude per station')
-        # WIND1 calls SIMILT with neutral L=ZI=10000 m.  Preserve every
-        # REAL*4 assignment in SIMILT rather than evaluating the equivalent
-        # log profile and turning-angle equations in NumPy float64.
         ws1=np.asarray(np.sqrt(np.asarray(
             np.asarray(u*u,dtype=f32)+np.asarray(v*v,dtype=f32),dtype=f32)),dtype=f32)
         factor=f32(57.2957795)
@@ -566,7 +561,7 @@ def component_wind_profiles(u_component,v_component,anemometer_height_m,z_center
                             upper_air_separation_cells=-1.,dx_km=1.,dy_km=1.,
                             power_exponent=.143):
     """Profile grid-oriented DIAG.DAT U/V surface observations."""
-    f32=np.float32
+    f32=np.float64
     u=np.asarray(u_component,dtype=f32); v=np.asarray(v_component,dtype=f32)
     if u.shape!=v.shape: raise ValueError('surface U/V components have different shapes')
     anem=np.asarray(anemometer_height_m,dtype=f32)

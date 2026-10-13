@@ -106,10 +106,10 @@ class MM4Data:
         if min(hours,model_nx,model_ny,nzp,nx,ny)<=0:
             raise ValueError('MM4.DAT header dimensions and duration must be positive')
         sigma=np.array([float(cls._line(stream,f'sigma level {index+1}')[:6])
-                        for index in range(nzp)],dtype=np.float32)
-        latitude=np.empty((ny,nx),dtype=np.float32)
-        longitude=np.empty((ny,nx),dtype=np.float32)
-        terrain=np.empty((ny,nx),dtype=np.float32)
+                        for index in range(nzp)],dtype=np.float64)
+        latitude=np.empty((ny,nx),dtype=np.float64)
+        longitude=np.empty((ny,nx),dtype=np.float64)
+        terrain=np.empty((ny,nx),dtype=np.float64)
         landuse=np.empty((ny,nx),dtype=np.int32)
         for j in range(ny):
             for i in range(nx):
@@ -129,8 +129,8 @@ class MM4Data:
         while True:
             first=stream.readline()
             if not first: break
-            surface=np.empty((ny,nx,3),dtype=np.float32)
-            pressure=np.empty((levels,ny,nx),dtype=np.float32); height=np.empty_like(pressure)
+            surface=np.empty((ny,nx,3),dtype=np.float64)
+            pressure=np.empty((levels,ny,nx),dtype=np.float64); height=np.empty_like(pressure)
             encoded_temperature=np.empty_like(pressure); depression=np.empty_like(pressure)
             direction=np.empty_like(pressure); speed=np.empty_like(pressure)
             timestamp=None
@@ -153,7 +153,7 @@ class MM4Data:
                         pressure[level,j,i],height[level,j,i],encoded_temperature[level,j,i],\
                             depression[level,j,i],direction[level,j,i],speed[level,j,i]=values
             negative=(encoded_temperature.astype(np.int64)%2)!=0
-            f32=np.float32
+            f32=np.float64
             temperature_c=np.asarray(np.where(negative,-encoded_temperature,
                                                 encoded_temperature)/f32(10.),dtype=f32)
             dew_depression=np.asarray(np.where(depression<f32(56.),depression/f32(10.),
@@ -232,7 +232,7 @@ class MM4Data:
         from .calmet_solver import (PrognosticMapper,SourceThermalState,
                                     _prognostic_wind_components,_stull_temperature,_vertical_centers,
                                     solar_at_step_midpoint)
-        from .calmet_numerics import (_real4_libm,_real4_power,cloud_cover_mm5,cloud_fraction,
+        from .calmet_numerics import (cloud_cover_mm5,cloud_fraction,
                                       density_from_pressure_temperature,
                                       saturation_vapor_pressure_lowe)
         from .projections import grid_convergence
@@ -249,7 +249,7 @@ class MM4Data:
         convergence=grid_convergence(grid,self.header.longitude,self.header.latitude)
         source_u,source_v=_prognostic_wind_components(
             speed,direction,convergence[None,:,:])
-        centers=np.asarray(target_height_m,dtype=np.float32)
+        centers=np.asarray(target_height_m,dtype=np.float64)
         if centers.ndim!=1 or centers.size<1:
             raise ValueError('target MM4 heights must be a non-empty vector')
         def wind_centers(field):
@@ -261,13 +261,13 @@ class MM4Data:
             anchor_z=zflat[anchor,columns]; anchor_value=flat[anchor,columns]
             for level,center in enumerate(centers):
                 below=center<anchor_z
-                log_half=np.float32(_real4_libm('logf',np.float32(.5)))
-                numerator=np.float32(_real4_libm('logf',center)-log_half)
-                denominator=np.asarray(_real4_libm('logf',np.maximum(
-                    anchor_z,np.float32(.500001)))-log_half,dtype=np.float32)
+                log_half=np.float64(np.log(np.float64(.5)))
+                numerator=np.float64(np.log(center)-log_half)
+                denominator=np.asarray(np.log(np.maximum(
+                    anchor_z,np.float64(.500001)))-log_half,dtype=np.float64)
                 factor=np.divide(numerator,denominator,
-                    out=np.ones_like(anchor_z,dtype=np.float32),
-                    where=anchor_z>np.float32(.500001))
+                    out=np.ones_like(anchor_z,dtype=np.float64),
+                    where=anchor_z>np.float64(.500001))
                 base[level]=np.where(below.reshape(base.shape[1:]),
                     (factor*anchor_value).reshape(base.shape[1:]),base[level])
             return base
@@ -293,7 +293,7 @@ class MM4Data:
         def gather(values,index): return np.asarray(values).reshape(values.shape[0],-1)[index,columns].reshape(flat_shape)
         anchor_z=gather(height,anchor); following_z=gather(height,following)
         anchor_temperature=gather(temperature,anchor); following_temperature=gather(temperature,following)
-        f32=np.float32
+        f32=np.float64
         temperature=np.asarray(temperature,dtype=f32)
         humidity=np.asarray(humidity,dtype=f32); pressure=np.asarray(pressure,dtype=f32)
         vapor=np.asarray(np.asarray(f32(.01)*humidity,dtype=f32)*
@@ -302,15 +302,15 @@ class MM4Data:
         mixing=np.asarray(np.asarray(f32(.622)*vapor,dtype=f32)/
                           np.asarray(pressure-vapor,dtype=f32),dtype=f32)
         specific=np.asarray(mixing/np.asarray(f32(1.)+mixing,dtype=f32),dtype=f32)
-        potential=np.asarray(temperature*_real4_power(
+        potential=np.asarray(temperature*np.power(
             np.asarray(f32(1000.)/pressure,dtype=f32),f32(.286)),dtype=f32)
         virtual_potential=np.asarray(potential*np.asarray(
             f32(1.)+np.asarray(f32(.61)*specific,dtype=f32),dtype=f32),dtype=f32)
         theta2=gather(virtual_potential,anchor); theta3=gather(virtual_potential,following)
         if thermal_state is None:
             scale=np.asarray(following_z/f32(5.),dtype=f32)
-            upper_exp=_real4_libm('expf',np.asarray(-f32(.77)*following_z/scale,dtype=f32))
-            lower_exp=_real4_libm('expf',np.asarray(-f32(.77)*anchor_z/scale,dtype=f32))
+            upper_exp=np.exp(np.asarray(-f32(.77)*following_z/scale,dtype=f32))
+            lower_exp=np.exp(np.asarray(-f32(.77)*anchor_z/scale,dtype=f32))
             denominator=np.asarray(upper_exp-lower_exp,dtype=f32)
             drop=np.divide(np.asarray(theta3-theta2,dtype=f32),denominator,
                            out=np.zeros_like(theta2,dtype=f32),where=denominator!=f32(0.))
@@ -333,10 +333,10 @@ class MM4Data:
         logarithm_argument=np.asarray(
             np.asarray(anchor_temperature*immediate_theta,dtype=f32)/
             np.asarray(immediate_temperature*theta2,dtype=f32),dtype=f32)
-        coefficient=np.divide(_real4_libm('logf',logarithm_argument),
+        coefficient=np.divide(np.log(logarithm_argument),
             np.asarray(anchor_z-immediate_z,dtype=f32),out=np.zeros_like(anchor_z,dtype=f32),
             where=anchor_z!=immediate_z).astype(f32)
-        multiplier=np.asarray(np.asarray(_real4_libm('expf',np.asarray(
+        multiplier=np.asarray(np.asarray(np.exp(np.asarray(
             -coefficient*anchor_z,dtype=f32))*anchor_temperature,dtype=f32)/theta2,dtype=f32)
         ocean=self.header.landuse==prognostic_ocean_category
         for level,center in enumerate(centers):
@@ -351,8 +351,8 @@ class MM4Data:
             land_theta=_stull_temperature(theta2,anchor_z,theta3,following_z,
                                            theta20,theta30,center)
             night_theta=np.where(ocean,ocean_theta,land_theta)
-            nighttime=np.asarray(np.asarray(night_theta*_real4_libm(
-                'expf',np.asarray(coefficient*center,dtype=f32)),dtype=f32)*multiplier,dtype=f32)
+            nighttime=np.asarray(np.asarray(night_theta*np.exp(
+                np.asarray(coefficient*center,dtype=f32)),dtype=f32)*multiplier,dtype=f32)
             replacement=np.where(daylight,daytime,nighttime)
             source_temperature_centers[level]=np.where(below,replacement,
                                                         source_temperature_centers[level])
