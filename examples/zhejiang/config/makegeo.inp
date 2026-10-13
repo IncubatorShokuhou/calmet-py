@@ -18,11 +18,11 @@ INPUT GROUP: 0 -- Input and Output File Names
 
     Default Name  Type          File Name
     ------------  ----          ---------
-    LU.DAT       input    ! LUDAT = LULC.DAT      !
+    LU.DAT       input    ! LUDAT = ../../../output/zhejiang/landuse.nc !
     LU2.DAT      input    ! LU2DAT = Luglobe.dat      !
-    TERR.DAT     input    ! TERRDAT = TERR.DAT      !
-    GEO.DAT      output   ! GEODAT = Geo.dat      !
-    MAKEGEO.LST  output   ! RUNLST = Makegeo.lst      !
+    TERR.DAT     input    ! TERRDAT = ../../../output/zhejiang/terrain.nc !
+    GEO.DAT      output   ! GEODAT = ../../../output/zhejiang/geo.nc !
+    MAKEGEO.LST  output   ! RUNLST = ../../../output/zhejiang/makegeo.lst !
     QALUSE.GRD   output   * LUGRD  =            *
     QATERR.GRD   output   * TEGRD =            *
 

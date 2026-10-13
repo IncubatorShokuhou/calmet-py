@@ -30,8 +30,8 @@ Subgroup (0a)
      Default Name    Type        File Name
      ------------    ----        ---------
      PREV.DAT      input    ! PREVDAT =        !
-     LU.DAT        output   ! LUDAT =  LULC.DAT      !
-     CTGPROC.LST   output   ! RUNLST  = CTGPROC.LST   !
+     LU.DAT        output   ! LUDAT = ../../../output/zhejiang/landuse.nc !
+     CTGPROC.LST   output   ! RUNLST = ../../../output/zhejiang/ctgproc.lst !
     ---------------------------------------------------------
     (Coastline Data)
        USGS Global Self-consistent Hierarchical High-resolution
@@ -45,7 +45,7 @@ Subgroup (0a)
 
      All file names will be converted to lower case if LCFILES = T
      Otherwise, if LCFILES = F, file names will be converted to UPPER CASE
-     (LCFILES)                  Default: T      ! LCFILES = F !
+     (LCFILES)                  Default: T      ! LCFILES = T !
         T = lower case
         F = UPPER CASE
 
@@ -81,7 +81,7 @@ Subgroup (0b)
     (UMDGLC)  designates Univ. of Maryland Global Land Cover GeoTIFF
     (MODIS)   designates Boston Univ. Modis Global Land Cover
 
-1 !GLAZAS = EAUSGS1.IMG!    !END!
+1 !GEN = ../landuse/zhejiang_generic.landuse! !END!
 
 --------------------------------------------------------------------------------
 

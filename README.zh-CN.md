@@ -49,38 +49,20 @@ python -m pytest -q
 | MAKEGEO | `examples/zhejiang/config/makegeo.inp` |
 | CALMET | `examples/zhejiang/config/calmet.inp` |
 
-控制文件内的相对路径以该控制文件所在目录为基准。传入控制文件路径时，还可以用
-关键字参数覆盖其中的值，常用于指定用户输入和输出位置。阶段函数会返回主输出
-文件路径。
+控制文件内的相对路径以该控制文件所在目录为基准。仓库中的示例已由这五份文件
+完整定义，因此 Python 调用不再重复传参。只有明确要让同一控制文件使用其他数据
+时，才需要关键字参数覆盖。阶段函数会返回主输出文件路径。
 
 ```python
-from pathlib import Path
-
 import pycalmet
 
-meteorology = pycalmet.calwrf(
-    "examples/zhejiang/config/calwrf.inp",
-    wrf_files=sorted(Path("examples/zhejiang").glob("wrfout*.nc")),
-    start="2018031800",
-    end="2018031802",  # CALMET 时间平均所需的下一小时时次
-    output="output/calwrf.nc",
-    legacy_output="output/calwrf.m3d",
-    create_surface=False,
-)
-
-result = pycalmet.calmet(
-    "examples/zhejiang/config/calmet.inp",
-    meteorology="output/calwrf.m3d",
-    geophysical="examples/zhejiang/geo.nc",
-    output="output/calmet.nc",
-    start="2018031800",
-    end="2018031801",
-)
+base = "examples/zhejiang/config"
+pycalmet.calwrf(f"{base}/calwrf.inp")
+pycalmet.terrel(f"{base}/terrel.inp")
+pycalmet.ctrproc(f"{base}/ctgproc.inp")
+pycalmet.makegeo(f"{base}/makegeo.inp")
+result = pycalmet.calmet(f"{base}/calmet.inp")
 ```
-
-重建静态地理场时会依次使用 `TERREL`、`CTGPROC` 和 `MAKEGEO` 控制文件；该流程
-还需要仓库未附带的外部土地利用栅格。下面的可运行命令直接复用仓库中的
-`geo.nc`。
 
 公开 API：
 
@@ -95,21 +77,18 @@ pycalmet.readlst(...)
 
 ## 浙江示例
 
-仓库内置三个连续 WRF 时次和已生成的地理场。从仓库根目录运行：
+仓库内置三个连续 WRF 时次、42 个原始 SRTM3 `.hgt` 瓦片和分类土地利用点数据。
+示例会重新生成地形、土地利用和地理场，不依赖预先做好的 `geo.nc`。从仓库根目录
+运行全部五个阶段：
 
 ```bash
 sha256sum -c examples/zhejiang/SHA256SUMS
+cd terrain/srtm3 && sha256sum -c SHA256SUMS && cd ../..
 
-./examples/zhejiang/run.sh \
-  --wrf examples/zhejiang \
-  --geo examples/zhejiang/geo.nc \
-  --start 2018031800 \
-  --end 2018031801 \
-  --skip-static \
-  --output output/zhejiang.nc
+./examples/zhejiang/run.sh
 ```
 
-数据来源、时间边界和静态场重建方法见
+数据来源、时间边界和生成结果见
 [examples/zhejiang/README.md](examples/zhejiang/README.md)。
 
 ## 仓库结构

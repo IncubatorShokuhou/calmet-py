@@ -16,14 +16,14 @@ Subgroup (a)
 ------------
 Default Name  Type          File Name
 ------------  ----          ---------
-GEO.DAT       input    ! GEODAT=GEO.DAT       !
+GEO.DAT       input    ! GEODAT=../../../output/zhejiang/geo.nc !
 SURF.DAT      input    * SRFDAT=            *
 CLOUD.DAT     input    * CLDDAT=            *
 PRECIP.DAT    input    * PRCDAT=            *
 WT.DAT        input    * WTDAT=             *
 
-CALMET.LST    output   ! METLST=CALMET.LST     !
-CALMET.DAT    output   ! METDAT=CALMET.DAT    !
+CALMET.LST    output   ! METLST=../../../output/zhejiang/calmet.lst !
+CALMET.DAT    output   ! METDAT=../../../output/zhejiang/calmet.nc !
 PACOUT.DAT    output   * PACDAT=            *
 
 All file names will be converted to lower case if LCFILES = T
@@ -69,7 +69,7 @@ MM4/MM5/3D.DAT files (consecutive or overlapping)
 ------------------------------------------------
 Default Name  Type       File Name
 ------------  ----       ---------
-MM51.DAT       input     1  ! M3DDAT=  calwrfout_zhejiang.m3d !  !END!
+MM51.DAT       input     1  ! M3DDAT=../../../output/zhejiang/calwrf.m3d ! !END!
 --------------------------------------------------------------------------------
 Subgroup (e)
 -------------------------------------------------

@@ -52,39 +52,22 @@ five:
 | MAKEGEO | `examples/zhejiang/config/makegeo.inp` |
 | CALMET | `examples/zhejiang/config/calmet.inp` |
 
-Paths inside a control file are resolved relative to that file. Keyword
-arguments supplied with a control-file path override its values, which is
-useful for selecting user inputs and output locations. Stage functions return
-the path of their primary output.
+Paths inside a control file are resolved relative to that file. The bundled
+example is fully defined by these files, so no duplicate Python arguments are
+needed. Keyword overrides remain available for applications that deliberately
+reuse a control file with different data. Stage functions return the path of
+their primary output.
 
 ```python
-from pathlib import Path
-
 import pycalmet
 
-meteorology = pycalmet.calwrf(
-    "examples/zhejiang/config/calwrf.inp",
-    wrf_files=sorted(Path("examples/zhejiang").glob("wrfout*.nc")),
-    start="2018031800",
-    end="2018031802",  # following-hour boundary for CALMET averaging
-    output="output/calwrf.nc",
-    legacy_output="output/calwrf.m3d",
-    create_surface=False,
-)
-
-result = pycalmet.calmet(
-    "examples/zhejiang/config/calmet.inp",
-    meteorology="output/calwrf.m3d",
-    geophysical="examples/zhejiang/geo.nc",
-    output="output/calmet.nc",
-    start="2018031800",
-    end="2018031801",
-)
+base = "examples/zhejiang/config"
+pycalmet.calwrf(f"{base}/calwrf.inp")
+pycalmet.terrel(f"{base}/terrel.inp")
+pycalmet.ctrproc(f"{base}/ctgproc.inp")
+pycalmet.makegeo(f"{base}/makegeo.inp")
+result = pycalmet.calmet(f"{base}/calmet.inp")
 ```
-
-`TERREL`, `CTGPROC`, and `MAKEGEO` controls are used when rebuilding the
-static geophysical grid. That route also requires an external land-use raster;
-the runnable command below reuses the bundled `geo.nc` instead.
 
 The public processing API is:
 
@@ -99,23 +82,20 @@ pycalmet.readlst(...)
 
 ## Zhejiang example
 
-The bundled example contains three consecutive WRF records and a prepared
-geophysical grid. Run the full Python workflow from the repository root:
+The bundled example contains three consecutive WRF records, 42 original SRTM3
+`.hgt` tiles, and a categorical land-use point dataset. It rebuilds terrain,
+land use, and the geophysical grid instead of using a prepared `geo.nc`.
+Run all five stages from the repository root:
 
 ```bash
 sha256sum -c examples/zhejiang/SHA256SUMS
+cd terrain/srtm3 && sha256sum -c SHA256SUMS && cd ../..
 
-./examples/zhejiang/run.sh \
-  --wrf examples/zhejiang \
-  --geo examples/zhejiang/geo.nc \
-  --start 2018031800 \
-  --end 2018031801 \
-  --skip-static \
-  --output output/zhejiang.nc
+./examples/zhejiang/run.sh
 ```
 
 See [examples/zhejiang/README.md](examples/zhejiang/README.md) for provenance,
-input boundaries, and instructions for rebuilding the static fields.
+input boundaries, source data, and generated products.
 
 ## Repository layout
 

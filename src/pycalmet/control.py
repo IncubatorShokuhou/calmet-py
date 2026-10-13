@@ -556,7 +556,8 @@ def makegeo_config(path: str | Path, **overrides) -> MakegeoConfig:
               snow_depth_minimum_m=float(_number(_one(values,'SDPMIN','0.01'))),
               landuse_plot_output=makegeo_path(_one(values,'LUGRD','QALUSE.GRD')),
               terrain_plot_output=makegeo_path(_one(values,'TEGRD','QATERR.GRD')),
-              color_map_output=source.parent/'luse.clr',
+              color_map_output=makegeo_path(
+                  str(Path(_one(values,"GEODAT","GEO.DAT")).with_name('luse.clr'))),
               image_mode=int(_number(_one(values,'IMAGE','0'))),title=title)
     if 'output' in overrides:
         for name in ('landuse_plot_output','terrain_plot_output','color_map_output'):

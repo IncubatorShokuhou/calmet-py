@@ -36,14 +36,14 @@ Subgroup (0a)
 
      Default Name    Type        File Name
      ------------    ----        ---------
-    TERREL.DAT       output    ! OUTFIL = TERR.DAT      !
-    TERREL.LST       output    ! LSTFIL = TERR.LST      !
-    TERREL.GRD       output    ! PLTFIL = QATERR.GRD      !
+    TERREL.DAT       output    ! OUTFIL = ../../../output/zhejiang/terrain.nc !
+    TERREL.LST       output    ! LSTFIL = ../../../output/zhejiang/terrel.lst !
+    TERREL.GRD       output    ! PLTFIL = ../../../output/zhejiang/terrain.grd !
     RAWECHO.DAT      output    * RAWECHO =       *
     ---------------------------------------------------------
     (Save-files)
     PREV.SAV         input     * PREVFIL =                 *
-    TERREL.SAV       output    ! SAVEFIL = TERR.SAV     !
+    TERREL.SAV       output    ! SAVEFIL = ../../../output/zhejiang/terrel.sav !
     ---------------------------------------------------------
     ---------------------------------------------------------
     (Discrete (X,Y) Point Files)
@@ -66,7 +66,7 @@ Subgroup (0a)
 
      All file names will be converted to lower case if LCFILES = T
      Otherwise, if LCFILES = F, file names will be converted to UPPER CASE
-     (LCFILES)                  Default: T      ! LCFILES = F !
+     (LCFILES)                  Default: T      ! LCFILES = T !
         T = lower case
         F = UPPER CASE
 
@@ -97,48 +97,48 @@ Subgroup (0b)
     (NZGEN)    designates New Zealand Generic data files
     (GEN)      designates Generic data files
     (GEOTIFF)  designates GEOTIFF data files
-!SRTM3 = N26E117.HGT! !END!
-!SRTM3 = N26E118.HGT! !END!
-!SRTM3 = N26E119.HGT! !END!
-!SRTM3 = N26E120.HGT! !END!
-!SRTM3 = N26E121.HGT! !END!
-!SRTM3 = N26E122.HGT! !END!
-!SRTM3 = N26E123.HGT! !END!
-!SRTM3 = N27E117.HGT! !END!
-!SRTM3 = N27E118.HGT! !END!
-!SRTM3 = N27E119.HGT! !END!
-!SRTM3 = N27E120.HGT! !END!
-!SRTM3 = N27E121.HGT! !END!
-!SRTM3 = N27E122.HGT! !END!
-!SRTM3 = N27E123.HGT! !END!
-!SRTM3 = N28E117.HGT! !END!
-!SRTM3 = N28E118.HGT! !END!
-!SRTM3 = N28E119.HGT! !END!
-!SRTM3 = N28E120.HGT! !END!
-!SRTM3 = N28E121.HGT! !END!
-!SRTM3 = N28E122.HGT! !END!
-!SRTM3 = N28E123.HGT! !END!
-!SRTM3 = N29E117.HGT! !END!
-!SRTM3 = N29E118.HGT! !END!
-!SRTM3 = N29E119.HGT! !END!
-!SRTM3 = N29E120.HGT! !END!
-!SRTM3 = N29E121.HGT! !END!
-!SRTM3 = N29E122.HGT! !END!
-!SRTM3 = N29E123.HGT! !END!
-!SRTM3 = N30E117.HGT! !END!
-!SRTM3 = N30E118.HGT! !END!
-!SRTM3 = N30E119.HGT! !END!
-!SRTM3 = N30E120.HGT! !END!
-!SRTM3 = N30E121.HGT! !END!
-!SRTM3 = N30E122.HGT! !END!
-!SRTM3 = N30E123.HGT! !END!
-!SRTM3 = N31E117.HGT! !END!
-!SRTM3 = N31E118.HGT! !END!
-!SRTM3 = N31E119.HGT! !END!
-!SRTM3 = N31E120.HGT! !END!
-!SRTM3 = N31E121.HGT! !END!
-!SRTM3 = N31E122.HGT! !END!
-!SRTM3 = N31E123.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N26E117.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N26E118.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N26E119.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N26E120.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N26E121.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N26E122.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N26E123.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N27E117.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N27E118.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N27E119.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N27E120.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N27E121.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N27E122.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N27E123.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N28E117.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N28E118.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N28E119.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N28E120.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N28E121.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N28E122.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N28E123.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N29E117.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N29E118.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N29E119.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N29E120.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N29E121.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N29E122.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N29E123.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N30E117.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N30E118.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N30E119.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N30E120.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N30E121.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N30E122.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N30E123.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N31E117.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N31E118.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N31E119.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N31E120.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N31E121.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N31E122.HGT! !END!
+!SRTM3 = ../../../terrain/srtm3/N31E123.HGT! !END!
 -------------
 Subgroup (0c)
 -------------

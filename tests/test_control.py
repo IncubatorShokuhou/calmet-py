@@ -181,7 +181,7 @@ def test_ctgproc_legacy_zero_ndbf_uses_luindat_and_lulc(tmp_path):
     control=tmp_path/'ctgproc.inp'; control.write_text(text,encoding='ascii')
     config=ctgproc_config(control)
     assert config.landuse_sources==(CtgprocSource(
-        tmp_path/'LEGACY-LANDUSE.DAT','GLAZAF','ESR-S',12),)
+        tmp_path/'legacy-landuse.dat','GLAZAF','ESR-S',12),)
     assert config.input_type=='GLAZAF'
 
 
@@ -359,19 +359,19 @@ def test_existing_component_controls_map_to_typed_configs():
     terrel=terrel_config(ROOT/'examples/zhejiang/config/terrel.inp')
     assert (terrel.grid.nx,terrel.grid.ny,terrel.datum)==(610,499,'WGS-84')
     assert terrel.model==1 and terrel.processing_method==2
-    assert terrel.plot_output==ROOT/'examples/zhejiang/config/QATERR.GRD'
+    assert Path(terrel.plot_output).name=='terrain.grd'
     assert terrel.raw_echo_output is None and terrel.qa_hit_threshold_percent==75
-    assert len(terrel.terrain_files)==42 and Path(terrel.terrain_files[0]).name=='N26E117.HGT'
+    assert len(terrel.terrain_files)==42 and Path(terrel.terrain_files[0]).name.casefold()=='n26e117.hgt'
     assert len(terrel.terrain_sources)==42
     assert terrel.terrain_sources[0].input_type=='SRTM3'
     assert terrel.terrain_sources[0].input_datum=='WGS-96'
 
     ctg=ctgproc_config(ROOT/'examples/zhejiang/config/ctgproc.inp')
-    assert ctg.input_type=='GLAZAS' and ctg.mesh_density==12 and ctg.input_datum=='ESR-S'
+    assert ctg.input_type=='GEN' and ctg.mesh_density==12 and ctg.input_datum=='WGS-84'
 
     geo=makegeo_config(ROOT/'examples/zhejiang/config/makegeo.inp')
     assert geo.title=='Demo Application'
-    assert geo.grid.lon0==117.5 and Path(geo.terrain).name.casefold()=='terr.dat'
+    assert geo.grid.lon0==117.5 and Path(geo.terrain).name.casefold()=='terrain.nc'
     assert (geo.water_threshold,geo.missing_category,geo.minimum_coverage)==(.5,55,.96)
     assert geo.secondary_landuse is None and geo.use_terrain
     assert len(geo.input_properties)==38 and geo.input_properties[11]==(.5,.18,1.,.2,0.,1.,10)
@@ -380,7 +380,8 @@ def test_existing_component_controls_map_to_typed_configs():
     assert geo.qa_cell==(20,15) and not geo.snow_processing
     assert geo.landuse_plot_output==ROOT/'examples/zhejiang/config/qaluse.grd'
     assert geo.terrain_plot_output==ROOT/'examples/zhejiang/config/qaterr.grd'
-    assert geo.color_map_output==ROOT/'examples/zhejiang/config/luse.clr'
+    assert Path(geo.color_map_output).name=='luse.clr'
+    assert Path(geo.color_map_output).parent==Path(geo.output).parent
     assert geo.image_mode==0
 
     calmet=calmet_config(CALMET_CONTROL)
@@ -509,7 +510,7 @@ def test_ctgproc_control_reads_preprocessed_coastline_fill(tmp_path):
         '! LBLNREAD = F  !','! LBLNREAD = T  !')
     control=tmp_path/'ctgproc.inp'; control.write_text(text,encoding='ascii')
     config=ctgproc_config(control)
-    assert config.coastline_file==tmp_path/'COAST.BLN'
+    assert config.coastline_file==tmp_path/'coast.bln'
     assert config.fill_empty_ocean and not config.coastline_swap
     assert config.ocean_category==55
 
@@ -519,8 +520,8 @@ def test_ctgproc_control_selects_direct_gshhs_extraction(tmp_path):
     text=text.replace('! LCOAST = F !','! LCOAST = T !')
     control=tmp_path/'ctgproc.inp'; control.write_text(text,encoding='ascii')
     config=ctgproc_config(control)
-    assert config.gshhs_file==tmp_path/'GSHHS_F.B'
-    assert config.coastline_file==tmp_path/'COAST.BLN'
+    assert config.gshhs_file==tmp_path/'gshhs_f.b'
+    assert config.coastline_file==tmp_path/'coast.bln'
     assert config.coastline_source_datum=='WGS-84'
 
 
@@ -531,7 +532,7 @@ def test_ctgproc_control_reads_continuation_options(tmp_path):
         '! PREVDAT =        !','! PREVDAT = PREV.DAT !')
     control=tmp_path/'ctgproc.inp'; control.write_text(text,encoding='ascii')
     config=ctgproc_config(control)
-    assert config.previous_landuse==tmp_path/'PREV.DAT'
+    assert config.previous_landuse==tmp_path/'prev.dat'
     assert not config.final_output
 
 
@@ -539,7 +540,7 @@ def test_ctgproc_control_uses_default_continuation_file(tmp_path):
     text=(ROOT/'examples/zhejiang/config/ctgproc.inp').read_text(encoding='ascii')
     text=text.replace('! LPREV = F  !','! LPREV = T  !')
     control=tmp_path/'ctgproc.inp'; control.write_text(text,encoding='ascii')
-    assert ctgproc_config(control).previous_landuse==tmp_path/'PREV.DAT'
+    assert ctgproc_config(control).previous_landuse==tmp_path/'prev.dat'
 
 
 def test_ctgproc_control_honors_lowercase_file_policy(tmp_path):
@@ -550,8 +551,8 @@ def test_ctgproc_control_honors_lowercase_file_policy(tmp_path):
         '! LCOAST = F !','! LCOAST = T !')
     control=tmp_path/'ctgproc.inp'; control.write_text(text,encoding='ascii')
     config=ctgproc_config(control)
-    assert config.landuse_sources[0].path==tmp_path/'eausgs1.img'
-    assert config.output==tmp_path/'lulc.dat'
+    assert config.landuse_sources[0].path==tmp_path/'../landuse/zhejiang_generic.landuse'
+    assert Path(config.output).name=='landuse.nc'
     assert config.previous_landuse==tmp_path/'previous.dat'
     assert config.gshhs_file==tmp_path/'gshhs_f.b'
     assert config.coastline_file==tmp_path/'coast.bln'
@@ -595,10 +596,10 @@ def test_makegeo_control_honors_uppercase_file_policy(tmp_path):
         '! LLU2 = F    !','! LLU2 = T    !')
     control=tmp_path/'makegeo.inp'; control.write_text(text,encoding='ascii')
     config=makegeo_config(control)
-    assert config.terrain==tmp_path/'TERR.DAT'
-    assert config.landuse==tmp_path/'LULC.DAT'
+    assert Path(config.terrain).name=='TERRAIN.NC'
+    assert Path(config.landuse).name=='LANDUSE.NC'
     assert config.secondary_landuse==tmp_path/'LUGLOBE.DAT'
-    assert config.output==tmp_path/'GEO.DAT'
+    assert Path(config.output).name=='GEO.NC'
     assert config.landuse_plot_output==tmp_path/'QALUSE.GRD'
     assert config.terrain_plot_output==tmp_path/'QATERR.GRD'
 
@@ -626,12 +627,12 @@ def test_ctgproc_control_builds_mixed_sources_in_processing_order(tmp_path):
     text+='\n! CTG = extra.ctg !\n! CORINE = europe.tif !\n! DCORINE = WGS-84 !\n! MESHCORN = 3 !\n'
     control=tmp_path/'ctgproc.inp'; control.write_text(text,encoding='ascii')
     config=ctgproc_config(control)
-    assert [item.input_type for item in config.landuse_sources]==['CTG','GLAZAS','CORINE']
-    assert config.landuse_sources[0].path==tmp_path/'EXTRA.CTG'
+    assert [item.input_type for item in config.landuse_sources]==['CTG','CORINE','GEN']
+    assert config.landuse_sources[0].path==tmp_path/'extra.ctg'
     assert config.landuse_sources[0].input_datum=='NAS-C'
     assert config.landuse_sources[0].mesh_density==12
-    assert config.landuse_sources[-1]==CtgprocSource(
-        tmp_path/'EUROPE.TIF','CORINE','WGS-84',3)
+    assert config.landuse_sources[1]==CtgprocSource(
+        tmp_path/'europe.tif','CORINE','WGS-84',3)
 
 
 def test_terrel_control_builds_mixed_sources_with_source_datums(tmp_path):
@@ -641,7 +642,7 @@ def test_terrel_control_builds_mixed_sources_with_source_datums(tmp_path):
     control = tmp_path / "terrel.inp"
     control.write_text(text, encoding="ascii")
     config = terrel_config(control)
-    assert config.terrain_sources[-1].path == tmp_path / "TERRAIN.GEN"
+    assert config.terrain_sources[-1].path == tmp_path / "terrain.gen"
     assert config.terrain_sources[-1].input_type == "GEN"
     assert config.terrain_sources[-1].input_datum == "NAS-C"
 
@@ -691,12 +692,13 @@ def test_terrel_control_uses_source_defaults_for_receptors_and_cded(tmp_path):
 def test_terrel_control_uses_legacy_grid_and_save_defaults(tmp_path):
     text = (ROOT / "examples/zhejiang/config/terrel.inp").read_text(encoding="ascii")
     text = text.replace("! IGRID = 1 !", "* IGRID = 1 *")
-    text = text.replace("! SAVEFIL = TERR.SAV     !", "* SAVEFIL = TERR.SAV     *")
+    text = text.replace("! SAVEFIL = ../../../output/zhejiang/terrel.sav !",
+                        "* SAVEFIL = ../../../output/zhejiang/terrel.sav *")
     control = tmp_path / "terrel.inp"
     control.write_text(text, encoding="ascii")
     config = terrel_config(control)
     assert config.grid.grid_type == 1
-    assert config.save_output == tmp_path / "TERREL.SAV"
+    assert config.save_output == tmp_path / "terrel.sav"
 
 
 def test_makegeo_control_rejects_unsupported_ifmtgeo(tmp_path):
@@ -745,14 +747,15 @@ def test_ctgproc_file_override_rebuilds_control_sources(tmp_path):
     config=ctgproc_config(ROOT / "examples/zhejiang/config/ctgproc.inp",landuse_files=files)
     assert tuple(config.landuse_files)==files
     assert config.landuse_sources==(CtgprocSource(
-        files[0],"GLAZAS","ESR-S",12),)
+        files[0],"GEN","WGS-84",12),)
 
 
 def test_ctgproc_source_setting_overrides_rebuild_control_sources():
     config=ctgproc_config(ROOT / "examples/zhejiang/config/ctgproc.inp",mesh_density=3,
                           input_datum="WGS-84")
     assert config.landuse_sources==(CtgprocSource(
-        ROOT / "examples/zhejiang/config/EAUSGS1.IMG","GLAZAS","WGS-84",3),)
+        ROOT / "examples/zhejiang/config/../landuse/zhejiang_generic.landuse",
+        "GEN","WGS-84",3),)
 
 
 def test_terrel_center_reference_is_normalized_to_cell_corner(tmp_path):
@@ -784,8 +787,8 @@ def test_terrel_control_reads_discrete_receptor_options(tmp_path):
     control = tmp_path / "terrel.inp"
     control.write_text(text, encoding="ascii")
     config = terrel_config(control)
-    assert config.receptor_input == tmp_path / "RECEPTORS.INP"
-    assert config.receptor_output == tmp_path / "RECEPTORS.OUT"
+    assert config.receptor_input == tmp_path / "receptors.inp"
+    assert config.receptor_output == tmp_path / "receptors.out"
     assert config.receptor_columns == 2
     assert config.interpolate_receptors
     assert config.receptor_radius_km == 0.15
@@ -798,9 +801,9 @@ def test_terrel_control_uses_default_receptor_and_continuation_files(tmp_path):
     control = tmp_path / "terrel.inp"
     control.write_text(text, encoding="ascii")
     config = terrel_config(control)
-    assert config.receptor_input == tmp_path / "XYINP.DAT"
-    assert config.receptor_output == tmp_path / "XYOUT.DAT"
-    assert config.previous_save == tmp_path / "PREV.SAV"
+    assert config.receptor_input == tmp_path / "xyinp.dat"
+    assert config.receptor_output == tmp_path / "xyout.dat"
+    assert config.previous_save == tmp_path / "prev.sav"
 
 
 def test_terrel_control_reads_continuation_save_files(tmp_path):
@@ -810,8 +813,8 @@ def test_terrel_control_reads_continuation_save_files(tmp_path):
     control = tmp_path / "terrel.inp"
     control.write_text(text, encoding="ascii")
     config = terrel_config(control)
-    assert config.previous_save == tmp_path / "PREVIOUS.SAV"
-    assert config.save_output == tmp_path / "TERR.SAV"
+    assert config.previous_save == tmp_path / "previous.sav"
+    assert Path(config.save_output).name == "terrel.sav"
 
 
 def test_terrel_control_selects_direct_sample_projection(tmp_path):
@@ -834,7 +837,7 @@ def test_terrel_control_reads_replacement_and_coastline_options(tmp_path):
     control = tmp_path / "terrel.inp"
     control.write_text(text, encoding="ascii")
     config = terrel_config(control)
-    assert config.coastline_file == tmp_path / "COAST.BLN"
+    assert config.coastline_file == tmp_path / "coast.bln"
     assert config.gshhs_file is None
     assert config.noise_replacement == (1, 2, 0, 0, 0)
     assert config.noise_minimum_m == (-2.0, 3.0, 1.0, 1.0, 1.0)
@@ -847,7 +850,7 @@ def test_terrel_control_reads_raw_echo_output(tmp_path):
     text=text.replace('! LRAWECHO = F !','! LRAWECHO = T !')
     text+='\n! RAWECHO = raw.dat !\n'
     control=tmp_path/'terrel.inp'; control.write_text(text,encoding='ascii')
-    assert terrel_config(control).raw_echo_output==tmp_path/'RAW.DAT'
+    assert terrel_config(control).raw_echo_output==tmp_path/'raw.dat'
 
 
 def test_terrel_control_honors_lowercase_file_policy(tmp_path):
@@ -862,15 +865,15 @@ def test_terrel_control_honors_lowercase_file_policy(tmp_path):
     text+='! COASTBLN = Coast.BLN !\n! RAWECHO = Raw.DAT !\n'
     control=tmp_path/'terrel.inp'; control.write_text(text,encoding='ascii')
     config=terrel_config(control)
-    assert config.terrain_sources[0].path==tmp_path/'n26e117.hgt'
-    assert config.output==tmp_path/'terr.dat'
+    assert config.terrain_sources[0].path==tmp_path/'../../../terrain/srtm3/n26e117.hgt'
+    assert Path(config.output).name=='terrain.nc'
     assert config.receptor_input==tmp_path/'receptors.inp'
     assert config.receptor_output==tmp_path/'receptors.out'
     assert config.previous_save==tmp_path/'previous.sav'
-    assert config.save_output==tmp_path/'terr.sav'
+    assert Path(config.save_output).name=='terrel.sav'
     assert config.gshhs_file==tmp_path/'shore.b'
     assert config.coastline_file==tmp_path/'coast.bln'
-    assert config.plot_output==tmp_path/'qaterr.grd'
+    assert Path(config.plot_output).name=='terrain.grd'
     assert config.raw_echo_output==tmp_path/'raw.dat'
 
 
