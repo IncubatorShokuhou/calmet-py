@@ -1,0 +1,11 @@
+Create CALWRF data for the Zhejiang example
+../../../output/calwrf.lst
+../../../output/calwrf.m3d
+-9,-9,-9,-9,-9,-9
+2018031800
+2018031802
+3
+../wrfout_d01_2018-03-18_00_00_00.nc
+../wrfout_d01_2018-03-18_01_00_00.nc
+../wrfout_d01_2018-03-18_02_00_00.nc
+0

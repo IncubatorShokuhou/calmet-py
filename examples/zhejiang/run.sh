@@ -87,6 +87,7 @@ legacy_met=work/'calwrf.m3d'
 calwrf_end=(datetime.strptime(end,'%Y%m%d%H')+timedelta(hours=1)).strftime('%Y%m%d%H')
 print(f'[1/5] CALWRF through {calwrf_end} boundary:',met,flush=True)
 pycalmet.calwrf(
+    repo/'examples/zhejiang/config/calwrf.inp',
     wrf_files=wrf_files,start=start,end=calwrf_end,output=met,
     legacy_output=legacy_met,create_surface=False,
 )

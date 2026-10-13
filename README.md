@@ -39,30 +39,52 @@ python -m pytest -q
 
 ## Quick start
 
-Each stage accepts explicit keyword arguments or a legacy CALMET-family control
-file. Stage functions return the path of their primary output.
+Each stage accepts either explicit keyword arguments or its legacy
+CALMET-family control file. These `.inp` files are program-specific control
+files rather than Fortran `NAMELIST` files. The Zhejiang example defines all
+five:
+
+| Stage | Example control file |
+| --- | --- |
+| CALWRF | `examples/zhejiang/config/calwrf.inp` |
+| TERREL | `examples/zhejiang/config/terrel.inp` |
+| CTGPROC | `examples/zhejiang/config/ctgproc.inp` |
+| MAKEGEO | `examples/zhejiang/config/makegeo.inp` |
+| CALMET | `examples/zhejiang/config/calmet.inp` |
+
+Paths inside a control file are resolved relative to that file. Keyword
+arguments supplied with a control-file path override its values, which is
+useful for selecting user inputs and output locations. Stage functions return
+the path of their primary output.
 
 ```python
 from pathlib import Path
 
 import pycalmet
 
-wrf = pycalmet.calwrf(
-    wrf_files=[Path("wrfout_d01_2018-03-18_00_00_00")],
+meteorology = pycalmet.calwrf(
+    "examples/zhejiang/config/calwrf.inp",
+    wrf_files=sorted(Path("examples/zhejiang").glob("wrfout*.nc")),
     start="2018031800",
-    end="2018031801",
+    end="2018031802",  # following-hour boundary for CALMET averaging
     output="output/calwrf.nc",
+    legacy_output="output/calwrf.m3d",
+    create_surface=False,
 )
 
-calmet = pycalmet.calmet(
+result = pycalmet.calmet(
     "examples/zhejiang/config/calmet.inp",
-    meteorology=wrf,
+    meteorology="output/calwrf.m3d",
     geophysical="examples/zhejiang/geo.nc",
     output="output/calmet.nc",
     start="2018031800",
     end="2018031801",
 )
 ```
+
+`TERREL`, `CTGPROC`, and `MAKEGEO` controls are used when rebuilding the
+static geophysical grid. That route also requires an external land-use raster;
+the runnable command below reuses the bundled `geo.nc` instead.
 
 The public processing API is:
 

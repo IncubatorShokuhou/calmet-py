@@ -33,6 +33,12 @@ The Python runner keeps a canonical `calwrf.nc` intermediate and also writes a
 traditional `calwrf.m3d`. CALMET reads the M3D so its fixed-width input
 quantization matches the GNU Fortran workflow.
 
+The `config/` directory contains one traditional control file for each stage:
+`calwrf.inp`, `terrel.inp`, `ctgproc.inp`, `makegeo.inp`, and `calmet.inp`.
+They are processor-specific CALMET controls, not Fortran `NAMELIST` files.
+The runner loads these controls and overrides input and output paths from its
+command-line arguments.
+
 Release validation compared all 108 retained variable/time pairs
 (107,317,746 values) with the 3.0 GiB source without a mismatch. Across the
 three hours, Python and the retained Fortran reference agreed bit-for-bit for

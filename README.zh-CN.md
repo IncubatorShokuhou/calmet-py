@@ -37,30 +37,50 @@ python -m pytest -q
 
 ## 快速开始
 
-每个阶段既可以直接传入关键字参数，也可以读取 CALMET 系列传统控制文件。阶段
-函数会返回主输出文件路径。
+每个阶段既可以直接传入关键字参数，也可以读取对应的 CALMET 系列传统控制文件。
+这里的 `.inp` 是各程序自己的控制文件，并不是标准 Fortran `NAMELIST`。浙江示例
+已经为五个阶段分别定义了控制文件：
+
+| 阶段 | 示例控制文件 |
+| --- | --- |
+| CALWRF | `examples/zhejiang/config/calwrf.inp` |
+| TERREL | `examples/zhejiang/config/terrel.inp` |
+| CTGPROC | `examples/zhejiang/config/ctgproc.inp` |
+| MAKEGEO | `examples/zhejiang/config/makegeo.inp` |
+| CALMET | `examples/zhejiang/config/calmet.inp` |
+
+控制文件内的相对路径以该控制文件所在目录为基准。传入控制文件路径时，还可以用
+关键字参数覆盖其中的值，常用于指定用户输入和输出位置。阶段函数会返回主输出
+文件路径。
 
 ```python
 from pathlib import Path
 
 import pycalmet
 
-wrf = pycalmet.calwrf(
-    wrf_files=[Path("wrfout_d01_2018-03-18_00_00_00")],
+meteorology = pycalmet.calwrf(
+    "examples/zhejiang/config/calwrf.inp",
+    wrf_files=sorted(Path("examples/zhejiang").glob("wrfout*.nc")),
     start="2018031800",
-    end="2018031801",
+    end="2018031802",  # CALMET 时间平均所需的下一小时时次
     output="output/calwrf.nc",
+    legacy_output="output/calwrf.m3d",
+    create_surface=False,
 )
 
-calmet = pycalmet.calmet(
+result = pycalmet.calmet(
     "examples/zhejiang/config/calmet.inp",
-    meteorology=wrf,
+    meteorology="output/calwrf.m3d",
     geophysical="examples/zhejiang/geo.nc",
     output="output/calmet.nc",
     start="2018031800",
     end="2018031801",
 )
 ```
+
+重建静态地理场时会依次使用 `TERREL`、`CTGPROC` 和 `MAKEGEO` 控制文件；该流程
+还需要仓库未附带的外部土地利用栅格。下面的可运行命令直接复用仓库中的
+`geo.nc`。
 
 公开 API：
 
