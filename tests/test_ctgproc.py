@@ -19,13 +19,6 @@ from pycalmet.projections import geographic_crs,grid_crs
 ROOT=Path(__file__).resolve().parents[1]
 
 
-def test_gnu_build_keeps_ctgproc_local_storage_static():
-    script=(ROOT/'build_gnu.sh').read_text(encoding='utf-8')
-    ctgproc_section=script.split("echo '[3/5] CTGPROC'",1)[1].split(
-        "echo '[4/5] MAKEGEO'",1)[0]
-    assert '-fno-automatic' in ctgproc_section
-
-
 def test_glaz_translation_is_the_legacy_table():
     assert GLAZ_TO_USGS[1] == 16
     assert GLAZ_TO_USGS[16] == 52

@@ -129,7 +129,7 @@ def test_sea_mixing_height_uses_real4_meters_and_station_order():
     values=np.array([123.4567,987.6543,345.6789],dtype=np.float32)
     got=grid_sea_mixing_height(values,points,grid)
     assert got.dtype==np.float32
-    # diagnostics/code/water_zi_reference.f90, compiled with GNU Fortran.
+    # fortran/reference/water_zi_reference.f90, compiled with GNU Fortran.
     np.testing.assert_array_equal(got.view(np.uint32),
                                   [[0x437A4B34,0x446CE7CF]])
 

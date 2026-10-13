@@ -185,9 +185,9 @@ def test_source_specific_legacy_kwargs_override_control_metadata(monkeypatch,tmp
     monkeypatch.setattr("pycalmet._ctgproc.run",lambda config:
                         landuse.append(config) or SimpleNamespace(output=config.output))
     root=Path(__file__).resolve().parents[1]
-    pycalmet.terrel(root/'TERREL/terrel.inp',DSRTM3='WGS-84',
+    pycalmet.terrel(root/'examples/zhejiang/config/terrel.inp',DSRTM3='WGS-84',
                     output=tmp_path/'terrain.nc')
-    pycalmet.ctrproc(root/'CTGPROC/ctgproc.inp',DUSGSLA='WGS-84',MESHGLAZ=3,
+    pycalmet.ctrproc(root/'examples/zhejiang/config/ctgproc.inp',DUSGSLA='WGS-84',MESHGLAZ=3,
                      output=tmp_path/'landuse.nc')
     assert {source.input_datum for source in terrain[0].terrain_sources}=={'WGS-84'}
     assert {(source.input_datum,source.mesh_density)
@@ -327,7 +327,7 @@ def test_legacy_grid_override_is_applied_to_control_config(monkeypatch):
     captured = []
     monkeypatch.setattr("pycalmet._makegeo.run", lambda config:
                         captured.append(config) or SimpleNamespace(output=config.output))
-    pycalmet.makegeo(ROOT / "MAKEGEO/makegeo.inp", NX=7)
+    pycalmet.makegeo(ROOT / "examples/zhejiang/config/makegeo.inp", NX=7)
     assert captured[0].grid.nx == 7
 
 
@@ -356,9 +356,9 @@ def test_legacy_declared_file_counts_are_validated(tmp_path):
 
 @pytest.mark.parametrize(("stage", "source", "engine", "config_type"), (
     ("calwrf", CALWRF_CONTROL, "pycalmet._calwrf.run", CalwrfConfig),
-    ("terrel", ROOT / "TERREL/terrel.inp", "pycalmet._terrel.run", TerrelConfig),
-    ("ctrproc", ROOT / "CTGPROC/ctgproc.inp", "pycalmet._ctgproc.run", CtgprocConfig),
-    ("makegeo", ROOT / "MAKEGEO/makegeo.inp", "pycalmet._makegeo.run", MakegeoConfig),
+    ("terrel", ROOT / "examples/zhejiang/config/terrel.inp", "pycalmet._terrel.run", TerrelConfig),
+    ("ctrproc", ROOT / "examples/zhejiang/config/ctgproc.inp", "pycalmet._ctgproc.run", CtgprocConfig),
+    ("makegeo", ROOT / "examples/zhejiang/config/makegeo.inp", "pycalmet._makegeo.run", MakegeoConfig),
     ("calmet", CALMET_CONTROL, "pycalmet._calmet.run", CalmetConfig),
 ))
 def test_readlst_is_kwargs_ready_for_each_public_stage(
@@ -383,7 +383,7 @@ def test_readlst_is_kwargs_ready_for_each_public_stage(
 
 def test_readlst_component_override_accepts_ctrproc_spelling(tmp_path):
     control = tmp_path / "generic.inp"
-    control.write_text((ROOT / "CTGPROC/ctgproc.inp").read_text(encoding="ascii"),
+    control.write_text((ROOT / "examples/zhejiang/config/ctgproc.inp").read_text(encoding="ascii"),
                        encoding="ascii")
     params = pycalmet.readlst(control, component="ctrproc")
     assert isinstance(params["grid"], pycalmet.GridConfig)
@@ -391,9 +391,9 @@ def test_readlst_component_override_accepts_ctrproc_spelling(tmp_path):
 
 
 @pytest.mark.parametrize(("stage", "control", "engine", "config_type"), (
-    ("terrel", ROOT / "TERREL/terrel.inp", "pycalmet._terrel.run", TerrelConfig),
-    ("ctrproc", ROOT / "CTGPROC/ctgproc.inp", "pycalmet._ctgproc.run", CtgprocConfig),
-    ("makegeo", ROOT / "MAKEGEO/makegeo.inp", "pycalmet._makegeo.run", MakegeoConfig),
+    ("terrel", ROOT / "examples/zhejiang/config/terrel.inp", "pycalmet._terrel.run", TerrelConfig),
+    ("ctrproc", ROOT / "examples/zhejiang/config/ctgproc.inp", "pycalmet._ctgproc.run", CtgprocConfig),
+    ("makegeo", ROOT / "examples/zhejiang/config/makegeo.inp", "pycalmet._makegeo.run", MakegeoConfig),
     ("calmet", CALMET_CONTROL, "pycalmet._calmet.run", CalmetConfig),
 ))
 def test_every_active_assignment_name_is_accepted_as_raw_kwargs(

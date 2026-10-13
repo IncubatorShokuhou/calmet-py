@@ -9,7 +9,7 @@ from textwrap import dedent
 
 
 ROOT=Path(__file__).resolve().parents[1]
-SCRIPT=ROOT/'run_zhejiang_python.sh'
+SCRIPT=ROOT/'examples/zhejiang/run.sh'
 
 
 def _fake_python(tmp_path: Path) -> Path:
@@ -86,7 +86,7 @@ def test_runner_converts_following_hour_for_calmet_boundary(tmp_path):
     assert result.returncode==0,result.stderr
     assert capture.read_text(encoding='ascii')=='2018031802'
     control,meteorology=(tmp_path/'calmet-inputs.txt').read_text().splitlines()
-    assert control.endswith('/calmet_mpi/calmet_zhejiang.inp')
+    assert control.endswith('/examples/zhejiang/config/calmet.inp')
     assert meteorology.endswith('/work/calwrf.m3d')
 
 

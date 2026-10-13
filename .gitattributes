@@ -1,4 +1,3 @@
 # Preserve byte-exact scientific inputs on every platform.
-MAKEGEO/geo.dat -text -whitespace
-TERREL/SRTM3/*.hgt -text
-example/zhejiang/*.nc -text
+terrain/srtm3/*.hgt -text
+examples/zhejiang/*.nc -text

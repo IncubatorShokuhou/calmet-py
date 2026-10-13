@@ -617,7 +617,7 @@ def test_mixht_real_power_and_square_root_intrinsics_match_gnu():
     stable2=f(f(.4)*_real4_libm('sqrtf',f(f(ustar*length)/coriolis)))
     convective=f(_real4_libm('sqrtf',f(456789.125))+
                  f(_real4_libm('sqrtf',f(.0234567))/gamma))
-    # diagnostics/code/mixht_real_intrinsics_reference.f90
+    # fortran/reference/mixht_real_intrinsics_reference.f90
     assert [value.view(np.uint32) for value in
             (bvf,cmech,mechanical,stable1,stable2,convective)]==[
                 np.uint32(0x3da95d87),np.uint32(0x43172af9),
@@ -911,7 +911,7 @@ def test_esat_and_water_delta_inputs_match_real4_oracle():
     saturation=saturation_vapor_pressure_lowe(
         sea.astype(np.float32)-np.float32(273.15))
     got=np.column_stack((saturation,theta,difference,difference_10m,theta_10m))
-    # Bit patterns printed by diagnostics/code/esat_water_reference.f90.
+    # Bit patterns printed by fortran/reference/esat_water_reference.f90.
     expected_bits=np.array([
         [0x419AEC34,0x4390E16E,0xC0240500,0xC02404FF,0x4390E16E],
         [0x40E1BDE6,0x4388E9D7,0xC0042580,0xC00F92BC,0x4388D2FD],
@@ -1027,7 +1027,7 @@ def test_surface_fields_apply_coare_to_water_with_sea_data(monkeypatch):
     assert passed_sst[-1][0,1]==np.float32(432.)
     # WATER converts RH to g/kg at its fixed 1000 mb before calling COARE;
     # values below 2 would instead be interpreted as an RH fraction there.
-    # Bit pattern from diagnostics/code/water_humidity_reference.f90.
+    # Bit pattern from fortran/reference/water_humidity_reference.f90.
     np.testing.assert_array_equal(passed_humidity[-1].astype(np.float32).view(np.uint32),
                                   np.full(shape,0x41086237,dtype=np.uint32))
     np.testing.assert_array_equal(cold_result.monin_obukhov_length,[[-5.,5.]])
@@ -2336,7 +2336,7 @@ def test_elustr_wind_speed_uses_fortran_sum_then_sqrt_rounding():
         np.array([[-9.195294]],dtype=np.float32),np.full(shape,.25),10.,
         np.full(shape,1.2),np.full(shape,290.),np.zeros(shape),
         np.zeros(shape),np.full(shape,20))
-    # diagnostics/code/elustr_speed_reference.f90 prints WS then USTAR.
+    # fortran/reference/elustr_speed_reference.f90 prints WS then USTAR.
     assert ustar.view(np.uint32).item()==np.uint32(0x3fb13dee)
 
 
@@ -2347,7 +2347,7 @@ def test_elustr_stable_refinement_uses_fortran_105_percent_exit():
         one*np.float32(.25),10.,one*np.float32(1.2),one*np.float32(290.),
         np.zeros(shape,dtype=np.float32),one*np.float32(-.1),
         np.full(shape,20))
-    # diagnostics/code/elustr_stable_reference.f90 prints USTAR, QH and EL.
+    # fortran/reference/elustr_stable_reference.f90 prints USTAR, QH and EL.
     assert ustar.view(np.uint32).item()==np.uint32(0x400aad81)
     assert qh.view(np.uint32).item()==np.uint32(0xc26fa15d)
     assert length.view(np.uint32).item()==np.uint32(0x466a6256)
@@ -2383,7 +2383,7 @@ def test_elustr_daytime_cube_and_convergence_match_fortran():
         np.full(shape,20))
     # Iteration 4 is just above the 0.5% threshold when REAL**3 is lowered
     # as two REAL*4 multiplies, so ELUSTR performs iteration 5.
-    # See diagnostics/code/elustr_daytime_reference.f90.
+    # See fortran/reference/elustr_daytime_reference.f90.
     assert ustar.view(np.uint32).item()==np.uint32(0x3eac6a5b)
     assert length.view(np.uint32).item()==np.uint32(0xc303c7d2)
 

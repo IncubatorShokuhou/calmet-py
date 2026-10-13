@@ -144,9 +144,9 @@ def test_calmet_modern_control_requires_explicit_timezone(tmp_path):
 
 
 @pytest.mark.parametrize(('relative','reader','program'),(
-    ('TERREL/terrel.inp',terrel_config,'TERREL'),
-    ('CTGPROC/ctgproc.inp',ctgproc_config,'CTGPROC'),
-    ('MAKEGEO/makegeo.inp',makegeo_config,'MAKEGEO'),
+    ('examples/zhejiang/config/terrel.inp',terrel_config,'TERREL'),
+    ('examples/zhejiang/config/ctgproc.inp',ctgproc_config,'CTGPROC'),
+    ('examples/zhejiang/config/makegeo.inp',makegeo_config,'MAKEGEO'),
 ))
 def test_preprocessor_controls_require_explicit_reference_origin(
         tmp_path,relative,reader,program):
@@ -160,8 +160,8 @@ def test_preprocessor_controls_require_explicit_reference_origin(
 
 
 @pytest.mark.parametrize(('relative','reader','count_name'),(
-    ('TERREL/terrel.inp',terrel_config,'NTDF'),
-    ('CTGPROC/ctgproc.inp',ctgproc_config,'NDBF'),
+    ('examples/zhejiang/config/terrel.inp',terrel_config,'NTDF'),
+    ('examples/zhejiang/config/ctgproc.inp',ctgproc_config,'NDBF'),
 ))
 def test_preprocessor_controls_validate_declared_source_count(
         tmp_path,relative,reader,count_name):
@@ -175,7 +175,7 @@ def test_preprocessor_controls_validate_declared_source_count(
 
 
 def test_ctgproc_legacy_zero_ndbf_uses_luindat_and_lulc(tmp_path):
-    text=(ROOT/'CTGPROC/ctgproc.inp').read_text(encoding='ascii')
+    text=(ROOT/'examples/zhejiang/config/ctgproc.inp').read_text(encoding='ascii')
     text=text.replace('! NDBF = 1 !','! NDBF = 0 !')
     text+='\n! LUINDAT = legacy-landuse.dat !\n! LULC = 2 !\n! IGLAZR = 5 !\n'
     control=tmp_path/'ctgproc.inp'; control.write_text(text,encoding='ascii')
@@ -186,7 +186,7 @@ def test_ctgproc_legacy_zero_ndbf_uses_luindat_and_lulc(tmp_path):
 
 
 def test_ctgproc_legacy_glaz_requires_valid_region(tmp_path):
-    text=(ROOT/'CTGPROC/ctgproc.inp').read_text(encoding='ascii')
+    text=(ROOT/'examples/zhejiang/config/ctgproc.inp').read_text(encoding='ascii')
     text=text.replace('! NDBF = 1 !','! NDBF = 0 !')
     text+='\n! LULC = 2 !\n! IGLAZR = 0 !\n'
     control=tmp_path/'ctgproc.inp'; control.write_text(text,encoding='ascii')
@@ -288,23 +288,23 @@ def test_calwrf_output_override_disables_hidden_control_side_outputs(tmp_path):
 
 
 def test_terrel_output_override_disables_hidden_control_side_outputs(tmp_path):
-    redirected=terrel_config(ROOT/'TERREL/terrel.inp',output=tmp_path/'candidate.dat')
+    redirected=terrel_config(ROOT/'examples/zhejiang/config/terrel.inp',output=tmp_path/'candidate.dat')
     assert redirected.output==tmp_path/'candidate.dat'
     assert redirected.save_output is None
     assert redirected.plot_output is None
     assert redirected.raw_echo_output is None
-    explicit=terrel_config(ROOT/'TERREL/terrel.inp',output=tmp_path/'candidate.dat',
+    explicit=terrel_config(ROOT/'examples/zhejiang/config/terrel.inp',output=tmp_path/'candidate.dat',
                            save_output=tmp_path/'candidate.sav')
     assert explicit.save_output==tmp_path/'candidate.sav'
 
 
 def test_makegeo_output_override_disables_hidden_control_side_outputs(tmp_path):
-    redirected=makegeo_config(ROOT/'MAKEGEO/makegeo.inp',output=tmp_path/'candidate.dat')
+    redirected=makegeo_config(ROOT/'examples/zhejiang/config/makegeo.inp',output=tmp_path/'candidate.dat')
     assert redirected.output==tmp_path/'candidate.dat'
     assert redirected.landuse_plot_output is None
     assert redirected.terrain_plot_output is None
     assert redirected.color_map_output is None
-    explicit=makegeo_config(ROOT/'MAKEGEO/makegeo.inp',output=tmp_path/'candidate.dat',
+    explicit=makegeo_config(ROOT/'examples/zhejiang/config/makegeo.inp',output=tmp_path/'candidate.dat',
                             color_map_output=tmp_path/'candidate.clr')
     assert explicit.color_map_output==tmp_path/'candidate.clr'
 
@@ -356,20 +356,20 @@ def test_existing_component_controls_map_to_typed_configs():
     assert calwrf.listing_output==FIXTURES/'calwrf.lst'
     assert calwrf.i_range is None and calwrf.j_range is None and calwrf.k_range is None
 
-    terrel=terrel_config(ROOT/'TERREL/terrel.inp')
+    terrel=terrel_config(ROOT/'examples/zhejiang/config/terrel.inp')
     assert (terrel.grid.nx,terrel.grid.ny,terrel.datum)==(610,499,'WGS-84')
     assert terrel.model==1 and terrel.processing_method==2
-    assert terrel.plot_output==ROOT/'TERREL/QATERR.GRD'
+    assert terrel.plot_output==ROOT/'examples/zhejiang/config/QATERR.GRD'
     assert terrel.raw_echo_output is None and terrel.qa_hit_threshold_percent==75
     assert len(terrel.terrain_files)==42 and Path(terrel.terrain_files[0]).name=='N26E117.HGT'
     assert len(terrel.terrain_sources)==42
     assert terrel.terrain_sources[0].input_type=='SRTM3'
     assert terrel.terrain_sources[0].input_datum=='WGS-96'
 
-    ctg=ctgproc_config(ROOT/'CTGPROC/ctgproc.inp')
+    ctg=ctgproc_config(ROOT/'examples/zhejiang/config/ctgproc.inp')
     assert ctg.input_type=='GLAZAS' and ctg.mesh_density==12 and ctg.input_datum=='ESR-S'
 
-    geo=makegeo_config(ROOT/'MAKEGEO/makegeo.inp')
+    geo=makegeo_config(ROOT/'examples/zhejiang/config/makegeo.inp')
     assert geo.title=='Demo Application'
     assert geo.grid.lon0==117.5 and Path(geo.terrain).name.casefold()=='terr.dat'
     assert (geo.water_threshold,geo.missing_category,geo.minimum_coverage)==(.5,55,.96)
@@ -378,9 +378,9 @@ def test_existing_component_controls_map_to_typed_configs():
     assert tuple(geo.water_categories)==(51,52,53,54,55)
     assert len(geo.output_categories)==14 and not geo.category_splits
     assert geo.qa_cell==(20,15) and not geo.snow_processing
-    assert geo.landuse_plot_output==ROOT/'MAKEGEO/qaluse.grd'
-    assert geo.terrain_plot_output==ROOT/'MAKEGEO/qaterr.grd'
-    assert geo.color_map_output==ROOT/'MAKEGEO/luse.clr'
+    assert geo.landuse_plot_output==ROOT/'examples/zhejiang/config/qaluse.grd'
+    assert geo.terrain_plot_output==ROOT/'examples/zhejiang/config/qaterr.grd'
+    assert geo.color_map_output==ROOT/'examples/zhejiang/config/luse.clr'
     assert geo.image_mode==0
 
     calmet=calmet_config(CALMET_CONTROL)
@@ -473,9 +473,9 @@ def test_calmet_control_parses_lake_breeze_regions(tmp_path):
 
 @pytest.mark.parametrize(('source','reader','attribute','expected'),(
     (CALWRF_CONTROL,calwrf_config,'start','2018031800'),
-    (ROOT/'TERREL/terrel.inp',terrel_config,'grid.nx',610),
-    (ROOT/'CTGPROC/ctgproc.inp',ctgproc_config,'mesh_density',12),
-    (ROOT/'MAKEGEO/makegeo.inp',makegeo_config,'grid.ny',499),
+    (ROOT/'examples/zhejiang/config/terrel.inp',terrel_config,'grid.nx',610),
+    (ROOT/'examples/zhejiang/config/ctgproc.inp',ctgproc_config,'mesh_density',12),
+    (ROOT/'examples/zhejiang/config/makegeo.inp',makegeo_config,'grid.ny',499),
     (CALMET_CONTROL,calmet_config,'iprog',14),
 ))
 def test_list_summary_follows_recorded_control(tmp_path,source,reader,attribute,expected):
@@ -504,7 +504,7 @@ def test_failed_partial_calmet_listing_is_not_used_as_control(tmp_path):
 
 
 def test_ctgproc_control_reads_preprocessed_coastline_fill(tmp_path):
-    text=(ROOT/'CTGPROC/ctgproc.inp').read_text(encoding='ascii')
+    text=(ROOT/'examples/zhejiang/config/ctgproc.inp').read_text(encoding='ascii')
     text=text.replace('! LCOAST = F !','! LCOAST = T !').replace(
         '! LBLNREAD = F  !','! LBLNREAD = T  !')
     control=tmp_path/'ctgproc.inp'; control.write_text(text,encoding='ascii')
@@ -515,7 +515,7 @@ def test_ctgproc_control_reads_preprocessed_coastline_fill(tmp_path):
 
 
 def test_ctgproc_control_selects_direct_gshhs_extraction(tmp_path):
-    text=(ROOT/'CTGPROC/ctgproc.inp').read_text(encoding='ascii')
+    text=(ROOT/'examples/zhejiang/config/ctgproc.inp').read_text(encoding='ascii')
     text=text.replace('! LCOAST = F !','! LCOAST = T !')
     control=tmp_path/'ctgproc.inp'; control.write_text(text,encoding='ascii')
     config=ctgproc_config(control)
@@ -525,7 +525,7 @@ def test_ctgproc_control_selects_direct_gshhs_extraction(tmp_path):
 
 
 def test_ctgproc_control_reads_continuation_options(tmp_path):
-    text=(ROOT/'CTGPROC/ctgproc.inp').read_text(encoding='ascii')
+    text=(ROOT/'examples/zhejiang/config/ctgproc.inp').read_text(encoding='ascii')
     text=text.replace('! LPREV = F  !','! LPREV = T  !').replace(
         '! LFINAL = T !','! LFINAL = F !').replace(
         '! PREVDAT =        !','! PREVDAT = PREV.DAT !')
@@ -536,14 +536,14 @@ def test_ctgproc_control_reads_continuation_options(tmp_path):
 
 
 def test_ctgproc_control_uses_default_continuation_file(tmp_path):
-    text=(ROOT/'CTGPROC/ctgproc.inp').read_text(encoding='ascii')
+    text=(ROOT/'examples/zhejiang/config/ctgproc.inp').read_text(encoding='ascii')
     text=text.replace('! LPREV = F  !','! LPREV = T  !')
     control=tmp_path/'ctgproc.inp'; control.write_text(text,encoding='ascii')
     assert ctgproc_config(control).previous_landuse==tmp_path/'PREV.DAT'
 
 
 def test_ctgproc_control_honors_lowercase_file_policy(tmp_path):
-    text=(ROOT/'CTGPROC/ctgproc.inp').read_text(encoding='ascii')
+    text=(ROOT/'examples/zhejiang/config/ctgproc.inp').read_text(encoding='ascii')
     text=text.replace('! LCFILES = F !','! LCFILES = T !').replace(
         '! LPREV = F  !','! LPREV = T  !').replace(
         '! PREVDAT =        !','! PREVDAT = Previous.DAT !').replace(
@@ -558,7 +558,7 @@ def test_ctgproc_control_honors_lowercase_file_policy(tmp_path):
 
 
 def test_ctgproc_control_reads_snow_and_qa_options(tmp_path):
-    text=(ROOT/'CTGPROC/ctgproc.inp').read_text(encoding='ascii')
+    text=(ROOT/'examples/zhejiang/config/ctgproc.inp').read_text(encoding='ascii')
     text=text.replace('! LSNOW = F  !','! LSNOW = T  !').replace(
         '! LQACELL =  F  !','! LQACELL =  T  !').replace(
         '! ITHRESH = 75 !','! ITHRESH = 60 !')
@@ -570,8 +570,8 @@ def test_ctgproc_control_reads_snow_and_qa_options(tmp_path):
 
 
 def test_makegeo_control_reads_daily_snow_configuration(tmp_path):
-    base=(ROOT/'MAKEGEO/makegeo.inp').read_text(encoding='ascii')
-    properties=assignments(ROOT/'MAKEGEO/makegeo.inp')['X']
+    base=(ROOT/'examples/zhejiang/config/makegeo.inp').read_text(encoding='ascii')
+    properties=assignments(ROOT/'examples/zhejiang/config/makegeo.inp')['X']
     extra=['! LSNOW = T !','! SNOWDAT = daily-snow.dat !',
            '! IDATEBEG = 20180101 !','! IDATEEND = 20180103 !',
            '! MSRL = 1 !','! HSCL = 0.4 !','! MSAL = 2 !','! SDPMIN = 0.02 !']
@@ -590,7 +590,7 @@ def test_makegeo_control_reads_daily_snow_configuration(tmp_path):
 
 
 def test_makegeo_control_honors_uppercase_file_policy(tmp_path):
-    text=(ROOT/'MAKEGEO/makegeo.inp').read_text(encoding='ascii')
+    text=(ROOT/'examples/zhejiang/config/makegeo.inp').read_text(encoding='ascii')
     text=text.replace('! LCFILES = T     !','! LCFILES = F     !').replace(
         '! LLU2 = F    !','! LLU2 = T    !')
     control=tmp_path/'makegeo.inp'; control.write_text(text,encoding='ascii')
@@ -604,7 +604,7 @@ def test_makegeo_control_honors_uppercase_file_policy(tmp_path):
 
 
 def test_makegeo_control_uses_default_secondary_landuse_file(tmp_path):
-    text=(ROOT/'MAKEGEO/makegeo.inp').read_text(encoding='ascii')
+    text=(ROOT/'examples/zhejiang/config/makegeo.inp').read_text(encoding='ascii')
     text=text.replace('! LU2DAT = Luglobe.dat      !',
                       '* LU2DAT = Luglobe.dat      *').replace(
         '! LLU2 = F    !','! LLU2 = T    !')
@@ -613,7 +613,7 @@ def test_makegeo_control_uses_default_secondary_landuse_file(tmp_path):
 
 
 def test_makegeo_control_preserves_a80_title_columns(tmp_path):
-    lines=(ROOT/'MAKEGEO/makegeo.inp').read_text(encoding='ascii').splitlines()
+    lines=(ROOT/'examples/zhejiang/config/makegeo.inp').read_text(encoding='ascii').splitlines()
     lines[0]='  Regional application '+('x'*80)
     control=tmp_path/'makegeo.inp'
     control.write_text('\n'.join(lines)+'\n',encoding='ascii')
@@ -621,7 +621,7 @@ def test_makegeo_control_preserves_a80_title_columns(tmp_path):
 
 
 def test_ctgproc_control_builds_mixed_sources_in_processing_order(tmp_path):
-    text=(ROOT/'CTGPROC/ctgproc.inp').read_text(encoding='ascii')
+    text=(ROOT/'examples/zhejiang/config/ctgproc.inp').read_text(encoding='ascii')
     text=text.replace('! NDBF = 1 !','! NDBF = 3 !')
     text+='\n! CTG = extra.ctg !\n! CORINE = europe.tif !\n! DCORINE = WGS-84 !\n! MESHCORN = 3 !\n'
     control=tmp_path/'ctgproc.inp'; control.write_text(text,encoding='ascii')
@@ -635,7 +635,7 @@ def test_ctgproc_control_builds_mixed_sources_in_processing_order(tmp_path):
 
 
 def test_terrel_control_builds_mixed_sources_with_source_datums(tmp_path):
-    text = (ROOT / "TERREL/terrel.inp").read_text(encoding="ascii")
+    text = (ROOT / "examples/zhejiang/config/terrel.inp").read_text(encoding="ascii")
     text = text.replace("! NTDF = 42 !", "! NTDF = 43 !")
     text += "\n! GEN = terrain.gen !\n! DGEN = NAS-C !\n"
     control = tmp_path / "terrel.inp"
@@ -647,7 +647,7 @@ def test_terrel_control_builds_mixed_sources_with_source_datums(tmp_path):
 
 
 def test_terrel_control_reads_void_fill_options(tmp_path):
-    text = (ROOT / "TERREL/terrel.inp").read_text(encoding="ascii")
+    text = (ROOT / "examples/zhejiang/config/terrel.inp").read_text(encoding="ascii")
     text = text.replace("! LVOIDFIL = F !", "! LVOIDFIL = T !").replace(
         "! CELLRADKM = 5. !", "! CELLRADKM = 7. !"
     )
@@ -658,7 +658,7 @@ def test_terrel_control_reads_void_fill_options(tmp_path):
 
 
 def test_terrel_control_builds_polar_ring_and_ray_grid(tmp_path):
-    text = (ROOT / "TERREL/terrel.inp").read_text(encoding="ascii")
+    text = (ROOT / "examples/zhejiang/config/terrel.inp").read_text(encoding="ascii")
     text = text.replace("! IGRID = 1 !", "! IGRID = 3 !")
     text = text.replace("! IMODEL = 1 !", "! IMODEL = 3 !")
     text = text.replace("! NRING =  0   !", "! NRING = 2 !")
@@ -675,7 +675,7 @@ def test_terrel_control_builds_polar_ring_and_ray_grid(tmp_path):
 
 
 def test_terrel_control_uses_source_defaults_for_receptors_and_cded(tmp_path):
-    text = (ROOT / "TERREL/terrel.inp").read_text(encoding="ascii")
+    text = (ROOT / "examples/zhejiang/config/terrel.inp").read_text(encoding="ascii")
     text = text.replace("! NTDF = 42 !", "! NTDF = 43 !")
     text = text.replace("! NXYCOL = 2!", "* NXYCOL = 2*")
     text = text.replace("! DCDED    = WGS-84    !", "* DCDED    = WGS-84    *")
@@ -689,7 +689,7 @@ def test_terrel_control_uses_source_defaults_for_receptors_and_cded(tmp_path):
 
 
 def test_terrel_control_uses_legacy_grid_and_save_defaults(tmp_path):
-    text = (ROOT / "TERREL/terrel.inp").read_text(encoding="ascii")
+    text = (ROOT / "examples/zhejiang/config/terrel.inp").read_text(encoding="ascii")
     text = text.replace("! IGRID = 1 !", "* IGRID = 1 *")
     text = text.replace("! SAVEFIL = TERR.SAV     !", "* SAVEFIL = TERR.SAV     *")
     control = tmp_path / "terrel.inp"
@@ -700,7 +700,7 @@ def test_terrel_control_uses_legacy_grid_and_save_defaults(tmp_path):
 
 
 def test_makegeo_control_rejects_unsupported_ifmtgeo(tmp_path):
-    text = (ROOT / "MAKEGEO/makegeo.inp").read_text(encoding="ascii")
+    text = (ROOT / "examples/zhejiang/config/makegeo.inp").read_text(encoding="ascii")
     control = tmp_path / "makegeo.inp"
     control.write_text(text + "\n! IFMTGEO = 2 !\n", encoding="ascii")
     with pytest.raises(ValueError, match="IFMTGEO=1"):
@@ -708,13 +708,13 @@ def test_makegeo_control_rejects_unsupported_ifmtgeo(tmp_path):
 
 
 def test_makegeo_control_uses_legacy_snow_parameter_defaults():
-    config=makegeo_config(ROOT / "MAKEGEO/makegeo.inp")
+    config=makegeo_config(ROOT / "examples/zhejiang/config/makegeo.inp")
     assert config.snow_height_scale_m==10.
     assert config.snow_depth_minimum_m==.01
 
 
 def test_makegeo_control_skips_optional_version_record_for_title(tmp_path):
-    lines = (ROOT / "MAKEGEO/makegeo.inp").read_text(encoding="ascii").splitlines()
+    lines = (ROOT / "examples/zhejiang/config/makegeo.inp").read_text(encoding="ascii").splitlines()
     lines[:1] = ["MAKEGEO.INP 3.2", "Versioned regional title"]
     control = tmp_path / "makegeo.inp"
     control.write_text("\n".join(lines) + "\n", encoding="ascii")
@@ -722,7 +722,7 @@ def test_makegeo_control_skips_optional_version_record_for_title(tmp_path):
 
 
 def test_makegeo_control_ignores_zero_outcat_padding(tmp_path):
-    text = (ROOT / "MAKEGEO/makegeo.inp").read_text(encoding="ascii")
+    text = (ROOT / "examples/zhejiang/config/makegeo.inp").read_text(encoding="ascii")
     text = text.replace("60, 61!", "60, 61, 0!")
     control = tmp_path / "makegeo.inp"
     control.write_text(text, encoding="ascii")
@@ -733,7 +733,7 @@ def test_makegeo_control_ignores_zero_outcat_padding(tmp_path):
 
 def test_terrel_file_override_rebuilds_control_sources(tmp_path):
     files=(tmp_path / "N30E120.HGT",tmp_path / "N30E121.HGT")
-    config=terrel_config(ROOT / "TERREL/terrel.inp",terrain_files=files)
+    config=terrel_config(ROOT / "examples/zhejiang/config/terrel.inp",terrain_files=files)
     assert tuple(config.terrain_files)==files
     assert tuple(item.path for item in config.terrain_sources)==files
     assert {(item.input_type,item.input_datum) for item in config.terrain_sources}=={
@@ -742,21 +742,21 @@ def test_terrel_file_override_rebuilds_control_sources(tmp_path):
 
 def test_ctgproc_file_override_rebuilds_control_sources(tmp_path):
     files=(tmp_path / "replacement.img",)
-    config=ctgproc_config(ROOT / "CTGPROC/ctgproc.inp",landuse_files=files)
+    config=ctgproc_config(ROOT / "examples/zhejiang/config/ctgproc.inp",landuse_files=files)
     assert tuple(config.landuse_files)==files
     assert config.landuse_sources==(CtgprocSource(
         files[0],"GLAZAS","ESR-S",12),)
 
 
 def test_ctgproc_source_setting_overrides_rebuild_control_sources():
-    config=ctgproc_config(ROOT / "CTGPROC/ctgproc.inp",mesh_density=3,
+    config=ctgproc_config(ROOT / "examples/zhejiang/config/ctgproc.inp",mesh_density=3,
                           input_datum="WGS-84")
     assert config.landuse_sources==(CtgprocSource(
-        ROOT / "CTGPROC/EAUSGS1.IMG","GLAZAS","WGS-84",3),)
+        ROOT / "examples/zhejiang/config/EAUSGS1.IMG","GLAZAS","WGS-84",3),)
 
 
 def test_terrel_center_reference_is_normalized_to_cell_corner(tmp_path):
-    text = (ROOT / "TERREL/terrel.inp").read_text(encoding="ascii")
+    text = (ROOT / "examples/zhejiang/config/terrel.inp").read_text(encoding="ascii")
     text = text.replace("! IGRID = 1 !", "! IGRID = 2 !")
     text = text.replace("! IMODEL = 1 !", "! IMODEL = 2 !")
     text = text.replace("! XREFKM = 0  !", "! XREFKM = 10 !")
@@ -769,7 +769,7 @@ def test_terrel_center_reference_is_normalized_to_cell_corner(tmp_path):
 
 
 def test_terrel_calmet_rejects_cell_centre_reference(tmp_path):
-    text = (ROOT / "TERREL/terrel.inp").read_text(encoding="ascii")
+    text = (ROOT / "examples/zhejiang/config/terrel.inp").read_text(encoding="ascii")
     text = text.replace("! IGRID = 1 !", "! IGRID = 2 !")
     control = tmp_path / "terrel.inp"
     control.write_text(text, encoding="ascii")
@@ -778,7 +778,7 @@ def test_terrel_calmet_rejects_cell_centre_reference(tmp_path):
 
 
 def test_terrel_control_reads_discrete_receptor_options(tmp_path):
-    text = (ROOT / "TERREL/terrel.inp").read_text(encoding="ascii")
+    text = (ROOT / "examples/zhejiang/config/terrel.inp").read_text(encoding="ascii")
     text = text.replace("! LXY = F !", "! LXY = T !")
     text += "\n! XYINP = receptors.inp !\n! XYOUT = receptors.out !\n"
     control = tmp_path / "terrel.inp"
@@ -792,7 +792,7 @@ def test_terrel_control_reads_discrete_receptor_options(tmp_path):
 
 
 def test_terrel_control_uses_default_receptor_and_continuation_files(tmp_path):
-    text = (ROOT / "TERREL/terrel.inp").read_text(encoding="ascii")
+    text = (ROOT / "examples/zhejiang/config/terrel.inp").read_text(encoding="ascii")
     text = text.replace("! LXY = F !", "! LXY = T !")
     text = text.replace("! LPREV = F !", "! LPREV = T !")
     control = tmp_path / "terrel.inp"
@@ -804,7 +804,7 @@ def test_terrel_control_uses_default_receptor_and_continuation_files(tmp_path):
 
 
 def test_terrel_control_reads_continuation_save_files(tmp_path):
-    text = (ROOT / "TERREL/terrel.inp").read_text(encoding="ascii")
+    text = (ROOT / "examples/zhejiang/config/terrel.inp").read_text(encoding="ascii")
     text = text.replace("! LPREV = F !", "! LPREV = T !")
     text += "\n! PREVFIL = previous.sav !\n"
     control = tmp_path / "terrel.inp"
@@ -815,7 +815,7 @@ def test_terrel_control_reads_continuation_save_files(tmp_path):
 
 
 def test_terrel_control_selects_direct_sample_projection(tmp_path):
-    text = (ROOT / "TERREL/terrel.inp").read_text(encoding="ascii")
+    text = (ROOT / "examples/zhejiang/config/terrel.inp").read_text(encoding="ascii")
     text = text.replace("! MSHEET = 0 !", "! MSHEET = 1 !")
     control = tmp_path / "terrel.inp"
     control.write_text(text, encoding="ascii")
@@ -823,7 +823,7 @@ def test_terrel_control_selects_direct_sample_projection(tmp_path):
 
 
 def test_terrel_control_reads_replacement_and_coastline_options(tmp_path):
-    text = (ROOT / "TERREL/terrel.inp").read_text(encoding="ascii")
+    text = (ROOT / "examples/zhejiang/config/terrel.inp").read_text(encoding="ascii")
     text = text.replace("! LCOAST = F !", "! LCOAST = T !")
     text = text.replace("! LBLNREAD = F  !", "! LBLNREAD = T !")
     text = text.replace("! INOISEREP =   0,0   !", "! INOISEREP = 1,2 !")
@@ -843,7 +843,7 @@ def test_terrel_control_reads_replacement_and_coastline_options(tmp_path):
 
 
 def test_terrel_control_reads_raw_echo_output(tmp_path):
-    text=(ROOT/'TERREL/terrel.inp').read_text(encoding='ascii')
+    text=(ROOT/'examples/zhejiang/config/terrel.inp').read_text(encoding='ascii')
     text=text.replace('! LRAWECHO = F !','! LRAWECHO = T !')
     text+='\n! RAWECHO = raw.dat !\n'
     control=tmp_path/'terrel.inp'; control.write_text(text,encoding='ascii')
@@ -851,7 +851,7 @@ def test_terrel_control_reads_raw_echo_output(tmp_path):
 
 
 def test_terrel_control_honors_lowercase_file_policy(tmp_path):
-    text=(ROOT/'TERREL/terrel.inp').read_text(encoding='ascii')
+    text=(ROOT/'examples/zhejiang/config/terrel.inp').read_text(encoding='ascii')
     text=text.replace('! LCFILES = F !','! LCFILES = T !').replace(
         '! LXY = F !','! LXY = T !').replace(
         '! LPREV = F !','! LPREV = T !').replace(

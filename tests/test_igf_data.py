@@ -255,7 +255,7 @@ def test_r2interpi_matches_real4_neighbor_and_sum_oracle():
     targets=np.array([[.01,.02],[1.7,2.2],[4.1,.7]])
     values=np.array([[1.25,3.75,-7.5,11.5,20.125,-2.25]])
     got=_r2interpi_four(source,targets,values)[0]
-    # Bit patterns from diagnostics/code/r2interpi_reference.f90.
+    # Bit patterns from fortran/reference/r2interpi_reference.f90.
     np.testing.assert_array_equal(got.view(np.uint32),
                                   np.array([0x3F9FD624,0x40AF97F1,0x412C088A],dtype=np.uint32))
 
