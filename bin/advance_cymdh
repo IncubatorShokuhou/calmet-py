@@ -1,0 +1,15 @@
+#!/bin/csh -f
+
+if ( $#argv != 2 ) then
+   set cmd = $0
+   echo Usage : $cmd:t ccyymmddhh delta_h
+   echo '        delta_h (in hours) can be negative'
+   exit 1
+endif
+
+set tmpfile = /tmp/advance_date.$$
+echo {$1}, {$2} | advance_cymdh.exe >&! $tmpfile
+set a = `cat $tmpfile`
+echo $a[3]
+#echo $a[1]
+\rm -rf $tmpfile core

@@ -1,0 +1,88 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.omc/
+.venv/
+*.egg-info/
+build/
+dist/
+
+# Bundled legacy runtimes (the NumPy port uses environment packages)
+LIBRARIES/
+CALWRF/binary_windows/
+CALWRF/binary_linux/
+binary_linux/
+
+# Compiled programs and objects
+*.exe
+*.o
+*.mod
+
+# Runtime products and logs
+output/
+*.log
+*.lst
+*.LST
+fort.*
+qa.met
+QA3D.DAT
+QAMETG.bna
+
+# Large meteorological/geospatial data and archives
+*.dat
+*.DAT
+*.nc
+*.HGT
+*.hgt
+*.IMG
+*.grd
+*.GRD
+*.m2d
+*.m3d
+wrfout*
+ZJWARMS*
+*.tar
+*.tar.gz
+*.zip
+*.pdf
+*.docx
+strm_data/
+deprecated/
+diagnostics/results/
+diagnostics/legacy/
+diagnostics/archived_examples/
+zj2wrfout/wrfout*
+CALWRF/WRFOUT_wds/
+LULC/GLC2000CN.txt
+*.dat.aux
+
+# Generated legacy inputs and symlinks
+CALWRF/calwrf.inp
+CALWRF/calwrf_out/
+TERREL/filename.txt
+TERREL/*.SAV
+TERREL/*.INP
+calmet_mpi/calmet.inp
+calmet_mpi/metlist
+calmet_mpi/*.m3d
+calmet_mpi/geo.dat
+
+# Versioned Zhejiang validation data. Keep these exceptions after the broad
+# geospatial and NetCDF rules above.
+!MAKEGEO/geo.dat
+!TERREL/SRTM3/
+!TERREL/SRTM3/README.md
+!TERREL/SRTM3/SHA256SUMS
+!TERREL/SRTM3/N2[6-9]E11[7-9].hgt
+!TERREL/SRTM3/N2[6-9]E12[0-3].hgt
+!TERREL/SRTM3/N3[0-1]E11[7-9].hgt
+!TERREL/SRTM3/N3[0-1]E12[0-3].hgt
+!example/
+!example/zhejiang/
+!example/zhejiang/README.md
+!example/zhejiang/SHA256SUMS
+!example/zhejiang/geo.nc
+!example/zhejiang/wrfout_d01_2018-03-18_00_00_00.nc
+!example/zhejiang/wrfout_d01_2018-03-18_01_00_00.nc
+!example/zhejiang/wrfout_d01_2018-03-18_02_00_00.nc

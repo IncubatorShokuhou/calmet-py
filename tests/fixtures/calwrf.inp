@@ -1,0 +1,8 @@
+Create 3D.DAT file for WRF output
+calwrf.lst
+calwrf_out/calwrf.m3d
+-9,-9,-9,-9,-9,-9
+2018031800
+2018031812
+1
+wrf.nc

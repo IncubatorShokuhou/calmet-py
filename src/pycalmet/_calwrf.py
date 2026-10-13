@@ -1,0 +1,573 @@
+"""Vectorized WRF extraction corresponding to CALWRF 2.0.2."""
+
+from __future__ import annotations
+
+import ctypes
+import math
+from collections.abc import Sequence
+from datetime import datetime,timedelta
+from pathlib import Path
+
+import netCDF4 as nc
+import numpy as np
+
+from ._common import fortran_inclusive_slice
+
+from .config import CalwrfConfig
+from .legacy_calwrf import write_m3d
+
+_PROCESS_LIBRARY=ctypes.CDLL(None)
+
+
+def _real4_unary(name,value):
+    """GNU default-REAL scalar intrinsic used by CALWRF setup maths."""
+    argument=np.float32(value)
+    try:
+        function=getattr(_PROCESS_LIBRARY,name)
+    except AttributeError:
+        return np.float32(getattr(math,name[:-1])(float(argument)))
+    function.argtypes=(ctypes.c_float,)
+    function.restype=ctypes.c_float
+    return np.float32(function(ctypes.c_float(argument)))
+
+
+def _real4_atan2(y,x):
+    """Elementwise GNU ``ATAN2`` for default REAL arrays."""
+    left,right=np.broadcast_arrays(np.asarray(y,dtype=np.float32),
+                                   np.asarray(x,dtype=np.float32))
+    try:
+        function=_PROCESS_LIBRARY.atan2f
+    except AttributeError:
+        scalar=lambda a,b: math.atan2(float(a),float(b))
+    else:
+        function.argtypes=(ctypes.c_float,ctypes.c_float)
+        function.restype=ctypes.c_float
+        scalar=lambda a,b: function(ctypes.c_float(a),ctypes.c_float(b))
+    if left.ndim==0:
+        return np.float32(scalar(left,right))
+    return np.frompyfunc(scalar,2,1)(left,right).astype(np.float32)
+
+
+def _real4_power(base, exponent):
+    """Elementwise GNU ``REAL ** REAL`` through the runtime ``powf``."""
+    left,right=np.broadcast_arrays(np.asarray(base,dtype=np.float32),
+                                   np.asarray(exponent,dtype=np.float32))
+    try:
+        function=_PROCESS_LIBRARY.powf
+    except AttributeError:
+        scalar=lambda a,b: math.pow(float(a),float(b))
+    else:
+        function.argtypes=(ctypes.c_float,ctypes.c_float)
+        function.restype=ctypes.c_float
+        scalar=lambda a,b: function(ctypes.c_float(a),ctypes.c_float(b))
+    if left.ndim==0:
+        return np.float32(scalar(left,right))
+    return np.frompyfunc(scalar,2,1)(left,right).astype(np.float32)
+
+_LIMITS_3D = {
+    "pressure": (10.0, 1100.0), "temperature": (150.0, 330.0),
+    "wind_direction": (0.0, 360.0), "wind_speed": (0.0, 150.0),
+    "vertical_velocity": (-50.0, 50.0), "qvapor": (0.0, 0.05),
+    "qcloud": (0.0, 0.05), "qrain": (0.0, 0.05),
+    "qice": (0.0, 0.05), "qsnow": (0.0, 0.05), "qgraupel": (0.0, 0.05),
+}
+_LIMITS_2D = {
+    "surface_pressure": (50000.0, 110000.0), "precipitation": (0.0, 500.0),
+    "snow_cover": (0.0, 1.1), "shortwave_down": (0.0, 1500.0),
+    "longwave_down": (0.0, 1000.0), "temperature_2m": (210.0, 330.0),
+    "qvapor_2m": (0.0, 0.05), "wind_direction_10m": (0.0, 360.0),
+    "wind_speed_10m": (0.0, 50.0), "sst": (0.0, 350.0),
+}
+
+
+def _horizontal_range_check(values, low, high, ys, xs):
+    """Apply CALWRF INTERPH to a selected horizontal domain."""
+    original = np.asarray(values, dtype="f4")
+    result = original[..., ys, xs].copy()
+    ny, nx = original.shape[-2:]
+    jb, je, ib, ie = ys.start + 1, ys.stop, xs.start + 1, xs.stop
+    jb_edge, je_edge = min(jb, 2), max(je, ny - 1)
+    jj, ii = np.arange(jb, je + 1), np.arange(ib, ie + 1)
+    j1 = np.maximum(jj - 1, jb_edge) - 1
+    j2 = np.minimum(jj + 1, je_edge) - 1
+    # The original accidentally uses J-edge bounds for I too; retain it.
+    i1 = np.maximum(ii - 1, jb_edge) - 1
+    i2 = np.minimum(ii + 1, je_edge) - 1
+    neighbours = np.stack((
+        original[..., jj[:, None] - 1, i1[None, :]],
+        original[..., jj[:, None] - 1, i2[None, :]],
+        original[..., j1[:, None], ii[None, :] - 1],
+        original[..., j2[:, None], ii[None, :] - 1],
+    ), axis=0)
+    good = (neighbours >= low) & (neighbours <= high)
+    count = good.sum(axis=0)
+    total = np.where(good, neighbours, 0.0).sum(axis=0, dtype="f4")
+    fallback = np.where(result < low, low, high).astype("f4")
+    replacement = np.divide(total, count, out=fallback, where=count > 0)
+    return np.where((result < low) | (result > high), replacement, result).astype("f4")
+
+
+def _vertical_range_check(values, low, high, zs, ys, xs):
+    """Apply CALWRF's two-level INTERPH rule to hydrometeors."""
+    original = np.asarray(values, dtype="f4")
+    result = original[zs, ys, xs].copy()
+    kk = np.arange(zs.start, zs.stop)
+    neighbours = np.stack((
+        original[np.maximum(kk - 1, 0), ys, xs],
+        original[np.minimum(kk + 1, original.shape[0] - 1), ys, xs],
+    ), axis=0)
+    good = (neighbours >= low) & (neighbours <= high)
+    count = good.sum(axis=0)
+    total = np.where(good, neighbours, 0.0).sum(axis=0, dtype="f4")
+    fallback = np.where(result < low, low, high).astype("f4")
+    replacement = np.divide(total, count, out=fallback, where=count > 0)
+    return np.where((result < low) | (result > high), replacement, result).astype("f4")
+
+
+def _times(ds: nc.Dataset) -> list[str]:
+    values = nc.chartostring(ds.variables["Times"][:])
+    return [str(x) for x in np.asarray(values).tolist()]
+
+
+def _stamp(value: str) -> datetime:
+    for form in ("%Y-%m-%d_%H:%M:%S","%Y%m%d%H"):
+        try: return datetime.strptime(value,form)
+        except ValueError: pass
+    raise ValueError(f"invalid CALWRF timestamp: {value!r}")
+
+
+def _write_time_text(variable,index,text):
+    """Write one WRF-style timestamp without netCDF4 scalar-string coercion."""
+    encoded=str(text).encode('ascii')
+    if len(encoded)!=19:
+        raise ValueError('CALWRF time_text values must contain 19 ASCII bytes')
+    variable[index]=np.frombuffer(encoded,dtype='S1')
+
+def _selection(value,size,label):
+    """Convert CALWRF's inclusive one-based subset to a Python slice."""
+    return fortran_inclusive_slice(value,size,label=f'CALWRF {label}')
+
+
+def destagger_x(a: np.ndarray) -> np.ndarray:
+    return np.float32(0.5) * (a[..., :-1] + a[..., 1:])
+
+
+def destagger_y(a: np.ndarray) -> np.ndarray:
+    return np.float32(0.5) * (a[..., :-1, :] + a[..., 1:, :])
+
+
+def destagger_z(a: np.ndarray) -> np.ndarray:
+    return np.float32(0.5) * (a[:-1, ...] + a[1:, ...])
+
+
+def _geopotential_height(ph: np.ndarray, phb: np.ndarray) -> np.ndarray:
+    """Reproduce CALWRF's REAL*4 PH/PHB conversion before destaggering."""
+    f32 = np.float32
+    geopotential = np.asarray(
+        np.asarray(ph, dtype=f32) + np.asarray(phb, dtype=f32), dtype=f32
+    )
+    height_staggered = np.asarray(geopotential / f32(9.81), dtype=f32)
+    return destagger_z(height_staggered)
+
+
+def _cone(truelat1: float, truelat2: float) -> np.float32:
+    """CALWRF's implicitly REAL Lambert cone parameter."""
+    f32=np.float32
+    first=f32(truelat1); second=f32(truelat2)
+    pi=f32(3.141592653589793); rpd=np.asarray(pi/f32(180.),dtype=f32)
+    if abs(np.asarray(first-second,dtype=f32))<=f32(.1):
+        argument=np.asarray(np.abs(first)*rpd,dtype=f32)
+        return _real4_unary('sinf',argument)
+    first_argument=np.asarray(first*rpd,dtype=f32)
+    second_argument=np.asarray(second*rpd,dtype=f32)
+    first_cos=_real4_unary('cosf',first_argument)
+    second_cos=_real4_unary('cosf',second_argument)
+    numerator=np.asarray(_real4_unary('logf',first_cos)-
+                         _real4_unary('logf',second_cos),dtype=f32)
+    def tangent_log(latitude):
+        half=np.asarray(np.abs(latitude)/f32(2.),dtype=f32)
+        argument=np.asarray(np.asarray(f32(45.)-half,dtype=f32)*rpd,dtype=f32)
+        tangent=_real4_unary('tanf',argument)
+        return _real4_unary('logf',tangent)
+    denominator=np.asarray(tangent_log(first)-tangent_log(second),dtype=f32)
+    return np.asarray(numerator/denominator,dtype=f32)
+
+
+def rotation_angle(ds: nc.Dataset, lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
+    """CALWRF map-to-earth rotation angle in radians."""
+    map_projection=int(getattr(ds,"MAP_PROJ",0))
+    # CALWRF sets OP_ROT=.FALSE. for every WRF projection code >= 3, not
+    # only Mercator (3).  This also covers global/rotated lat-lon products
+    # using later WRF projection identifiers.
+    if map_projection>=3:
+        return np.zeros_like(lon, dtype="f4")
+    if map_projection not in {1,2}:
+        raise ValueError(f"CALWRF does not support WRF MAP_PROJ={map_projection}")
+    f32=np.float32
+    latitude=np.asarray(lat,dtype=f32); longitude=np.asarray(lon,dtype=f32)
+    stand_lon=f32(getattr(ds,"STAND_LON"))
+    cone=(f32(1.) if map_projection==2 else
+          _cone(getattr(ds,"TRUELAT1"),getattr(ds,"TRUELAT2")))
+    delta=np.asarray(longitude-stand_lon,dtype=f32)
+    delta=np.where(delta>f32(180.),np.asarray(delta-f32(360.),dtype=f32),delta)
+    delta=np.where(delta<f32(-180.),np.asarray(delta+f32(360.),dtype=f32),delta)
+    rpd=np.asarray(f32(3.141592653589793)/f32(180.),dtype=f32)
+    alpha=np.asarray(np.asarray(delta*cone,dtype=f32)*rpd,dtype=f32)
+    return np.where(latitude<f32(0.),np.asarray(-f32(1.)*alpha,dtype=f32),alpha).astype(f32)
+
+
+def earth_wind(u: np.ndarray, v: np.ndarray, alpha: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Rotate WRF grid-relative U/V to eastward/northward components."""
+    f32=np.float32
+    u=np.asarray(u,dtype=f32); v=np.asarray(v,dtype=f32); angle=np.asarray(alpha,dtype=f32)
+    ca=np.asarray(np.cos(angle.astype(np.float64)),dtype=f32)
+    sa=np.asarray(np.sin(angle.astype(np.float64)),dtype=f32)
+    east=np.asarray(np.asarray(v*sa,dtype=f32)+np.asarray(u*ca,dtype=f32),dtype=f32)
+    north=np.asarray(np.asarray(v*ca,dtype=f32)-np.asarray(u*sa,dtype=f32),dtype=f32)
+    return east,north
+
+
+def speed_direction(u: np.ndarray, v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    f32=np.float32
+    u=np.asarray(u,dtype=f32); v=np.asarray(v,dtype=f32)
+    speed=np.asarray(np.sqrt(np.asarray(
+        np.asarray(u*u,dtype=f32)+np.asarray(v*v,dtype=f32),dtype=f32)),dtype=f32)
+    pi=f32(3.141592653589793); degrees_per_radian=np.asarray(f32(180.)/pi,dtype=f32)
+    angle=_real4_atan2(v,u)
+    calculated=np.asarray(f32(270.)-np.asarray(degrees_per_radian*angle,dtype=f32),dtype=f32)
+    direction=np.where(speed>=f32(1.e-9),calculated,f32(0.)).astype(f32)
+    direction=np.where(direction>f32(360.),np.asarray(direction-f32(360.),dtype=f32),direction)
+    direction=np.where(direction<=f32(0.),np.asarray(direction+f32(360.),dtype=f32),direction)
+    return speed, direction
+
+
+def _var(dst: nc.Dataset,name: str,dims: tuple[str,...],units: str,compression=1) -> nc.Variable:
+    var=dst.createVariable(name,"f4",dims,zlib=compression>0,complevel=compression,shuffle=compression>0)
+    var.units = units
+    return var
+
+
+def _mass_coordinate(source: nc.Dataset,name: str,time_index=0) -> np.ndarray:
+    """Read WRF mass-point coordinates using CALWRF's alias fallback."""
+    for candidate in (name,f'{name}_M'):
+        if candidate in source.variables:
+            return np.asarray(source[candidate][time_index],dtype='f4')
+    raise ValueError(f'WRF file has neither {name} nor {name}_M')
+
+
+def _rain_increment(current,previous):
+    """CALWRF accumulation difference from the preceding processed time."""
+    values=np.asarray(current,dtype='f4')
+    return (values.copy() if previous is None else
+            np.asarray(values-np.asarray(previous,dtype='f4'),dtype='f4'))
+
+
+def _rain_increments(rainnc,rainc,previous,*,reset_total=False):
+    """Return total, grid and convective increments with legacy reset support.
+
+    CALWRF 2.0.2 clears only ``PPOLD`` when it opens each WRF file.  Its
+    component baselines, ``PPNCOLD`` and ``PPCOLD``, continue across the same
+    boundary.  ``reset_total`` reproduces that asymmetric behavior for strict
+    comparisons while the normal path keeps all three accumulations continuous.
+    """
+    nonconvective=np.asarray(rainnc,dtype='f4')
+    convective=np.asarray(rainc,dtype='f4')
+    previous_nonconvective=None if previous is None else previous[0]
+    previous_convective=None if previous is None else previous[1]
+    previous_total=(None if previous is None or reset_total else
+                    np.asarray(previous_nonconvective,dtype='f4')+
+                    np.asarray(previous_convective,dtype='f4'))
+    total=np.asarray(nonconvective+convective,dtype='f4')
+    return (
+        _rain_increment(total,previous_total),
+        _rain_increment(nonconvective,previous_nonconvective),
+        _rain_increment(convective,previous_convective),
+    )
+
+
+def _reset_total_rain_at_file_boundary(enabled,previous,previous_path,current_path):
+    """Select CALWRF 2.0.2's asymmetric reset at a real file change."""
+    return bool(enabled and previous is not None and previous_path is not None and
+                Path(previous_path)!=Path(current_path))
+
+
+def _surface_variable(source,index,name,shape,*,required=False):
+    """Read one CALWRF 2-D field, retaining its missing-field policy."""
+    if name in source.variables:
+        return np.asarray(source[name][index],dtype='f4')
+    if required:
+        raise ValueError(f'WRF file is missing required 2-D variable {name}')
+    # GET2D clears X2D before each time record and skips absent optional
+    # variables, so their stored field remains exactly zero before QA.
+    return np.zeros(shape,dtype='f4')
+
+
+def _volume_variable(source,index,name,shape,*,required=False):
+    """Read one CALWRF 3-D field with its required/optional policy."""
+    if name in source.variables:
+        return np.asarray(source[name][index],dtype='f4')
+    if required:
+        raise ValueError(f'WRF file is missing required 3-D variable {name}')
+    return np.zeros(shape,dtype='f4')
+
+
+def _surface_wind(source,index,shape,alpha):
+    """Return CALWRF WD10/WS10, including its missing-U10 shortcut."""
+    if 'U10' not in source.variables:
+        zeros=np.zeros(shape,dtype='f4')
+        return zeros.copy(),zeros
+    u10=_surface_variable(source,index,'U10',shape)
+    v10=_surface_variable(source,index,'V10',shape)
+    east,north=earth_wind(u10,v10,alpha)
+    speed,direction=speed_direction(east,north)
+    return speed,direction
+
+
+def _pressure_temperature(perturbation_pressure,base_pressure,perturbation_theta):
+    """CALWRF pressure (hPa) and potential-temperature conversion."""
+    f32=np.float32
+    pressure=np.asarray(np.asarray(perturbation_pressure,dtype=f32)+
+                        np.asarray(base_pressure,dtype=f32),dtype=f32)
+    pressure=np.asarray(pressure*f32(.01),dtype=f32)
+    ratio=np.asarray(pressure/f32(1000.),dtype=f32)
+    exponent=np.asarray(f32(287.04)/f32(1004.),dtype=f32)
+    # CALWRF evaluates this default-REAL exponentiation through libm powf.
+    # A float64 detour differs by one or two ulps at rare F6.1 half-decimal
+    # boundaries; GETRH1 can then also round to the neighbouring integer.
+    factor=np.asarray(_real4_power(ratio,exponent),dtype=f32)
+    theta=np.asarray(np.asarray(perturbation_theta,dtype=f32)+f32(300.),dtype=f32)
+    temperature=np.asarray(theta*factor,dtype=f32)
+    return pressure,temperature
+
+
+def _select_wrf_times(paths,begin,end):
+    """Select output records and CALWRF's optional preceding rain record."""
+    selected=[]
+    baseline=None
+    baseline_time=begin-timedelta(hours=1)
+    seen=set()
+    for path in paths:
+        with nc.Dataset(path) as dataset:
+            for index,text in enumerate(_times(dataset)):
+                when=_stamp(text)
+                if when==baseline_time and baseline is None:
+                    baseline=(path,index,text)
+                if begin<=when<=end and text not in seen:
+                    selected.append((path,index,text)); seen.add(text)
+    selected.sort(key=lambda item:item[2])
+    return selected,baseline
+
+
+def _requested_interval(
+    paths: Sequence[Path], start: str | int, end: str | int,
+) -> tuple[datetime, datetime]:
+    """Resolve CALWRF's negative-date sentinel to the available interval."""
+    def all_times_requested(value: str | int) -> bool:
+        token=str(value).strip()
+        try:
+            return int(token)<1
+        except ValueError:
+            return token.startswith('-')
+
+    if not (all_times_requested(start) or all_times_requested(end)):
+        return _stamp(str(start)),_stamp(str(end))
+    available=[]
+    for path in paths:
+        with nc.Dataset(path) as dataset:
+            available.extend(_stamp(text) for text in _times(dataset))
+    if not available:
+        raise ValueError('WRF inputs contain no dated records')
+    return min(available),max(available)
+
+
+def _copy_static(src: nc.Dataset,dst: nc.Dataset,ys,xs,zs,compression=1) -> None:
+    for name, units in (("latitude", "degrees_north"), ("longitude", "degrees_east"),
+                        ("terrain", "m"), ("landuse", "category")):
+        _var(dst,name,("y","x"),units,compression)
+    dst["latitude"][:] = _mass_coordinate(src,"XLAT")[ys,xs]
+    dst["longitude"][:] = _mass_coordinate(src,"XLONG")[ys,xs]
+    dst["terrain"][:] = np.asarray(src["HGT"][0,ys,xs], dtype="f4")
+    dst["landuse"][:] = np.asarray(src["LU_INDEX"][0,ys,xs], dtype="f4")
+    _var(dst,"sigma",("level",),"1",compression)[:]=np.asarray(src["ZNU"][0,zs],dtype="f4")
+
+
+def _create_output(path: Path,src: nc.Dataset,nt: int,ny: int,nx: int,nz: int,ys,xs,zs,*,compression=1) -> nc.Dataset:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dst = nc.Dataset(path, "w", format="NETCDF4")
+    dst.createDimension("time", nt)
+    dst.createDimension("level", nz)
+    dst.createDimension("y", ny)
+    dst.createDimension("x", nx)
+    dst.createDimension("date_strlen", 19)
+    dst.createVariable("time_text", "S1", ("time", "date_strlen"))
+    _copy_static(src,dst,ys,xs,zs,compression)
+    fields3 = {
+        "pressure": "hPa", "height": "m", "temperature": "K",
+        "wind_speed": "m s-1", "wind_direction": "degree",
+        "vertical_velocity": "m s-1", "qvapor": "kg kg-1",
+        "qcloud": "kg kg-1", "qrain": "kg kg-1", "qice": "kg kg-1",
+        "qsnow": "kg kg-1", "qgraupel": "kg kg-1",
+    }
+    fields2 = {
+        "surface_pressure": "Pa", "precipitation": "mm", "snow_cover": "1",
+        "shortwave_down": "W m-2", "longwave_down": "W m-2",
+        "temperature_2m": "K", "qvapor_2m": "kg kg-1",
+        "wind_speed_10m": "m s-1", "wind_direction_10m": "degree",
+        "sst": "K", "skin_temperature": "K", "pbl_height": "m",
+        "sensible_heat_flux": "W m-2", "latent_heat_flux": "W m-2",
+        "friction_velocity": "m s-1", "convective_precipitation": "mm",
+        "grid_precipitation": "mm",
+    }
+    for name, units in fields3.items():
+        _var(dst,name,("time","level","y","x"),units,compression)
+    # IOSRF only controls the additional 2D.DAT file.  GET2D still runs and
+    # WRTOUT embeds the surface record in 3D.DAT for every grid point.
+    for name,units in fields2.items():
+        _var(dst,name,("time","y","x"),units,compression)
+    dst.source_format = "WRF NetCDF"
+    dst.pycalmet_stage = "calwrf"
+    dst.wrf_dx_m = np.float32(getattr(src, "DX"))
+    dst.wrf_dy_m = np.float32(getattr(src, "DY"))
+    dst.source_i_start=xs.start+1; dst.source_i_end=xs.stop
+    dst.source_j_start=ys.start+1; dst.source_j_end=ys.stop
+    dst.source_k_start=zs.start+1; dst.source_k_end=zs.stop
+    dst.source_grid_nx=len(src.dimensions["west_east"])
+    dst.source_grid_ny=len(src.dimensions["south_north"])
+    dst.source_grid_nz=len(src.dimensions["bottom_top"])
+    source_latitude=_mass_coordinate(src,"XLAT")
+    source_longitude=_mass_coordinate(src,"XLONG")
+    dst.source_latitude_1_1=np.float32(source_latitude[0,0])
+    dst.source_longitude_1_1=np.float32(source_longitude[0,0])
+    for attr in ("MAP_PROJ", "TRUELAT1", "TRUELAT2", "STAND_LON", "CEN_LAT", "CEN_LON",
+                 "MOAD_CEN_LAT"):
+        if hasattr(src, attr):
+            dst.setncattr(attr.lower(), getattr(src, attr))
+    for attr in ('MP_PHYSICS','CU_PHYSICS','BL_PBL_PHYSICS','RA_SW_PHYSICS',
+                 'SF_SURFACE_PHYSICS','GRID_FDDA','OBS_NUDGE_OPT'):
+        if hasattr(src,attr): dst.setncattr(attr.lower(),getattr(src,attr))
+    present=[name in src.variables for name in ('QCLOUD','QRAIN','QICE','QSNOW','QGRAUP')]
+    dst.legacy_cloud_component_count=(5 if present[4] else 4 if present[2] and present[3]
+                                      else 2 if present[1] else 1 if present[0] else 1)
+    return dst
+
+
+def run(config: CalwrfConfig) -> Path:
+    paths = [Path(p) for p in config.wrf_files]
+    if not paths:
+        raise ValueError("wrf_files is empty")
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    begin,end=_requested_interval(paths,config.start,config.end)
+    if end < begin:
+        raise ValueError("end precedes start")
+    if not 0<=config.compression<=9:
+        raise ValueError('compression must be between zero and nine')
+
+    selected,rain_baseline=_select_wrf_times(paths,begin,end)
+    if not selected:
+        raise ValueError("no WRF times fall inside requested interval")
+    selected_times=[_stamp(item[2]) for item in selected]
+    if selected_times[0]!=begin or selected_times[-1]!=end or any(
+            right-left!=timedelta(hours=1) for left,right in zip(selected_times[:-1],selected_times[1:])):
+        raise ValueError('selected CALWRF output times must cover the requested interval hourly')
+
+    with nc.Dataset(selected[0][0]) as first:
+        source_ny=len(first.dimensions["south_north"]); source_nx=len(first.dimensions["west_east"])
+        source_nz=len(first.dimensions["bottom_top"])
+        xs=_selection(config.i_range,source_nx,'I'); ys=_selection(config.j_range,source_ny,'J')
+        zs=_selection(config.k_range,source_nz,'K')
+        nx=xs.stop-xs.start; ny=ys.stop-ys.start; nz=zs.stop-zs.start
+        dst=_create_output(Path(config.output),first,len(selected),ny,nx,nz,ys,xs,zs,
+                           compression=config.compression)
+        dst.title=config.title
+        dst.legacy_file_rain_reset=int(config.legacy_file_rain_reset)
+    previous_rain=None
+    previous_rain_path=None
+    if rain_baseline is not None:
+        baseline_path,baseline_index,_=rain_baseline
+        with nc.Dataset(baseline_path) as baseline_source:
+            baseline_shape=(len(baseline_source.dimensions['south_north']),
+                            len(baseline_source.dimensions['west_east']))
+            rainnc=_surface_variable(baseline_source,baseline_index,'RAINNC',baseline_shape,
+                                     required=True)
+            rainc=_surface_variable(baseline_source,baseline_index,'RAINC',baseline_shape)
+            previous_rain=(rainnc,rainc)
+            previous_rain_path=Path(baseline_path)
+    try:
+        for out_index, (path, time_index, text) in enumerate(selected):
+            with nc.Dataset(path) as src:
+                take = lambda name: np.asarray(src[name][time_index], dtype="f4")
+                crop2=lambda values: np.asarray(values)[ys,xs]
+                crop3=lambda values: np.asarray(values)[zs,ys,xs]
+                lat,lon=_mass_coordinate(src,"XLAT",time_index),_mass_coordinate(
+                    src,"XLONG",time_index)
+                alpha = rotation_angle(src, lat, lon)
+                pressure_hpa,temperature=_pressure_temperature(take("P"),take("PB"),take("T"))
+                height = _geopotential_height(take("PH"), take("PHB"))
+                vertical = destagger_z(take("W"))
+                u = destagger_x(take("U")); v = destagger_y(take("V"))
+                ue, vn = earth_wind(u, v, alpha[None, ...])
+                speed, direction = speed_direction(ue, vn)
+                surface_shape=alpha.shape
+                speed10,direction10=_surface_wind(
+                    src,time_index,surface_shape,alpha)
+
+                _write_time_text(dst["time_text"],out_index,text)
+                fields3={"pressure":pressure_hpa, "temperature":temperature,
+                         "wind_speed":speed, "wind_direction":direction,
+                         "vertical_velocity":vertical}
+                fields3["qvapor"]=_volume_variable(
+                    src,time_index,"QVAPOR",pressure_hpa.shape,required=True)
+                for source, target in (("QCLOUD", "qcloud"), ("QRAIN", "qrain"),
+                                       ("QICE", "qice"),
+                                       ("QSNOW", "qsnow"), ("QGRAUP", "qgraupel")):
+                    fields3[target]=_volume_variable(
+                        src,time_index,source,pressure_hpa.shape)
+                dst["pressure"][out_index] = _horizontal_range_check(fields3["pressure"],*_LIMITS_3D["pressure"],ys,xs)[zs]
+                dst["height"][out_index] = crop3(height)
+                for target in ("temperature","wind_speed","wind_direction","vertical_velocity","qvapor"):
+                    dst[target][out_index]=_horizontal_range_check(fields3[target],*_LIMITS_3D[target],ys,xs)[zs]
+                for target in ("qcloud","qrain","qice","qsnow","qgraupel"):
+                    dst[target][out_index]=_vertical_range_check(fields3[target],*_LIMITS_3D[target],zs,ys,xs)
+
+                rainnc=_surface_variable(src,time_index,'RAINNC',surface_shape,required=True)
+                rainc=_surface_variable(src,time_index,'RAINC',surface_shape)
+                reset_total=_reset_total_rain_at_file_boundary(
+                    config.legacy_file_rain_reset,previous_rain,previous_rain_path,path)
+                increment,grid_increment,convective_increment=_rain_increments(
+                    rainnc,rainc,previous_rain,reset_total=reset_total)
+                previous_rain=(rainnc.copy(),rainc.copy())
+                previous_rain_path=Path(path)
+                surface={
+                    "surface_pressure":_surface_variable(
+                        src,time_index,'PSFC',surface_shape,required=True),
+                    "precipitation":increment,
+                    "grid_precipitation":grid_increment,
+                    "convective_precipitation":convective_increment,
+                    "snow_cover":_surface_variable(
+                        src,time_index,'SNOWC',surface_shape,required=True),
+                    "shortwave_down":_surface_variable(src,time_index,'SWDOWN',surface_shape),
+                    "longwave_down":_surface_variable(src,time_index,'GLW',surface_shape),
+                    "temperature_2m":_surface_variable(src,time_index,'T2',surface_shape),
+                    "qvapor_2m":_surface_variable(src,time_index,'Q2',surface_shape),
+                    "wind_speed_10m":speed10,"wind_direction_10m":direction10,
+                    "sst":_surface_variable(src,time_index,'SST',surface_shape),
+                    "skin_temperature":_surface_variable(src,time_index,'TSK',surface_shape),
+                    "pbl_height":_surface_variable(src,time_index,'PBLH',surface_shape),
+                    "sensible_heat_flux":_surface_variable(src,time_index,'HFX',surface_shape),
+                    "latent_heat_flux":_surface_variable(src,time_index,'LH',surface_shape),
+                    "friction_velocity":_surface_variable(src,time_index,'UST',surface_shape),
+                }
+                for target, values in surface.items():
+                    if target in _LIMITS_2D:
+                        values=_horizontal_range_check(values,*_LIMITS_2D[target],ys,xs)
+                    else:
+                        values=crop2(values)
+                    dst[target][out_index] = values
+    finally:
+        dst.close()
+    if config.legacy_output is not None:
+        write_m3d(config.output,config.legacy_output,
+                  config.surface_output if config.create_surface else None)
+    return Path(config.output)

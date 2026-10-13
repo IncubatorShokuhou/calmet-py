@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pycalmet"
+version = "0.1.1"
+description = "NumPy implementation of the CALMET preprocessing and diagnostic workflow"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.23,<3",
+  "scipy>=1.11,<2",
+  "xarray>=2023.1,<2027",
+  "netCDF4>=1.6,<2",
+  "pyproj>=3.4,<4",
+  "tifffile>=2023.7,<2027",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

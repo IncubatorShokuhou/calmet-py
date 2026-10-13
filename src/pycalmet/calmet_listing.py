@@ -1,0 +1,355 @@
+"""Legacy CALMET line-printer grid formatting."""
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import numpy as np
+
+from .calmet_numerics import convective_velocity_scale, pgt_stability
+
+
+def _coded_time(value: datetime) -> int:
+    return value.year*100000+value.timetuple().tm_yday*100+value.hour
+
+
+def format_surface_input_debug(record,stations) -> str:
+    """Reproduce COMP formats 108/109 for one raw SURF.DAT record."""
+    stations=tuple(stations)
+    count=len(stations)
+    fields=(record.wind_speed,record.wind_direction,record.ceiling_hundreds_ft,
+            record.cloud_tenths,record.temperature_k,record.relative_humidity,
+            record.pressure_mb,record.precipitation_code)
+    if any(np.asarray(values).shape!=(count,) for values in fields):
+        raise ValueError('surface debug record does not match station count')
+    lines=[
+        (f"\n SURFACE MET. INPUT DATA -- YYYYJJJHH: {_coded_time(record.begin):10d}   "
+         f"seconds: {record.begin.minute*60+record.begin.second:5d}  to -- YYYYJJJHH: "
+         f"{_coded_time(record.end):10d}   seconds: "
+         f"{record.end.minute*60+record.end.second:5d}"),
+        (" Station ID      WS       WD     Ceil Ht   Cloud Cover    Temp    "
+         "Rel Hum    Pres   Precip Code"),
+        ("                (m/s)   (deg)   (100s FT)    (tenths)    (deg K)"
+         "    (%)      (mb)"),
+    ]
+    for index,station in enumerate(stations):
+        lines.append(
+            f" {int(station.identifier):9d}    {float(record.wind_speed[index]):7.2f}  "
+            f"{float(record.wind_direction[index]):6.1f}     "
+            f"{int(record.ceiling_hundreds_ft[index]):4d}        "
+            f"{int(record.cloud_tenths[index]):4d}      "
+            f"{float(record.temperature_k[index]):7.2f}    "
+            f"{int(record.relative_humidity[index]):4d}    "
+            f"{float(record.pressure_mb[index]):7.2f}     "
+            f"{int(record.precipitation_code[index]):4d}")
+    return "\n".join(lines)+"\n"
+
+
+def format_no_upper_prepdi_debug(step, ending: datetime) -> str:
+    """Reproduce COMP formats 153--156 for ``NOOBS=1`` PREPDI data."""
+    if step.debug_domain_temperature is None:
+        raise ValueError('ISURFT=-1 leaves legacy TINF undefined in LDB output')
+    names=tuple(step.debug_station_names)
+    u=np.asarray(step.debug_station_u)
+    v=np.asarray(step.debug_station_v)
+    if u.shape!=(len(names),) or v.shape!=(len(names),):
+        raise ValueError('PREPDI debug winds do not match station count')
+    day=ending.timetuple().tm_yday
+    second=ending.minute*60+ending.second
+    lines=[
+        (f"\n  Diagnostic wind field data -- Year: {ending.year:4d}   "
+         f"Julian day: {day:3d}   Hour: {ending.hour:2d}   Second: {second:4d}"),
+        (f"  Domain scale surf. temperature (TINF) = "
+         f"{step.debug_domain_temperature:10.2f} (deg. K)"),
+        "  Domain-scale temp. lapse rate (GAMMA) is not yet  defined",
+        "  Domain-scale U-component of wind (UM) is not yet  defined",
+        "  Domain-scale V-component of wind (VM) is not yet  defined",
+        (f"\n  Surface station data for wind field module -- Year: {ending.year:4d}   "
+         f"Julian day: {day:3d}   Hour: {ending.hour:2d}   Second: {second:4d}"),
+        "     Station  Station    U-CMPT    V-CMPT",
+        "      Name     Number     (m/s)     (m/s)",
+    ]
+    for index,(name,u_value,v_value) in enumerate(zip(names,u,v),1):
+        lines.append(f"      {str(name):4.4s}     {index:4d}     {u_value:7.2f}   {v_value:7.2f}")
+    lines.append("  upper air data not yet defined...")
+    return "\n".join(lines)+"\n"
+
+
+def format_upper_air_input_debug(station_number,sounding,convergence_degrees,
+                                 layer_u,layer_v,temperature_faces=None) -> str:
+    """Reproduce COMP formats 133--136 for one raw UP.DAT sounding."""
+    height,u,v=sounding.converted(convergence_degrees)
+    count=len(height)
+    fields=(sounding.pressure_mb,sounding.temperature_c,u,v)
+    if any(np.asarray(values).shape!=(count,) for values in fields):
+        raise ValueError('upper-air debug sounding fields do not match')
+    timestamp=sounding.timestamp
+    lines=[
+        (f"\n  UPPER AIR DATA  --  Year:{timestamp.year:4d}  Julian Day:"
+         f"{timestamp.timetuple().tm_yday:3d}  Hour:{timestamp.hour:2d} (GMT)"),
+        "",
+        "  STA  PRES   HEIGHT    TEMP      U       V",
+        "       (mb)   (m LGL)   (K)     (m/s)   (m/s)",
+    ]
+    temperature=np.asarray(sounding.temperature_c,dtype=np.float32)
+    temperature=np.where(temperature<np.float32(999.89),
+                         temperature+np.float32(273.15),temperature)
+    for pressure,z,temp,u_value,v_value in zip(
+            sounding.pressure_mb,height,temperature,u,v):
+        lines.append(f" {int(station_number):3d}  {pressure:6.1f}  {z:7.1f}  "
+                     f"{temp:6.2f}  {u_value:6.2f}  {v_value:6.2f}")
+    def profile(label,values):
+        values=np.asarray(values)
+        chunks=[]
+        for begin in range(0,values.size,10):
+            prefix=f" {label:<20} = " if begin==0 else " "*24
+            chunks.append(prefix+''.join(f"{value:10.3f}" for value in values[begin:begin+10]))
+        return chunks
+    lines.extend(profile('U -- cell averaged',layer_u))
+    lines.extend(profile('V -- cell averaged',layer_v))
+    if temperature_faces is not None:
+        lines.extend(profile('T -- cell face',temperature_faces))
+    return "\n".join(lines)+"\n"
+
+
+def format_full_prepdi_debug(step,ending: datetime,lapse_rate) -> str:
+    """Reproduce COMP formats 152, 154--159 for ``NOOBS=0``."""
+    if any(value is None for value in (step.debug_domain_temperature,
+                                       step.debug_domain_u,step.debug_domain_v)):
+        raise ValueError('complete PREPDI debug scalars are required')
+    names=tuple(step.debug_station_names)
+    u=np.asarray(step.debug_station_u); v=np.asarray(step.debug_station_v)
+    if u.shape!=(len(names),) or v.shape!=(len(names),):
+        raise ValueError('PREPDI debug winds do not match station count')
+    day=ending.timetuple().tm_yday
+    second=ending.minute*60+ending.second
+    lines=[
+        (f"\n  Diagnostic wind field data -- Year: {ending.year:4d}   "
+         f"Julian day: {day:3d}   Hour: {ending.hour:2d}   Second: {second:4d}"),
+        ("  Domain-scale temp. lapse rate at point (1,1)(GAMMA) = "
+         f"{float(np.asarray(lapse_rate)[0,0]):10.5f} (deg. K/m)"),
+        (f"  Domain scale surf. temperature (TINF) = "
+         f"{step.debug_domain_temperature:10.2f} (deg. K)"),
+        (f"  Domain-scale U-component of wind (UM) = "
+         f"{step.debug_domain_u:10.3f} (m/s)"),
+        (f"  Domain-scale V-component of wind (VM) = "
+         f"{step.debug_domain_v:10.3f} (m/s)"),
+        (f"\n  Surface station data for wind field module -- Year: {ending.year:4d}   "
+         f"Julian day: {day:3d}   Hour: {ending.hour:2d}   Second: {second:4d}"),
+        "     Station  Station    U-CMPT    V-CMPT",
+        "      Name     Number     (m/s)     (m/s)",
+    ]
+    for index,(name,u_value,v_value) in enumerate(zip(names,u,v),1):
+        lines.append(f"      {str(name):4.4s}     {index:4d}     {u_value:7.2f}   {v_value:7.2f}")
+    for station_number,item in enumerate(step.debug_upper_data,1):
+        station,_,_,upper_u,upper_v=item
+        lines.extend((
+            (f"\n  Upper air station: {str(station.name):4.4s}   Number: "
+             f"{station_number:4d}   Year: {ending.year:4d}   Julian day: {day:3d}"
+             f"   Hour: {ending.hour:2d}   Second: {second:4d}"),
+            "        Level   U-CMPT   V-CMPT",
+            "                 (m/s)    (m/s)",
+        ))
+        for level,(u_value,v_value) in enumerate(zip(upper_u,upper_v),1):
+            lines.append(f"       {level:4d}    {u_value:7.2f}  {v_value:7.2f}")
+    return "\n".join(lines)+"\n"
+
+
+def format_grid(
+    values,
+    message: str,
+    *,
+    significant_digits: int = 5,
+    begin: datetime | None = None,
+    timestep_seconds: int = 3600,
+) -> str:
+    """Reproduce CALMET ``OUT/WRT/WRT2`` for one two-dimensional field."""
+    if significant_digits not in range(1, 6):
+        raise ValueError("significant_digits must be from 1 through 5")
+    data=np.asarray(values)
+    if data.ndim!=2:
+        raise ValueError("line-printer fields must be two-dimensional")
+    ny,nx=data.shape
+    width=(3,3,3,4,5)[significant_digits-1]
+    columns=(40,40,30,25,20)[significant_digits-1]
+    lines=["", "", f" {message:<70}"[:71]]
+    if begin is not None:
+        end=begin+timedelta(seconds=timestep_seconds)
+        lines.extend(("", _period_line(begin,end), ""))
+    maximum=float(np.max(data)); minimum=float(np.min(data))
+    if minimum==0. and maximum==0.:
+        lines.append(" GRID NOT PRINTED -- all values zero")
+        return "\n".join(lines)+"\n"
+    magnitude=max(maximum,abs(minimum))
+    exponent=int(np.log10(np.float32(magnitude)))
+    if magnitude<1.: exponent-=1
+    exponent-=significant_digits-(1 if significant_digits==1 else 2)
+    scale=np.float32(10.)**np.int32(-exponent)
+    lines.extend((f" Multiply all values by 10 ** {exponent:3d}", ""))
+    for first in range(0,nx,columns):
+        last=min(first+columns,nx)
+        for row in range(ny-1,-1,-1):
+            selected=np.asarray(data[row,first:last],dtype=np.float32)
+            signs=np.where(selected<0.,'-','+')
+            rounded=np.where(selected<0.,-(selected*scale-np.float32(.5)),
+                             selected*scale+np.float32(.5)).astype(np.int64)
+            lines.append(f" {row+1:3d} I"+''.join(f"{value:{width}d} " for value in rounded))
+            lines.append("     I"+''.join(f"{sign:>{width}} " for sign in signs))
+        count=last-first
+        underline=(significant_digits+2 if significant_digits==1
+                   else significant_digits+1)*count-1
+        lines.append("     "+'-'*underline)
+        lines.append("      "+''.join(f"{index:{width}d} "
+                                      for index in range(first+1,last+1)))
+    return "\n".join(lines)+"\n"
+
+
+def _period_line(begin: datetime, end: datetime) -> str:
+    return (f" FROM: year: {begin.year:4d}  month: {begin.month:2d}  day: {begin.day:2d}  "
+            f"hour: {begin.hour:2d}  second: {begin.minute*60+begin.second:4d}  TO: year: "
+            f"{end.year:4d}  month: {end.month:2d}  day: {end.day:2d}  hour: {end.hour:2d}  "
+            f"second: {end.minute*60+end.second:4d}")
+
+
+class CalmetListingWriter:
+    """Append the Input Group 3 selected fields to a CALMET listing."""
+
+    def __init__(self, path, config, landuse, water_range):
+        target=Path(path); target.parent.mkdir(parents=True,exist_ok=True)
+        self.stream=target.open('w',encoding='ascii')
+        self.config=config
+        self.landuse=np.asarray(landuse)
+        self.water_range=tuple(water_range)
+        self.first_hour=None
+
+    def append(self, hour, solar_elevation_sine):
+        config=self.config
+        timestamp=hour.timestamp
+        current_hour=timestamp.replace(minute=0,second=0,microsecond=0)
+        if self.first_hour is None:
+            self.first_hour=current_hour
+        nh=int((current_hour-self.first_hour).total_seconds()//3600)+1
+        if (config.micrometeorology_debug and
+                config.debug_first_step<=nh<=config.debug_last_step):
+            self._append_noobs_debug(hour,solar_elevation_sine)
+        if (nh%config.print_interval_hours or timestamp.minute or timestamp.second):
+            return
+        duration=config.timestep_seconds
+        def write(values,message,digits=5):
+            self.stream.write(format_grid(values,message,significant_digits=digits,
+                                           begin=timestamp,
+                                           timestep_seconds=duration))
+        for level,enabled in enumerate(config.print_uv_levels):
+            if enabled:
+                write(hour.wind.u[level],f'U-component (m/s) -- Level: {level+1:3d}')
+                write(hour.wind.v[level],f'V-component (m/s) -- Level: {level+1:3d}')
+        for level,enabled in enumerate(config.print_w_levels):
+            if enabled:
+                write(hour.wind.w[level+1],f'W-component (m/s) -- Level: {level+1:3d}')
+        step=hour.step1; surface=hour.surface
+        switches=config.print_surface_fields
+        if switches[0]:
+            stability=pgt_stability(hour.wind.u[0],hour.wind.v[0],solar_elevation_sine,
+                step.cloud_fraction,step.ceiling_height,self.landuse,
+                surface.monin_obukhov_length,water_range=self.water_range)
+            write(stability,'PGT stability class',2)
+        averaging=('After averaging' if config.iavezi else 'No averaging')
+        fields=(
+            (lambda:surface.friction_velocity,'Friction velocity (m/s)'),
+            (lambda:surface.monin_obukhov_length,'Monin-Obukhov length (m)'),
+            (lambda:surface.mixing_height,f'Mixing height (m) -- {averaging}'),
+            (lambda:self._convective_velocity(hour),'Convective velocity scale (m/s)'),
+            (lambda:step.precipitation_rate,'Precipitation rate (mm/hr)'),
+            (lambda:surface.sensible_heat_flux,'Surface sensible heat flux (W/m**2)'),
+            (lambda:surface.convective_mixing_height,
+             f'Convective mixing height (m) -- {averaging}'),
+        )
+        for enabled,(values,message) in zip(switches[1:],fields):
+            if enabled:
+                write(values(),message)
+        if config.include_w_temperature or config.itprog>=1:
+            for level,enabled in enumerate(config.print_temperature_levels):
+                if enabled:
+                    write(hour.temperature[level],f'Temperature (K) -- Level: {level+1:3d}')
+        self.stream.flush()
+
+    def _append_noobs_debug(self,hour,solar_elevation_sine):
+        """Write COMP's LDB diagnostics that apply in NOOBS=2 mode."""
+        timestamp=hour.timestamp
+        surface=hour.surface
+        sine=float(np.asarray(solar_elevation_sine)[0,0])
+        self.stream.write(
+            f"\n  Computed solar elevation angle data at point 1,1 -- Year: "
+            f"{timestamp.year:4d}  Julian day: {timestamp.timetuple().tm_yday:3d}"
+            f"   Hour: {timestamp.hour:2d}\n\n"
+            f"   Sine (solar elev. angle)  {sine:7.5f}\n")
+        if self.config.noobs==2:
+            self.stream.write(
+                " No observation mode\n"
+                " upper air data not yet defined...\n"
+                " surface   data not yet defined...\n")
+        else:
+            if hour.step1.debug_surface_record is None:
+                raise RuntimeError('missing retained SURF.DAT debug record')
+            self.stream.write(format_surface_input_debug(
+                hour.step1.debug_surface_record,
+                hour.step1.debug_surface_stations))
+            ending=timestamp+timedelta(seconds=self.config.timestep_seconds)
+            if self.config.noobs==0:
+                from .upper_air import temperature_faces
+                for station_number,item in enumerate(
+                        hour.step1.debug_upper_data,1):
+                    _,soundings,convergence,layer_u,layer_v=item
+                    for sounding in soundings:
+                        face_temperature=(temperature_faces(
+                            sounding,self.config.z_faces_m)+np.float32(273.15)
+                            if self.config.include_w_temperature else None)
+                        self.stream.write(format_upper_air_input_debug(
+                            station_number,sounding,convergence,layer_u,layer_v,
+                            face_temperature))
+                self.stream.write(format_full_prepdi_debug(
+                    hour.step1,ending,hour.wind.lapse_rate))
+            else:
+                self.stream.write(format_no_upper_prepdi_debug(hour.step1,ending))
+        self.stream.write(
+            f"\n  Computed surface parameters -- Year: {timestamp.year:4d}   "
+            f"Julian day: {timestamp.timetuple().tm_yday:3d}   "
+            f"Hour: {timestamp.hour:2d}   Second: "
+            f"{timestamp.minute*60+timestamp.second:4d}   At point (1,1):\n"
+            f"       Air Density            {surface.density[0,0]:6.3f}    (kg/m**3)\n"
+            f"       Short-Wave Radiation   {surface.shortwave_flux[0,0]:7.2f}    (W/m**2)\n")
+        switches=self.config.print_surface_fields
+        if switches[3] and surface.unaveraged_mixing_height is not None:
+            self.stream.write(format_grid(surface.unaveraged_mixing_height,
+                'Mixing height (m) -- Before averaging ',
+                begin=timestamp,timestep_seconds=self.config.timestep_seconds))
+        if switches[7] and surface.unaveraged_convective_mixing_height is not None:
+            self.stream.write(format_grid(surface.unaveraged_convective_mixing_height,
+                'Convective mixing height (m) -- Before averaging',
+                begin=timestamp,timestep_seconds=self.config.timestep_seconds))
+        self.stream.write(format_grid(surface.temperature_jump,
+            'Temperature jump at top of mixed layer (deg. K)',
+            begin=timestamp,timestep_seconds=self.config.timestep_seconds))
+        self.stream.flush()
+
+    def _convective_velocity(self,hour):
+        surface=hour.surface
+        value=convective_velocity_scale(surface.convective_mixing_height,
+            surface.sensible_heat_flux,hour.temperature[0],surface.density,
+            self.landuse,water_range=self.water_range)
+        if surface.water_convective_velocity_scale is not None:
+            water=((self.landuse>=self.water_range[0])&
+                   (self.landuse<=self.water_range[1]))
+            value=np.where(water,surface.water_convective_velocity_scale,value)
+        return np.asarray(value,dtype=np.float32)
+
+    def close(self):
+        if self.stream is not None:
+            self.stream.close()
+            self.stream=None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self,*exc):
+        self.close()

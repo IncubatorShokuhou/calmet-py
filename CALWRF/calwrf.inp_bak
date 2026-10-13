@@ -1,0 +1,9 @@
+Create 3D.DAT file for WRF output
+calwrf.lst          ! Log file name
+calwrf_out/calwrfout_2018051700_2018052000.m3d ! Output file name
+-9,-9,-9,-9,-9,-9    ! Beg/End I/J/K ("-" for all)
+-2018051700         ! Start datetime (UTC yyyymmddhh, "-" for all)
+-2018051712         ! End   datetime (UTC yyyymmddhh, "-" for all)
+1                 ! Number of WRF output files
+!WRFOUT_wds/wrfout_d01_2018-05-17_00_00_00
+WRFOUT_wds/wrfout_d01_2018-05-17_00_00_00
