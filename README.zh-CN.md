@@ -64,6 +64,34 @@ pycalmet.makegeo(f"{base}/makegeo.inp")
 result = pycalmet.calmet(f"{base}/calmet.inp")
 ```
 
+每个阶段同时提供完整的类型化关键字 API。让 `inp` 保持默认值 `None`，即可直接
+传入控制参数；`nx`、`dx_km`、`projection` 等网格项也是普通函数参数。日期接受
+`datetime`，路径接受 `str` 或 `Path`，重复项接受 Python 序列。调用方没有传入的
+参数会使用原程序定义的默认值。例如：
+
+```python
+from datetime import datetime
+from pathlib import Path
+
+result = pycalmet.calmet(
+    inp=None,
+    meteorology=Path("output/calwrf.nc"),
+    geophysical=Path("output/geo.nc"),
+    output=Path("output/calmet.nc"),
+    start=datetime(2018, 3, 18, 0),
+    end=datetime(2018, 3, 18, 1),
+    nx=610,
+    ny=499,
+    dx_km=1.0,
+    dy_km=1.0,
+    lat0=27.0,
+    lon0=117.5,
+)
+```
+
+函数签名会列出全部支持项，包括某份 `.inp` 没有写出、但 Fortran 程序定义了默认
+值的参数；IDE 补全、类型检查器、`help()` 和 `inspect.signature()` 都能直接看到。
+
 公开 API：
 
 ```python

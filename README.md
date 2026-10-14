@@ -69,6 +69,37 @@ pycalmet.makegeo(f"{base}/makegeo.inp")
 result = pycalmet.calmet(f"{base}/calmet.inp")
 ```
 
+Every stage also has a complete typed keyword API. Leave `inp` at its default
+`None` and pass the control values directly; grid controls such as `nx`,
+`dx_km`, and `projection` are ordinary parameters. Dates accept `datetime`,
+paths accept `str` or `Path`, and repeated controls accept Python sequences.
+Parameters omitted by the caller use the defaults defined by the original
+program. For example:
+
+```python
+from datetime import datetime
+from pathlib import Path
+
+result = pycalmet.calmet(
+    inp=None,
+    meteorology=Path("output/calwrf.nc"),
+    geophysical=Path("output/geo.nc"),
+    output=Path("output/calmet.nc"),
+    start=datetime(2018, 3, 18, 0),
+    end=datetime(2018, 3, 18, 1),
+    nx=610,
+    ny=499,
+    dx_km=1.0,
+    dy_km=1.0,
+    lat0=27.0,
+    lon0=117.5,
+)
+```
+
+The signatures list every supported control, including controls with Fortran
+defaults that may be absent from a particular `.inp` file. They are visible to
+IDE completion, type checkers, `help()`, and `inspect.signature()`.
+
 The public processing API is:
 
 ```python

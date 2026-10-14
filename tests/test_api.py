@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, MISSING
+import inspect
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +30,58 @@ def _sea_metadata(*,version='2.11',timezone='UTC-0000',**changes):
 def test_unknown_parameter_is_rejected():
     with pytest.raises(TypeError, match="unknown CalwrfConfig parameters"):
         pycalmet.calwrf({"not_a_parameter": 1})
+
+
+@pytest.mark.parametrize(("stage", "config_type", "has_grid"), (
+    ("calwrf", pycalmet.CalwrfConfig, False),
+    ("terrel", pycalmet.TerrelConfig, True),
+    ("ctrproc", pycalmet.CtgprocConfig, True),
+    ("ctgproc", pycalmet.CtgprocConfig, True),
+    ("makegeo", pycalmet.MakegeoConfig, True),
+    ("calmet", pycalmet.CalmetConfig, True),
+))
+def test_stage_signatures_expose_every_typed_configuration_parameter(
+        stage, config_type, has_grid):
+    signature = inspect.signature(getattr(pycalmet, stage))
+    expected = {field.name for field in fields(config_type)}
+    if has_grid:
+        expected.update(field.name for field in fields(pycalmet.GridConfig))
+    assert expected <= signature.parameters.keys()
+    assert signature.parameters["inp"].default is None
+    for field in fields(config_type):
+        if field.name == "grid" or field.default is MISSING:
+            continue
+        if field.default_factory is not MISSING:
+            assert signature.parameters[field.name].default is None
+        else:
+            assert signature.parameters[field.name].default == field.default
+
+
+def test_parameter_only_calmet_accepts_datetime_and_flat_grid(monkeypatch, tmp_path):
+    captured = []
+    monkeypatch.setattr("pycalmet._calmet.run",
+                        lambda config: captured.append(config) or Path(config.output))
+    result = pycalmet.calmet(
+        inp=None,
+        meteorology=tmp_path / "calwrf.nc",
+        geophysical=tmp_path / "geo.nc",
+        output=tmp_path / "calmet.nc",
+        start=datetime(2018, 3, 18),
+        end=datetime(2018, 3, 18, 1),
+        nx=4,
+        ny=3,
+        dx_km=1.0,
+        dy_km=1.0,
+        lat0=30.0,
+        lon0=120.0,
+    )
+    config = captured[0]
+    assert result == tmp_path / "calmet.nc"
+    assert config.start == "2018-03-18_00:00:00"
+    assert config.end == "2018-03-18_01:00:00"
+    assert (config.grid.nx, config.grid.ny) == (4, 3)
+    assert config.noobs == 2
+    assert config.timestep_seconds == 3600
 
 
 def test_fortran_invalid_calmet_wind_pair_fails_explicitly():

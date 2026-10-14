@@ -10,8 +10,8 @@ import shlex
 from typing import Any, Callable
 
 from .config import (
-    CalmetConfig, CalwrfConfig, CtgprocConfig, CtgprocSource, MakegeoConfig,
-    TerrelConfig, TerrelSource,
+    CalmetConfig, CalwrfConfig, CtgprocConfig, CtgprocSource, GridConfig,
+    MakegeoConfig, TerrelConfig, TerrelSource,
 )
 
 
@@ -438,6 +438,7 @@ def normalize_public_parameters(cls: type[Any], parameters: Mapping[str, Any]) -
     """Return case-insensitive Python fields for descriptive or legacy names."""
     aliases = ALIASES.get(cls, {})
     canonical = {field.name.casefold(): field.name for field in fields(cls)}
+    grid_canonical = {field.name.casefold(): field.name for field in fields(GridConfig)}
     values: dict[str, Any] = {}
     grid: dict[str, Any] = {}
     special: dict[str, Any] = {}
@@ -476,7 +477,12 @@ def normalize_public_parameters(cls: type[Any], parameters: Mapping[str, Any]) -
             converted = converter(value)
             for target in targets: assign(target, converted, name)
         elif folded in canonical:
-            assign(canonical[folded], value, name)
+            target = canonical[folded]
+            if target in {"start", "end"} and isinstance(value, datetime):
+                value = value.strftime("%Y-%m-%d_%H:%M:%S")
+            assign(target, value, name)
+        elif folded in grid_canonical:
+            assign("grid." + grid_canonical[folded], value, name)
         else:
             unknown.append(name)
     if unknown:
