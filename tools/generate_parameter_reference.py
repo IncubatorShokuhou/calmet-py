@@ -100,6 +100,153 @@ MEANING_OVERRIDES = {
     "ray_angles_deg": ("Radial-grid ray angles in degrees.", "极坐标网格各射线的角度，单位度。"),
 }
 
+MEANING_OVERRIDES.update({
+    # Projection and grid definitions shared by TERREL, CTGPROC, MAKEGEO, and CALMET.
+    "nx": ("Number of grid cells in the east-west direction.", "东西方向的网格单元数。"),
+    "ny": ("Number of grid cells in the north-south direction.", "南北方向的网格单元数。"),
+    "dx_km": ("East-west grid-cell size in kilometres.", "东西方向网格分辨率，单位 km。"),
+    "dy_km": ("North-south grid-cell size in kilometres.", "南北方向网格分辨率，单位 km。"),
+    "projection": ("Map projection code: UTM, TTM, LCC, PS, EM, or LAZA.", "地图投影代码：UTM、TTM、LCC、PS、EM 或 LAZA。"),
+    "lat0": ("Latitude of the projection origin or tangent point, in decimal degrees.", "投影原点或切点纬度，单位为十进制度。"),
+    "lon0": ("Central-meridian or tangent-point longitude, in decimal degrees.", "中央经线或切点经度，单位为十进制度。"),
+    "lat1": ("First standard latitude for LCC, or true-scale latitude for PS.", "LCC 第一标准纬线，或 PS 真比例纬线。"),
+    "lat2": ("Second standard latitude for LCC; unused by PS.", "LCC 第二标准纬线；PS 不使用。"),
+    "x_origin_km": ("Easting of the south-west corner of grid cell (1, 1), in kilometres.", "网格单元 (1,1) 西南角的东向坐标，单位 km。"),
+    "y_origin_km": ("Northing of the south-west corner of grid cell (1, 1), in kilometres.", "网格单元 (1,1) 西南角的北向坐标，单位 km。"),
+    "false_easting_km": ("False easting at the projection origin; used by TTM, LCC, and LAZA.", "投影原点假东距；用于 TTM、LCC 和 LAZA。"),
+    "false_northing_km": ("False northing at the projection origin; used by TTM, LCC, and LAZA.", "投影原点假北距；用于 TTM、LCC 和 LAZA。"),
+    "utm_zone": ("UTM zone number from 1 through 60; used only for UTM.", "UTM 分区号 1–60；仅 UTM 投影使用。"),
+    "hemisphere": ("UTM hemisphere, N or S; used only for UTM.", "UTM 半球，N 或 S；仅 UTM 投影使用。"),
+    "datum": ("Datum-region code used to interpret and write coordinates.", "用于解释和写出坐标的大地基准区域代码。"),
+    "grid_type": ("Grid geometry code: rectangular, shifted rectangular, or polar.", "网格几何类型：矩形、偏移矩形或极坐标网格。"),
+    "polar_processing": ("Polar-grid processing method used by TERREL.", "TERREL 极坐标网格处理方法。"),
+    "ttm_scale": ("Scale factor on the central meridian for TTM projection.", "TTM 投影中央经线比例因子。"),
+    # TERREL and CTGPROC controls.
+    "cell_radius_km": ("Radius around each output cell used to collect terrain samples.", "每个输出格点收集地形样本时采用的搜索半径。"),
+    "processing_method": ("TERREL rectangular/polar processing algorithm selector.", "TERREL 矩形或极坐标处理算法选项。"),
+    "model": ("TERREL output model: CALMET (1), MESOPAC (2), ISC polar (3), ISC Cartesian (4), NUATMOS (5), or generic (6); this also selects cell-average versus peak elevations.", "TERREL 输出模型：CALMET (1)、MESOPAC (2)、ISC 极坐标 (3)、ISC 笛卡尔 (4)、NUATMOS (5) 或通用格式 (6)；同时决定输出格点平均高程还是峰值高程。"),
+    "receptor_radius_km": ("Sampling radius used to calculate discrete-receptor elevations.", "计算离散接收点高程时采用的采样半径。"),
+    "noise_replacement": ("Replacement-method code for noisy terrain values, by input database class.", "按输入数据库类别指定噪声地形值的替换方法代码。"),
+    "noise_minimum_m": ("Minimum valid terrain elevation used by the noise tests, by database class.", "各数据库类别用于噪声检查的最小有效高程。"),
+    "missing_replacement": ("Replacement-method code for missing terrain values, by database class.", "按数据库类别指定缺失地形值的替换方法代码。"),
+    "default_elevation_m": ("Fallback elevation used when terrain samples remain missing.", "地形样本仍缺失时采用的后备高程。"),
+    "qa_hit_threshold_percent": ("Minimum percentage of expected samples required for a QA pass.", "质量检查通过所需的最小有效采样比例。"),
+    "mesh_density": ("Number of sub-cell sampling intervals used for land-use databases.", "土地利用数据库在每个输出格内采用的子网格采样密度。"),
+    "input_type": ("Land-use database format or family code.", "土地利用数据库格式或数据族代码。"),
+    "input_datum": ("Datum of the input land-use coordinates.", "输入土地利用坐标采用的大地基准。"),
+    "output_format": ("Output encoding: choose from the filename (auto), traditional CTGPROC format (legacy), or NetCDF.", "输出编码：按文件名判断 (auto)、传统 CTGPROC 格式 (legacy)，或 NetCDF。"),
+    "coastline_swap": ("Swap land and water classifications across the supplied coastline.", "依据给定岸线交换陆地与水体分类。"),
+    "fill_empty_ocean": ("Fill unsampled ocean cells with ocean_category.", "使用 ocean_category 填充没有样本的海洋格点。"),
+    "ocean_category": ("Land-use category assigned to ocean cells.", "赋给海洋格点的土地利用类别。"),
+    "final_output": ("Write the final CTGPROC land-use data set.", "是否写出最终 CTGPROC 土地利用数据集。"),
+    # MAKEGEO controls.
+    "water_threshold": ("Minimum water fraction for treating a grid cell as water.", "将格点判定为水体所需的最小水体比例。"),
+    "missing_category": ("Land-use category assigned when usable coverage is insufficient.", "有效覆盖不足时赋给格点的土地利用类别。"),
+    "minimum_coverage": ("Minimum summed land-use fraction accepted for a grid cell.", "格点可接受的最小土地利用覆盖比例总和。"),
+    "use_terrain": ("Read and include terrain elevations in the geophysical output.", "是否读取地形高程并写入地理物理输出。"),
+    "water_categories": ("Input land-use categories treated as water.", "被视为水体的输入土地利用类别。"),
+    "output_categories": ("Ordered land-use categories retained in the geophysical output.", "地理物理输出中保留的有序土地利用类别。"),
+    "output_water_min": ("Lowest output category regarded as water by CALMET.", "CALMET 视为水体的最小输出类别。"),
+    "output_water_max": ("Highest output category regarded as water by CALMET.", "CALMET 视为水体的最大输出类别。"),
+    "qa_cell": ("One-based grid cell whose intermediate MAKEGEO calculations are reported.", "输出 MAKEGEO 中间计算信息的网格单元，索引从 1 开始。"),
+    "snow_processing": ("Enable seasonally varying snow-covered surface properties.", "是否启用随季节变化的积雪地表属性。"),
+    "snow_start_date": ("First YYYYMMDD date covered by snow processing.", "积雪处理覆盖的首个日期，格式 YYYYMMDD。"),
+    "snow_end_date": ("Last YYYYMMDD date covered by snow processing.", "积雪处理覆盖的末个日期，格式 YYYYMMDD。"),
+    "snow_roughness_method": ("Method used to modify aerodynamic roughness for snow.", "积雪条件下空气动力粗糙度的修正方法。"),
+    "snow_height_scale_m": ("Snow-depth scale controlling the roughness adjustment.", "控制粗糙度修正的积雪深度尺度。"),
+    "snow_albedo_method": ("Method used to calculate snow albedo as snow ages.", "根据雪龄计算积雪反照率的方法。"),
+    "snow_depth_minimum_m": ("Minimum snow depth required to apply snow properties.", "应用积雪地表属性所需的最小雪深。"),
+    "image_mode": ("QA Surfer-grid coordinate convention: cell-centre bounds (0) or cell-edge bounds (1).", "质量检查 Surfer 网格的坐标约定：格点中心边界 (0) 或格点外缘边界 (1)。"),
+    # General CALMET and meteorological-data controls.
+    "timestep_seconds": ("CALMET computational time step; it must divide evenly into one hour.", "CALMET 计算时间步长，必须能整除 1 小时。"),
+    "prognostic_timestep_seconds": ("Time interval between consecutive prognostic input records.", "相邻预报场输入记录之间的时间间隔。"),
+    "test_mode": ("1 stops after input setup checks; 2 continues into model computation.", "1 在输入设置检查后停止；2 继续执行模型计算。"),
+    "regulatory_mode": ("Enable checks that selected technical options follow regulatory guidance.", "是否检查所选技术选项符合监管模式要求。"),
+    "include_w_temperature": ("Write 3-D vertical wind and temperature fields required by CALGRID.", "是否写出 CALGRID 所需的三维垂直风速和温度场。"),
+    "cloud_method": ("Cloud method: observations (1), CLOUD.DAT (2), 850-hPa RH (3), or all-level RH (4).", "云场方法：观测 (1)、CLOUD.DAT (2)、850 hPa 相对湿度 (3) 或全层相对湿度 (4)。"),
+    "cloud_data_format": ("CLOUD.DAT format: unformatted binary (1) or formatted text (2).", "CLOUD.DAT 格式：非格式化二进制 (1) 或格式化文本 (2)。"),
+    "surface_data_format": ("SURF.DAT format: unformatted binary (1) or formatted text (2).", "SURF.DAT 格式：非格式化二进制 (1) 或格式化文本 (2)。"),
+    "precipitation_data_format": ("PRECIP.DAT format: unformatted binary (1) or formatted text (2).", "PRECIP.DAT 格式：非格式化二进制 (1) 或格式化文本 (2)。"),
+    "precipitation_station_count": ("Number of precipitation stations; -1 selects precipitation from prognostic data.", "降水站数量；-1 表示使用预报资料中的降水。"),
+    # Wind-field options from CALMET input groups 4 and 5.
+    "wind_extrapolation": ("Surface-wind extrapolation method; negative codes also ignore layer-1 upper-air data.", "地面风向高层外推方法；负值还会忽略高空站第一层资料。"),
+    "extrapolate_calm": ("Extrapolate a surface observation even when it reports calm wind.", "地面站报告静风时是否仍进行垂直外推。"),
+    "upper_air_separation_cells": ("Minimum surface-to-upper-air station separation that permits surface-wind extrapolation; -1 disables the restriction.", "允许地面风外推的地面站与高空站最小间距；-1 取消该限制。"),
+    "varying_radius": ("Expand the influence radius until a station is found when none lies within the configured maximum.", "最大影响半径内没有站点时，是否扩大半径直至找到最近站点。"),
+    "minimum_station_radius_km": ("Minimum influence radius used for wind interpolation.", "风场插值使用的最小影响半径。"),
+    "maximum_surface_radius_km": ("Maximum station influence radius over land in the surface layer.", "陆地下垫面近地层站点的最大影响半径。"),
+    "maximum_upper_radius_km": ("Maximum station influence radius over land aloft.", "陆地高层站点的最大影响半径。"),
+    "maximum_water_radius_km": ("Maximum station influence radius over water.", "水面站点的最大影响半径。"),
+    "surface_background_radius_km": ("Distance where surface observations and the first-guess field receive equal weight.", "近地层观测与初始猜测场权重相等时的距离尺度。"),
+    "upper_background_radius_km": ("Distance where upper-air observations and the first-guess field receive equal weight.", "高层观测与初始猜测场权重相等时的距离尺度。"),
+    "prognostic_radius_km": ("Weighting distance for prognostic winds when IPROG uses them as a step-1 field.", "IPROG 将预报风作为第一步风场时采用的权重距离。"),
+    "barrier_count": ("Number of line barriers that block wind interpolation.", "阻挡风场插值的线状障碍物数量。"),
+    "barrier_top_level": ("Highest model layer to which interpolation barriers apply.", "插值障碍物影响到的最高模型层。"),
+    "critical_froude": ("Critical Froude number separating terrain blocking from flow-over behavior.", "区分地形阻塞与越岭气流的临界弗劳德数。"),
+    "divergence_limit": ("Convergence target for wind-field divergence minimization.", "风场散度最小化过程的收敛目标。"),
+    "divergence_iterations": ("Maximum iterations allowed for divergence minimization.", "散度最小化允许的最大迭代次数。"),
+    "terrain_radius_km": ("Horizontal radius over which terrain affects the diagnostic wind adjustment.", "地形影响诊断风场调整的水平半径。"),
+    # Mixing height, temperature, humidity, precipitation, and overwater fluxes.
+    "coriolis": ("Absolute Coriolis parameter used by mixing-height equations, in s⁻¹.", "混合层高度方程使用的科里奥利参数绝对值，单位 s⁻¹。"),
+    "iavezi": ("Enable spatial averaging of calculated mixing heights.", "是否对计算得到的混合层高度进行空间平均。"),
+    "mixing_wind_level": ("Wind-field layer used to define the upwind averaging direction.", "确定上风向平均方向时使用的风场层。"),
+    "half_average_angle": ("Half-angle of the upwind search cone used for spatial averaging.", "空间平均所用上风向搜索锥的半角。"),
+    "imixh": ("Convective mixing-height method: ±1 Maul-Carson or ±2 Batchvarova-Gryning; negative uses OCD over water.", "对流混合层方法：±1 为 Maul–Carson，±2 为 Batchvarova–Gryning；负值在水面使用 OCD。"),
+    "land_flux_threshold": ("Minimum positive land buoyancy flux that sustains convective mixing-height growth.", "维持陆地对流混合层增长所需的最小正浮力通量。"),
+    "water_flux_threshold": ("Minimum positive water buoyancy flux that sustains convective mixing-height growth.", "维持水面对流混合层增长所需的最小正浮力通量。"),
+    "convective_relaxation": ("Relax convective mixing height toward equilibrium when buoyancy flux is below its threshold.", "浮力通量低于阈值时，是否让对流混合层高度向平衡值松弛。"),
+    "convective_relaxation_time_s": ("Relaxation time scale used when convective_relaxation is enabled.", "启用对流混合层松弛时使用的时间尺度。"),
+    "water_temperature_mode": ("Overwater lapse-rate source: SEA.DAT (0), prognostic lapse rate (1), or prognostic lapse rate and ΔT (2).", "水面递减率来源：SEA.DAT (0)、预报递减率 (1)，或预报递减率和 ΔT (2)。"),
+    "prognostic_ocean_category": ("Land-use category representing ocean in the prognostic meteorological input.", "预报气象输入中代表海洋的土地利用类别。"),
+    "overwater_flux_method": ("Overwater flux method: legacy OCD (0) or a selected COARE wave option (10, ±11, ±12).", "水面通量方法：传统 OCD (0) 或相应 COARE 波浪方案 (10、±11、±12)。"),
+    "coastal_shelf_length_km": ("Coastal/shallow-water length scale used by COARE roughness calculations.", "COARE 粗糙度计算使用的沿岸或浅水长度尺度。"),
+    "irhprog": ("Relative-humidity source: SURF.DAT observations (0) or prognostic fields (1).", "相对湿度来源：SURF.DAT 观测 (0) 或预报场 (1)。"),
+    "itprog": ("Temperature source: observations (0), surface observations plus prognostic aloft (1), or prognostic at all levels (2).", "温度来源：观测 (0)、地面观测加高层预报 (1)，或所有高度均使用预报场 (2)。"),
+    "temperature_interpolation_power": ("Temperature interpolation weighting: inverse distance (1) or inverse-distance squared (2).", "温度插值权重：距离反比 (1) 或距离平方反比 (2)。"),
+    "temperature_radius_km": ("Radius of influence for temperature interpolation.", "温度插值的影响半径。"),
+    "temperature_station_limit": ("Maximum number of stations included in temperature interpolation.", "温度插值最多使用的站点数。"),
+    "iavet": ("Enable spatial averaging of interpolated temperatures using the mixing-height averaging geometry.", "是否使用混合层平均的搜索几何对插值温度进行空间平均。"),
+    "water_temperature_gradient_below": ("Default water-cell temperature gradient below mixing height, in K m⁻¹.", "水体格点混合层以下的默认温度梯度，单位 K/m。"),
+    "water_temperature_gradient_above": ("Default water-cell temperature gradient above mixing height, in K m⁻¹.", "水体格点混合层以上的默认温度梯度，单位 K/m。"),
+    "water_temperature_category_min": ("First land-use category treated as water during temperature interpolation.", "温度插值中视为水体的起始土地利用类别。"),
+    "water_temperature_category_max": ("Last land-use category treated as water during temperature interpolation.", "温度插值中视为水体的结束土地利用类别。"),
+    "precipitation_interpolation": ("Precipitation weighting: 1/R (1), 1/R² (2), or exponential/R² (3).", "降水插值权重：1/R (1)、1/R² (2) 或指数/R² (3)。"),
+    "precipitation_radius_km": ("Precipitation-station radius of influence.", "降水站的影响半径。"),
+    "precipitation_cutoff": ("Rates below this threshold are set to zero, in mm h⁻¹.", "低于该阈值的降水率置零，单位 mm/h。"),
+    # Diagnostic inputs and output/debug selection.
+    "diagnostic_surface_temperature": ("Surface temperature source: compute internally (0) or read DIAG.DAT (1).", "地表温度来源：内部计算 (0) 或读取 DIAG.DAT (1)。"),
+    "diagnostic_initial_wind": ("Initial-guess wind source: compute internally (0) or read DIAG.DAT (1).", "初始猜测风来源：内部计算 (0) 或读取 DIAG.DAT (1)。"),
+    "diagnostic_surface_wind": ("Surface wind source: SURF.DAT speed/direction (0) or DIAG.DAT U/V (1).", "地面风来源：SURF.DAT 风速风向 (0) 或 DIAG.DAT U/V (1)。"),
+    "diagnostic_upper_wind": ("Upper-air wind source: UP.DAT speed/direction (0) or DIAG.DAT U/V (1).", "高空风来源：UP.DAT 风速风向 (0) 或 DIAG.DAT U/V (1)。"),
+    "surface_temperature_option": ("Surface station used for temperature: station number, -1 for spatially varying, or -2 for domain-average prognostic temperature.", "地表温度代表站：站号；-1 为空间变化场；-2 为预报温度区域平均。"),
+    "upper_temperature_option": ("Upper-air station used for lapse rate: station number, -1 for spatially varying, or -2 for domain-average prognostic lapse rate.", "递减率代表高空站：站号；-1 为空间变化场；-2 为预报递减率区域平均。"),
+    "lapse_height_m": ("Layer depth used to calculate the domain-scale temperature lapse rate.", "计算区域尺度温度递减率所用的层厚。"),
+    "initial_guess_upper_station": ("Upper-air station for initial wind guess; -1 retains a spatially varying 3-D guess.", "初始风猜测场使用的高空站；-1 保留空间变化的三维猜测场。"),
+    "initial_guess_height_range_m": ("Bottom and top heights used to form a domain-average initial wind.", "生成区域平均初始风时使用的底部和顶部高度。"),
+    "print_fields": ("Enable line-printer-style meteorological field output.", "是否启用传统文本形式的气象场输出。"),
+    "print_interval_hours": ("Interval between printed meteorological fields, in hours.", "气象场文本输出的时间间隔，单位小时。"),
+    "print_uv_levels": ("Per-layer switches selecting U/V wind output when print_fields is enabled.", "启用 print_fields 时选择输出 U/V 风场层的逐层开关。"),
+    "print_w_levels": ("Per-layer switches selecting vertical-wind output; also requires include_w_temperature.", "选择垂直风速输出层的逐层开关；还需启用 include_w_temperature。"),
+    "print_temperature_levels": ("Per-layer switches selecting 3-D temperature output; also requires include_w_temperature.", "选择三维温度输出层的逐层开关；还需启用 include_w_temperature。"),
+    "micrometeorology_debug": ("Print micrometeorological inputs and internal variables; produces large output.", "是否打印微气象输入和内部变量；会产生大量输出。"),
+    "debug_first_step": ("First time step included in micrometeorology debug output.", "微气象调试输出包含的首个时步。"),
+    "debug_last_step": ("Last time step included in micrometeorology debug output.", "微气象调试输出包含的末个时步。"),
+    "wind_debug_levels": ("Number of wind-field levels written to diagnostic files, starting at the surface.", "从地面开始写入风场诊断文件的层数。"),
+    "noobs": ("Observation mode: 0 uses surface/overwater/upper-air observations; 1 replaces upper-air observations with prognostic data; 2 uses prognostic data at all levels.", "观测模式：0 使用地面、水面和高空观测；1 用预报资料替代高空观测；2 所有高度均使用预报资料。"),
+    "iwfcod": ("Wind model: objective analysis only (0) or the full diagnostic wind module (1).", "风场模型：仅客观分析 (0)，或完整诊断风场模块 (1)。"),
+    "iprog": ("How prognostic winds enter the wind model: disabled (0), step-1 field (1/3/13), initial guess (2/4/14), or pseudo-observations (5/15); codes distinguish CSUMM, MM4, and MM5/3D inputs.", "预报风进入风场模型的方式：禁用 (0)、作为第一步风场 (1/3/13)、作为初始猜测场 (2/4/14)，或作为伪观测 (5/15)；不同代码对应 CSUMM、MM4 和 MM5/3D 输入。"),
+    "mnmdav": ("Maximum search radius, in grid cells, for mixing-height and temperature spatial averaging.", "混合层高度和温度空间平均的最大搜索半径，单位为网格单元。"),
+    "wind_bias": ("Per-layer station-weight bias from -1 to 1: negative reduces upper-air weight, positive reduces surface-station weight, and zero leaves 1/R² weights unchanged.", "逐层站点权重偏差，范围 -1 到 1：负值降低高空站权重，正值降低地面站权重，0 保持 1/R² 权重不变。"),
+    "mixing_lapse_depth_m": ("Depth above the current convective mixing height over which the stable-layer lapse rate is calculated.", "在当前对流混合层顶以上计算稳定层温度递减率时采用的层厚。"),
+    "turbidity_coefficient_1": ("HA1 coefficient, in W m⁻², in the Holtslag–van Ulden energy-budget solar/turbidity parameterization.", "Holtslag–van Ulden 能量收支太阳辐射/浑浊度参数化中的 HA1 系数，单位 W/m²。"),
+    "turbidity_coefficient_2": ("HA2 coefficient, in W m⁻², in the Holtslag–van Ulden energy-budget solar/turbidity parameterization.", "Holtslag–van Ulden 能量收支太阳辐射/浑浊度参数化中的 HA2 系数，单位 W/m²。"),
+    "cloudiness_coefficient_1": ("Dimensionless HB1 cloud-cover coefficient in the Holtslag–van Ulden energy budget.", "Holtslag–van Ulden 能量收支中的无量纲云量系数 HB1。"),
+    "cloudiness_coefficient_2": ("Dimensionless HB2 cloud-cover coefficient in the Holtslag–van Ulden energy budget.", "Holtslag–van Ulden 能量收支中的无量纲云量系数 HB2。"),
+    "net_radiation_coefficient_1": ("HC1 net-radiation coefficient in the Holtslag–van Ulden energy budget, in W m⁻² K⁻⁶.", "Holtslag–van Ulden 能量收支中的净辐射系数 HC1，单位 W/(m²·K⁶)。"),
+    "net_radiation_coefficient_2": ("HC2 net-radiation coefficient in the Holtslag–van Ulden energy budget, in W m⁻².", "Holtslag–van Ulden 能量收支中的净辐射系数 HC2，单位 W/m²。"),
+    "net_radiation_coefficient_3": ("Dimensionless HC3 net-radiation coefficient in the Holtslag–van Ulden energy budget.", "Holtslag–van Ulden 能量收支中的无量纲净辐射系数 HC3。"),
+})
+
 ZH_WORDS = {
     "minimum": "最小", "maximum": "最大", "surface": "地面", "upper": "高空",
     "water": "水体", "temperature": "温度", "wind": "风场", "cloud": "云量",
@@ -286,7 +433,10 @@ caller omits that parameter; “Zhejiang value” is the effective value after
 parsing the bundled control file. `inp` itself and `**legacy_parameters` are
 entry/compatibility mechanisms rather than model controls, so they are not
 repeated in each table. Paths are relative to the repository root. Long
-sequences are abbreviated with their total item count. Regenerate the tables
+sequences are abbreviated with their total item count. Meanings and option
+effects are checked against the detailed comments in the bundled CALMET-family
+control templates, the reference Fortran sources, and the Python code that
+consumes each value. Regenerate the tables
 with `python tools/generate_parameter_reference.py`; use `--check` in CI."""
     else:
         intro = """## 完整参数参考
@@ -294,7 +444,9 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI."""
 以下表格由公开函数签名和类型化配置模型生成。“默认值”表示 `inp=None` 模式下调用方
 省略参数时采用的值；“浙江示例值”表示解析仓库内置控制文件后得到的实际值。`inp`
 本身和 `**legacy_parameters` 是入口及兼容机制，不属于模型控制项，因此不在每张表中
-重复列出。路径均相对于仓库根目录，较长序列会缩写并标出元素总数。API 变化后运行
+重复列出。路径均相对于仓库根目录，较长序列会缩写并标出元素总数。参数含义和选项
+效果依据仓库内 CALMET 系列控制文件的详细注释、参考 Fortran 源码，以及实际读取
+这些参数的 Python 代码交叉核对。API 变化后运行
 `python tools/generate_parameter_reference.py` 重新生成；CI 可使用 `--check` 检查。"""
     tables = [_table(*stage, language) for stage in STAGES]
     return START + "\n" + intro + "\n\n" + "\n\n".join(tables) + "\n" + END

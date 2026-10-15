@@ -98,7 +98,9 @@ result = pycalmet.calmet(
 以下表格由公开函数签名和类型化配置模型生成。“默认值”表示 `inp=None` 模式下调用方
 省略参数时采用的值；“浙江示例值”表示解析仓库内置控制文件后得到的实际值。`inp`
 本身和 `**legacy_parameters` 是入口及兼容机制，不属于模型控制项，因此不在每张表中
-重复列出。路径均相对于仓库根目录，较长序列会缩写并标出元素总数。API 变化后运行
+重复列出。路径均相对于仓库根目录，较长序列会缩写并标出元素总数。参数含义和选项
+效果依据仓库内 CALMET 系列控制文件的详细注释、参考 Fortran 源码，以及实际读取
+这些参数的 Python 代码交叉核对。API 变化后运行
 `python tools/generate_parameter_reference.py` 重新生成；CI 可使用 `--check` 检查。
 
 <details>
@@ -130,53 +132,53 @@ result = pycalmet.calmet(
 | --- | --- | --- | --- | --- |
 | `srtm_dir` | 原始 SRTM 高程瓦片所在目录。 | `str \| Path \| None` | `必填` | `examples/zhejiang/config` |
 | `output` | 主输出文件路径。 | `str \| Path \| None` | `必填` | `output/zhejiang/terrain.nc` |
-| `datum` | 大地基准。 | `str` | `'WGS-84'` | `'WGS-84'` |
+| `datum` | 用于解释和写出坐标的大地基准区域代码。 | `str` | `'WGS-84'` | `'WGS-84'` |
 | `sampling` | 地形采样方法：直接采样或双线性/传统采样。 | `str` | `'bilinear'` | `'legacy'` |
 | `terrain_files` | 地形文件路径。 | `Sequence[str \| Path]` | `()` | `[terrain/srtm3/N26E117.hgt, terrain/srtm3/N26E118.hgt, … (42 items)]` |
 | `terrain_sources` | 带有格式和源基准信息的地形文件列表。 | `Sequence[TerrelSource]` | `()` | `(TerrelSource(path=terrain/srtm3/N26E117.hgt, input_type='SRTM3', input_datum='WGS-96'), TerrelSource(path=terrain/…datum='WGS-96'), … (42 items))` |
 | `void_fill` | 是否填补高程输入中的空洞格点。 | `bool` | `False` | `False` |
-| `cell_radius_km` | 格点半径（单位：km）。 | `float` | `0.0` | `5.0` |
-| `model` | 模型。 | `int` | `1` | `1` |
-| `processing_method` | 处理方法。 | `int \| None` | `None` | `2` |
+| `cell_radius_km` | 每个输出格点收集地形样本时采用的搜索半径。 | `float` | `0.0` | `5.0` |
+| `model` | TERREL 输出模型：CALMET (1)、MESOPAC (2)、ISC 极坐标 (3)、ISC 笛卡尔 (4)、NUATMOS (5) 或通用格式 (6)；同时决定输出格点平均高程还是峰值高程。 | `int` | `1` | `1` |
+| `processing_method` | TERREL 矩形或极坐标处理算法选项。 | `int \| None` | `None` | `2` |
 | `receptor_input` | 接收点输入路径。 | `str \| Path \| None` | `None` | `None` |
 | `receptor_output` | 接收点输出路径。 | `str \| Path \| None` | `None` | `None` |
 | `receptor_columns` | 离散接收点输入文件的列数。 | `int` | `2` | `2` |
 | `interpolate_receptors` | 是否计算离散接收点处的地形高度。 | `bool` | `False` | `True` |
-| `receptor_radius_km` | 接收点半径（单位：km）。 | `float` | `0.0` | `0.15` |
+| `receptor_radius_km` | 计算离散接收点高程时采用的采样半径。 | `float` | `0.0` | `0.15` |
 | `previous_save` | 先前保存路径。 | `str \| Path \| None` | `None` | `None` |
 | `save_output` | 保存输出路径。 | `str \| Path \| None` | `None` | `output/zhejiang/terrel.sav` |
 | `coastline_file` | 岸线文件路径。 | `str \| Path \| None` | `None` | `None` |
 | `gshhs_file` | GSHHS文件路径。 | `str \| Path \| None` | `None` | `None` |
 | `coastline_source_datum` | 岸线来源大地基准。 | `str` | `'WGS-84'` | `'WGS-84'` |
 | `coastline_wdbii_datum` | 岸线WDBII大地基准。 | `str` | `'WGS-72'` | `'WGS-72'` |
-| `noise_replacement` | 噪声替换值。 | `Sequence[int]` | `(0, 0, 0, 0, 0)` | `(0, 0, 0, 0, 0)` |
-| `noise_minimum_m` | 噪声最小（单位：m）。 | `Sequence[float]` | `(0.0, 1.0, 1.0, 1.0, 1.0)` | `(0.0, 1.0, 1.0, 1.0, 1.0)` |
-| `missing_replacement` | 缺失值替换值。 | `Sequence[int]` | `(3, 0, 0, 0, 0)` | `(3, 0, 0, 0, 0)` |
-| `default_elevation_m` | 默认高程（单位：m）。 | `Sequence[float]` | `(0.0, 0.0, 0.0, 0.0, 0.0)` | `(0.0, 0.0, 0.0, 0.0, 0.0)` |
+| `noise_replacement` | 按输入数据库类别指定噪声地形值的替换方法代码。 | `Sequence[int]` | `(0, 0, 0, 0, 0)` | `(0, 0, 0, 0, 0)` |
+| `noise_minimum_m` | 各数据库类别用于噪声检查的最小有效高程。 | `Sequence[float]` | `(0.0, 1.0, 1.0, 1.0, 1.0)` | `(0.0, 1.0, 1.0, 1.0, 1.0)` |
+| `missing_replacement` | 按数据库类别指定缺失地形值的替换方法代码。 | `Sequence[int]` | `(3, 0, 0, 0, 0)` | `(3, 0, 0, 0, 0)` |
+| `default_elevation_m` | 地形样本仍缺失时采用的后备高程。 | `Sequence[float]` | `(0.0, 0.0, 0.0, 0.0, 0.0)` | `(0.0, 0.0, 0.0, 0.0, 0.0)` |
 | `plot_output` | PLOT输出路径。 | `str \| Path \| None` | `None` | `output/zhejiang/terrain.grd` |
 | `raw_echo_output` | 原始回显输出路径。 | `str \| Path \| None` | `None` | `None` |
-| `qa_hit_threshold_percent` | QAHIT阈值（单位：%）。 | `int` | `75` | `75` |
+| `qa_hit_threshold_percent` | 质量检查通过所需的最小有效采样比例。 | `int` | `75` | `75` |
 | `grid` | 完整网格对象，可替代下方展开的网格参数。 | `GridConfig \| Mapping[str, Any] \| None` | `None` | `见下方展开的网格参数` |
-| `nx` | NX。 | `int \| None` | `必填` | `610` |
-| `ny` | NY。 | `int \| None` | `必填` | `499` |
-| `dx_km` | DX（单位：km）。 | `float \| None` | `必填` | `1.0` |
-| `dy_km` | DY（单位：km）。 | `float \| None` | `必填` | `1.0` |
-| `projection` | 投影。 | `str` | `'LCC'` | `'LCC'` |
-| `lat0` | LAT0。 | `float` | `27.0` | `27.0` |
-| `lon0` | LON0。 | `float` | `117.5` | `117.5` |
-| `lat1` | LAT1。 | `float` | `30.0` | `30.0` |
-| `lat2` | LAT2。 | `float` | `60.0` | `60.0` |
-| `x_origin_km` | X原点（单位：km）。 | `float` | `0.0` | `0.0` |
-| `y_origin_km` | Y原点（单位：km）。 | `float` | `0.0` | `0.0` |
-| `false_easting_km` | 假东距（单位：km）。 | `float` | `0.0` | `0.0` |
-| `false_northing_km` | 假北距（单位：km）。 | `float` | `0.0` | `0.0` |
-| `utm_zone` | UTM分区。 | `int` | `50` | `50` |
-| `hemisphere` | 半球。 | `str` | `'N'` | `'N'` |
-| `grid_type` | 网格类型。 | `int` | `1` | `1` |
+| `nx` | 东西方向的网格单元数。 | `int \| None` | `必填` | `610` |
+| `ny` | 南北方向的网格单元数。 | `int \| None` | `必填` | `499` |
+| `dx_km` | 东西方向网格分辨率，单位 km。 | `float \| None` | `必填` | `1.0` |
+| `dy_km` | 南北方向网格分辨率，单位 km。 | `float \| None` | `必填` | `1.0` |
+| `projection` | 地图投影代码：UTM、TTM、LCC、PS、EM 或 LAZA。 | `str` | `'LCC'` | `'LCC'` |
+| `lat0` | 投影原点或切点纬度，单位为十进制度。 | `float` | `27.0` | `27.0` |
+| `lon0` | 中央经线或切点经度，单位为十进制度。 | `float` | `117.5` | `117.5` |
+| `lat1` | LCC 第一标准纬线，或 PS 真比例纬线。 | `float` | `30.0` | `30.0` |
+| `lat2` | LCC 第二标准纬线；PS 不使用。 | `float` | `60.0` | `60.0` |
+| `x_origin_km` | 网格单元 (1,1) 西南角的东向坐标，单位 km。 | `float` | `0.0` | `0.0` |
+| `y_origin_km` | 网格单元 (1,1) 西南角的北向坐标，单位 km。 | `float` | `0.0` | `0.0` |
+| `false_easting_km` | 投影原点假东距；用于 TTM、LCC 和 LAZA。 | `float` | `0.0` | `0.0` |
+| `false_northing_km` | 投影原点假北距；用于 TTM、LCC 和 LAZA。 | `float` | `0.0` | `0.0` |
+| `utm_zone` | UTM 分区号 1–60；仅 UTM 投影使用。 | `int` | `50` | `50` |
+| `hemisphere` | UTM 半球，N 或 S；仅 UTM 投影使用。 | `str` | `'N'` | `'N'` |
+| `grid_type` | 网格几何类型：矩形、偏移矩形或极坐标网格。 | `int` | `1` | `1` |
 | `ring_distances_km` | 极坐标网格各环的半径，单位 km。 | `Sequence[float]` | `()` | `()` |
 | `ray_angles_deg` | 极坐标网格各射线的角度，单位度。 | `Sequence[float]` | `()` | `()` |
-| `polar_processing` | 极坐标处理。 | `int` | `1` | `2` |
-| `ttm_scale` | TTM比例。 | `float` | `1.0` | `1.0` |
+| `polar_processing` | TERREL 极坐标网格处理方法。 | `int` | `1` | `2` |
+| `ttm_scale` | TTM 投影中央经线比例因子。 | `float` | `1.0` | `1.0` |
 
 </details>
 
@@ -188,46 +190,46 @@ result = pycalmet.calmet(
 | `landuse_files` | 土地利用文件路径。 | `Sequence[str \| Path] \| None` | `必填` | `[examples/zhejiang/landuse/zhejiang_generic.landuse]` |
 | `output` | 主输出文件路径。 | `str \| Path \| None` | `必填` | `output/zhejiang/landuse.nc` |
 | `category_map` | 输入土地利用类别到输出类别的映射。 | `dict[int, int] \| None` | `{}` | `{}` |
-| `input_type` | 输入类型。 | `str` | `'GLAZAS'` | `'GEN'` |
-| `mesh_density` | MESH密度。 | `int` | `12` | `12` |
-| `input_datum` | 输入大地基准。 | `str` | `'ESR-S'` | `'WGS-84'` |
-| `output_format` | 输出格式。 | `str` | `'auto'` | `'auto'` |
+| `input_type` | 土地利用数据库格式或数据族代码。 | `str` | `'GLAZAS'` | `'GEN'` |
+| `mesh_density` | 土地利用数据库在每个输出格内采用的子网格采样密度。 | `int` | `12` | `12` |
+| `input_datum` | 输入土地利用坐标采用的大地基准。 | `str` | `'ESR-S'` | `'WGS-84'` |
+| `output_format` | 输出编码：按文件名判断 (auto)、传统 CTGPROC 格式 (legacy)，或 NetCDF。 | `str` | `'auto'` | `'auto'` |
 | `coastline_file` | 岸线文件路径。 | `str \| Path \| None` | `None` | `None` |
 | `gshhs_file` | GSHHS文件路径。 | `str \| Path \| None` | `None` | `None` |
 | `coastline_source_datum` | 岸线来源大地基准。 | `str` | `'WGS-84'` | `'WGS-84'` |
 | `coastline_wdbii_datum` | 岸线WDBII大地基准。 | `str` | `'WGS-72'` | `'WGS-72'` |
-| `coastline_swap` | 是否启用岸线交换。 | `bool` | `False` | `False` |
-| `fill_empty_ocean` | 是否启用填补空海洋。 | `bool` | `False` | `False` |
-| `ocean_category` | 海洋类别。 | `int` | `55` | `55` |
+| `coastline_swap` | 依据给定岸线交换陆地与水体分类。 | `bool` | `False` | `False` |
+| `fill_empty_ocean` | 使用 ocean_category 填充没有样本的海洋格点。 | `bool` | `False` | `False` |
+| `ocean_category` | 赋给海洋格点的土地利用类别。 | `int` | `55` | `55` |
 | `previous_landuse` | 先前土地利用路径。 | `str \| Path \| None` | `None` | `None` |
-| `final_output` | 是否启用最终输出。 | `bool` | `True` | `True` |
+| `final_output` | 是否写出最终 CTGPROC 土地利用数据集。 | `bool` | `True` | `True` |
 | `landuse_sources` | 带有格式、基准和网格采样密度的土地利用文件列表。 | `Sequence[CtgprocSource]` | `()` | `(CtgprocSource(path=examples/zhejiang/landuse/zhejiang_generic.landuse, input_type='GEN', input_datum='WGS-84', mesh_density=12))` |
-| `snow_processing` | 是否启用积雪处理。 | `bool` | `False` | `False` |
+| `snow_processing` | 是否启用随季节变化的积雪地表属性。 | `bool` | `False` | `False` |
 | `qa_cell_output` | 是否启用QA格点输出。 | `bool` | `False` | `False` |
-| `qa_hit_threshold_percent` | QAHIT阈值（单位：%）。 | `int` | `75` | `75` |
+| `qa_hit_threshold_percent` | 质量检查通过所需的最小有效采样比例。 | `int` | `75` | `75` |
 | `qa_output_directory` | QA输出目录路径。 | `str \| Path \| None` | `None` | `None` |
 | `grid` | 完整网格对象，可替代下方展开的网格参数。 | `GridConfig \| Mapping[str, Any] \| None` | `None` | `见下方展开的网格参数` |
-| `nx` | NX。 | `int \| None` | `必填` | `610` |
-| `ny` | NY。 | `int \| None` | `必填` | `499` |
-| `dx_km` | DX（单位：km）。 | `float \| None` | `必填` | `1.0` |
-| `dy_km` | DY（单位：km）。 | `float \| None` | `必填` | `1.0` |
-| `projection` | 投影。 | `str` | `'LCC'` | `'LCC'` |
-| `lat0` | LAT0。 | `float` | `27.0` | `27.0` |
-| `lon0` | LON0。 | `float` | `117.5` | `117.5` |
-| `lat1` | LAT1。 | `float` | `30.0` | `30.0` |
-| `lat2` | LAT2。 | `float` | `60.0` | `60.0` |
-| `x_origin_km` | X原点（单位：km）。 | `float` | `0.0` | `0.0` |
-| `y_origin_km` | Y原点（单位：km）。 | `float` | `0.0` | `0.0` |
-| `false_easting_km` | 假东距（单位：km）。 | `float` | `0.0` | `0.0` |
-| `false_northing_km` | 假北距（单位：km）。 | `float` | `0.0` | `0.0` |
-| `utm_zone` | UTM分区。 | `int` | `50` | `50` |
-| `hemisphere` | 半球。 | `str` | `'N'` | `'N'` |
-| `datum` | 大地基准。 | `str` | `'WGS-84'` | `'WGS-84'` |
-| `grid_type` | 网格类型。 | `int` | `1` | `1` |
+| `nx` | 东西方向的网格单元数。 | `int \| None` | `必填` | `610` |
+| `ny` | 南北方向的网格单元数。 | `int \| None` | `必填` | `499` |
+| `dx_km` | 东西方向网格分辨率，单位 km。 | `float \| None` | `必填` | `1.0` |
+| `dy_km` | 南北方向网格分辨率，单位 km。 | `float \| None` | `必填` | `1.0` |
+| `projection` | 地图投影代码：UTM、TTM、LCC、PS、EM 或 LAZA。 | `str` | `'LCC'` | `'LCC'` |
+| `lat0` | 投影原点或切点纬度，单位为十进制度。 | `float` | `27.0` | `27.0` |
+| `lon0` | 中央经线或切点经度，单位为十进制度。 | `float` | `117.5` | `117.5` |
+| `lat1` | LCC 第一标准纬线，或 PS 真比例纬线。 | `float` | `30.0` | `30.0` |
+| `lat2` | LCC 第二标准纬线；PS 不使用。 | `float` | `60.0` | `60.0` |
+| `x_origin_km` | 网格单元 (1,1) 西南角的东向坐标，单位 km。 | `float` | `0.0` | `0.0` |
+| `y_origin_km` | 网格单元 (1,1) 西南角的北向坐标，单位 km。 | `float` | `0.0` | `0.0` |
+| `false_easting_km` | 投影原点假东距；用于 TTM、LCC 和 LAZA。 | `float` | `0.0` | `0.0` |
+| `false_northing_km` | 投影原点假北距；用于 TTM、LCC 和 LAZA。 | `float` | `0.0` | `0.0` |
+| `utm_zone` | UTM 分区号 1–60；仅 UTM 投影使用。 | `int` | `50` | `50` |
+| `hemisphere` | UTM 半球，N 或 S；仅 UTM 投影使用。 | `str` | `'N'` | `'N'` |
+| `datum` | 用于解释和写出坐标的大地基准区域代码。 | `str` | `'WGS-84'` | `'WGS-84'` |
+| `grid_type` | 网格几何类型：矩形、偏移矩形或极坐标网格。 | `int` | `1` | `1` |
 | `ring_distances_km` | 极坐标网格各环的半径，单位 km。 | `Sequence[float]` | `()` | `()` |
 | `ray_angles_deg` | 极坐标网格各射线的角度，单位度。 | `Sequence[float]` | `()` | `()` |
-| `polar_processing` | 极坐标处理。 | `int` | `1` | `1` |
-| `ttm_scale` | TTM比例。 | `float` | `1.0` | `1.0` |
+| `polar_processing` | TERREL 极坐标网格处理方法。 | `int` | `1` | `1` |
+| `ttm_scale` | TTM 投影中央经线比例因子。 | `float` | `1.0` | `1.0` |
 
 </details>
 
@@ -239,55 +241,55 @@ result = pycalmet.calmet(
 | `terrain` | 地形路径。 | `str \| Path \| None` | `必填` | `output/zhejiang/terrain.nc` |
 | `landuse` | 土地利用路径。 | `str \| Path \| None` | `必填` | `output/zhejiang/landuse.nc` |
 | `output` | 主输出文件路径。 | `str \| Path \| None` | `必填` | `output/zhejiang/geo.nc` |
-| `water_threshold` | 水体阈值。 | `float` | `0.5` | `0.5` |
-| `missing_category` | 缺失值类别。 | `int` | `55` | `55` |
-| `minimum_coverage` | 最小覆盖率。 | `float` | `0.96` | `0.96` |
+| `water_threshold` | 将格点判定为水体所需的最小水体比例。 | `float` | `0.5` | `0.5` |
+| `missing_category` | 有效覆盖不足时赋给格点的土地利用类别。 | `int` | `55` | `55` |
+| `minimum_coverage` | 格点可接受的最小土地利用覆盖比例总和。 | `float` | `0.96` | `0.96` |
 | `secondary_landuse` | 第二套土地利用路径。 | `str \| Path \| None` | `None` | `None` |
-| `use_terrain` | 是否启用使用地形。 | `bool` | `True` | `True` |
+| `use_terrain` | 是否读取地形高程并写入地理物理输出。 | `bool` | `True` | `True` |
 | `input_properties` | 每个输入土地利用类别对应的地表属性元组。 | `dict[int, tuple[float, float, float, float, float, float, int]] \| None` | `{}` | `{11: (0.5, 0.18, 1.0, 0.2, 0.0, 1.0, 10), 12: (1.0, 0.18, 1.5, 0.25, 0.0, 0.2, 10), … (38 items)}` |
-| `water_categories` | 水体类别。 | `Sequence[int]` | `(51, 52, 53, 54, 55)` | `[51, 52, 53, 54, 55]` |
-| `output_categories` | 输出类别。 | `Sequence[int]` | `(10, 20, … (14 items))` | `[10, 20, … (14 items)]` |
-| `output_water_min` | 输出水体MIN。 | `int` | `50` | `50` |
-| `output_water_max` | 输出水体MAX。 | `int` | `55` | `55` |
+| `water_categories` | 被视为水体的输入土地利用类别。 | `Sequence[int]` | `(51, 52, 53, 54, 55)` | `[51, 52, 53, 54, 55]` |
+| `output_categories` | 地理物理输出中保留的有序土地利用类别。 | `Sequence[int]` | `(10, 20, … (14 items))` | `[10, 20, … (14 items)]` |
+| `output_water_min` | CALMET 视为水体的最小输出类别。 | `int` | `50` | `50` |
+| `output_water_max` | CALMET 视为水体的最大输出类别。 | `int` | `55` | `55` |
 | `category_splits` | 输入类别、输出类别及拆分比例记录。 | `Sequence[tuple[int, int, float]]` | `()` | `()` |
-| `qa_cell` | QA格点。 | `tuple[int, int] \| None` | `None` | `(20, 15)` |
-| `snow_processing` | 是否启用积雪处理。 | `bool` | `False` | `False` |
+| `qa_cell` | 输出 MAKEGEO 中间计算信息的网格单元，索引从 1 开始。 | `tuple[int, int] \| None` | `None` | `(20, 15)` |
+| `snow_processing` | 是否启用随季节变化的积雪地表属性。 | `bool` | `False` | `False` |
 | `snow_data` | 积雪数据路径。 | `str \| Path \| None` | `None` | `None` |
-| `snow_start_date` | 积雪开始日期。 | `int \| None` | `None` | `None` |
-| `snow_end_date` | 积雪END日期。 | `int \| None` | `None` | `None` |
+| `snow_start_date` | 积雪处理覆盖的首个日期，格式 YYYYMMDD。 | `int \| None` | `None` | `None` |
+| `snow_end_date` | 积雪处理覆盖的末个日期，格式 YYYYMMDD。 | `int \| None` | `None` | `None` |
 | `snow_properties` | 每个类别在积雪条件下对应的地表属性元组。 | `dict[int, tuple[float, float, float, float, float, float, int]] \| None` | `{}` | `{}` |
 | `snow_age_parameters` | 各类别的雪龄分级和衰减因子。 | `dict[int, tuple[int, float]] \| None` | `{}` | `{}` |
-| `snow_roughness_method` | 积雪粗糙度方法。 | `int` | `1` | `1` |
-| `snow_height_scale_m` | 积雪高度比例（单位：m）。 | `float` | `1.0` | `10.0` |
-| `snow_albedo_method` | 积雪反照率方法。 | `int` | `1` | `1` |
-| `snow_depth_minimum_m` | 积雪深度最小（单位：m）。 | `float` | `0.0` | `0.01` |
+| `snow_roughness_method` | 积雪条件下空气动力粗糙度的修正方法。 | `int` | `1` | `1` |
+| `snow_height_scale_m` | 控制粗糙度修正的积雪深度尺度。 | `float` | `1.0` | `10.0` |
+| `snow_albedo_method` | 根据雪龄计算积雪反照率的方法。 | `int` | `1` | `1` |
+| `snow_depth_minimum_m` | 应用积雪地表属性所需的最小雪深。 | `float` | `0.0` | `0.01` |
 | `landuse_plot_output` | 土地利用PLOT输出路径。 | `str \| Path \| None` | `None` | `examples/zhejiang/config/qaluse.grd` |
 | `terrain_plot_output` | 地形PLOT输出路径。 | `str \| Path \| None` | `None` | `examples/zhejiang/config/qaterr.grd` |
 | `color_map_output` | 颜色映射输出路径。 | `str \| Path \| None` | `None` | `output/zhejiang/luse.clr` |
-| `image_mode` | 图像模式。 | `int` | `0` | `0` |
+| `image_mode` | 质量检查 Surfer 网格的坐标约定：格点中心边界 (0) 或格点外缘边界 (1)。 | `int` | `0` | `0` |
 | `title` | 标题。 | `str` | `'PyCALMET Application'` | `'Demo Application'` |
 | `grid` | 完整网格对象，可替代下方展开的网格参数。 | `GridConfig \| Mapping[str, Any] \| None` | `None` | `见下方展开的网格参数` |
-| `nx` | NX。 | `int \| None` | `必填` | `610` |
-| `ny` | NY。 | `int \| None` | `必填` | `499` |
-| `dx_km` | DX（单位：km）。 | `float \| None` | `必填` | `1.0` |
-| `dy_km` | DY（单位：km）。 | `float \| None` | `必填` | `1.0` |
-| `projection` | 投影。 | `str` | `'LCC'` | `'LCC'` |
-| `lat0` | LAT0。 | `float` | `27.0` | `27.0` |
-| `lon0` | LON0。 | `float` | `117.5` | `117.5` |
-| `lat1` | LAT1。 | `float` | `30.0` | `30.0` |
-| `lat2` | LAT2。 | `float` | `60.0` | `60.0` |
-| `x_origin_km` | X原点（单位：km）。 | `float` | `0.0` | `0.0` |
-| `y_origin_km` | Y原点（单位：km）。 | `float` | `0.0` | `0.0` |
-| `false_easting_km` | 假东距（单位：km）。 | `float` | `0.0` | `0.0` |
-| `false_northing_km` | 假北距（单位：km）。 | `float` | `0.0` | `0.0` |
-| `utm_zone` | UTM分区。 | `int` | `50` | `50` |
-| `hemisphere` | 半球。 | `str` | `'N'` | `'N'` |
-| `datum` | 大地基准。 | `str` | `'WGS-84'` | `'WGS-84'` |
-| `grid_type` | 网格类型。 | `int` | `1` | `1` |
+| `nx` | 东西方向的网格单元数。 | `int \| None` | `必填` | `610` |
+| `ny` | 南北方向的网格单元数。 | `int \| None` | `必填` | `499` |
+| `dx_km` | 东西方向网格分辨率，单位 km。 | `float \| None` | `必填` | `1.0` |
+| `dy_km` | 南北方向网格分辨率，单位 km。 | `float \| None` | `必填` | `1.0` |
+| `projection` | 地图投影代码：UTM、TTM、LCC、PS、EM 或 LAZA。 | `str` | `'LCC'` | `'LCC'` |
+| `lat0` | 投影原点或切点纬度，单位为十进制度。 | `float` | `27.0` | `27.0` |
+| `lon0` | 中央经线或切点经度，单位为十进制度。 | `float` | `117.5` | `117.5` |
+| `lat1` | LCC 第一标准纬线，或 PS 真比例纬线。 | `float` | `30.0` | `30.0` |
+| `lat2` | LCC 第二标准纬线；PS 不使用。 | `float` | `60.0` | `60.0` |
+| `x_origin_km` | 网格单元 (1,1) 西南角的东向坐标，单位 km。 | `float` | `0.0` | `0.0` |
+| `y_origin_km` | 网格单元 (1,1) 西南角的北向坐标，单位 km。 | `float` | `0.0` | `0.0` |
+| `false_easting_km` | 投影原点假东距；用于 TTM、LCC 和 LAZA。 | `float` | `0.0` | `0.0` |
+| `false_northing_km` | 投影原点假北距；用于 TTM、LCC 和 LAZA。 | `float` | `0.0` | `0.0` |
+| `utm_zone` | UTM 分区号 1–60；仅 UTM 投影使用。 | `int` | `50` | `50` |
+| `hemisphere` | UTM 半球，N 或 S；仅 UTM 投影使用。 | `str` | `'N'` | `'N'` |
+| `datum` | 用于解释和写出坐标的大地基准区域代码。 | `str` | `'WGS-84'` | `'WGS-84'` |
+| `grid_type` | 网格几何类型：矩形、偏移矩形或极坐标网格。 | `int` | `1` | `1` |
 | `ring_distances_km` | 极坐标网格各环的半径，单位 km。 | `Sequence[float]` | `()` | `()` |
 | `ray_angles_deg` | 极坐标网格各射线的角度，单位度。 | `Sequence[float]` | `()` | `()` |
-| `polar_processing` | 极坐标处理。 | `int` | `1` | `1` |
-| `ttm_scale` | TTM比例。 | `float` | `1.0` | `1.0` |
+| `polar_processing` | TERREL 极坐标网格处理方法。 | `int` | `1` | `1` |
+| `ttm_scale` | TTM 投影中央经线比例因子。 | `float` | `1.0` | `1.0` |
 
 </details>
 
@@ -301,138 +303,138 @@ result = pycalmet.calmet(
 | `output` | 主输出文件路径。 | `str \| Path \| None` | `必填` | `output/zhejiang/calmet.nc` |
 | `start` | 计算开始时刻。 | `str \| datetime \| None` | `必填` | `'2018-03-18_00:00:00'` |
 | `end` | 计算结束时刻。 | `str \| datetime \| None` | `必填` | `'2018-03-18_01:00:00'` |
-| `noobs` | 观测资料模式：仅预报场，或结合观测进行诊断。 | `int` | `2` | `2` |
+| `noobs` | 观测模式：0 使用地面、水面和高空观测；1 用预报资料替代高空观测；2 所有高度均使用预报资料。 | `int` | `2` | `2` |
 | `run_type` | CALMET 运行类型：仅风场，或风场加微气象场。 | `int` | `1` | `1` |
 | `save_output` | 是否启用保存输出。 | `bool` | `True` | `True` |
 | `legacy_output_format` | 传统 CALMET 输出格式选项。 | `int` | `1` | `1` |
-| `test_mode` | 测试模式。 | `int` | `2` | `2` |
-| `regulatory_mode` | 法规模式。 | `int` | `0` | `0` |
-| `timestep_seconds` | 时间步长（单位：s）。 | `int` | `3600` | `3600` |
-| `prognostic_timestep_seconds` | 预报时间步长（单位：s）。 | `int` | `3600` | `3600` |
-| `cloud_method` | 云量方法。 | `int` | `4` | `4` |
+| `test_mode` | 1 在输入设置检查后停止；2 继续执行模型计算。 | `int` | `2` | `2` |
+| `regulatory_mode` | 是否检查所选技术选项符合监管模式要求。 | `int` | `0` | `0` |
+| `timestep_seconds` | CALMET 计算时间步长，必须能整除 1 小时。 | `int` | `3600` | `3600` |
+| `prognostic_timestep_seconds` | 相邻预报场输入记录之间的时间间隔。 | `int` | `3600` | `3600` |
+| `cloud_method` | 云场方法：观测 (1)、CLOUD.DAT (2)、850 hPa 相对湿度 (3) 或全层相对湿度 (4)。 | `int` | `4` | `4` |
 | `cloud_data` | 云量数据路径。 | `str \| Path \| None` | `None` | `examples/zhejiang/config/cloud.dat` |
-| `cloud_data_format` | 云量数据格式。 | `int` | `2` | `2` |
+| `cloud_data_format` | CLOUD.DAT 格式：非格式化二进制 (1) 或格式化文本 (2)。 | `int` | `2` | `2` |
 | `cloud_output` | 云场输出选项。 | `int` | `0` | `0` |
 | `surface_data` | 地面数据路径。 | `str \| Path \| None` | `None` | `examples/zhejiang/config/surf.dat` |
-| `surface_data_format` | 地面数据格式。 | `int` | `2` | `2` |
+| `surface_data_format` | SURF.DAT 格式：非格式化二进制 (1) 或格式化文本 (2)。 | `int` | `2` | `2` |
 | `surface_control_stations` | 地面站名称、编号、坐标、时区和风速仪高度记录。 | `Sequence[tuple[str, int, float, float, float, float]]` | `()` | `()` |
 | `upper_air_files` | 高空探空文件路径。 | `Sequence[str \| Path]` | `()` | `()` |
 | `upper_control_stations` | 高空站名称、编号、坐标和时区记录。 | `Sequence[tuple[str, int, float, float, float]]` | `()` | `()` |
 | `sea_files` | 海面文件路径。 | `Sequence[str \| Path]` | `()` | `()` |
 | `diagnostic_data` | 诊断数据路径。 | `str \| Path \| None` | `None` | `examples/zhejiang/config/diag.dat` |
-| `diagnostic_surface_temperature` | 诊断地面温度。 | `int` | `0` | `0` |
+| `diagnostic_surface_temperature` | 地表温度来源：内部计算 (0) 或读取 DIAG.DAT (1)。 | `int` | `0` | `0` |
 | `diagnostic_lapse_rate` | 诊断场是否使用观测温度递减率。 | `int` | `0` | `0` |
-| `diagnostic_initial_wind` | 诊断初始风场。 | `int` | `0` | `0` |
-| `diagnostic_surface_wind` | 诊断地面风场。 | `int` | `0` | `0` |
-| `diagnostic_upper_wind` | 诊断高空风场。 | `int` | `0` | `0` |
-| `initial_guess_upper_station` | 初始猜测场高空站点。 | `int` | `-1` | `-1` |
-| `initial_guess_height_range_m` | 初始猜测场高度范围（单位：m）。 | `Sequence[float]` | `(1.0, 1000.0)` | `(1.0, 1000.0)` |
+| `diagnostic_initial_wind` | 初始猜测风来源：内部计算 (0) 或读取 DIAG.DAT (1)。 | `int` | `0` | `0` |
+| `diagnostic_surface_wind` | 地面风来源：SURF.DAT 风速风向 (0) 或 DIAG.DAT U/V (1)。 | `int` | `0` | `0` |
+| `diagnostic_upper_wind` | 高空风来源：UP.DAT 风速风向 (0) 或 DIAG.DAT U/V (1)。 | `int` | `0` | `0` |
+| `initial_guess_upper_station` | 初始风猜测场使用的高空站；-1 保留空间变化的三维猜测场。 | `int` | `-1` | `-1` |
+| `initial_guess_height_range_m` | 生成区域平均初始风时使用的底部和顶部高度。 | `Sequence[float]` | `(1.0, 1000.0)` | `(1.0, 1000.0)` |
 | `use_initial_guess_calmet` | 是否使用已有 CALMET 风场作为初始猜测场。 | `int` | `0` | `0` |
 | `initial_guess_calmet_files` | 初始猜测场CALMET文件路径。 | `Sequence[str \| Path]` | `()` | `()` |
 | `weight_data` | 权重数据路径。 | `str \| Path \| None` | `None` | `examples/zhejiang/config/wt.dat` |
-| `precipitation_station_count` | 降水站点数量。 | `int` | `-1` | `-1` |
+| `precipitation_station_count` | 降水站数量；-1 表示使用预报资料中的降水。 | `int` | `-1` | `-1` |
 | `precipitation_data` | 降水数据路径。 | `str \| Path \| None` | `None` | `examples/zhejiang/config/precip.dat` |
-| `precipitation_data_format` | 降水数据格式。 | `int` | `2` | `2` |
+| `precipitation_data_format` | PRECIP.DAT 格式：非格式化二进制 (1) 或格式化文本 (2)。 | `int` | `2` | `2` |
 | `precipitation_control_stations` | 降水站名称、编号和坐标记录。 | `Sequence[tuple[str, int, float, float]]` | `()` | `()` |
-| `iprog` | 预报风场输入及插值方案控制。 | `int` | `14` | `14` |
-| `irhprog` | 预报资料相对湿度来源选项。 | `int` | `1` | `1` |
-| `itprog` | 预报资料温度来源选项。 | `int` | `2` | `2` |
-| `imixh` | 混合层高度计算方法选项。 | `int` | `1` | `1` |
+| `iprog` | 预报风进入风场模型的方式：禁用 (0)、作为第一步风场 (1/3/13)、作为初始猜测场 (2/4/14)，或作为伪观测 (5/15)；不同代码对应 CSUMM、MM4 和 MM5/3D 输入。 | `int` | `14` | `14` |
+| `irhprog` | 相对湿度来源：SURF.DAT 观测 (0) 或预报场 (1)。 | `int` | `1` | `1` |
+| `itprog` | 温度来源：观测 (0)、地面观测加高层预报 (1)，或所有高度均使用预报场 (2)。 | `int` | `2` | `2` |
+| `imixh` | 对流混合层方法：±1 为 Maul–Carson，±2 为 Batchvarova–Gryning；负值在水面使用 OCD。 | `int` | `1` | `1` |
 | `constb` | 中性机械混合层高度系数 B。 | `float` | `1.41` | `1.41` |
 | `conste` | 对流混合层夹卷系数。 | `float` | `0.15` | `0.15` |
 | `constn` | 稳定机械混合层高度系数 N。 | `float` | `2400.0` | `2400.0` |
 | `constw` | 对流速度尺度系数 W。 | `float` | `0.16` | `0.16` |
-| `coriolis` | 科里奥利参数。 | `float` | `0.0001` | `0.0001` |
+| `coriolis` | 混合层高度方程使用的科里奥利参数绝对值，单位 s⁻¹。 | `float` | `0.0001` | `0.0001` |
 | `minimum_lapse_rate` | 最小位温递减率。 | `float` | `0.001` | `0.001` |
-| `mixing_lapse_depth_m` | 混合层递减率深度（单位：m）。 | `float` | `200.0` | `200.0` |
+| `mixing_lapse_depth_m` | 在当前对流混合层顶以上计算稳定层温度递减率时采用的层厚。 | `float` | `200.0` | `200.0` |
 | `minimum_mixing_height_m` | 最小混合层高度（单位：m）。 | `float` | `50.0` | `50.0` |
 | `maximum_mixing_height_m` | 最大混合层高度（单位：m）。 | `float` | `3000.0` | `2500.0` |
 | `minimum_water_mixing_height_m` | 最小水体混合层高度（单位：m）。 | `float` | `50.0` | `50.0` |
 | `maximum_water_mixing_height_m` | 最大水体混合层高度（单位：m）。 | `float` | `3000.0` | `2500.0` |
-| `land_flux_threshold` | 陆地通量阈值。 | `float` | `0.0` | `0.0` |
-| `water_flux_threshold` | 水体通量阈值。 | `float` | `0.05` | `0.05` |
-| `water_temperature_mode` | 水体温度模式。 | `int` | `0` | `0` |
-| `prognostic_ocean_category` | 预报海洋类别。 | `int` | `16` | `16` |
-| `overwater_flux_method` | 水面通量方法。 | `int` | `10` | `10` |
-| `coastal_shelf_length_km` | 沿海陆架长度（单位：km）。 | `float` | `0.0` | `0.0` |
+| `land_flux_threshold` | 维持陆地对流混合层增长所需的最小正浮力通量。 | `float` | `0.0` | `0.0` |
+| `water_flux_threshold` | 维持水面对流混合层增长所需的最小正浮力通量。 | `float` | `0.05` | `0.05` |
+| `water_temperature_mode` | 水面递减率来源：SEA.DAT (0)、预报递减率 (1)，或预报递减率和 ΔT (2)。 | `int` | `0` | `0` |
+| `prognostic_ocean_category` | 预报气象输入中代表海洋的土地利用类别。 | `int` | `16` | `16` |
+| `overwater_flux_method` | 水面通量方法：传统 OCD (0) 或相应 COARE 波浪方案 (10、±11、±12)。 | `int` | `10` | `10` |
+| `coastal_shelf_length_km` | COARE 粗糙度计算使用的沿岸或浅水长度尺度。 | `float` | `0.0` | `0.0` |
 | `warm_layer` | COARE 暖层修正选项。 | `int` | `0` | `0` |
 | `cool_skin` | COARE 冷皮层修正选项。 | `int` | `0` | `0` |
-| `convective_relaxation` | 对流松弛。 | `int` | `1` | `1` |
-| `convective_relaxation_time_s` | 对流松弛时间（单位：s）。 | `float` | `800.0` | `800.0` |
-| `precipitation_interpolation` | 降水插值。 | `int` | `2` | `2` |
-| `precipitation_radius_km` | 降水半径（单位：km）。 | `float` | `100.0` | `50.0` |
-| `precipitation_cutoff` | 降水截断阈值。 | `float` | `0.01` | `0.01` |
-| `turbidity_coefficient_1` | 浑浊度系数1。 | `float` | `990.0` | `990.0` |
-| `turbidity_coefficient_2` | 浑浊度系数2。 | `float` | `-30.0` | `-30.0` |
-| `cloudiness_coefficient_1` | 云量系数1。 | `float` | `-0.75` | `-0.75` |
-| `cloudiness_coefficient_2` | 云量系数2。 | `float` | `3.4` | `3.4` |
-| `net_radiation_coefficient_1` | 净辐射系数1。 | `float` | `5.31e-13` | `5.31e-13` |
-| `net_radiation_coefficient_2` | 净辐射系数2。 | `float` | `60.0` | `60.0` |
-| `net_radiation_coefficient_3` | 净辐射系数3。 | `float` | `0.12` | `0.12` |
-| `surface_temperature_option` | 地面温度选项。 | `int` | `-1` | `-1` |
-| `upper_temperature_option` | 高空温度选项。 | `int` | `-1` | `-1` |
-| `lapse_height_m` | 递减率高度（单位：m）。 | `float` | `200.0` | `200.0` |
-| `temperature_interpolation_power` | 温度插值幂指数。 | `int` | `1` | `1` |
-| `temperature_radius_km` | 温度半径（单位：km）。 | `float` | `500.0` | `20.0` |
-| `temperature_station_limit` | 温度站点上限。 | `int` | `5` | `5` |
-| `water_temperature_gradient_below` | 水体温度梯度下方。 | `float` | `-0.0098` | `-0.0098` |
-| `water_temperature_gradient_above` | 水体温度梯度上方。 | `float` | `-0.0045` | `-0.0045` |
-| `water_temperature_category_min` | 水体温度类别MIN。 | `int` | `55` | `55` |
-| `water_temperature_category_max` | 水体温度类别MAX。 | `int` | `55` | `55` |
-| `iavet` | 温度场垂直平均选项。 | `int` | `1` | `1` |
-| `iavezi` | 混合层高度所用风场平均选项。 | `int` | `1` | `1` |
-| `mixing_wind_level` | 混合层风场层。 | `int` | `1` | `1` |
-| `mnmdav` | 执行平均所需的最少有效值数量。 | `int` | `1` | `10` |
-| `iwfcod` | 风场模型计算方案代码。 | `int` | `1` | `1` |
-| `wind_extrapolation` | 风场外推。 | `int` | `-1` | `-1` |
-| `upper_air_separation_cells` | 高空探空间距格点。 | `float` | `4.0` | `-1.0` |
-| `extrapolate_calm` | 外推静风。 | `int` | `0` | `0` |
-| `wind_bias` | 逐层风向或风分量加性偏差控制值。 | `Sequence[float]` | `(0.0, 0.0, … (10 items))` | `(0.0, 0.0, … (10 items))` |
-| `varying_radius` | 是否启用可变半径。 | `bool` | `True` | `True` |
-| `minimum_station_radius_km` | 最小站点半径（单位：km）。 | `float` | `0.1` | `0.1` |
-| `maximum_surface_radius_km` | 最大地面半径（单位：km）。 | `float` | `30.0` | `30.0` |
-| `maximum_upper_radius_km` | 最大高空半径（单位：km）。 | `float` | `30.0` | `30.0` |
-| `maximum_water_radius_km` | 最大水体半径（单位：km）。 | `float` | `50.0` | `50.0` |
-| `surface_background_radius_km` | 地面背景场半径（单位：km）。 | `float` | `1.0` | `1.0` |
-| `upper_background_radius_km` | 高空背景场半径（单位：km）。 | `float` | `1.0` | `1.0` |
-| `prognostic_radius_km` | 预报半径（单位：km）。 | `float` | `0.0` | `0.0` |
+| `convective_relaxation` | 浮力通量低于阈值时，是否让对流混合层高度向平衡值松弛。 | `int` | `1` | `1` |
+| `convective_relaxation_time_s` | 启用对流混合层松弛时使用的时间尺度。 | `float` | `800.0` | `800.0` |
+| `precipitation_interpolation` | 降水插值权重：1/R (1)、1/R² (2) 或指数/R² (3)。 | `int` | `2` | `2` |
+| `precipitation_radius_km` | 降水站的影响半径。 | `float` | `100.0` | `50.0` |
+| `precipitation_cutoff` | 低于该阈值的降水率置零，单位 mm/h。 | `float` | `0.01` | `0.01` |
+| `turbidity_coefficient_1` | Holtslag–van Ulden 能量收支太阳辐射/浑浊度参数化中的 HA1 系数，单位 W/m²。 | `float` | `990.0` | `990.0` |
+| `turbidity_coefficient_2` | Holtslag–van Ulden 能量收支太阳辐射/浑浊度参数化中的 HA2 系数，单位 W/m²。 | `float` | `-30.0` | `-30.0` |
+| `cloudiness_coefficient_1` | Holtslag–van Ulden 能量收支中的无量纲云量系数 HB1。 | `float` | `-0.75` | `-0.75` |
+| `cloudiness_coefficient_2` | Holtslag–van Ulden 能量收支中的无量纲云量系数 HB2。 | `float` | `3.4` | `3.4` |
+| `net_radiation_coefficient_1` | Holtslag–van Ulden 能量收支中的净辐射系数 HC1，单位 W/(m²·K⁶)。 | `float` | `5.31e-13` | `5.31e-13` |
+| `net_radiation_coefficient_2` | Holtslag–van Ulden 能量收支中的净辐射系数 HC2，单位 W/m²。 | `float` | `60.0` | `60.0` |
+| `net_radiation_coefficient_3` | Holtslag–van Ulden 能量收支中的无量纲净辐射系数 HC3。 | `float` | `0.12` | `0.12` |
+| `surface_temperature_option` | 地表温度代表站：站号；-1 为空间变化场；-2 为预报温度区域平均。 | `int` | `-1` | `-1` |
+| `upper_temperature_option` | 递减率代表高空站：站号；-1 为空间变化场；-2 为预报递减率区域平均。 | `int` | `-1` | `-1` |
+| `lapse_height_m` | 计算区域尺度温度递减率所用的层厚。 | `float` | `200.0` | `200.0` |
+| `temperature_interpolation_power` | 温度插值权重：距离反比 (1) 或距离平方反比 (2)。 | `int` | `1` | `1` |
+| `temperature_radius_km` | 温度插值的影响半径。 | `float` | `500.0` | `20.0` |
+| `temperature_station_limit` | 温度插值最多使用的站点数。 | `int` | `5` | `5` |
+| `water_temperature_gradient_below` | 水体格点混合层以下的默认温度梯度，单位 K/m。 | `float` | `-0.0098` | `-0.0098` |
+| `water_temperature_gradient_above` | 水体格点混合层以上的默认温度梯度，单位 K/m。 | `float` | `-0.0045` | `-0.0045` |
+| `water_temperature_category_min` | 温度插值中视为水体的起始土地利用类别。 | `int` | `55` | `55` |
+| `water_temperature_category_max` | 温度插值中视为水体的结束土地利用类别。 | `int` | `55` | `55` |
+| `iavet` | 是否使用混合层平均的搜索几何对插值温度进行空间平均。 | `int` | `1` | `1` |
+| `iavezi` | 是否对计算得到的混合层高度进行空间平均。 | `int` | `1` | `1` |
+| `mixing_wind_level` | 确定上风向平均方向时使用的风场层。 | `int` | `1` | `1` |
+| `mnmdav` | 混合层高度和温度空间平均的最大搜索半径，单位为网格单元。 | `int` | `1` | `10` |
+| `iwfcod` | 风场模型：仅客观分析 (0)，或完整诊断风场模块 (1)。 | `int` | `1` | `1` |
+| `wind_extrapolation` | 地面风向高层外推方法；负值还会忽略高空站第一层资料。 | `int` | `-1` | `-1` |
+| `upper_air_separation_cells` | 允许地面风外推的地面站与高空站最小间距；-1 取消该限制。 | `float` | `4.0` | `-1.0` |
+| `extrapolate_calm` | 地面站报告静风时是否仍进行垂直外推。 | `int` | `0` | `0` |
+| `wind_bias` | 逐层站点权重偏差，范围 -1 到 1：负值降低高空站权重，正值降低地面站权重，0 保持 1/R² 权重不变。 | `Sequence[float]` | `(0.0, 0.0, … (10 items))` | `(0.0, 0.0, … (10 items))` |
+| `varying_radius` | 最大影响半径内没有站点时，是否扩大半径直至找到最近站点。 | `bool` | `True` | `True` |
+| `minimum_station_radius_km` | 风场插值使用的最小影响半径。 | `float` | `0.1` | `0.1` |
+| `maximum_surface_radius_km` | 陆地下垫面近地层站点的最大影响半径。 | `float` | `30.0` | `30.0` |
+| `maximum_upper_radius_km` | 陆地高层站点的最大影响半径。 | `float` | `30.0` | `30.0` |
+| `maximum_water_radius_km` | 水面站点的最大影响半径。 | `float` | `50.0` | `50.0` |
+| `surface_background_radius_km` | 近地层观测与初始猜测场权重相等时的距离尺度。 | `float` | `1.0` | `1.0` |
+| `upper_background_radius_km` | 高层观测与初始猜测场权重相等时的距离尺度。 | `float` | `1.0` | `1.0` |
+| `prognostic_radius_km` | IPROG 将预报风作为第一步风场时采用的权重距离。 | `float` | `0.0` | `0.0` |
 | `stations_per_level` | 每个垂直层最多使用的观测站数量。 | `Sequence[int]` | `(5, 5, … (10 items))` | `(5, 5, … (10 items))` |
 | `wind_extrapolation_factors` | 风场垂直外推使用的逐层系数。 | `Sequence[float]` | `(0.0, 0.0, … (10 items))` | `(0.0, 0.0, … (10 items))` |
-| `barrier_count` | 障碍物数量。 | `int` | `0` | `0` |
-| `barrier_top_level` | 障碍物顶部层。 | `int` | `0` | `10` |
+| `barrier_count` | 阻挡风场插值的线状障碍物数量。 | `int` | `0` | `0` |
+| `barrier_top_level` | 插值障碍物影响到的最高模型层。 | `int` | `0` | `10` |
 | `barriers` | 用于气流阻塞计算的障碍物起止坐标。 | `Sequence[tuple[float, float, float, float]]` | `()` | `()` |
 | `lake_breeze_regions` | 湖陆风区域框、岸线线段及其关联站点。 | `Sequence[tuple[float, float, float, float, float, float, float, float, Sequence[int]]]` | `()` | `()` |
 | `ifradj` | 基于弗劳德数的地形绕流调整开关。 | `int` | `1` | `1` |
 | `ikine` | 运动学地形效应调整开关。 | `int` | `0` | `0` |
 | `iobr` | 地形阻塞效应调整开关。 | `int` | `0` | `0` |
 | `islope` | 坡面流调整开关。 | `int` | `1` | `1` |
-| `critical_froude` | 临界弗劳德数。 | `float` | `1.0` | `1.0` |
+| `critical_froude` | 区分地形阻塞与越岭气流的临界弗劳德数。 | `float` | `1.0` | `1.0` |
 | `smoothing_passes` | 每个垂直层的风场平滑次数。 | `Sequence[int]` | `(2, 4, … (10 items))` | `[2, 4, … (10 items)]` |
-| `divergence_limit` | 散度上限。 | `float` | `5e-06` | `5e-06` |
-| `divergence_iterations` | 散度迭代次数。 | `int` | `50` | `50` |
+| `divergence_limit` | 风场散度最小化过程的收敛目标。 | `float` | `5e-06` | `5e-06` |
+| `divergence_iterations` | 散度最小化允许的最大迭代次数。 | `int` | `50` | `50` |
 | `kinematic_alpha` | 运动学风场调整的松弛系数 Alpha。 | `float` | `0.1` | `0.1` |
 | `z_faces_m` | 垂直层界面高度，数量比模型层数多 1。 | `Sequence[float]` | `(0.0, 20.0, … (11 items))` | `[0.0, 20.0, … (11 items)]` |
 | `base_timezone` | 基准时区。 | `int` | `0` | `0` |
 | `base_timezone_label` | 基准时区标签。 | `str \| None` | `None` | `'UTC-0000'` |
-| `terrain_radius_km` | 地形半径（单位：km）。 | `float` | `15.0` | `15.0` |
-| `half_average_angle` | 半平均角度。 | `float` | `30.0` | `30.0` |
-| `include_w_temperature` | 是否启用包含W温度。 | `bool` | `False` | `False` |
+| `terrain_radius_km` | 地形影响诊断风场调整的水平半径。 | `float` | `15.0` | `15.0` |
+| `half_average_angle` | 空间平均所用上风向搜索锥的半角。 | `float` | `30.0` | `30.0` |
+| `include_w_temperature` | 是否写出 CALGRID 所需的三维垂直风速和温度场。 | `bool` | `False` | `False` |
 | `compression` | 压缩级别。 | `int` | `1` | `1` |
 | `control_lines` | 写入传统输出元数据的原始 CALMET 控制文件文本。 | `Sequence[str]` | `<0 control lines>` | `<1106 control lines>` |
 | `mesopac_output` | MESOPAC输出路径。 | `str \| Path \| None` | `None` | `None` |
 | `distance_to_coast_output` | 距离到海岸输出路径。 | `str \| Path \| None` | `None` | `None` |
 | `listing_output` | 列表文件输出路径。 | `str \| Path \| None` | `None` | `output/zhejiang/calmet.lst` |
-| `print_fields` | 是否启用打印字段。 | `bool` | `False` | `False` |
-| `print_interval_hours` | 打印间隔（单位：小时）。 | `int` | `1` | `1` |
-| `print_uv_levels` | 打印UV层。 | `Sequence[int]` | `()` | `(0, 0, … (10 items))` |
-| `print_w_levels` | 打印W层。 | `Sequence[int]` | `()` | `(0, 0, … (10 items))` |
-| `print_temperature_levels` | 打印温度层。 | `Sequence[int]` | `()` | `(0, 0, … (10 items))` |
+| `print_fields` | 是否启用传统文本形式的气象场输出。 | `bool` | `False` | `False` |
+| `print_interval_hours` | 气象场文本输出的时间间隔，单位小时。 | `int` | `1` | `1` |
+| `print_uv_levels` | 启用 print_fields 时选择输出 U/V 风场层的逐层开关。 | `Sequence[int]` | `()` | `(0, 0, … (10 items))` |
+| `print_w_levels` | 选择垂直风速输出层的逐层开关；还需启用 include_w_temperature。 | `Sequence[int]` | `()` | `(0, 0, … (10 items))` |
+| `print_temperature_levels` | 选择三维温度输出层的逐层开关；还需启用 include_w_temperature。 | `Sequence[int]` | `()` | `(0, 0, … (10 items))` |
 | `print_surface_fields` | 选择写入文本输出的地面场开关数组。 | `Sequence[int]` | `(0, 0, 0, 0, 0, 0, 0, 0)` | `(0, 0, 0, 0, 0, 0, 0, 0)` |
-| `micrometeorology_debug` | 是否启用微气象调试。 | `bool` | `False` | `False` |
-| `debug_first_step` | 调试首个时步。 | `int` | `1` | `1` |
-| `debug_last_step` | 调试末个时步。 | `int` | `1` | `1` |
+| `micrometeorology_debug` | 是否打印微气象输入和内部变量；会产生大量输出。 | `bool` | `False` | `False` |
+| `debug_first_step` | 微气象调试输出包含的首个时步。 | `int` | `1` | `1` |
+| `debug_last_step` | 微气象调试输出包含的末个时步。 | `int` | `1` | `1` |
 | `wind_debug_output` | 风场诊断输出选项。 | `int` | `0` | `0` |
-| `wind_debug_levels` | 风场调试层。 | `int` | `1` | `0` |
+| `wind_debug_levels` | 从地面开始写入风场诊断文件的层数。 | `int` | `1` | `0` |
 | `wind_debug_fields` | 选择风场模型诊断量的开关数组。 | `Sequence[int]` | `(0, 0, … (9 items))` | `(0, 0, … (9 items))` |
 | `final_wind_debug_output` | 最终风场调试输出路径。 | `str \| Path \| None` | `None` | `examples/zhejiang/config/test.out` |
 | `kinematic_wind_debug_output` | 运动学风场调试输出路径。 | `str \| Path \| None` | `None` | `examples/zhejiang/config/test.kin` |
@@ -440,27 +442,27 @@ result = pycalmet.calmet(
 | `slope_wind_debug_output` | 坡面流风场调试输出路径。 | `str \| Path \| None` | `None` | `examples/zhejiang/config/test.slp` |
 | `wind_print_output` | 风场打印输出路径。 | `str \| Path \| None` | `None` | `examples/zhejiang/config/test.prt` |
 | `grid` | 完整网格对象，可替代下方展开的网格参数。 | `GridConfig \| Mapping[str, Any] \| None` | `None` | `见下方展开的网格参数` |
-| `nx` | NX。 | `int \| None` | `必填` | `610` |
-| `ny` | NY。 | `int \| None` | `必填` | `499` |
-| `dx_km` | DX（单位：km）。 | `float \| None` | `必填` | `1.0` |
-| `dy_km` | DY（单位：km）。 | `float \| None` | `必填` | `1.0` |
-| `projection` | 投影。 | `str` | `'LCC'` | `'LCC'` |
-| `lat0` | LAT0。 | `float` | `27.0` | `27.0` |
-| `lon0` | LON0。 | `float` | `117.5` | `117.5` |
-| `lat1` | LAT1。 | `float` | `30.0` | `30.0` |
-| `lat2` | LAT2。 | `float` | `60.0` | `60.0` |
-| `x_origin_km` | X原点（单位：km）。 | `float` | `0.0` | `0.0` |
-| `y_origin_km` | Y原点（单位：km）。 | `float` | `0.0` | `0.0` |
-| `false_easting_km` | 假东距（单位：km）。 | `float` | `0.0` | `0.0` |
-| `false_northing_km` | 假北距（单位：km）。 | `float` | `0.0` | `0.0` |
-| `utm_zone` | UTM分区。 | `int` | `50` | `50` |
-| `hemisphere` | 半球。 | `str` | `'N'` | `'N'` |
-| `datum` | 大地基准。 | `str` | `'WGS-84'` | `'WGS-84'` |
-| `grid_type` | 网格类型。 | `int` | `1` | `1` |
+| `nx` | 东西方向的网格单元数。 | `int \| None` | `必填` | `610` |
+| `ny` | 南北方向的网格单元数。 | `int \| None` | `必填` | `499` |
+| `dx_km` | 东西方向网格分辨率，单位 km。 | `float \| None` | `必填` | `1.0` |
+| `dy_km` | 南北方向网格分辨率，单位 km。 | `float \| None` | `必填` | `1.0` |
+| `projection` | 地图投影代码：UTM、TTM、LCC、PS、EM 或 LAZA。 | `str` | `'LCC'` | `'LCC'` |
+| `lat0` | 投影原点或切点纬度，单位为十进制度。 | `float` | `27.0` | `27.0` |
+| `lon0` | 中央经线或切点经度，单位为十进制度。 | `float` | `117.5` | `117.5` |
+| `lat1` | LCC 第一标准纬线，或 PS 真比例纬线。 | `float` | `30.0` | `30.0` |
+| `lat2` | LCC 第二标准纬线；PS 不使用。 | `float` | `60.0` | `60.0` |
+| `x_origin_km` | 网格单元 (1,1) 西南角的东向坐标，单位 km。 | `float` | `0.0` | `0.0` |
+| `y_origin_km` | 网格单元 (1,1) 西南角的北向坐标，单位 km。 | `float` | `0.0` | `0.0` |
+| `false_easting_km` | 投影原点假东距；用于 TTM、LCC 和 LAZA。 | `float` | `0.0` | `0.0` |
+| `false_northing_km` | 投影原点假北距；用于 TTM、LCC 和 LAZA。 | `float` | `0.0` | `0.0` |
+| `utm_zone` | UTM 分区号 1–60；仅 UTM 投影使用。 | `int` | `50` | `50` |
+| `hemisphere` | UTM 半球，N 或 S；仅 UTM 投影使用。 | `str` | `'N'` | `'N'` |
+| `datum` | 用于解释和写出坐标的大地基准区域代码。 | `str` | `'WGS-84'` | `'WGS-84'` |
+| `grid_type` | 网格几何类型：矩形、偏移矩形或极坐标网格。 | `int` | `1` | `1` |
 | `ring_distances_km` | 极坐标网格各环的半径，单位 km。 | `Sequence[float]` | `()` | `()` |
 | `ray_angles_deg` | 极坐标网格各射线的角度，单位度。 | `Sequence[float]` | `()` | `()` |
-| `polar_processing` | 极坐标处理。 | `int` | `1` | `1` |
-| `ttm_scale` | TTM比例。 | `float` | `1.0` | `1.0` |
+| `polar_processing` | TERREL 极坐标网格处理方法。 | `int` | `1` | `1` |
+| `ttm_scale` | TTM 投影中央经线比例因子。 | `float` | `1.0` | `1.0` |
 
 </details>
 <!-- parameter-reference:end -->
