@@ -5,10 +5,9 @@
 Runtime Python code lives in `src/pycalmet/`. Tests live in `tests/`, the
 runnable real-data case in `examples/zhejiang/`, original terrain data in
 `data/terrain/`, original land-use data in `data/landuse/`, Python utilities
-in `tools/`, and reference-only Fortran sources in `fortran/`. Large bundled
-binary sources such as `data/landuse/usgs-glcc/EAUSGS1.IMG` use Git LFS;
-`EAUSGS2.IMG` is not part of the Zhejiang workflow and must not be added merely
-as an unused companion file.
+in `tools/`, and reference-only Fortran sources in `fortran/`. The bundled
+`EAUSGS1.IMG` (`GLAZAS`) and `EAUSGS2.IMG` (`GLAZEU`) land-use rasters use Git
+LFS. The Zhejiang workflow keeps `NDBF=1` and reads only `EAUSGS1.IMG`.
 
 Do not add generated executables, model outputs, caches, NCL programs, regional
 run wrappers, or machine-specific paths to the repository.

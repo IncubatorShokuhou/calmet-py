@@ -687,7 +687,7 @@ src/pycalmet/          Python package and opt-in legacy namespace
 tests/                 Unit and integration tests
 examples/zhejiang/     Runnable real-data example and control files
 data/terrain/srtm3/    Original SRTM3 tiles used by the Zhejiang domain
-data/landuse/usgs-glcc/ Original USGS Global/GLCC-style land-use raster
+data/landuse/usgs-glcc/ Original USGS Global/GLCC-style land-use rasters
 fortran/               Reference Fortran sources; not used at runtime
 tools/                 Maintainer utilities
 ```
@@ -702,11 +702,12 @@ Canonical outputs are NetCDF files created and read with `netCDF4.Dataset`.
 The package does not depend on xarray. Legacy formatted and unformatted
 CALMET-family files remain available when an output path or compatibility
 option explicitly requests them. The bundled raw data is grouped under
-`data/terrain/` and `data/landuse/`; large binary sources such as
-`EAUSGS1.IMG` are tracked through Git LFS. `EAUSGS2.IMG` is not used by the
-Zhejiang configuration and is not included. User-supplied large inputs should
-normally stay outside the source tree, while generated files belong under
-`output/`, which is ignored by Git.
+[`data/`](data/); the `EAUSGS1.IMG` Asia raster and `EAUSGS2.IMG` Europe raster
+are tracked through Git LFS. The Zhejiang configuration uses `NDBF=1` and
+reads only `EAUSGS1.IMG`; `EAUSGS2.IMG` is retained as the original `GLAZEU`
+companion data. User-supplied large inputs should normally stay outside the
+source tree, while generated files belong under `output/`, which is ignored by
+Git.
 
 Physical fields and model-state arrays use 32-bit floating point by default.
 Time coordinates, integer categories and indices, projection coordinates, and
@@ -747,6 +748,6 @@ the input configuration, and the exact validation command used.
 ## Acknowledgements
 
 PyCALMET follows the processing model and file conventions of the CALPUFF
-system. The included WRF subset and terrain data are provided to make numerical
-validation reproducible; their provenance and checksums are documented beside
-the data.
+system. The included WRF subset, terrain data, and USGS GLCC land-use rasters
+are provided to make numerical validation reproducible; their provenance and
+checksums are documented beside the data.

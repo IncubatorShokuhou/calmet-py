@@ -43,10 +43,17 @@ def test_example_controls_form_a_complete_source_to_output_chain():
     assert landuse.input_type == "GLAZAS"
     assert landuse.input_datum == "ESR-S"
     assert landuse.mesh_density == 12
-    assert all(Path(path).is_file() for path in landuse.landuse_files)
+    active_landuse = ROOT / "data" / "landuse" / "usgs-glcc" / "EAUSGS1.IMG"
+    archived_europe_landuse = (
+        ROOT / "data" / "landuse" / "usgs-glcc" / "EAUSGS2.IMG"
+    )
+    assert tuple(Path(path).resolve() for path in landuse.landuse_files) == (
+        active_landuse,
+    )
     assert [Path(path).stat().st_size for path in landuse.landuse_files] == [
         156_000_000
     ]
+    assert archived_europe_landuse.stat().st_size == 169_000_000
     assert geo.terrain == terrain.output
     assert geo.landuse == landuse.output
     assert calmet.geophysical == geo.output

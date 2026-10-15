@@ -20,9 +20,10 @@ grid or read a traditional control file in its default runner.
   `run_stages.py` example. Their relative paths form a complete processing
   chain.
 
-`EAUSGS1.IMG` is stored with Git LFS. The companion `EAUSGS2.IMG` is not used:
-the Zhejiang setup has one database (`NDBF=1`) and selects only the
-Asia-optimized raster, so the unused file is not included.
+Both land-use rasters are stored with Git LFS. The companion `EAUSGS2.IMG` is
+the Europe-optimized `GLAZEU` source. It is archived with the raw data, but the
+Zhejiang setup has one database (`NDBF=1`) and reads only the Asia-optimized
+`EAUSGS1.IMG`; the Europe raster does not participate in this example.
 
 Verify the source files from the repository root:
 
