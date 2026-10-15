@@ -682,7 +682,7 @@ def test_legacy_calmet_header_and_hour_record_layout(tmp_path):
     shape=(1,1); three=np.ones((3,1,1)); step=Step1Fields(three,three,three*290.,np.full(shape,290.),np.full(shape,1000.),np.full(shape,1.2),three*50.,np.zeros(shape),np.zeros(shape),np.full(shape,.1),np.zeros(shape),np.zeros(shape),three*290.,np.array([0.,100.,300.])[:,None,None],np.full(shape,50),np.zeros(shape),np.zeros(shape,dtype=int))
     wind=DiagnosticWindFields(three,three,np.ones((4,1,1)),three,np.zeros(shape),np.zeros(shape)); surface=SurfaceFields(np.full(shape,.1),np.full(shape,1.2),np.full(shape,100.),np.full(shape,20.),np.full(shape,.2),np.full(shape,-100.),np.full(shape,500.),np.full(shape,300.),np.zeros(shape)); hour=HourFields(datetime(2018,3,18),step,wind,surface,three*280.)
     geo={'terrain_height':np.zeros(shape),'dominant_landuse':np.full(shape,20),'roughness_length':np.full(shape,.1),'leaf_area_index':np.ones(shape)}; path=tmp_path/'calmet.dat'
-    with LegacyCalmetWriter(path,GridConfig(1,1,1.,1.),[0.,20.,100.,300.],geo,datetime(2018,3,18),datetime(2018,3,18,1),control_lines=['TEST'],base_timezone='UTC-0830',water_range=(42,42),landuse_category_count=2,run_type=0) as writer:
+    with LegacyCalmetWriter(path,GridConfig(1,1,1.,1.,projection='LCC'),[0.,20.,100.,300.],geo,datetime(2018,3,18),datetime(2018,3,18,1),control_lines=['TEST'],base_timezone='UTC-0830',water_range=(42,42),landuse_category_count=2,run_type=0) as writer:
         writer.append(hour,np.full(shape,.5),surface_relative_humidity=np.full(shape,50),precipitation_rate=np.zeros(shape),precipitation_code=np.zeros(shape))
     with FortranSequentialReader(path) as reader:
         assert len(reader.read_record())==96; n=np.frombuffer(reader.read_record(),dtype='<i4').item(); assert n==3
@@ -921,14 +921,16 @@ def test_slope_flow_uses_standard_power_for_gradient_magnitude():
 def test_prognostic_mapper_hits_exact_source_point():
     lat=np.array([[27.,27.],[28.,28.]])
     lon=np.array([[117.5,118.5],[117.5,118.5]])
-    mapper=PrognosticMapper.build(lat,lon,GridConfig(1,1,.001,.001))
+    mapper=PrognosticMapper.build(
+        lat,lon,GridConfig(1,1,.001,.001,projection='LCC'))
     got=mapper.interpolate(np.array([[7.,2.],[3.,4.]]))
     assert got.shape==(1,1); assert abs(got.item()-7.)<.02
 
 def test_precipitation_radius_mapping_uses_all_nearby_sources_and_fallback():
     lat=np.array([[27.,27.],[28.,28.]])
     lon=np.array([[117.5,118.5],[117.5,118.5]])
-    mapper=PrognosticMapper.build(lat,lon,GridConfig(1,1,.001,.001))
+    mapper=PrognosticMapper.build(
+        lat,lon,GridConfig(1,1,.001,.001,projection='LCC'))
     field=np.array([[7.,2.],[3.,4.]])
     nearest=mapper.radius_interpolate(field,.00001)
     np.testing.assert_allclose(nearest,mapper.nearest(field))

@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
+from ..._path_safety import validate_calwrf_paths
+
 
 @dataclass(slots=True)
 class CalwrfConfig:
@@ -24,6 +26,14 @@ class CalwrfConfig:
     listing_output: str | Path | None = None
     legacy_file_rain_reset: bool = False
 
+    def __post_init__(self) -> None:
+        validate_calwrf_paths(
+            self.wrf_files, self.output, self.legacy_output,
+            (self.surface_output
+             if self.create_surface and self.legacy_output is not None else None),
+            self.listing_output,
+        )
+
 
 @dataclass(slots=True)
 class GridConfig:
@@ -31,7 +41,7 @@ class GridConfig:
     ny: int
     dx_km: float
     dy_km: float
-    projection: str = "LCC"
+    projection: str = "UTM"
     lat0: float = 27.0
     lon0: float = 117.5
     lat1: float = 30.0
@@ -46,7 +56,7 @@ class GridConfig:
     grid_type: int = 1
     ring_distances_km: Sequence[float] = ()
     ray_angles_deg: Sequence[float] = ()
-    polar_processing: int = 1
+    polar_processing: int = 2
     ttm_scale: float = 1.0
 
 
@@ -72,7 +82,7 @@ class TerrelConfig:
     processing_method: int | None = None
     receptor_input: str | Path | None = None
     receptor_output: str | Path | None = None
-    receptor_columns: int = 2
+    receptor_columns: int = 4
     interpolate_receptors: bool = False
     receptor_radius_km: float = 0.0
     previous_save: str | Path | None = None
@@ -104,16 +114,16 @@ class CtgprocConfig:
     output: str | Path
     grid: GridConfig
     category_map: dict[int, int] = field(default_factory=dict)
-    input_type: str = "GLAZAS"
-    mesh_density: int = 12
-    input_datum: str = "ESR-S"
+    input_type: str = "CTG"
+    mesh_density: int = 1
+    input_datum: str = "NAS-C"
     output_format: str = "auto"
     coastline_file: str | Path | None = None
     gshhs_file: str | Path | None = None
     coastline_source_datum: str = "WGS-84"
     coastline_wdbii_datum: str = "WGS-72"
     coastline_swap: bool = False
-    fill_empty_ocean: bool = False
+    fill_empty_ocean: bool | None = None
     ocean_category: int = 55
     previous_landuse: str | Path | None = None
     final_output: bool = True
@@ -122,6 +132,10 @@ class CtgprocConfig:
     qa_cell_output: bool = False
     qa_hit_threshold_percent: int = 75
     qa_output_directory: str | Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.fill_empty_ocean is None:
+            self.fill_empty_ocean=self.coastline_file is not None
 
 
 @dataclass(slots=True)
@@ -149,9 +163,9 @@ class MakegeoConfig:
     snow_properties: dict[int, tuple[float,float,float,float,float,float,int]] = field(default_factory=dict)
     snow_age_parameters: dict[int, tuple[int,float]] = field(default_factory=dict)
     snow_roughness_method: int = 1
-    snow_height_scale_m: float = 1.0
+    snow_height_scale_m: float = 10.0
     snow_albedo_method: int = 1
-    snow_depth_minimum_m: float = 0.0
+    snow_depth_minimum_m: float = 0.01
     landuse_plot_output: str | Path | None = None
     terrain_plot_output: str | Path | None = None
     color_map_output: str | Path | None = None
@@ -167,7 +181,7 @@ class CalmetConfig:
     start: str
     end: str
     grid: GridConfig
-    noobs: int = 2
+    noobs: int = 0
     run_type: int = 1
     save_output: bool = True
     legacy_output_format: int = 1
@@ -196,19 +210,19 @@ class CalmetConfig:
     use_initial_guess_calmet: int = 0
     initial_guess_calmet_files: Sequence[str | Path] = ()
     weight_data: str | Path | None = None
-    precipitation_station_count: int = -1
+    precipitation_station_count: int = 0
     precipitation_data: str | Path | None = None
     precipitation_data_format: int = 2
     precipitation_control_stations: Sequence[tuple[str,int,float,float]] = ()
-    iprog: int = 14
-    irhprog: int = 1
-    itprog: int = 2
+    iprog: int = 0
+    irhprog: int = 0
+    itprog: int = 0
     imixh: int = 1
     constb: float = 1.41
     conste: float = 0.15
     constn: float = 2400.
     constw: float = 0.16
-    coriolis: float = 1.e-4
+    coriolis: float = 999.0
     minimum_lapse_rate: float = .001
     mixing_lapse_depth_m: float = 200.
     minimum_mixing_height_m: float = 50.
@@ -243,18 +257,18 @@ class CalmetConfig:
     temperature_station_limit: int = 5
     water_temperature_gradient_below: float = -.0098
     water_temperature_gradient_above: float = -.0045
-    water_temperature_category_min: int = 55
-    water_temperature_category_max: int = 55
+    water_temperature_category_min: int = 999
+    water_temperature_category_max: int = 999
     iavet: int = 1
     iavezi: int = 1
     mixing_wind_level: int = 1
     mnmdav: int = 1
     iwfcod: int = 1
-    wind_extrapolation: int = -1
+    wind_extrapolation: int = -4
     upper_air_separation_cells: float = 4.
     extrapolate_calm: int = 0
-    wind_bias: Sequence[float] = (0.,0.,0.,0.,0.,0.,0.,0.,0.,0.)
-    varying_radius: bool = True
+    wind_bias: Sequence[float] | None = None
+    varying_radius: bool = False
     minimum_station_radius_km: float = .1
     maximum_surface_radius_km: float = 30.
     maximum_upper_radius_km: float = 30.
@@ -262,10 +276,10 @@ class CalmetConfig:
     surface_background_radius_km: float = 1.
     upper_background_radius_km: float = 1.
     prognostic_radius_km: float = 0.
-    stations_per_level: Sequence[int] = (5,5,5,5,5,5,5,5,5,5)
-    wind_extrapolation_factors: Sequence[float] = (0.,0.,0.,0.,0.,0.,0.,0.,0.,0.)
+    stations_per_level: Sequence[int] | None = None
+    wind_extrapolation_factors: Sequence[float] | None = None
     barrier_count: int = 0
-    barrier_top_level: int = 0
+    barrier_top_level: int | None = None
     barriers: Sequence[tuple[float,float,float,float]] = ()
     lake_breeze_regions: Sequence[
         tuple[float,float,float,float,float,float,float,float,Sequence[int]]
@@ -275,7 +289,7 @@ class CalmetConfig:
     iobr: int = 0
     islope: int = 1
     critical_froude: float = 1.
-    smoothing_passes: Sequence[int] = (2,4,4,4,4,4,4,4,4,4)
+    smoothing_passes: Sequence[int] | None = None
     divergence_limit: float = 5.e-6
     divergence_iterations: int = 50
     kinematic_alpha: float = .1
@@ -284,7 +298,7 @@ class CalmetConfig:
     base_timezone_label: str | None = None
     terrain_radius_km: float = 15.
     half_average_angle: float = 30.
-    include_w_temperature: bool = False
+    include_w_temperature: bool = True
     compression: int = 1
     control_lines: Sequence[str] = ()
     mesopac_output: str | Path | None = None
@@ -307,3 +321,16 @@ class CalmetConfig:
     froude_wind_debug_output: str | Path | None = None
     slope_wind_debug_output: str | Path | None = None
     wind_print_output: str | Path | None = None
+
+    def __post_init__(self) -> None:
+        layers=len(self.z_faces_m)-1
+        if self.wind_bias is None:
+            self.wind_bias=(0.,)*layers
+        if self.stations_per_level is None:
+            self.stations_per_level=(99,)*layers
+        if self.wind_extrapolation_factors is None:
+            self.wind_extrapolation_factors=(0.,)*layers
+        if self.smoothing_passes is None:
+            self.smoothing_passes=(2,)+(4,)*(layers-1)
+        if self.barrier_top_level is None:
+            self.barrier_top_level=layers

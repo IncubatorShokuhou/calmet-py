@@ -50,22 +50,41 @@ def _source_control_overrides(cls: type[T], result: T,
     return result
 
 
+def _merge_grid(supplied: GridConfig | Mapping[str, Any] | None,
+                updates: Mapping[str, Any], base: GridConfig | None = None) -> GridConfig:
+    if supplied is None:
+        grid=base
+    elif isinstance(supplied,GridConfig):
+        grid=supplied
+    elif isinstance(supplied,Mapping):
+        grid=(GridConfig(**supplied) if base is None
+              else replace(base,**supplied))
+    else:
+        raise TypeError("grid must be a GridConfig or mapping")
+    if grid is None:
+        return GridConfig(**updates)
+    return replace(grid,**updates) if updates else grid
+
+
 def _config(cls: type[T], value: T | Mapping[str, Any] | str | Path | None,
             kwargs: dict[str, Any], loader: Callable[...,T] | None=None) -> T:
     if isinstance(value,(str,Path)):
         if loader is None: raise TypeError(f"{cls.__name__} does not support control files")
         parameters=normalize_public_parameters(cls,kwargs)
+        supplied_grid=parameters.values.pop("grid",None)
         result=loader(value,**parameters.values)
-        if parameters.grid:
-            result=replace(result,grid=replace(result.grid,**parameters.grid))
+        if supplied_grid is not None or parameters.grid:
+            result=replace(result,grid=_merge_grid(
+                supplied_grid,parameters.grid,result.grid))
         return _source_control_overrides(cls,result,parameters.special)
     if value is not None and kwargs:
         raise TypeError("pass either a config/mapping or keyword parameters, not both")
     if isinstance(value, cls):
         return value
     parameters=normalize_public_parameters(cls,dict(value or kwargs))
-    if parameters.grid:
-        parameters.values["grid"]=GridConfig(**parameters.grid)
+    supplied_grid=parameters.values.get("grid")
+    if supplied_grid is not None or parameters.grid:
+        parameters.values["grid"]=_merge_grid(supplied_grid,parameters.grid)
     return cls(**parameters.values)
 
 

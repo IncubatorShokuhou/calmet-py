@@ -301,7 +301,8 @@ def test_usgsla_preserves_bottom_up_rows_and_legacy_base_255_decode(tmp_path, mo
         "pycalmet._terrel.project_glaz_to_lcc",
         lambda x, y, source_grid, target_grid, units: (x * 1000.0, y * 1000.0),
     )
-    grid = GridConfig(2, 2, 1.0, 1.0, x_origin_km=1.0, y_origin_km=1.0)
+    grid = GridConfig(2, 2, 1.0, 1.0, projection="LCC",
+                      x_origin_km=1.0, y_origin_km=1.0)
     sums = np.zeros(4)
     counts = np.zeros(4, dtype=np.int64)
     assert _accumulate_usgsla(path, grid, sums, counts, spec=spec) == 4
@@ -632,7 +633,7 @@ def test_isc_polar_writer_emits_gridpolr_records(tmp_path):
     output = tmp_path / "polar.dat"
     grid = GridConfig(2, 2, 1.0, 1.0, x_origin_km=10.0, y_origin_km=20.0,
                       grid_type=3, ring_distances_km=(1.0, 2.0),
-                      ray_angles_deg=(10.0, 190.0))
+                      ray_angles_deg=(10.0, 190.0), polar_processing=1)
     _write_legacy(output, np.array([[1.0, 2.0], [3.0, 4.0]]), grid, "WGS-84", model=3)
     lines = output.read_text(encoding="ascii").splitlines()
     start = lines.index("RE GRIDPOLR  XXXXX  STA")
@@ -877,6 +878,7 @@ def test_polar_save_header_uses_outer_boundary_southwest_corner():
         grid_type=3,
         ring_distances_km=(1.0, 2.0),
         ray_angles_deg=(10.0, 190.0),
+        polar_processing=1,
     )
     # Normal IPROC boundary beyond the final 2 km ring is 2.5 km.
     np.testing.assert_array_equal(
@@ -954,6 +956,7 @@ def test_discrete_receptor_ignores_source_points_outside_grid(tmp_path, monkeypa
         terrain_sources=[TerrelSource(source, "GEN", "WGS-84")],
         receptor_input=receptors,
         receptor_output=receptor_output,
+        receptor_columns=2,
         receptor_radius_km=0.05,
     ))
     assert np.loadtxt(receptor_output)[2] == -999.0
@@ -975,6 +978,7 @@ def test_polar_coastline_uses_outer_ring_bounding_box(tmp_path):
         grid_type=3,
         ring_distances_km=(1.0, 2.0),
         ray_angles_deg=(10.0, 190.0),
+        polar_processing=1,
     )
     terrain_filter = _terrain_filter(TerrelConfig(tmp_path, tmp_path / "out.nc", grid,
                                                   coastline_file=coast))

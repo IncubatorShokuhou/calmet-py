@@ -1,15 +1,21 @@
 import numpy as np
+import pytest
 from pyproj import CRS,Transformer
 
 from pycalmet.config import GridConfig
 from pycalmet.datums import DATUMS,datum_definition,datum_shift
+from pycalmet.legacy._compat.config import GridConfig as LegacyGridConfig
+from pycalmet.legacy._compat.projections import (
+    geographic_crs as legacy_geographic_crs,
+    grid_crs as legacy_grid_crs,
+)
 from pycalmet.projections import (geographic_crs,grid_convergence,grid_crs,
                                   project_geographic,project_glaz_to_lcc,transform_grid,
                                   unproject_geographic)
 
 
 def test_current_lcc_definition_preserves_kilometre_coordinates():
-    grid=GridConfig(2,2,1.,1.)
+    grid=GridConfig(2,2,1.,1.,projection='LCC')
     # COORDLIB's NIMA table intentionally carries its 2003 WGS-84 inverse
     # flattening precision, rather than PROJ's newer EPSG precision.
     old=CRS.from_proj4('+proj=lcc +lat_0=27 +lon_0=117.5 +lat_1=30 +lat_2=60 '
@@ -47,6 +53,81 @@ def test_ttm_uses_control_scale_factor():
     actual=Transformer.from_crs('EPSG:4326',grid_crs(grid),always_xy=True).transform(121.,31.)
     wanted=Transformer.from_crs('EPSG:4326',expected,always_xy=True).transform(121.,31.)
     np.testing.assert_allclose(actual,wanted,rtol=0.,atol=1.e-8)
+
+
+@pytest.mark.parametrize(
+    ('grid_type','geographic_crs_function','grid_crs_function'),
+    ((GridConfig,geographic_crs,grid_crs),
+     (LegacyGridConfig,legacy_geographic_crs,legacy_grid_crs)),
+    ids=('public','legacy'),
+)
+@pytest.mark.parametrize(('hemisphere','expected_y'),(('N',0.),('S',10000.)))
+def test_spherical_datum_utm_uses_equivalent_transverse_mercator(
+        grid_type,geographic_crs_function,grid_crs_function,
+        hemisphere,expected_y):
+    grid=grid_type(1,1,1.,1.,projection='UTM',utm_zone=50,
+                   hemisphere=hemisphere,datum='ESR-S')
+    forward=Transformer.from_crs(
+        geographic_crs_function('ESR-S'),grid_crs_function(grid,units='km'),
+        always_xy=True)
+    reverse=Transformer.from_crs(
+        grid_crs_function(grid,units='km'),geographic_crs_function('ESR-S'),
+        always_xy=True)
+    x,y=forward.transform(117.,0.)
+    np.testing.assert_allclose([x,y],[500.,expected_y],rtol=0.,atol=1.e-9)
+    np.testing.assert_allclose(reverse.transform(x,y),[117.,0.],rtol=0.,atol=1.e-10)
+
+
+@pytest.mark.parametrize(
+    ('projection','projection_parameters','point'),
+    (('UTM',{'utm_zone':50,'hemisphere':'N'},(118.,28.)),
+     ('PS',{'lat0':70.,'lon0':20.,'lat1':60.},(25.,75.)),
+     ('EM',{'lat0':0.,'lon0':20.},(25.,30.))),
+)
+def test_utm_ps_em_ignore_user_false_offsets_and_match_public_legacy(
+        projection,projection_parameters,point):
+    results=[]
+    for grid_type,geographic_crs_function,grid_crs_function in (
+            (GridConfig,geographic_crs,grid_crs),
+            (LegacyGridConfig,legacy_geographic_crs,legacy_grid_crs)):
+        base=grid_type(1,1,1.,1.,projection=projection,
+                       **projection_parameters)
+        with_user_offsets=grid_type(
+            1,1,1.,1.,projection=projection,
+            false_easting_km=123.5,false_northing_km=-456.25,
+            **projection_parameters)
+        source=geographic_crs_function(base.datum)
+        base_transformer=Transformer.from_crs(
+            source,grid_crs_function(base,units='km'),always_xy=True)
+        offset_transformer=Transformer.from_crs(
+            source,grid_crs_function(with_user_offsets,units='km'),always_xy=True)
+        base_result=base_transformer.transform(*point)
+        offset_result=offset_transformer.transform(*point)
+        np.testing.assert_allclose(offset_result,base_result,rtol=0.,atol=1.e-9)
+        results.append(base_result)
+    np.testing.assert_allclose(results[1],results[0],rtol=0.,atol=1.e-9)
+
+
+@pytest.mark.parametrize(
+    ('grid_type','geographic_crs_function','grid_crs_function'),
+    ((GridConfig,geographic_crs,grid_crs),
+     (LegacyGridConfig,legacy_geographic_crs,legacy_grid_crs)),
+    ids=('public','legacy'),
+)
+@pytest.mark.parametrize(('lat0','lat1'),((70.,60.),(-70.,-60.)),ids=('north','south'))
+def test_polar_stereographic_control_origin_maps_to_zero(
+        grid_type,geographic_crs_function,grid_crs_function,lat0,lat1):
+    grid=grid_type(
+        1,1,1.,1.,projection='PS',lat0=lat0,lon0=20.,lat1=lat1,
+        false_easting_km=123.5,false_northing_km=-456.25)
+    projected=grid_crs_function(grid,units='km')
+    geographic=geographic_crs_function(grid.datum)
+    forward=Transformer.from_crs(geographic,projected,always_xy=True)
+    reverse=Transformer.from_crs(projected,geographic,always_xy=True)
+    x,y=forward.transform(grid.lon0,grid.lat0)
+    np.testing.assert_allclose([x,y],[0.,0.],rtol=0.,atol=1.e-9)
+    np.testing.assert_allclose(
+        reverse.transform(0.,0.),[grid.lon0,grid.lat0],rtol=0.,atol=1.e-10)
 
 
 def test_documented_calpuff_datums_have_explicit_proj_definitions():

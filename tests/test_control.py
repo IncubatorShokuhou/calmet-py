@@ -51,7 +51,9 @@ def test_calmet_python_defaults_match_legacy_model_not_bundled_case():
 
 def test_calmet_control_missing_values_use_model_defaults(tmp_path):
     text=(CALMET_CONTROL).read_text(encoding='ascii')
-    for name in ('MNMDAV','ZIMAX','ZIMAXW','SIGMAP'):
+    for name in ('MNMDAV','ZIMAX','ZIMAXW','SIGMAP','NOOBS','IPROG','IEXTRP',
+                 'LVARY','NINTR2','JWAT1','JWAT2','ITPROG','IRHPROG','KBAR',
+                 'FCORIOL','LCALGRD','NPSTA'):
         text,count=re.subn(rf'!\s*{name}\s*=\s*[^!]*!',
                            lambda match: match.group().replace('!','*'),text,count=1)
         assert count==1
@@ -60,6 +62,15 @@ def test_calmet_control_missing_values_use_model_defaults(tmp_path):
     assert (config.mnmdav,config.maximum_mixing_height_m,
             config.maximum_water_mixing_height_m,
             config.precipitation_radius_km)==(1,3000.,3000.,100.)
+    assert (config.noobs,config.iprog,config.wind_extrapolation,
+            config.varying_radius,config.itprog,config.irhprog)==(0,0,-4,False,0,0)
+    assert tuple(config.stations_per_level)==(99,)*10
+    assert (config.water_temperature_category_min,
+            config.water_temperature_category_max)==(999,999)
+    assert config.coriolis==999.
+    assert config.include_w_temperature
+    assert config.precipitation_station_count==0
+    assert config.barrier_top_level==len(config.z_faces_m)-1
 
 
 def test_calmet_control_uses_pacdat_for_mesopac_output(tmp_path):

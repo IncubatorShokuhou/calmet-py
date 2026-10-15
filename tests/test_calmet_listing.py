@@ -161,6 +161,7 @@ def test_listing_interval_counts_hours_not_substeps(tmp_path):
 def test_noobs_micrometeorology_debug_uses_requested_steps_and_preaverage_fields(tmp_path):
     config=CalmetConfig('met','geo','out','2018-03-18_00:00:00',
         '2018-03-18_02:00:00',GridConfig(1,1,1.,1.),z_faces_m=(0.,20.),
+        noobs=2,
         micrometeorology_debug=True,debug_first_step=2,debug_last_step=2,
         print_surface_fields=(0,0,0,1,0,0,0,1))
     array=np.ones((1,1),dtype=np.float32)

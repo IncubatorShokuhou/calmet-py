@@ -141,7 +141,7 @@ def grid_from_assignments(values: dict[str,list[str]]) -> GridConfig:
     return GridConfig(
         nx=int(_number(_one(values,"NX"))),ny=int(_number(_one(values,"NY"))),
         dx_km=float(_number(_one(values,"DGRIDKM"))),dy_km=float(_number(_one(values,"DGRIDKM"))),
-        projection=str(_one(values,"PMAP","LCC")).upper(),
+        projection=str(_one(values,"PMAP","UTM")).upper(),
         lat0=_angle(_one(values,"RLAT0","0")),lon0=_angle(_one(values,"RLON0","0")),
         lat1=_angle(_one(values,"RLAT1",_one(values,"XLAT1","0"))),
         lat2=_angle(_one(values,"RLAT2",_one(values,"XLAT2","0"))),
@@ -649,7 +649,7 @@ def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
     start,end,base_timezone,base_timezone_label=_calmet_period(version,values)
     smoothing_text=_one(values,"NSMTH",','.join(['2']+['4']*(len(faces)-2)))
     smoothing=[int(_number(item)) for item in re.split(r"\s*,\s*",smoothing_text) if item]
-    nintr=[int(_number(item)) for item in re.split(r"\s*,\s*",_one(values,'NINTR2',','.join(['5']*(len(faces)-1)))) if item]
+    nintr=[int(_number(item)) for item in re.split(r"\s*,\s*",_one(values,'NINTR2',','.join(['99']*(len(faces)-1)))) if item]
     fextr=[float(_number(item)) for item in re.split(r"\s*,\s*",_one(values,'FEXTR2',','.join(['0']*(len(faces)-1)))) if item]
     wind_bias=[float(_number(item)) for item in re.split(
         r"\s*,\s*",_one(values,'BIAS',','.join(['0']*(len(faces)-1)))) if item]
@@ -699,7 +699,7 @@ def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
     else:
         lake_regions=()
     surface_count=int(_number(_one(values,'NSSTA','0')))
-    precipitation_count=int(_number(_one(values,'NPSTA','-1')))
+    precipitation_count=int(_number(_one(values,'NPSTA','0')))
     surface_control_stations=_station_rows(values,'SS',surface_count,6)
     upper_control_stations=_station_rows(values,'US',int(_number(_one(values,'NUSTA','0'))),5)
     precipitation_control_stations=(_station_rows(values,'PS',precipitation_count,4)
@@ -799,7 +799,7 @@ def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
               use_initial_guess_calmet=int(_number(_one(values,"IGFMET","0"))),
               initial_guess_calmet_files=initial_guess_files,
               weight_data=calmet_path(_one(values,"WTDAT","WT.DAT")),
-              precipitation_station_count=int(_number(_one(values,"NPSTA","-1"))),
+              precipitation_station_count=int(_number(_one(values,"NPSTA","0"))),
               precipitation_data=calmet_path(_one(values,"PRCDAT","PRECIP.DAT")),
               precipitation_data_format=int(_number(_one(values,"IFORMP","2"))),
               precipitation_control_stations=precipitation_control_stations,
@@ -810,12 +810,12 @@ def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
               mixing_wind_level=int(_number(_one(values,"ILEVZI","1"))),
               mnmdav=int(_number(_one(values,"MNMDAV","1"))),
               half_average_angle=float(_number(_one(values,"HAFANG","30"))),
-              include_w_temperature=_logical(_one(values,"LCALGRD","F")))
+              include_w_temperature=_logical(_one(values,"LCALGRD","T")))
     data.update(constb=float(_number(_one(values,"CONSTB","1.41"))),
                 conste=float(_number(_one(values,"CONSTE","0.15"))),
                 constn=float(_number(_one(values,"CONSTN","2400"))),
                 constw=float(_number(_one(values,"CONSTW","0.16"))),
-                coriolis=float(_number(_one(values,"FCORIOL","1e-4"))),
+                coriolis=float(_number(_one(values,"FCORIOL","999"))),
                 minimum_lapse_rate=float(_number(_one(values,"DPTMIN","0.001"))),
                 mixing_lapse_depth_m=float(_number(_one(values,"DZZI","200"))),
                 minimum_mixing_height_m=float(_number(_one(values,"ZIMIN","50"))),
@@ -850,8 +850,8 @@ def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
                 temperature_station_limit=int(_number(_one(values,"NUMTS","5"))),
                 water_temperature_gradient_below=float(_number(_one(values,"TGDEFB","-.0098"))),
                 water_temperature_gradient_above=float(_number(_one(values,"TGDEFA","-.0045"))),
-                water_temperature_category_min=int(_number(_one(values,"JWAT1","55"))),
-                water_temperature_category_max=int(_number(_one(values,"JWAT2","55"))))
+                water_temperature_category_min=int(_number(_one(values,"JWAT1","999"))),
+                water_temperature_category_max=int(_number(_one(values,"JWAT2","999"))))
     data.update(iwfcod=int(_number(_one(values,"IWFCOD","1"))),
                 wind_extrapolation=int(_number(_one(values,"IEXTRP","-4"))),
                 upper_air_separation_cells=float(_number(_one(values,'RMIN2','4'))),

@@ -390,7 +390,8 @@ def test_makegeo_writes_surfer_landuse_and_terrain_qa_grids(tmp_path):
 
 
 def test_legacy_geo_round_trip_and_transparent_calmet_adapter(tmp_path):
-    grid=GridConfig(2,2,1.,1.,lat0=27.,lon0=117.5,lat1=30.,lat2=60.)
+    grid=GridConfig(2,2,1.,1.,projection='LCC',lat0=27.,lon0=117.5,
+                    lat1=30.,lat2=60.)
     config=MakegeoConfig('terrain','land','geo',grid,output_categories=(10,20),
                          output_water_min=50,output_water_max=55)
     terrain=np.array([[1.25,2.5],[3.75,4.]])
@@ -503,7 +504,7 @@ def test_makegeo_accepts_generic_categories_and_control_properties(tmp_path):
         assert (dataset.water_category_min,dataset.water_category_max)==(55,55)
         assert dataset.landuse_categories=='10,55'
 
-def test_makegeo_category_split_is_applied_before_weighting():
+def test_makegeo_category_split_percentages_are_applied_before_weighting():
     fractions=np.array([[[1.]],[[0.]],[[0.]]])
     properties={1:(1.,.1,1.,.1,0.,1.,10),2:(.1,.2,2.,.2,0.,2.,20),3:(.01,.3,3.,.3,0.,3.,30)}
     config=MakegeoConfig('t','l','o',GridConfig(1,1,1.,1.),input_properties=properties,
@@ -512,12 +513,13 @@ def test_makegeo_category_split_is_applied_before_weighting():
     dominant,z0,albedo,bowen,soil,qf,lai=_fields(fractions,config,np.array([1,2,3]))
     assert dominant.item()==30
     np.testing.assert_allclose([z0.item(),albedo.item(),bowen.item(),soil.item(),lai.item()],
-        [0.,17.6,176.,17.6,176.],rtol=2.e-6,atol=1.e-6)
+        [10.**-1.75,.275,2.75,.275,2.75],rtol=2.e-6,atol=1.e-6)
 
 
 
 def test_generic_ctgproc_legacy_output_feeds_makegeo(tmp_path):
-    grid=GridConfig(1,1,1.,1.,false_easting_km=12.,false_northing_km=34.,datum='ESR-S')
+    grid=GridConfig(1,1,1.,1.,projection='LCC',false_easting_km=12.,
+                    false_northing_km=34.,datum='ESR-S')
     lon,lat=Transformer.from_crs(grid_crs(grid,units='km'),geographic_crs('WGS-84'),always_xy=True).transform(.5,.5)
     source=tmp_path/'generic.lu'
     source.write_text('GENERIC.LANDUSE 1.0\n0\nLL\nWGS-84\nDEG\n2\n7 42\n'

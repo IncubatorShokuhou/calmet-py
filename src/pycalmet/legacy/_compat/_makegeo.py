@@ -639,7 +639,7 @@ def _split_categories(categories,frac,splits):
         source_index=lookup[source]
         percentage_sum=np.float32(0.)
         # MAKEGEO 3.2 labels PREC as percent but uses it directly, without
-        # dividing by 100.  Preserve its record order and REAL*4 assignments.
+        # dividing by 100. Preserve that behavior in the bit-compatible API.
         for target,percent in targets:
             fraction=np.float32(percent)
             contribution=np.asarray(fraction*result[source_index],dtype=np.float32)

@@ -269,7 +269,8 @@ def test_public_calmet_runs_native_mm4_to_netcdf(tmp_path):
             dataset.createVariable(name,dtype,('y','x'))[:]=np.full(shape,value)
     output=tmp_path/'calmet.nc'
     config=CalmetConfig(path,geo,output,'2018010203','2018010204',grid,
-        iprog=4,iwfcod=1,noobs=2,z_faces_m=(0.,100.,200.),
+        iprog=4,iwfcod=1,noobs=2,itprog=2,irhprog=1,wind_extrapolation=-1,
+        z_faces_m=(0.,100.,200.),
         smoothing_passes=(0,0),ifradj=0,islope=0,ikine=0,iobr=0,
         iavet=0,iavezi=0,run_type=0,lapse_height_m=100.)
     assert run_calmet(config)==output

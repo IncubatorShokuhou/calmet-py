@@ -482,15 +482,14 @@ def normalize_public_parameters(cls: type[Any], parameters: Mapping[str, Any]) -
     if unknown:
         names = ", ".join(sorted((str(name) for name in unknown), key=str.casefold))
         raise TypeError(f"unknown {cls.__name__} parameters: {names}")
-    if "grid" in values and grid:
-        target = next(item for item in claimed if item.startswith("grid."))
-        raise _duplicate(cls, "grid", claimed["grid"], claimed[target])
-
     if cls is CalwrfConfig:
         if "fio" in special:
-            output = special["fio"]
-            assign("legacy_output", output, claimed["$fio"])
-            assign("output", Path(output).with_suffix(".nc"), claimed["$fio"])
+            output = Path(special["fio"])
+            if output.suffix.casefold() == ".nc":
+                assign("output", output, claimed["$fio"])
+            else:
+                assign("legacy_output", output, claimed["$fio"])
+                assign("output", output.with_suffix(".nc"), claimed["$fio"])
             if values.get("create_surface", True) and "surface_output" not in values:
                 assign("surface_output", Path(output).with_suffix(".m2d"),
                        claimed["$fio"])

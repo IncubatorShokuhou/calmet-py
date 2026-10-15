@@ -46,7 +46,8 @@ def geographic_crs(datum: str) -> CRS:
 
 def grid_crs(grid: GridConfig, datum: str | None=None, *, units: str='m') -> CRS:
     """Construct the CRS represented by CALPUFF grid-control parameters."""
-    projection=grid.projection.upper(); earth=_earth(grid.datum if datum is None else datum)
+    datum_name=grid.datum if datum is None else datum
+    projection=grid.projection.upper(); earth=_earth(datum_name)
     offsets=f'+x_0={grid.false_easting_km*1000:g} +y_0={grid.false_northing_km*1000:g}'
     if projection=='LCC':
         definition=(f'+proj=lcc +lat_0={grid.lat0:g} +lon_0={grid.lon0:g} '
@@ -55,14 +56,36 @@ def grid_crs(grid: GridConfig, datum: str | None=None, *, units: str='m') -> CRS
         definition=(f'+proj=tmerc +lat_0={grid.lat0:g} +lon_0={grid.lon0:g} '
                     f'+k={grid.ttm_scale:g} {offsets} {earth}')
     elif projection=='UTM':
-        south=' +south' if grid.hemisphere.upper()=='S' else ''
-        definition=f'+proj=utm +zone={grid.utm_zone:d}{south} {earth}'
+        normalized=normalize_datum(datum_name)
+        ellipsoid=datum_definition('ESR-S' if normalized=='ESR-R' else normalized)
+        if ellipsoid.inv_f>=1.e20:
+            # PROJ rejects ``+proj=utm`` with a sphere even though CALPUFF's
+            # COORDLIB supports the combination.  UTM is a fixed transverse
+            # Mercator definition, so spell it out for spherical datums.
+            central_meridian=grid.utm_zone*6-183
+            false_northing=10000000 if grid.hemisphere.upper()=='S' else 0
+            definition=(f'+proj=tmerc +lat_0=0 +lon_0={central_meridian:g} '
+                        f'+k=0.9996 +x_0=500000 +y_0={false_northing:g} {earth}')
+        else:
+            south=' +south' if grid.hemisphere.upper()=='S' else ''
+            definition=f'+proj=utm +zone={grid.utm_zone:d}{south} {earth}'
     elif projection=='PS':
         pole=90. if grid.lat0>=0. else -90.
-        definition=(f'+proj=stere +lat_0={pole:g} +lat_ts={grid.lat1:g} +lon_0={grid.lon0:g} '
-                    f'{offsets} {earth}')
+        # COORDLIB reports PS coordinates relative to RLON0/RLAT0 and does
+        # not apply the user FEAST/FNORTH values to this projection.
+        base=(f'+proj=stere +lat_0={pole:g} +lat_ts={grid.lat1:g} '
+              f'+lon_0={grid.lon0:g} +x_0=0 +y_0=0 {earth}')
+        origin_x,origin_y=Transformer.from_crs(
+            geographic_crs(datum_name),
+            CRS.from_proj4(base+' +units=m +no_defs'),always_xy=True,
+        ).transform(grid.lon0,grid.lat0)
+        definition=(f'+proj=stere +lat_0={pole:g} +lat_ts={grid.lat1:g} '
+                    f'+lon_0={grid.lon0:g} +x_0={-origin_x:.15g} '
+                    f'+y_0={-origin_y:.15g} {earth}')
     elif projection=='EM':
-        definition=f'+proj=merc +lat_ts=0 +lon_0={grid.lon0:g} {offsets} {earth}'
+        # CALPUFF fixes the EM latitude of origin at the equator and ignores
+        # user FEAST/FNORTH values.
+        definition=f'+proj=merc +lat_ts=0 +lon_0={grid.lon0:g} {earth}'
     elif projection=='LAZA':
         definition=f'+proj=laea +lat_0={grid.lat0:g} +lon_0={grid.lon0:g} {offsets} {earth}'
     elif projection=='ACEA':

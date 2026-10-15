@@ -363,6 +363,7 @@ def test_noobs1_dispatches_iextrp4_by_station_landuse_and_temperature_mode(
     surface=SimpleNamespace(stations=(station,),datum='WGS-84',timezone='UTC-0000',
                             at_begin=lambda when:record)
     config=CalmetConfig('met','geo','out','2018010100','2018010101',grid,noobs=1,
+        iprog=14,varying_radius=True,
         itprog=itprog,surface_data='surf',z_faces_m=(0.,20.),smoothing_passes=(0,),
         stations_per_level=(1,),wind_extrapolation_factors=(0.,),wind_extrapolation=4,
         water_temperature_mode=water_mode,imixh=-1,overwater_flux_method=flux_method,
@@ -627,7 +628,9 @@ def test_itprog1_water_temperature_uses_sea_station():
                                water_sensor_depth_m=.6,wave_period_s=-999.,wave_height_m=-999.)
     sea=SimpleNamespace(point=lambda target:np.array([.5,.5]),longitude_latitude=lambda:(lon,lat),
                         at_begin=lambda when:sea_record)
-    config=CalmetConfig('met','geo','out','2018010100','2018010101',grid,noobs=1,itprog=1,irhprog=0,
+    config=CalmetConfig('met','geo','out','2018010100','2018010101',grid,noobs=1,
+        iprog=14,itprog=1,irhprog=0,
+        water_temperature_category_min=55,water_temperature_category_max=55,
         surface_data='surf',sea_files=('sea',),z_faces_m=(0.,20.),smoothing_passes=(0,),
         stations_per_level=(2,),wind_extrapolation_factors=(0.,),wind_extrapolation=2)
     transform,_=_surface_step_transform(config,surface,

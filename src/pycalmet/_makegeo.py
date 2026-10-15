@@ -639,7 +639,7 @@ def _split_categories(categories,frac,splits):
         source_index=lookup[source]
         percentage_sum=np.float64(0.)
         for target,percent in targets:
-            fraction=np.float64(percent)
+            fraction=np.asarray(np.float64(percent)/np.float64(100.),dtype=np.float64)
             contribution=np.asarray(fraction*result[source_index],dtype=np.float64)
             target_index=lookup[target]
             result[target_index]=np.asarray(

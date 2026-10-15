@@ -17,6 +17,8 @@ from pycalmet._calmet import (_noobs_step_transform,_prognostic_precipitation_ra
 from pycalmet.config import CalmetConfig
 from pycalmet.sea_data import GriddedSeaData
 
+CALMET_CONTROL = Path(__file__).with_name("fixtures") / "calmet.inp"
+
 
 def _sea_metadata(*,version='2.11',timezone='UTC-0000',**changes):
     values=dict(version=version,timezone=timezone,
@@ -25,6 +27,24 @@ def _sea_metadata(*,version='2.11',timezone='UTC-0000',**changes):
         projection='LCC',datum='WGS-84',datum_date='20200101')
     values.update(changes)
     return SimpleNamespace(**values)
+
+
+def _prognostic_calmet_config(*args, **kwargs):
+    """Build the prognostic baseline used by the validation tests."""
+    defaults = {
+        "noobs": 2,
+        "iprog": 14,
+        "irhprog": 1,
+        "itprog": 2,
+        "water_temperature_category_min": 55,
+        "water_temperature_category_max": 55,
+        "wind_extrapolation": -1,
+        "varying_radius": True,
+        "stations_per_level": (5,) * 10,
+        "barrier_top_level": 0,
+    }
+    defaults.update(kwargs)
+    return CalmetConfig(*args, **defaults)
 
 
 def test_unknown_parameter_is_rejected():
@@ -57,6 +77,79 @@ def test_stage_signatures_expose_every_typed_configuration_parameter(
             assert signature.parameters[field.name].default == field.default
 
 
+def test_preprocessor_defaults_match_fortran_control_defaults():
+    grid = pycalmet.GridConfig(nx=1, ny=1, dx_km=1.0, dy_km=1.0)
+    makegeo = pycalmet.MakegeoConfig("terrain", "landuse", "geo", grid)
+
+    assert grid.polar_processing == 2
+    assert grid.projection == "UTM"
+    assert pycalmet.TerrelConfig("terrain", "out", grid).receptor_columns == 4
+    ctgproc = pycalmet.CtgprocConfig(("landuse",), "out", grid)
+    assert (ctgproc.input_type, ctgproc.mesh_density,
+            ctgproc.input_datum) == ("CTG", 1, "NAS-C")
+    assert ctgproc.fill_empty_ocean is False
+    assert pycalmet.CtgprocConfig(
+        ("landuse",), "out", grid, coastline_file="coast.bln",
+    ).fill_empty_ocean is True
+    assert makegeo.snow_height_scale_m == 10.0
+    assert makegeo.snow_depth_minimum_m == 0.01
+
+    for stage in ("terrel", "ctrproc", "ctgproc", "makegeo", "calmet"):
+        assert inspect.signature(getattr(pycalmet, stage)).parameters[
+            "polar_processing"
+        ].default == 2
+    makegeo_signature = inspect.signature(pycalmet.makegeo)
+    assert makegeo_signature.parameters["snow_height_scale_m"].default == 10.0
+    assert makegeo_signature.parameters["snow_depth_minimum_m"].default == 0.01
+
+
+def test_calmet_defaults_match_fortran_control_defaults():
+    config = CalmetConfig(
+        "met.nc", "geo.nc", "out.nc", "2018010100", "2018010101",
+        pycalmet.GridConfig(1, 1, 1.0, 1.0),
+    )
+    expected = {
+        "noobs": 0,
+        "iprog": 0,
+        "irhprog": 0,
+        "itprog": 0,
+        "precipitation_station_count": 0,
+        "water_temperature_category_min": 999,
+        "water_temperature_category_max": 999,
+        "coriolis": 999.0,
+        "wind_extrapolation": -4,
+        "varying_radius": False,
+        "include_w_temperature": True,
+    }
+    signature = inspect.signature(pycalmet.calmet)
+    for name, value in expected.items():
+        assert getattr(config, name) == value
+        assert signature.parameters[name].default == value
+    dynamic = {
+        "wind_bias": (0.0,) * 10,
+        "stations_per_level": (99,) * 10,
+        "wind_extrapolation_factors": (0.0,) * 10,
+        "smoothing_passes": (2,) + (4,) * 9,
+    }
+    for name, value in dynamic.items():
+        assert getattr(config, name) == value
+        assert signature.parameters[name].default is None
+    assert config.barrier_top_level == len(config.z_faces_m) - 1
+    assert signature.parameters["barrier_top_level"].default is None
+
+
+def test_calmet_default_barrier_top_level_tracks_vertical_grid():
+    config = _prognostic_calmet_config(
+        "met.nc", "geo.nc", "out.nc", "2018010100", "2018010101",
+        pycalmet.GridConfig(1, 1, 1.0, 1.0),
+        barrier_top_level=None,
+        z_faces_m=(0.0, 20.0, 60.0),
+        smoothing_passes=(0, 0),
+    )
+    _validate(config)
+    assert config.barrier_top_level == 2
+
+
 def test_parameter_only_calmet_accepts_datetime_and_flat_grid(monkeypatch, tmp_path):
     captured = []
     monkeypatch.setattr("pycalmet._calmet.run",
@@ -74,14 +167,65 @@ def test_parameter_only_calmet_accepts_datetime_and_flat_grid(monkeypatch, tmp_p
         dy_km=1.0,
         lat0=30.0,
         lon0=120.0,
+        z_faces_m=(0.0, 20.0, 60.0),
     )
     config = captured[0]
     assert result == tmp_path / "calmet.nc"
     assert config.start == "2018-03-18_00:00:00"
     assert config.end == "2018-03-18_01:00:00"
     assert (config.grid.nx, config.grid.ny) == (4, 3)
-    assert config.noobs == 2
+    assert config.noobs == 0
+    assert config.precipitation_station_count == 0
+    assert config.coriolis == 999.0
+    assert config.include_w_temperature is True
+    assert config.wind_bias == (0.0, 0.0)
+    assert config.stations_per_level == (99, 99)
+    assert config.wind_extrapolation_factors == (0.0, 0.0)
+    assert config.smoothing_passes == (2, 4)
     assert config.timestep_seconds == 3600
+
+
+def test_control_file_honours_explicit_overrides_equal_to_python_defaults(monkeypatch):
+    captured = []
+    monkeypatch.setattr("pycalmet._calmet.run",
+                        lambda config: captured.append(config) or Path(config.output))
+    pycalmet.calmet(
+        CALMET_CONTROL,
+        noobs=0,
+        iprog=0,
+        coriolis=999.0,
+        include_w_temperature=True,
+    )
+    config = captured[0]
+    assert config.noobs == 0
+    assert config.iprog == 0
+    assert config.coriolis == 999.0
+    assert config.include_w_temperature is True
+
+
+def test_grid_object_is_preserved_unless_flattened_grid_value_is_explicit(monkeypatch):
+    captured = []
+    monkeypatch.setattr("pycalmet._terrel.run",
+                        lambda config: captured.append(config) or
+                        SimpleNamespace(output=config.output))
+    grid = pycalmet.GridConfig(
+        2, 3, 1.0, 1.0, projection="LCC", lat0=27.0, lon0=117.5,
+        lat1=30.0, lat2=60.0,
+    )
+    pycalmet.terrel(srtm_dir="terrain", output="terrain.nc", grid=grid)
+    assert captured[-1].grid.projection == "LCC"
+    pycalmet.terrel(
+        srtm_dir="terrain", output="terrain.nc", grid=grid,
+        projection="UTM",
+    )
+    assert captured[-1].grid.projection == "UTM"
+    pycalmet.terrel(
+        srtm_dir="terrain", output="terrain.nc",
+        grid={"nx": 2, "ny": 3, "dx_km": 1.0, "dy_km": 1.0,
+              "projection": "LCC"},
+    )
+    assert isinstance(captured[-1].grid, pycalmet.GridConfig)
+    assert captured[-1].grid.projection == "LCC"
 
 
 def test_fortran_invalid_calmet_wind_pair_fails_explicitly():
@@ -94,8 +238,9 @@ def test_fortran_invalid_calmet_wind_pair_fails_explicitly():
         })
 
 def test_calmet_rejects_nonlegacy_wind_codes_and_rectangular_cells():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
-        pycalmet.GridConfig(1,1,1.,1.),z_faces_m=(0.,20.),smoothing_passes=(0,))
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
+        pycalmet.GridConfig(1,1,1.,1.,projection='LCC'),
+        z_faces_m=(0.,20.),smoothing_passes=(0,))
     config.iprog=6
     with pytest.raises(ValueError,match='IPROG must be'): _validate(config)
     config.iprog=14; config.iwfcod=2
@@ -105,7 +250,7 @@ def test_calmet_rejects_nonlegacy_wind_codes_and_rectangular_cells():
 
 
 def test_calmet_first_layer_midpoint_check_exempts_wind_only_runs():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),z_faces_m=(0.,30.),smoothing_passes=(0,))
     with pytest.raises(ValueError,match='first layer midpoint'): _validate(config)
     config.run_type=0
@@ -113,7 +258,7 @@ def test_calmet_first_layer_midpoint_check_exempts_wind_only_runs():
 
 
 def test_calmet_projection_qa_matches_fortran_set():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.,projection='EM'),z_faces_m=(0.,20.),
         smoothing_passes=(0,))
     assert _validate(config).tolist()==[0.,20.]
@@ -129,8 +274,9 @@ def test_calmet_projection_qa_matches_fortran_set():
     assert _validate(config).tolist()==[0.,20.]
 
 def test_calmet_readcf_validates_grid_timezone_and_start_time():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
-        pycalmet.GridConfig(1,1,1.,1.),z_faces_m=(0.,20.),smoothing_passes=(0,))
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
+        pycalmet.GridConfig(1,1,1.,1.,projection='LCC'),
+        z_faces_m=(0.,20.),smoothing_passes=(0,))
     config.base_timezone=13
     with pytest.raises(ValueError,match='timezone'): _validate(config)
     config.base_timezone=8; config.base_timezone_label='UTC+0800'
@@ -152,7 +298,7 @@ def test_calmet_readcf_validates_grid_timezone_and_start_time():
     with pytest.raises(ValueError,match='NSECDT'): _validate(config)
 
 def test_calmet_ignores_mixing_level_when_upwind_average_is_disabled():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),iavezi=0,mixing_wind_level=0,
         z_faces_m=(0.,20.),smoothing_passes=(0,))
     assert _validate(config).tolist()==[0.,20.]
@@ -161,7 +307,7 @@ def test_calmet_ignores_mixing_level_when_upwind_average_is_disabled():
 
 
 def test_calmet_accepts_legacy_output_and_setup_controls():
-    config=CalmetConfig('met.nc','geo.nc','out.dat','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.dat','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),z_faces_m=(0.,20.),smoothing_passes=(0,))
     config.save_output=False
     assert _validate(config).tolist()==[0.,20.]
@@ -178,7 +324,7 @@ def test_calmet_accepts_legacy_output_and_setup_controls():
 
 
 def test_calmet_rejects_unported_print_and_debug_outputs():
-    config=CalmetConfig('met.nc','geo.nc','out.dat','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.dat','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),z_faces_m=(0.,20.),smoothing_passes=(0,),
         print_fields=True,print_uv_levels=(1,))
     assert _validate(config).tolist()==[0.,20.]
@@ -213,7 +359,7 @@ def test_calmet_rejects_unported_print_and_debug_outputs():
 
 
 def test_calmet_selects_pacdat_only_for_mesopac_output():
-    config=CalmetConfig('met.nc','geo.nc','calmet.dat','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','calmet.dat','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),mesopac_output='pacout.dat')
     assert _output_path(config)==Path('calmet.dat')
     config.legacy_output_format=2
@@ -235,7 +381,7 @@ def test_calmet_writes_setcoast_surfer_grid(tmp_path):
 
 
 def test_calmet_iprog13_objective_noobs_mode_is_supported():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),iprog=13,iwfcod=0,prognostic_radius_km=10.,
         z_faces_m=(0.,20.),smoothing_passes=(0,))
     assert _validate(config).tolist()==[0.,20.]
@@ -247,7 +393,7 @@ def test_calmet_iprog13_objective_noobs_mode_is_supported():
 
 
 def test_calmet_iprog15_noobs_prognostic_observations_are_supported():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),iprog=15,iwfcod=1,
         z_faces_m=(0.,20.),smoothing_passes=(0,))
     with pytest.raises(ValueError,match='requires IDIOPT3=1'):
@@ -268,7 +414,7 @@ def test_calmet_iprog15_noobs_prognostic_observations_are_supported():
 
 
 def test_calmet_iprog15_objective_analysis_mode_is_supported():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),iprog=15,iwfcod=0,
         z_faces_m=(0.,20.),smoothing_passes=(0,))
     assert _validate(config).tolist()==[0.,20.]
@@ -277,12 +423,12 @@ def test_calmet_iprog15_objective_analysis_mode_is_supported():
 def test_calmet_mm4_wind_modes_map_to_their_mm5_counterparts():
     grid=pycalmet.GridConfig(1,1,1.,1.)
     for iprog,iwfcod in ((3,0),(4,1),(5,0)):
-        config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+        config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
             grid,iprog=iprog,iwfcod=iwfcod,
             prognostic_radius_km=(10. if iprog==3 else 0.),
             z_faces_m=(0.,20.),smoothing_passes=(0,))
         assert _validate(config).tolist()==[0.,20.]
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         grid,iprog=5,iwfcod=1,diagnostic_initial_wind=1,diagnostic_data='diag.dat',
         z_faces_m=(0.,20.),smoothing_passes=(0,))
     assert _validate(config).tolist()==[0.,20.]
@@ -298,8 +444,8 @@ def test_calmet_prog_wind_modes_are_supported_with_observations():
         noobs=0,surface_data='surf.dat',upper_air_files=('up.dat',),itprog=0,irhprog=0,
         precipitation_station_count=0,z_faces_m=(0.,20.),smoothing_passes=(0,),
         stations_per_level=(1,),wind_extrapolation_factors=(1.,))
-    first=CalmetConfig(**common,iprog=1,iwfcod=0,prognostic_radius_km=10.)
-    second=CalmetConfig(**common,iprog=2,iwfcod=1)
+    first=_prognostic_calmet_config(**common,iprog=1,iwfcod=0,prognostic_radius_km=10.)
+    second=_prognostic_calmet_config(**common,iprog=2,iwfcod=1)
     assert _validate(first).tolist()==[0.,20.]
     assert _validate(second).tolist()==[0.,20.]
     first.prognostic_radius_km=0.
@@ -310,7 +456,7 @@ def test_calmet_prog_wind_modes_are_supported_with_observations():
 
 
 def test_calmet_iprog0_wind1_observation_mode_is_supported():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),iprog=0,iwfcod=1,noobs=0,
         surface_data='surf.dat',upper_air_files=('up.dat',),itprog=0,irhprog=0,
         precipitation_station_count=0,
@@ -329,7 +475,7 @@ def test_calmet_iprog0_wind1_observation_mode_is_supported():
 
 
 def test_observed_similarity_wind_passes_setup_for_runtime_stheor_dispatch():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),iprog=0,iwfcod=1,noobs=0,
         surface_data='surf.dat',upper_air_files=('up.dat',),itprog=0,irhprog=0,
         precipitation_station_count=0,wind_extrapolation=4,
@@ -339,7 +485,7 @@ def test_observed_similarity_wind_passes_setup_for_runtime_stheor_dispatch():
 
 
 def test_calmet_selected_upper_initial_wind_controls_are_validated():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),iprog=0,iwfcod=1,noobs=0,
         surface_data='surf.dat',upper_air_files=('up.dat',),itprog=0,irhprog=0,
         precipitation_station_count=0,z_faces_m=(0.,20.),smoothing_passes=(0,),
@@ -353,7 +499,7 @@ def test_calmet_selected_upper_initial_wind_controls_are_validated():
 
 
 def test_calmet_diagnostic_data_controls_are_validated():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),noobs=0,surface_data='surf.dat',
         upper_air_files=('up.dat',),z_faces_m=(0.,20.),smoothing_passes=(0,),
         stations_per_level=(1,),wind_extrapolation_factors=(1.,),
@@ -370,7 +516,7 @@ def test_calmet_diagnostic_data_controls_are_validated():
 
 
 def test_calmet_initial_guess_file_controls_follow_fortran_compatibility():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),use_initial_guess_calmet=1,
         iprog=0,iwfcod=1,noobs=0,surface_data='surf.dat',upper_air_files=('up.dat',),
         itprog=0,irhprog=0,precipitation_station_count=0,
@@ -384,7 +530,7 @@ def test_calmet_initial_guess_file_controls_follow_fortran_compatibility():
 
 
 def test_calmet_spatial_averaging_switches_are_supported():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),iavet=0,iavezi=0,z_faces_m=(0.,20.),
         smoothing_passes=(0,))
     assert _validate(config).tolist()==[0.,20.]
@@ -413,7 +559,7 @@ def test_calmet_spatial_averaging_switches_are_supported():
 
 
 def test_calmet_overwater_and_regulatory_controls_are_validated():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),z_faces_m=(0.,20.),smoothing_passes=(0,))
     config.overwater_flux_method=9
     with pytest.raises(ValueError,match='ICOARE'): _validate(config)
@@ -431,7 +577,7 @@ def test_calmet_overwater_and_regulatory_controls_are_validated():
 
 
 def test_negative_icoare_requires_wave_capable_sea_data():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),overwater_flux_method=-11,
         z_faces_m=(0.,20.),smoothing_passes=(0,))
     old=_sea_metadata(version='2.00',timezone=None)
@@ -442,7 +588,7 @@ def test_negative_icoare_requires_wave_capable_sea_data():
 
 
 def test_sea_metadata_timezone_uses_calmet_positive_west_convention():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),base_timezone=8,
         z_faces_m=(0.,20.),smoothing_passes=(0,))
     _validate_sea_metadata(config,(_sea_metadata(timezone='UTC-0800'),))
@@ -498,7 +644,7 @@ def test_upper_air_equal_end_hour_preserves_readhd_begin_second_quirk():
 
 
 def test_sea_files_require_shared_projection_and_datum_metadata():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),z_faces_m=(0.,20.),smoothing_passes=(0,))
     first=_sea_metadata()
     matching=SimpleNamespace(**vars(first))
@@ -513,7 +659,7 @@ def test_sea_files_require_shared_projection_and_datum_metadata():
         _validate_sea_metadata(config,(first,shifted))
 
 def test_calmet_noobs1_requires_surface_data_and_rejects_unported_barriers():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),noobs=1,z_faces_m=(0.,20.),smoothing_passes=(0,),
         stations_per_level=(1,),wind_extrapolation_factors=(1.,))
     with pytest.raises(ValueError,match='SRFDAT'):
@@ -526,7 +672,7 @@ def test_calmet_noobs1_requires_surface_data_and_rejects_unported_barriers():
     assert _validate(config).tolist()==[0.,20.]
 
 def test_calmet_noobs0_requires_surface_and_upper_air_files():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),noobs=0,z_faces_m=(0.,20.),smoothing_passes=(0,),
         stations_per_level=(1,),wind_extrapolation_factors=(1.,))
     with pytest.raises(ValueError,match='SRFDAT'): _validate(config)
@@ -537,7 +683,7 @@ def test_calmet_noobs0_requires_surface_and_upper_air_files():
 
 
 def test_calmet_idiopt4_5_accept_control_metadata_without_observation_files():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),noobs=0,run_type=0,
         diagnostic_data='diag.dat',diagnostic_surface_wind=1,
         diagnostic_upper_wind=1,surface_control_stations=(('SFC',1,.5,.5,0.,10.),),
@@ -552,7 +698,7 @@ def test_calmet_idiopt4_5_accept_control_metadata_without_observation_files():
     with pytest.raises(ValueError,match='IDIOPT5.*US records'): _validate(config)
 
 def test_calmet_noobs2_accepts_external_gridded_cloud_data():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),noobs=2,cloud_method=2,
         cloud_data='cloud.dat',z_faces_m=(0.,20.),smoothing_passes=(0,))
     assert _validate(config).tolist()==[0.,20.]
@@ -561,7 +707,7 @@ def test_calmet_noobs2_accepts_external_gridded_cloud_data():
         _validate(config)
 
 def test_calmet_cloud_output_controls_match_legacy_rules():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),cloud_method=4,cloud_output=True,
         z_faces_m=(0.,20.),smoothing_passes=(0,))
     with pytest.raises(ValueError,match='CLDDAT'): _validate(config)
@@ -572,7 +718,7 @@ def test_calmet_cloud_output_controls_match_legacy_rules():
 
 
 def test_calmet_itprog1_accepts_observed_surface_temperature_controls():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),noobs=1,surface_data='surf.dat',itprog=1,
         z_faces_m=(0.,20.),smoothing_passes=(0,),stations_per_level=(1,),
         wind_extrapolation_factors=(1.,),temperature_interpolation_power=2,
@@ -587,7 +733,7 @@ def test_calmet_itprog1_accepts_observed_surface_temperature_controls():
 
 
 def test_calmet_irhprog0_is_reset_in_full_noobs_mode():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),irhprog=0,z_faces_m=(0.,20.),smoothing_passes=(0,))
     assert _validate(config).tolist()==[0.,20.]
     assert config.irhprog==1
@@ -597,7 +743,7 @@ def test_calmet_irhprog0_is_reset_in_full_noobs_mode():
     assert _validate(config).tolist()==[0.,20.]
 
 def test_calmet_prognostic_and_relaxation_timesteps_match_readcf_limits():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),z_faces_m=(0.,20.),smoothing_passes=(0,))
     config.prognostic_timestep_seconds=43200
     assert _validate(config).tolist()==[0.,20.]
@@ -612,7 +758,7 @@ def test_calmet_prognostic_and_relaxation_timesteps_match_readcf_limits():
 
 
 def test_calmet_selected_surface_temperature_is_observation_only():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),surface_temperature_option=1,
         z_faces_m=(0.,20.),smoothing_passes=(0,))
     with pytest.raises(ValueError,match='ITPROG>0'): _validate(config)
@@ -627,7 +773,7 @@ def test_calmet_selected_surface_temperature_is_observation_only():
 
 
 def test_calmet_domain_prognostic_surface_temperature_is_valid_with_itprog1():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),noobs=1,surface_data='surf.dat',
         iprog=14,iwfcod=1,itprog=1,surface_temperature_option=-2,
         z_faces_m=(0.,20.),smoothing_passes=(0,),stations_per_level=(1,),
@@ -636,7 +782,7 @@ def test_calmet_domain_prognostic_surface_temperature_is_valid_with_itprog1():
 
 
 def test_calmet_itprog0_iupt_minus2_requires_diagnostic_lapse_rate():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),noobs=0,surface_data='surf.dat',
         upper_air_files=('up.dat',),itprog=0,irhprog=0,
         upper_temperature_option=-2,precipitation_station_count=0,
@@ -648,7 +794,7 @@ def test_calmet_itprog0_iupt_minus2_requires_diagnostic_lapse_rate():
     assert _validate(config).tolist()==[0.,20.]
 
 def test_calmet_positive_npsta_requires_file_but_is_valid_in_noobs_mode():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),precipitation_station_count=1,
         z_faces_m=(0.,20.),smoothing_passes=(0,))
     with pytest.raises(ValueError,match='PRCDAT'): _validate(config)
@@ -657,7 +803,7 @@ def test_calmet_positive_npsta_requires_file_but_is_valid_in_noobs_mode():
 
 
 def test_calmet_rprog_matches_readcf_nonzero_rule():
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),iprog=13,iwfcod=0,
         z_faces_m=(0.,20.),smoothing_passes=(0,))
     with pytest.raises(ValueError,match='non-zero RPROG'): _validate(config)
@@ -673,7 +819,7 @@ def test_noobs_mode_grids_positive_npsta_precipitation(monkeypatch):
 
     record=SimpleNamespace(rate_mm_h=np.array([2.5],dtype=np.float32))
     precipitation=SimpleNamespace(at_begin=lambda timestamp: record)
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),precipitation_station_count=1,
         precipitation_data='precip.dat',z_faces_m=(0.,20.),smoothing_passes=(0,))
     transform=_noobs_step_transform(
@@ -712,7 +858,7 @@ def test_noobs_mode_preserves_sea_data_for_overwater_physics():
     sea=SimpleNamespace(at_begin=lambda timestamp: record,
         point=lambda grid: np.array([.5,.5]),
         longitude_latitude=lambda: (120.,30.))
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),noobs=2,itprog=2,
         z_faces_m=(0.,20.),smoothing_passes=(0,))
     step=Step(np.array([[290.]],dtype=np.float32),
@@ -741,7 +887,7 @@ def test_noobs_waterp_keeps_prognostic_thermodynamics_and_merges_only_waves():
         wave_height_m=2.,gradient_below_k_m=-.008,gradient_above_k_m=-.004)
     sea=SimpleNamespace(at_begin=lambda timestamp: record,
         point=lambda grid: np.array([.5,.5]),longitude_latitude=lambda: (120.,30.))
-    config=CalmetConfig('met.nc','geo.nc','out.nc','2018010100','2018010101',
+    config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),noobs=2,itprog=2,water_temperature_mode=2,
         z_faces_m=(0.,20.),smoothing_passes=(0,))
     shape=(1,1)

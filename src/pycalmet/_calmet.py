@@ -750,6 +750,8 @@ def _validate(config: CalmetConfig):
     if config.run_type!=0 and not np.float32(9.)<=first_center<=np.float32(11.):
         raise ValueError(
             'full CALMET runs require the first layer midpoint to be between 9 and 11 m')
+    if config.barrier_top_level is None:
+        config.barrier_top_level=faces.size-1
     if config.barrier_count and not 1<=config.barrier_top_level<faces.size:
         raise ValueError('barrier_top_level/KBAR must identify a CALMET layer')
     if config.grid.dx_km!=config.grid.dy_km:

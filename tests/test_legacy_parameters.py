@@ -7,12 +7,40 @@ import pycalmet
 from pycalmet.config import (CalmetConfig, CalwrfConfig, CtgprocConfig,
                              MakegeoConfig, TerrelConfig)
 from pycalmet.control import assignments
+from pycalmet.legacy import GridConfig as LegacyGridConfig
+from pycalmet.legacy import MakegeoConfig as LegacyMakegeoConfig
+from pycalmet.legacy._compat.control import calwrf_config as legacy_calwrf_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = Path(__file__).with_name("fixtures")
 CALWRF_CONTROL = FIXTURES / "calwrf.inp"
 CALMET_CONTROL = FIXTURES / "calmet.inp"
+
+
+def test_legacy_preprocessor_defaults_match_fortran():
+    grid = LegacyGridConfig(1, 1, 1.0, 1.0)
+    makegeo = LegacyMakegeoConfig("terrain", "landuse", "geo", grid)
+    terrel = pycalmet.legacy.TerrelConfig("terrain", "out", grid)
+    ctgproc = pycalmet.legacy.CtgprocConfig(("landuse",), "out", grid)
+    assert grid.projection == "UTM"
+    assert grid.polar_processing == 2
+    assert terrel.receptor_columns == 4
+    assert (ctgproc.input_type, ctgproc.mesh_density,
+            ctgproc.input_datum) == ("CTG", 1, "NAS-C")
+    assert ctgproc.fill_empty_ocean is False
+    assert pycalmet.legacy.CtgprocConfig(
+        ("landuse",), "out", grid, coastline_file="coast.bln",
+    ).fill_empty_ocean is True
+    assert makegeo.snow_height_scale_m == 10.0
+    assert makegeo.snow_depth_minimum_m == 0.01
+
+
+def test_legacy_calwrf_netcdf_control_does_not_overwrite_it_with_m3d():
+    config = legacy_calwrf_config(
+        ROOT / "examples/zhejiang/config/calwrf.inp")
+    assert config.output.suffix.casefold() == ".nc"
+    assert config.legacy_output is None
 
 
 def test_calwrf_accepts_fortran_parameter_names(monkeypatch, tmp_path):
@@ -329,21 +357,29 @@ def test_legacy_grid_override_is_applied_to_control_config(monkeypatch):
                         captured.append(config) or SimpleNamespace(output=config.output))
     pycalmet.makegeo(ROOT / "examples/zhejiang/config/makegeo.inp", NX=7)
     assert captured[0].grid.nx == 7
+    pycalmet.makegeo(
+        ROOT / "examples/zhejiang/config/makegeo.inp", grid={"nx": 8})
+    assert captured[1].grid.nx == 8
+    assert isinstance(captured[1].grid, pycalmet.GridConfig)
 
 
-def test_descriptive_and_legacy_alias_conflicts_are_rejected(tmp_path):
+def test_descriptive_alias_conflicts_are_rejected_and_grid_fields_merge(
+        monkeypatch, tmp_path):
     with pytest.raises(TypeError, match="duplicate CalwrfConfig parameter 'output'"):
         pycalmet.calwrf({
             "WRF_FILES": [tmp_path / "wrf.nc"], "START": "2018010100",
             "END": "2018010101", "OUTPUT": tmp_path / "a.nc",
             "FIO": tmp_path / "b.m3d",
         })
-    with pytest.raises(TypeError, match="duplicate CalmetConfig parameter 'grid'"):
-        pycalmet.calmet({
-            "meteorology": "m", "geophysical": "g", "output": "o",
-            "start": "2018010100", "end": "2018010101",
-            "grid": pycalmet.GridConfig(1, 1, 1., 1.), "NX": 2,
-        })
+    captured = []
+    monkeypatch.setattr("pycalmet._calmet.run",
+                        lambda config: captured.append(config) or Path(config.output))
+    pycalmet.calmet({
+        "meteorology": "m", "geophysical": "g", "output": "o",
+        "start": "2018010100", "end": "2018010101",
+        "grid": pycalmet.GridConfig(1, 1, 1., 1.), "NX": 2,
+    })
+    assert captured[0].grid.nx == 2
 
 
 def test_legacy_declared_file_counts_are_validated(tmp_path):

@@ -10,6 +10,8 @@ import netCDF4 as nc
 import numpy as np
 
 from ._common import fortran_inclusive_slice
+from ._calwrf_listing import write_calwrf_listing
+from ._path_safety import validate_calwrf_paths
 
 from .config import CalwrfConfig
 from .legacy_calwrf import write_m3d
@@ -382,6 +384,13 @@ def _create_output(path: Path,src: nc.Dataset,nt: int,ny: int,nx: int,nz: int,ys
 
 
 def run(config: CalwrfConfig) -> Path:
+    active_surface_output=(config.surface_output
+                           if config.create_surface and config.legacy_output is not None
+                           else None)
+    validate_calwrf_paths(
+        config.wrf_files, config.output, config.legacy_output,
+        active_surface_output, config.listing_output,
+    )
     paths = [Path(p) for p in config.wrf_files]
     if not paths:
         raise ValueError("wrf_files is empty")
@@ -500,4 +509,12 @@ def run(config: CalwrfConfig) -> Path:
     if config.legacy_output is not None:
         write_m3d(config.output,config.legacy_output,
                   config.surface_output if config.create_surface else None)
+    if config.listing_output is not None:
+        write_calwrf_listing(
+            config.listing_output,title=config.title,wrf_files=paths,
+            requested_start=begin,requested_end=end,output=config.output,
+            legacy_output=config.legacy_output,
+            surface_output=active_surface_output,written_times=selected_times,
+            nx=nx,ny=ny,nz=nz,
+        )
     return Path(config.output)
