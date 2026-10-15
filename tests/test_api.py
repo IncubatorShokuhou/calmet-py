@@ -866,6 +866,18 @@ def test_calmet_cloud_output_controls_match_legacy_rules():
     with pytest.raises(ValueError,match='MCLOUD=2'): _validate(config)
 
 
+@pytest.mark.parametrize('threshold',[0.,-0.001,np.inf,np.nan])
+def test_calmet_cloud_condensate_threshold_must_be_finite_and_positive(threshold):
+    config=_prognostic_calmet_config(
+        'met.nc','geo.nc','out.nc','2018010100','2018010101',
+        pycalmet.GridConfig(1,1,1.,1.),
+        cloud_condensate_threshold_g_kg=threshold,
+        z_faces_m=(0.,20.),smoothing_passes=(0,))
+
+    with pytest.raises(ValueError,match='finite and positive'):
+        _validate(config)
+
+
 def test_calmet_itprog1_accepts_observed_surface_temperature_controls():
     config=_prognostic_calmet_config('met.nc','geo.nc','out.nc','2018010100','2018010101',
         pycalmet.GridConfig(1,1,1.,1.),noobs=1,surface_data='surf.dat',itprog=1,

@@ -196,6 +196,7 @@ MEANING_OVERRIDES.update({
     "regulatory_mode": ("Regulatory check mode: 0 disables it; 1 enforces the USEPA-required mixing-height, overwater-flux, relaxation, and representative-temperature choices.", "法规检查模式：0 关闭；1 强制采用 USEPA 要求的混合层、水面通量、松弛和代表温度选项。"),
     "include_w_temperature": ("Store 3-D vertical-wind and temperature fields required by CALGRID and CALPUFF's subgrid complex-terrain option.", "是否存储 CALGRID 以及 CALPUFF 亚网格复杂地形选项所需的三维垂直风速和温度场。"),
     "cloud_method": ("Cloud source: 1 surface observations (NOOBS 0/1), 2 existing CLOUD.DAT, 3 prognostic 850-hPa RH, or 4 prognostic RH at all levels.", "云场来源：1 地面观测（NOOBS 0/1），2 已有 CLOUD.DAT，3 预报场 850 hPa 相对湿度，4 预报场所有高度的相对湿度。"),
+    "cloud_condensate_threshold_g_kg": ("Minimum layer-total non-precipitating cloud condensate (`QCLOUD + QICE`), in g kg⁻¹, used to retain prognostic cloud cover and diagnose its condensate-based ceiling.", "用于保留预报云量并诊断凝结物云底高度的逐层非降水云凝结物总量（`QCLOUD + QICE`）下限，单位 g/kg。"),
     "cloud_data_format": ("CLOUD.DAT format: unformatted binary (1) or formatted text (2).", "CLOUD.DAT 格式：非格式化二进制 (1) 或格式化文本 (2)。"),
     "surface_data_format": ("SURF.DAT format: unformatted binary (1) or formatted text (2).", "SURF.DAT 格式：非格式化二进制 (1) 或格式化文本 (2)。"),
     "precipitation_data_format": ("PRECIP.DAT format: unformatted binary (1) or formatted text (2).", "PRECIP.DAT 格式：非格式化二进制 (1) 或格式化文本 (2)。"),

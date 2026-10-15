@@ -477,10 +477,10 @@ def test_run_pipeline_signature_exposes_every_typed_stage_parameter():
         for parameter in _canonical_api_parameters(function)
     ]
 
-    # Keep the compact directory/grouped-config forms while making all 322
+    # Keep the compact directory/grouped-config forms while making all 323
     # canonical stage parameters discoverable to IDEs and inspect.signature.
     assert list(parameters) == grouped + expected_prefixed
-    assert len(expected_prefixed) == 322
+    assert len(expected_prefixed) == 323
     assert signature.return_annotation is not inspect.Signature.empty
 
     for name in grouped:

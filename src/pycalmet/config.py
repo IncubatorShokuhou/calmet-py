@@ -201,6 +201,7 @@ class CalmetConfig:
     timestep_seconds: int = 3600
     prognostic_timestep_seconds: int = 3600
     cloud_method: int = 4
+    cloud_condensate_threshold_g_kg: float = .005
     cloud_data: str | Path | None = None
     cloud_data_format: int = 2
     cloud_output: int = 0

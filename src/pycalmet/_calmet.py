@@ -726,6 +726,9 @@ def _validate(config: CalmetConfig):
         raise ValueError('prognostic_timestep_seconds/ISTEPPGS must not exceed 12 hours')
     if config.cloud_method not in {1,2,3,4}:
         raise ValueError('cloud_method/MCLOUD must be 1, 2, 3, or 4')
+    if (not np.isfinite(config.cloud_condensate_threshold_g_kg) or
+            config.cloud_condensate_threshold_g_kg<=0.):
+        raise ValueError('cloud_condensate_threshold_g_kg must be finite and positive')
     if config.cloud_output not in {0,1}:
         raise ValueError('cloud_output/ICLDOUT must be zero or one')
     if config.cloud_method==1 and config.noobs==2:
@@ -1786,6 +1789,7 @@ def run(config: CalmetConfig) -> Path:
                      water_temperature_mode=config.water_temperature_mode,
                      default_water_gradient_above=config.water_temperature_gradient_above,
                      cloud_method=config.cloud_method,
+                     cloud_condensate_threshold_g_kg=config.cloud_condensate_threshold_g_kg,
                      diagnostic_wind=config.iwfcod==1,
                      wind_only=(config.run_type==0 and
                                 bool(config.diagnostic_lapse_rate)),

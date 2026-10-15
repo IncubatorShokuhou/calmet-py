@@ -1247,22 +1247,39 @@ def mesopac_layer_average(u, v, mixing_height_m, z_faces_m, *,
                  (lower_u,lower_v,upper_u,upper_v))
 
 def prognostic_temperature_3d(prognostic_temperature_k, surface_temperature_k,
-                              convective_height_m, z_centers_m):
-    """TEMP3D's current ``ITPROG=2`` branch.
+                              convective_height_m, z_faces_m):
+    """Blend prognostic temperatures through the convective-layer boundary.
 
-    Level one is the final SURFVAR/AVETMP temperature.  Prognostic values are
-    retained aloft except levels inside the convective layer, where CALMET
-    imposes a dry-adiabatic profile relative to the first model midpoint.
+    The lowest CALMET layer remains anchored to the final SURFVAR/AVETMP
+    temperature.  Each layer aloft receives a dry-adiabatic temperature in
+    proportion to the layer thickness below the convective-layer top.  A
+    layer wholly below the top is therefore fully mixed, a layer wholly above
+    it retains its prognostic value, and a layer intersected by the top varies
+    continuously as that top moves through the layer.
     """
     source=np.asarray(prognostic_temperature_k,dtype=MODEL_DTYPE)
     surface=np.asarray(surface_temperature_k,dtype=MODEL_DTYPE)
     zic=np.asarray(convective_height_m,dtype=MODEL_DTYPE)
-    centers=np.asarray(z_centers_m,dtype=MODEL_DTYPE)
-    if source.ndim!=3 or source.shape[1:]!=surface.shape or surface.shape!=zic.shape or source.shape[0]!=centers.size: raise ValueError('TEMP3D inputs do not share CALMET dimensions')
+    faces=np.asarray(z_faces_m,dtype=MODEL_DTYPE)
+    if (source.ndim!=3 or source.shape[0]<1 or surface.ndim!=2 or
+            source.shape[1:]!=surface.shape or surface.shape!=zic.shape):
+        raise ValueError('TEMP3D inputs do not share CALMET dimensions')
+    if (faces.ndim!=1 or faces.size!=source.shape[0]+1 or
+            not np.all(np.isfinite(faces)) or np.any(np.diff(faces)<=0.)):
+        raise ValueError(
+            'TEMP3D requires one increasing face above and below each layer')
     result=source.copy(); result[0]=surface
-    if centers.size>1:
-        adiabatic=surface[None,:,:]-.0098*(centers[1:,None,None]-centers[0])
-        result[1:]=np.where(centers[1:,None,None]<=zic[None,:,:],adiabatic,result[1:])
+    if source.shape[0]>1:
+        centers=(faces[:-1]+faces[1:])*np.float32(.5)
+        lower=faces[1:-1,None,None]
+        upper=faces[2:,None,None]
+        fraction=np.clip(
+            (zic[None,:,:]-lower)/(upper-lower),np.float32(0.),np.float32(1.))
+        adiabatic=(surface[None,:,:]-np.float32(.0098)*
+                   (centers[1:,None,None]-centers[0]))
+        blended=(fraction*adiabatic+(np.float32(1.)-fraction)*source[1:])
+        result[1:]=np.where(fraction<=0.,source[1:],
+                            np.where(fraction>=1.,adiabatic,blended))
     return result
 
 def pgt_stability(u10, v10, solar_elevation_sine, cloud_fraction_field,

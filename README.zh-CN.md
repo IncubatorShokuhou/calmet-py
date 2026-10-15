@@ -396,7 +396,7 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 </details>
 
 <details>
-<summary><strong>CALMET</strong> — 共 165 个参数；浙江控制文件：`examples/zhejiang/config/calmet.inp`。</summary>
+<summary><strong>CALMET</strong> — 共 166 个参数；浙江控制文件：`examples/zhejiang/config/calmet.inp`。</summary>
 
 | 参数 | 含义 | Python 类型 | Python 默认值 | 浙江示例值 |
 | --- | --- | --- | --- | --- |
@@ -414,6 +414,7 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 | `timestep_seconds` | CALMET 计算时间步长，必须能整除 1 小时。 | `int` | `3600` | `3600` |
 | `prognostic_timestep_seconds` | 相邻预报记录的秒数：必须为 timestep_seconds 的正整数倍且不超过 12 小时。传统 PROG.DAT 与原生 MM4.DAT 受文件格式限制，仍为逐小时资料。 | `int` | `3600` | `3600` |
 | `cloud_method` | 云场来源：1 地面观测（NOOBS 0/1），2 已有 CLOUD.DAT，3 预报场 850 hPa 相对湿度，4 预报场所有高度的相对湿度。 | `int` | `4` | `4` |
+| `cloud_condensate_threshold_g_kg` | 用于保留预报云量并诊断凝结物云底高度的逐层非降水云凝结物总量（`QCLOUD + QICE`）下限，单位 g/kg。 | `float` | `0.005` | `0.005` |
 | `cloud_data` | CLOUD.DAT 路径：cloud_method=2 时作为输入，cloud_output=1 时作为输出目标。 | `str \| Path \| None` | `None` | `examples/zhejiang/config/cloud.dat` |
 | `cloud_data_format` | CLOUD.DAT 格式：非格式化二进制 (1) 或格式化文本 (2)。 | `int` | `2` | `2` |
 | `cloud_output` | 是否把内部生成的格点云场写为 CLOUD.DAT（0=否，1=是）；cloud_method=2 读取已有文件时不能同时输出。 | `int` | `0` | `0` |
@@ -590,6 +591,28 @@ pycalmet.readlst(...)
 pycalmet.legacy.calwrf(...)
 pycalmet.legacy.calmet(...)
 ```
+
+## 现代热力与云场诊断
+
+默认 API 对 WRF 驱动的 CALMET 计算采用以下处理：
+
+- **相对湿度。** 使用 WRF `QVAPOR` 诊断相对湿度时，先把水汽与干空气的质量
+  混合比 `r` 按 `e = p r / (ε + r)` 转换为水汽分压，其中 `ε = 0.622`；再按
+  `RH = 100 e / e_s(T)` 计算相对湿度。
+- **云凝结物。** 当输入含有 `QCLOUD` 或 `QICE` 时，只有逐层非降水云凝结物
+  总量 `QCLOUD + QICE` 达到 `cloud_condensate_threshold_g_kg`，才保留由相对
+  湿度诊断出的预报云量。默认阈值为 `0.005 g/kg`（`5 × 10⁻⁶ kg/kg`）；最低
+  的达标源层用于确定基于凝结物的云底高度。在 `run_pipeline` 中，对应参数名为
+  `calmet_cloud_condensate_threshold_g_kg`。若两个凝结物字段都不存在，则保留
+  未经该掩膜处理的相对湿度诊断云场。
+- **TEMP3D 层重叠。** 当 `ITPROG=2` 时，若对流混合层顶穿过某个 CALMET 层，
+  则按该层的几何厚度连续混合。对第 `k` 层，
+  `f_k = clip((z_i - z_{k-1/2}) / (z_{k+1/2} - z_{k-1/2}), 0, 1)`，且
+  `T_k = f_k T_mix,k + (1 - f_k) T_prog,k`。完全位于混合层内或其上的层分别
+  采用混合层廓线或预报廓线；混合层顶移动时，相交层的温度连续变化。
+
+这些处理属于默认 API；`pycalmet.legacy` 继续保留冻结的历史公式和按层中心切换的
+TEMP3D 行为，以支持结果复现。
 
 ## 浙江示例
 

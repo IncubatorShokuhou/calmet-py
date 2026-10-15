@@ -299,19 +299,19 @@ def test_source_uses_stored_relative_humidity_instead_of_reconstructing_it():
     np.testing.assert_array_equal(got,100.)
 
 
-def test_relative_humidity_uses_standard_wrf_mixing_ratio_definition():
+def test_relative_humidity_uses_exact_wrf_vapor_pressure_conversion():
     qvapor=np.array([.01],dtype=np.float32)
     pressure=np.array([1000.],dtype=np.float32)
     temperature=np.array([300.],dtype=np.float32)
     tc=temperature-273.15
-    vapor_pressure=6.112*np.exp(17.67*tc/(tc+243.5))
-    saturation_mixing_ratio=.622*vapor_pressure/(pressure-vapor_pressure)
+    saturation_vapor_pressure=6.112*np.exp(17.67*tc/(tc+243.5))
+    vapor_pressure=pressure*qvapor/(.622+qvapor)
 
     result=_relative_humidity(qvapor,pressure,temperature)
 
     assert result.dtype==np.float32
     np.testing.assert_allclose(
-        result,100.*qvapor/saturation_mixing_ratio,rtol=2.e-6)
+        result,100.*vapor_pressure/saturation_vapor_pressure,rtol=2.e-6)
 
 
 def test_step_interpolation_preserves_fractional_surface_humidity():
@@ -866,8 +866,35 @@ def test_surface_fields_can_retain_pre_average_mixing_grids():
 
 def test_temp3d_prognostic_branch_applies_surface_and_convective_adiabat():
     source=np.array([[[290.]],[[285.]],[[275.]]]); surface=np.array([[292.]])
-    got=prognostic_temperature_3d(source,surface,np.array([[200.]]),[10.,100.,300.])
+    got=prognostic_temperature_3d(
+        source,surface,np.array([[180.]]),[0.,20.,180.,420.])
     np.testing.assert_allclose(got[:,0,0],[292.,292.-.0098*90.,275.])
+
+def test_temp3d_prognostic_branch_blends_by_layer_overlap_continuously():
+    source=np.broadcast_to(
+        np.array([290.,280.,270.],dtype=np.float32)[:,None,None],(3,1,3))
+    surface=np.full((1,3),300.,dtype=np.float32)
+    lid=np.array([[100.,200.,300.]],dtype=np.float32)
+    got=prognostic_temperature_3d(source,surface,lid,[0.,100.,300.,700.])
+    mixed=300.-.0098*(200.-50.)
+    np.testing.assert_allclose(got[1,0],[280.,.5*(280.+mixed),mixed],rtol=2e-6)
+    np.testing.assert_allclose(got[2,0],270.)
+
+    epsilon=np.float32(.001)
+    adjacent_lids=np.array([[200.-epsilon,200.+epsilon]],dtype=np.float32)
+    adjacent_source=np.broadcast_to(source[:,:,:1],(3,1,2))
+    adjacent_surface=np.full((1,2),300.,dtype=np.float32)
+    adjacent=prognostic_temperature_3d(
+        adjacent_source,adjacent_surface,adjacent_lids,[0.,100.,300.,700.])
+    expected_delta=(mixed-280.)*(2.*epsilon/200.)
+    np.testing.assert_allclose(
+        adjacent[1,0,1]-adjacent[1,0,0],expected_delta,rtol=.01,atol=1e-6)
+
+@pytest.mark.parametrize('faces',([0.,100.,300.],[0.,100.,100.,700.]))
+def test_temp3d_prognostic_branch_rejects_invalid_faces(faces):
+    source=np.zeros((3,1,1),dtype=np.float32)
+    with pytest.raises(ValueError,match='one increasing face'):
+        prognostic_temperature_3d(source,np.zeros((1,1)),np.zeros((1,1)),faces)
 
 def test_gfortran_sequential_record_roundtrip(tmp_path):
     path=tmp_path/'records.dat'; payload=fixed_string('CALMET.DAT',16)+fixed_string('2.1',16)+fixed_string('No-Obs file structure with embedded control file',64)

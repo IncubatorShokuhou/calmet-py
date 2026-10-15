@@ -418,7 +418,7 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 </details>
 
 <details>
-<summary><strong>CALMET</strong> — 165 parameters; Zhejiang control: `examples/zhejiang/config/calmet.inp`.</summary>
+<summary><strong>CALMET</strong> — 166 parameters; Zhejiang control: `examples/zhejiang/config/calmet.inp`.</summary>
 
 | Parameter | Meaning | Python type | Python default | Zhejiang value |
 | --- | --- | --- | --- | --- |
@@ -436,6 +436,7 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 | `timestep_seconds` | CALMET computational time step; it must divide evenly into one hour. | `int` | `3600` | `3600` |
 | `prognostic_timestep_seconds` | Seconds between prognostic records: a positive multiple of timestep_seconds and no more than 12 hours. Traditional PROG.DAT and native MM4.DAT inputs remain hourly by file format. | `int` | `3600` | `3600` |
 | `cloud_method` | Cloud source: 1 surface observations (NOOBS 0/1), 2 existing CLOUD.DAT, 3 prognostic 850-hPa RH, or 4 prognostic RH at all levels. | `int` | `4` | `4` |
+| `cloud_condensate_threshold_g_kg` | Minimum layer-total non-precipitating cloud condensate (`QCLOUD + QICE`), in g kg⁻¹, used to retain prognostic cloud cover and diagnose its condensate-based ceiling. | `float` | `0.005` | `0.005` |
 | `cloud_data` | CLOUD.DAT path: input when cloud_method=2, or output destination when cloud_output=1. | `str \| Path \| None` | `None` | `examples/zhejiang/config/cloud.dat` |
 | `cloud_data_format` | CLOUD.DAT format: unformatted binary (1) or formatted text (2). | `int` | `2` | `2` |
 | `cloud_output` | Write the internally generated gridded cloud field as CLOUD.DAT (0=no, 1=yes); output is unavailable when cloud_method=2 reads an existing file. | `int` | `0` | `0` |
@@ -614,6 +615,34 @@ frozen compatibility implementation:
 pycalmet.legacy.calwrf(...)
 pycalmet.legacy.calmet(...)
 ```
+
+## Modern thermodynamics and cloud diagnostics
+
+The default API uses the following treatments for WRF-driven CALMET
+calculations:
+
+- **Relative humidity.** When relative humidity is diagnosed from WRF
+  `QVAPOR`, the dry-air mixing ratio `r` is first converted to water-vapour
+  partial pressure with `e = p r / (ε + r)`, where `ε = 0.622`. Relative
+  humidity is then `RH = 100 e / e_s(T)`.
+- **Cloud condensate.** When `QCLOUD` or `QICE` is present, prognostic cloud
+  cover derived from relative humidity is retained only where the layer-total
+  non-precipitating condensate `QCLOUD + QICE` reaches
+  `cloud_condensate_threshold_g_kg`. The default is `0.005 g kg⁻¹`
+  (`5 × 10⁻⁶ kg kg⁻¹`); the lowest qualifying source layer supplies the
+  condensate-based cloud ceiling. Use
+  `calmet_cloud_condensate_threshold_g_kg` for the same control in
+  `run_pipeline`. If neither condensate field exists, the RH-derived cloud
+  field remains available without this mask.
+- **TEMP3D layer overlap.** With `ITPROG=2`, a CALMET layer crossed by the
+  convective mixing height is blended by its geometric thickness. For layer
+  `k`, `f_k = clip((z_i - z_{k-1/2}) / (z_{k+1/2} - z_{k-1/2}), 0, 1)` and
+  `T_k = f_k T_mix,k + (1 - f_k) T_prog,k`. Layers wholly below or above the
+  mixing height retain the mixed or prognostic profile, respectively, while
+  the intersected layer changes continuously as the mixing height moves.
+
+These treatments belong to the default API. `pycalmet.legacy` retains the
+frozen historical formulas and level-centre TEMP3D switch for reproducibility.
 
 ## Zhejiang example
 

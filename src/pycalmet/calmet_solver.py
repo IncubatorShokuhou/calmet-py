@@ -409,7 +409,8 @@ def _interpolate_ceiling(left,right,fraction):
     return _model_array(np.where(
         (left!=0.)&(right!=0.),interpolated,np.maximum(left,right)))
 
-def interpolate_step1_fields(left: Step1Fields,right: Step1Fields,fraction,*,cloud_method=4):
+def interpolate_step1_fields(left: Step1Fields,right: Step1Fields,fraction,*,cloud_method=4,
+                             cloud_condensate_threshold_g_kg=.005):
     """Interpolate between two actual prognostic records."""
     f=MODEL_DTYPE(fraction)
     if not 0.<=f<=1.: raise ValueError('prognostic interpolation fraction must be between zero and one')
@@ -428,7 +429,8 @@ def interpolate_step1_fields(left: Step1Fields,right: Step1Fields,fraction,*,clo
     cloud_water=None
     if left.integrated_cloud_water is not None and right.integrated_cloud_water is not None:
         cloud_water=lerp(left.integrated_cloud_water,right.integrated_cloud_water)
-        cloudy=cloud_water>=1.e-6; cloud=np.where(cloudy,cloud,0.); ceiling=np.where(cloudy,ceiling,0.)
+        cloudy=cloud_water>=cloud_condensate_threshold_g_kg
+        cloud=np.where(cloudy,cloud,0.); ceiling=np.where(cloudy,ceiling,0.)
     temperature=lerp(left.temperature,right.temperature)
     precipitation=lerp(left.precipitation_rate,right.precipitation_rate)
     precipitation_code=np.where(precipitation>0.,np.where(temperature[0]<273.15,20,10),0).astype(np.int32)
@@ -603,22 +605,22 @@ def _prognostic_wind_components(speed,direction,convergence):
 def _relative_humidity(qvapor,pressure_hpa,temperature_k):
     """Diagnose RH from WRF water-vapour mixing ratio.
 
-    ``QVAPOR`` is the mass ratio of water vapour to dry air, so its saturation
-    value is ``epsilon * e_s / (p - e_s)``.  The legacy API retains CALWRF's
-    ``epsilon * e_s / p`` approximation.
+    ``QVAPOR`` is the mass ratio of water vapour to dry air.  Convert it to
+    vapour pressure with ``e = p r / (epsilon + r)`` before comparing it with
+    saturation vapour pressure.  The legacy API retains CALWRF's approximation.
     """
     temperature=np.asarray(temperature_k,dtype=MODEL_DTYPE)
     pressure=np.asarray(pressure_hpa,dtype=MODEL_DTYPE)
     vapor=np.asarray(qvapor,dtype=MODEL_DTYPE)
     tc=temperature-273.15
     es=6.112*np.exp(17.67*tc/(tc+243.5))
-    saturation=.622*es/(pressure-es)
-    return _model_array(np.clip(100.*vapor/saturation,0.,100.))
+    vapor_pressure=pressure*vapor/(.622+vapor)
+    return _model_array(np.clip(100.*vapor_pressure/es,0.,100.))
 
 def _cloud_water_g_kg(values):
-    """Convert canonical cloud water from kg/kg to g/kg without packing."""
+    """Convert canonical cloud condensate from kg/kg to nonnegative g/kg."""
     values=np.asarray(values,dtype=MODEL_DTYPE)
-    return _model_array(values*1000.)
+    return _model_array(np.maximum(values,0.)*1000.)
 
 
 def _source_relative_humidity(dataset,time_index,qvapor,pressure,temperature):
@@ -698,7 +700,7 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
                        base_timezone=0,thermal_state: SourceThermalState | None=None,
                        mapper: PrognosticMapper | None=None,prognostic_ocean_category=16,
                        water_temperature_mode=0,
-                       cloud_method=4,
+                       cloud_method=4,cloud_condensate_threshold_g_kg=.005,
                        precipitation_interpolation=2,precipitation_radius_km=50.,
                        precipitation_cutoff=.01,prognostic_observation_rmin_km=None,
                        prognostic_observation_barriers=(),prognostic_observation_barrier_top_level=0):
@@ -811,14 +813,20 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
         source_ceiling=np.full_like(source_cloud,80.*30.48)
     else:
         raise ValueError('cloud_method must be MCLOUD 3 or 4')
-    if 'qcloud' in dataset.variables:
-        source_qcloud=_cloud_water_g_kg(dataset['qcloud'][time_index])
-        source_aux=cloud_liquid_water_profile(source_qcloud,height,z_faces_m)
-        auxiliary_cloud=(mapper.nearest(source_aux[0]),mapper.nearest(source_aux[1]),
-                         mapper.nearest(source_aux[2]),mapper.nearest(source_aux[3]))
-        cloud_water=mapper.interpolate(np.sum(source_qcloud,axis=0))
-        cloudy=cloud_water>=1.e-6
-        present=source_qcloud>1.e-9
+    has_qcloud='qcloud' in dataset.variables
+    has_qice='qice' in dataset.variables
+    if has_qcloud or has_qice:
+        source_qcloud=(_cloud_water_g_kg(dataset['qcloud'][time_index])
+                       if has_qcloud else np.zeros_like(height,dtype=MODEL_DTYPE))
+        source_qice=(_cloud_water_g_kg(dataset['qice'][time_index])
+                     if has_qice else np.zeros_like(height,dtype=MODEL_DTYPE))
+        source_condensate=_model_array(source_qcloud+source_qice)
+        mapped_condensate=mapper.interpolate(source_condensate)
+        # Retain the historical internal field name, but store a per-column
+        # maximum in g/kg rather than summing mixing ratios over model levels.
+        cloud_water=_model_array(np.max(mapped_condensate,axis=0))
+        cloudy=cloud_water>=cloud_condensate_threshold_g_kg
+        present=source_condensate>=cloud_condensate_threshold_g_kg
         first=np.argmax(present,axis=0)
         source_qc_ceiling=np.take_along_axis(height,first[None,:,:],axis=0)[0]
         source_qc_ceiling=np.where(present.any(axis=0),source_qc_ceiling,0.)
@@ -826,8 +834,13 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
     else:
         cloudy=np.ones(mapper.target_shape,dtype=bool)
         cloud_water=None
-        auxiliary_cloud=(None,None,None,None)
         mapped_ceiling=mapper.interpolate(source_ceiling,ignore_zero=True)
+    if has_qcloud:
+        source_aux=cloud_liquid_water_profile(source_qcloud,height,z_faces_m)
+        auxiliary_cloud=(mapper.nearest(source_aux[0]),mapper.nearest(source_aux[1]),
+                         mapper.nearest(source_aux[2]),mapper.nearest(source_aux[3]))
+    else:
+        auxiliary_cloud=(None,None,None,None)
     mapped_source_cloud,rh850=map_prognostic_cloud(
         source_cloud,source_rh850 if cloud_method==3 else None,mapper,cloud_method)
     mapped_cloud=np.where(cloudy,mapped_source_cloud,0.)
@@ -1352,6 +1365,7 @@ def solve_hour(dataset, time_index, grid: GridConfig, z_faces_m, geophysical,
                prognostic_observation_mode=False,prognostic_observation_rmin_km=.1,
                prognostic_observation_barriers=(),prognostic_observation_barrier_top_level=0,
                water_range=(50,55),cloud_method=4,
+               cloud_condensate_threshold_g_kg=.005,
                overwater_flux_method=0,coastal_shelf_length_km=0.,cool_skin=False,
                water_flux_threshold=0.,water_temperature_mode=0,
                prognostic_ocean_category=16,
@@ -1390,6 +1404,7 @@ def solve_hour(dataset, time_index, grid: GridConfig, z_faces_m, geophysical,
         step=build_step1_fields(dataset,time_index,grid,z_faces_m,
               timestamp=record_time,base_timezone=base_timezone,
               thermal_state=source_thermal_state,mapper=mapper,cloud_method=4 if cloud_method in {1,2} else cloud_method,
+              cloud_condensate_threshold_g_kg=cloud_condensate_threshold_g_kg,
               precipitation_interpolation=precipitation_interpolation,
               precipitation_radius_km=precipitation_radius_km,
               precipitation_cutoff=precipitation_cutoff,
@@ -1493,9 +1508,7 @@ def solve_hour(dataset, time_index, grid: GridConfig, z_faces_m, geophysical,
                     water_gradient_above=step.water_gradient_above)
                  if temperature_mode==0 else
                  prognostic_temperature_3d(
-                     step.temperature,final_temp,zic,
-                     .5*(np.asarray(z_faces_m[:-1],dtype=MODEL_DTYPE)+
-                         np.asarray(z_faces_m[1:],dtype=MODEL_DTYPE))))
+                     step.temperature,final_temp,zic,z_faces_m))
     return HourFields(timestamp,final_step,wind,surface,temperature,
                       selected_lapse_convective_time,step)
 
@@ -1553,6 +1566,8 @@ def iter_hours(dataset, grid: GridConfig, z_faces_m, geophysical, *,
                     timestamp=record_time,
                     base_timezone=solver_options.get('base_timezone',0),thermal_state=endpoint_state,
                     mapper=solver_options.get('mapper'),cloud_method=4 if method in {1,2} else method,
+                    cloud_condensate_threshold_g_kg=solver_options.get(
+                        'cloud_condensate_threshold_g_kg',.005),
                     precipitation_interpolation=solver_options.get('precipitation_interpolation',2),
                     precipitation_radius_km=solver_options.get('precipitation_radius_km',50.),
                     precipitation_cutoff=solver_options.get('precipitation_cutoff',.01),
@@ -1597,7 +1612,9 @@ def iter_hours(dataset, grid: GridConfig, z_faces_m, geophysical, *,
             method=solver_options.get('cloud_method',4)
             step_override=interpolate_step1_fields(
                 endpoint(left_index),endpoint(time_index),fraction,
-                cloud_method=4 if method in {1,2} else method)
+                cloud_method=4 if method in {1,2} else method,
+                cloud_condensate_threshold_g_kg=solver_options.get(
+                    'cloud_condensate_threshold_g_kg',.005))
         cloud_provider=solver_options.get('cloud_provider')
         supplied=None if cloud_provider is None else cloud_provider(end)
         if isinstance(supplied,tuple): cloud_override,ceiling_override=supplied
