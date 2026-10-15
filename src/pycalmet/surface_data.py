@@ -7,16 +7,39 @@ from pathlib import Path
 import re
 import shlex
 import struct
+from collections.abc import Sequence
+from typing import Any, Literal, TypeAlias, TypedDict, cast, overload
 import numpy as np
+from numpy.typing import ArrayLike, DTypeLike, NDArray
 from scipy.spatial import cKDTree
 
+from .config import GridConfig
 from .projections import project_geographic
 from .legacy_io import FortranSequentialReader
 from .datetime_utils import parse_ordinal,parse_ordinal_code
 
 
-COMPUTE_DTYPE=np.float32
-SPATIAL_DTYPE=np.float64
+COMPUTE_DTYPE: type[np.float32]=np.float32
+SPATIAL_DTYPE: type[np.float64]=np.float64
+Float32Array: TypeAlias = NDArray[np.float32]
+Float64Array: TypeAlias = NDArray[np.float64]
+Int32Array: TypeAlias = NDArray[np.int32]
+IndexArray: TypeAlias = NDArray[np.intp]
+BoolArray: TypeAlias = NDArray[np.bool_]
+
+
+class _SurfaceFields(TypedDict):
+    """Typed field mapping used to construct a decoded surface record."""
+
+    wind_speed: Float32Array
+    wind_direction: Float32Array
+    ceiling_hundreds_ft: Int32Array
+    cloud_tenths: Int32Array
+    temperature_k: Float32Array
+    relative_humidity: Int32Array
+    pressure_mb: Float32Array
+    precipitation_code: Int32Array
+
 
 
 @dataclass(frozen=True,slots=True)
@@ -60,17 +83,19 @@ class SurfaceRecord:
     """
     begin: datetime
     end: datetime
-    wind_speed: np.ndarray
-    wind_direction: np.ndarray
-    ceiling_hundreds_ft: np.ndarray
-    cloud_tenths: np.ndarray
-    temperature_k: np.ndarray
-    relative_humidity: np.ndarray
-    pressure_mb: np.ndarray
-    precipitation_code: np.ndarray
+    wind_speed: Float32Array
+    wind_direction: Float32Array
+    ceiling_hundreds_ft: Int32Array
+    cloud_tenths: Int32Array
+    temperature_k: Float32Array
+    relative_humidity: Int32Array | Float32Array
+    pressure_mb: Float32Array
+    precipitation_code: Int32Array
 
 
-def unpack_surface(words):
+def unpack_surface(
+    words: ArrayLike,
+) -> _SurfaceFields:
     """Decode CALMET UNPCKS decimal fields for multiple stations.
 
     Args:
@@ -102,18 +127,23 @@ def unpack_surface(words):
     temperature_values=temperature.astype(COMPUTE_DTYPE)
     pressure_values=pressure.astype(COMPUTE_DTYPE)
     return dict(
-        wind_speed=np.where(speed==9999,9999.,speed_values/100.),
-        wind_direction=np.where(direction==999,9999.,direction_values),
+        wind_speed=cast(Float32Array,np.where(speed==9999,9999.,speed_values/100.)),
+        wind_direction=cast(Float32Array,np.where(direction==999,9999.,direction_values)),
         ceiling_hundreds_ft=ceiling.astype(np.int32),
         cloud_tenths=np.where(cloud==99,9999,cloud).astype(np.int32),
-        temperature_k=np.where(temperature==9999,9999.,temperature_values/10.),
+        temperature_k=cast(Float32Array,np.where(temperature==9999,9999.,temperature_values/10.)),
         relative_humidity=np.where(humidity==999,9999,humidity).astype(np.int32),
-        pressure_mb=np.where(pressure==9999,9999.,pressure_values/10.),
+        pressure_mb=cast(Float32Array,np.where(pressure==9999,9999.,pressure_values/10.)),
         precipitation_code=np.where(precipitation==99,9999,precipitation).astype(np.int32),
     )
 
 
-def _instant(year,day,hour,seconds):
+def _instant(
+    year: int | str,
+    day: int | str,
+    hour: int | str,
+    seconds: int | str,
+) -> datetime:
     """Build a SURF.DAT datetime from ordinal-date components.
 
     Args:
@@ -132,7 +162,7 @@ def _instant(year,day,hour,seconds):
     except ValueError as error: raise ValueError('invalid SURF.DAT timestamp') from error
 
 
-def _coded_instant(code,seconds=0):
+def _coded_instant(code: int | str,seconds: int | str=0) -> datetime:
     """Decode a compact SURF.DAT ordinal timestamp.
 
     Args:
@@ -149,7 +179,7 @@ def _coded_instant(code,seconds=0):
     except ValueError as error: raise ValueError(f'invalid SURF.DAT coded time {code!r}') from error
 
 
-def _coordinate(text,latitude):
+def _coordinate(text: str,latitude: bool) -> float:
     """Parse a signed or hemisphere-qualified geographic coordinate.
 
     Args:
@@ -192,7 +222,19 @@ class SurfaceData:
         records: Chronological list of :class:`SurfaceRecord` objects.
     """
 
-    def __init__(self,path,*,station_metadata=None,datum=None):
+    version: str
+    datum: str
+    datum_date: str
+    start: datetime
+    end: datetime
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        station_metadata: Sequence[SurfaceStation] | None=None,
+        datum: str | None=None,
+    ) -> None:
         """Parse formatted SURF.DAT text and validate its timeline.
 
         Args:
@@ -208,7 +250,7 @@ class SurfaceData:
             ValueError: If header metadata, station definitions, timestamps,
                 meteorological fields, or interval continuity are invalid.
         """
-        self.path=Path(path)
+        self.path: Path=Path(path)
         if not self.path.is_file(): raise FileNotFoundError(self.path)
         lines=self.path.read_text(encoding='ascii',errors='strict').splitlines()
         if not lines: raise ValueError('empty SURF.DAT')
@@ -233,6 +275,7 @@ class SurfaceData:
             if station_metadata is None or datum is None:
                 raise ValueError('SURF.DAT NONE requires control-file station metadata and datum')
             self.datum=str(datum); self.datum_date=''
+        self.timezone: str | int
         if explicit:
             self.timezone=lines[index][:8].strip(); index+=1
         header=shlex.split(lines[index]); index+=1
@@ -247,7 +290,7 @@ class SurfaceData:
             self.end=_instant(values[3],values[4],values[5],0)
             self.timezone=values[6]; count=values[7]
         if count<1: raise ValueError('SURF.DAT must contain at least one station')
-        stations=[]
+        stations: list[SurfaceStation]=[]
         if projection=='LL':
             for _ in range(count):
                 try: fields=shlex.split(lines[index]); index+=1
@@ -256,20 +299,20 @@ class SurfaceData:
                 stations.append(SurfaceStation(int(fields[0]),fields[1],_coordinate(fields[2],True),
                                                _coordinate(fields[3],False),float(fields[4])))
         else:
-            stations=list(station_metadata)
+            stations=list(cast(Sequence[SurfaceStation],station_metadata))
             if len(stations)!=count: raise ValueError('SURF.DAT station count does not match control-file metadata')
-            identifiers=[]
+            identifiers: list[int]=[]
             while len(identifiers)<count and index<len(lines):
                 identifiers.extend(int(item) for item in shlex.split(lines[index])); index+=1
             if len(identifiers)!=count: raise ValueError('SURF.DAT NONE station ID list has wrong length')
             if identifiers!=[item.identifier for item in stations]:
                 raise ValueError('SURF.DAT station IDs do not match control-file metadata')
         if len({station.identifier for station in stations})!=count: raise ValueError('duplicate SURF.DAT station ID')
-        self.stations=tuple(stations)
+        self.stations: tuple[SurfaceStation,...]=tuple(stations)
         tokens=shlex.split('\n'.join(lines[index:]),comments=False)
         width=(8 if explicit else 3)+8*count
         if len(tokens)%width: raise ValueError('SURF.DAT contains an incomplete meteorological record')
-        self.records=[]
+        self.records: list[SurfaceRecord]=[]
         for offset in range(0,len(tokens),width):
             row=tokens[offset:offset+width]
             if explicit:
@@ -288,7 +331,7 @@ class SurfaceData:
         if self.records[0].begin<self.start or self.records[-1].end>self.end:
             raise ValueError('SURF.DAT records fall outside the declared header period')
 
-    def at_begin(self,when):
+    def at_begin(self,when: datetime) -> SurfaceRecord:
         """Return the record whose half-open interval contains a timestamp.
 
         Args:
@@ -305,7 +348,12 @@ class SurfaceData:
         raise ValueError(f'SURF.DAT has no record covering {when}')
 
 
-def read_unformatted_surface(path,*,station_metadata=None,datum=None):
+def read_unformatted_surface(
+    path: str | Path,
+    *,
+    station_metadata: Sequence[SurfaceStation] | None=None,
+    datum: str | None=None,
+) -> SurfaceData:
     """Read legacy or 2.1 GNU-Fortran sequential-unformatted SURF.DAT.
 
     Args:
@@ -325,7 +373,7 @@ def read_unformatted_surface(path,*,station_metadata=None,datum=None):
     """
     source=Path(path); result=object.__new__(SurfaceData); result.path=source
     with FortranSequentialReader(source) as reader:
-        def record(size=None,label='record'):
+        def record(size: int | None=None,label: str='record') -> bytes:
             """Read and optionally size-check one required binary record.
 
             Args:
@@ -389,10 +437,11 @@ def read_unformatted_surface(path,*,station_metadata=None,datum=None):
                 _coordinate(latitudes[16*i:16*i+16].decode('ascii'),True),
                 _coordinate(longitudes[16*i:16*i+16].decode('ascii'),False),float(heights[i])) for i in range(count))
         else:
-            result.stations=tuple(station_metadata)
+            result.stations=tuple(cast(Sequence[SurfaceStation],station_metadata))
             if len(result.stations)!=count or identifiers.tolist()!=[item.identifier for item in result.stations]:
                 raise ValueError('SURF.DAT station IDs do not match control-file metadata')
-        result.records=[]
+        decoded_records: list[SurfaceRecord]=[]
+        result.records=decoded_records
         while (payload:=reader.read_record()) is not None:
             prefix_size=16 if explicit else 4
             expected=prefix_size+(12 if packing else 32)*count
@@ -409,7 +458,7 @@ def read_unformatted_surface(path,*,station_metadata=None,datum=None):
                 fields=unpack_surface(np.frombuffer(payload,dtype='<i4',offset=prefix_size).reshape(3,count).T)
             else:
                 offset=prefix_size
-                def take(dtype):
+                def take(dtype: DTypeLike) -> NDArray[Any]:
                     """Consume one station-vector field from a record payload.
 
                     Args:
@@ -423,9 +472,11 @@ def read_unformatted_surface(path,*,station_metadata=None,datum=None):
                     nonlocal offset
                     values=np.frombuffer(payload,dtype=dtype,count=count,offset=offset).copy(); offset+=4*count
                     return values
-                fields=dict(wind_speed=take('<f4'),wind_direction=take('<f4'),
-                    ceiling_hundreds_ft=take('<i4'),cloud_tenths=take('<i4'),temperature_k=take('<f4'),
-                    relative_humidity=take('<i4'),pressure_mb=take('<f4'),precipitation_code=take('<i4'))
+                fields=cast(_SurfaceFields,dict(
+                    wind_speed=take('<f4'),wind_direction=take('<f4'),
+                    ceiling_hundreds_ft=take('<i4'),cloud_tenths=take('<i4'),
+                    temperature_k=take('<f4'),relative_humidity=take('<i4'),
+                    pressure_mb=take('<f4'),precipitation_code=take('<i4')))
             result.records.append(SurfaceRecord(begin,end,**fields))
     if not result.records: raise ValueError('SURF.DAT contains no meteorological records')
     for left,right in zip(result.records[:-1],result.records[1:]):
@@ -435,7 +486,13 @@ def read_unformatted_surface(path,*,station_metadata=None,datum=None):
     return result
 
 
-def load_surface(path,format=2,*,station_metadata=None,datum=None):
+def load_surface(
+    path: str | Path,
+    format: int=2,
+    *,
+    station_metadata: Sequence[SurfaceStation] | None=None,
+    datum: str | None=None,
+) -> SurfaceData:
     """Load SURF.DAT according to CALMET ``IFORMS``.
 
     Args:
@@ -457,7 +514,11 @@ def load_surface(path,format=2,*,station_metadata=None,datum=None):
     raise ValueError('SURF.DAT format/IFORMS must be 1 or 2')
 
 
-def station_grid_mapping(stations,grid,datum):
+def station_grid_mapping(
+    stations: Sequence[SurfaceStation],
+    grid: GridConfig,
+    datum: str,
+) -> tuple[Float64Array,Int32Array]:
     """Project stations and build CALMET's nearest-station grid.
 
     Args:
@@ -477,11 +538,15 @@ def station_grid_mapping(stations,grid,datum):
     """
     sx,sy=project_geographic([item.longitude for item in stations],
                              [item.latitude for item in stations],grid,datum,units='km')
-    points=np.asarray(np.column_stack((sx,sy)),dtype=SPATIAL_DTYPE)
+    points: Float64Array=np.asarray(np.column_stack((sx,sy)),dtype=SPATIAL_DTYPE)
     return points,_nearest_station_grid(points,grid)
 
 
-def _nearest_indices(points,targets,block_size=65536):
+def _nearest_indices(
+    points: ArrayLike,
+    targets: ArrayLike,
+    block_size: int=65536,
+) -> IndexArray:
     """Query the nearest source point for each target.
 
     Args:
@@ -506,7 +571,7 @@ def _nearest_indices(points,targets,block_size=65536):
         raise ValueError('nearest-station targets must have shape (target, 2)')
     if block_size<1: raise ValueError('nearest-station block size must be positive')
     tree=cKDTree(source)
-    selected=np.empty(query.shape[0],dtype=np.intp)
+    selected: IndexArray=np.empty(query.shape[0],dtype=np.intp)
     for start in range(0,query.shape[0],block_size):
         stop=min(start+block_size,query.shape[0])
         selected[start:stop]=np.asarray(
@@ -514,7 +579,12 @@ def _nearest_indices(points,targets,block_size=65536):
     return selected
 
 
-def _nearest_neighbors(points,targets,count,block_size=65536):
+def _nearest_neighbors(
+    points: ArrayLike,
+    targets: ArrayLike,
+    count: int,
+    block_size: int=65536,
+) -> tuple[Float64Array,IndexArray]:
     """Return the closest source points and their distances.
 
     Args:
@@ -543,8 +613,8 @@ def _nearest_neighbors(points,targets,count,block_size=65536):
     count=min(int(count),source.shape[0])
     if count<1: raise ValueError('nearest-station count must be positive')
     tree=cKDTree(source)
-    chosen=np.empty((query.shape[0],count),dtype=np.intp)
-    distances=np.empty((query.shape[0],count),dtype=SPATIAL_DTYPE)
+    chosen: IndexArray=np.empty((query.shape[0],count),dtype=np.intp)
+    distances: Float64Array=np.empty((query.shape[0],count),dtype=SPATIAL_DTYPE)
     for start in range(0,query.shape[0],block_size):
         stop=min(start+block_size,query.shape[0])
         block_distance,block_chosen=tree.query(query[start:stop],k=count)
@@ -556,7 +626,11 @@ def _nearest_neighbors(points,targets,count,block_size=65536):
     return distances,chosen
 
 
-def _nearest_station_grid(points,grid,block_size=65536):
+def _nearest_station_grid(
+    points: ArrayLike,
+    grid: GridConfig,
+    block_size: int=65536,
+) -> Int32Array:
     """Return zero-based nearest-station IDs for every grid cell.
 
     Args:
@@ -585,7 +659,13 @@ def _nearest_station_grid(points,grid,block_size=65536):
     return nearest.reshape(grid.ny,grid.nx)
 
 
-def fill_missing_surface(record,station_xy,*,cloud_method=1,itprog=0):
+def fill_missing_surface(
+    record: SurfaceRecord,
+    station_xy: ArrayLike,
+    *,
+    cloud_method: int=1,
+    itprog: int=0,
+) -> SurfaceRecord:
     """Fill required missing observations from each variable's nearest station.
 
     Args:
@@ -612,7 +692,47 @@ def fill_missing_surface(record,station_xy,*,cloud_method=1,itprog=0):
     count=record.wind_speed.size
     if coordinates.shape!=(count,2): raise ValueError('surface station coordinates have wrong shape')
 
-    def filled(values,required,integer=False):
+    @overload
+    def filled(
+        values: ArrayLike,
+        required: bool,
+        integer: Literal[False]=False,
+    ) -> Float32Array:
+        """Type floating-point nearest-station filling.
+
+        Args:
+            values: One-dimensional station field.
+            required: Whether missing values must be filled.
+            integer: Literal selecting floating-point output.
+
+        Returns:
+            Filled float32 station values.
+        """
+        ...
+
+    @overload
+    def filled(
+        values: ArrayLike,
+        required: bool,
+        integer: Literal[True],
+    ) -> Int32Array:
+        """Type integer nearest-station filling.
+
+        Args:
+            values: One-dimensional station field.
+            required: Whether missing values must be filled.
+            integer: Literal selecting integer output.
+
+        Returns:
+            Filled int32 station values.
+        """
+        ...
+
+    def filled(
+        values: ArrayLike,
+        required: bool,
+        integer: bool=False,
+    ) -> Float32Array | Int32Array:
         """Fill one station vector from its nearest valid observations.
 
         Args:
@@ -632,14 +752,15 @@ def fill_missing_surface(record,station_xy,*,cloud_method=1,itprog=0):
         source=np.asarray(values,dtype=np.int32 if integer else COMPUTE_DTYPE)
         missing=(source>=9998.99
                  if not integer else source>=9999)
-        if not required or not missing.any(): return source.copy()
+        if not required or not missing.any():
+            return cast(Float32Array | Int32Array,source.copy())
         valid=~missing
         if not valid.any(): raise ValueError('surface variable is missing at every station')
         valid_indices=np.flatnonzero(valid)
         nearest=_nearest_indices(coordinates[valid],coordinates[missing])
         result=source.copy()
         result[missing]=source[valid_indices[nearest]]
-        return result
+        return cast(Float32Array | Int32Array,result)
 
     return SurfaceRecord(record.begin,record.end,
         np.asarray(record.wind_speed,dtype=COMPUTE_DTYPE).copy(),
@@ -652,7 +773,11 @@ def fill_missing_surface(record,station_xy,*,cloud_method=1,itprog=0):
         np.asarray(record.precipitation_code,dtype=np.int32).copy())
 
 
-def surface_cloud_fields(record,nearest_station,external_cloud=None):
+def surface_cloud_fields(
+    record: SurfaceRecord,
+    nearest_station: ArrayLike,
+    external_cloud: ArrayLike | None=None,
+) -> tuple[Float32Array,Int32Array]:
     """Map OUTCLD/PGTSTB cloud cover and ceiling to the model grid.
 
     Args:
@@ -684,8 +809,18 @@ def surface_cloud_fields(record,nearest_station,external_cloud=None):
     return cloud.astype(COMPUTE_DTYPE,copy=False),ceiling.astype(np.int32)
 
 
-def interpolate_surface_scalar(values,station_xy,grid,*,radius_km=500.,maximum_stations=5,
-                               power=1,target_water=None,station_water=None,empty_fallback=None):
+def interpolate_surface_scalar(
+    values: ArrayLike,
+    station_xy: ArrayLike,
+    grid: GridConfig,
+    *,
+    radius_km: float=500.,
+    maximum_stations: int=5,
+    power: int=1,
+    target_water: ArrayLike | None=None,
+    station_water: ArrayLike | None=None,
+    empty_fallback: ArrayLike | None=None,
+) -> Float32Array:
     """Interpolate a surface scalar with IDW and land/water separation.
 
     Args:
@@ -724,11 +859,11 @@ def interpolate_surface_scalar(values,station_xy,grid,*,radius_km=500.,maximum_s
     x=float(grid.x_origin_km)+(np.arange(grid.nx,dtype=SPATIAL_DTYPE)+.5)*float(grid.dx_km)
     y=float(grid.y_origin_km)+(np.arange(grid.ny,dtype=SPATIAL_DTYPE)+.5)*float(grid.dy_km)
     xx,yy=np.meshgrid(x,y); targets=np.column_stack((xx.ravel(),yy.ravel()))
-    output=np.empty(targets.shape[0],dtype=COMPUTE_DTYPE)
+    output: Float32Array=np.empty(targets.shape[0],dtype=COMPUTE_DTYPE)
     flat_water=target_mask.ravel()
     valid=values<9998.99
     radius=float(radius_km)
-    fallback=None
+    fallback: Float32Array | None=None
     if empty_fallback is not None:
         fallback=np.asarray(empty_fallback,dtype=COMPUTE_DTYPE)
         if fallback.shape!=(2,): raise ValueError('empty_fallback must contain land and water values')
@@ -765,8 +900,15 @@ def interpolate_surface_scalar(values,station_xy,grid,*,radius_km=500.,maximum_s
     return output.reshape(grid.ny,grid.nx)
 
 
-def _near_upper_air(station_count,station_xy,upper_xy,upper_valid,
-                    separation_cells,dx_km,dy_km):
+def _near_upper_air(
+    station_count: int,
+    station_xy: ArrayLike | None,
+    upper_xy: ArrayLike | None,
+    upper_valid: ArrayLike | None,
+    separation_cells: float,
+    dx_km: float,
+    dy_km: float,
+) -> BoolArray:
     """Identify surface stations within RMIN2 of valid upper-air data.
 
     Args:
@@ -810,7 +952,11 @@ def _near_upper_air(station_count,station_xy,upper_xy,upper_valid,
     return skip
 
 
-def _wind_components(wind_speed,wind_direction,grid_convergence_degrees=None):
+def _wind_components(
+    wind_speed: ArrayLike,
+    wind_direction: ArrayLike,
+    grid_convergence_degrees: ArrayLike | None=None,
+) -> tuple[Float32Array,Float32Array,BoolArray,Float32Array]:
     """Convert meteorological wind observations to grid-oriented components.
 
     Args:
@@ -845,10 +991,26 @@ def _wind_components(wind_speed,wind_direction,grid_convergence_degrees=None):
     return u,v,valid,direction
 
 
-def _apply_wind_extrapolation(u,v,valid,calm_speed,anem,levels,roughness,*,
-                              iextrp,factors,station_latitude,station_xy,
-                              upper_xy,upper_valid,upper_air_separation_cells,
-                              dx_km,dy_km,power_exponent):
+def _apply_wind_extrapolation(
+    u: Float32Array,
+    v: Float32Array,
+    valid: BoolArray,
+    calm_speed: Float32Array,
+    anem: Float32Array,
+    levels: Float32Array,
+    roughness: Float32Array,
+    *,
+    iextrp: int,
+    factors: ArrayLike | None,
+    station_latitude: ArrayLike | None,
+    station_xy: ArrayLike | None,
+    upper_xy: ArrayLike | None,
+    upper_valid: ArrayLike | None,
+    upper_air_separation_cells: float,
+    dx_km: float,
+    dy_km: float,
+    power_exponent: ArrayLike,
+) -> tuple[Float32Array,Float32Array]:
     """Apply one IEXTRP vertical profile to each surface observation.
 
     Args:
@@ -938,11 +1100,24 @@ def _apply_wind_extrapolation(u,v,valid,calm_speed,anem,levels,roughness,*,
     return output_u,output_v
 
 
-def wind_profiles(wind_speed,wind_direction,anemometer_height_m,z_centers_m,roughness_m,
-                  iextrp=-1,factors=None,station_latitude=None,
-                  grid_convergence_degrees=None,station_xy=None,upper_xy=None,
-                  upper_valid=None,upper_air_separation_cells=-1.,dx_km=1.,dy_km=1.,
-                  power_exponent=.143):
+def wind_profiles(
+    wind_speed: ArrayLike,
+    wind_direction: ArrayLike,
+    anemometer_height_m: ArrayLike,
+    z_centers_m: ArrayLike,
+    roughness_m: ArrayLike,
+    iextrp: int=-1,
+    factors: ArrayLike | None=None,
+    station_latitude: ArrayLike | None=None,
+    grid_convergence_degrees: ArrayLike | None=None,
+    station_xy: ArrayLike | None=None,
+    upper_xy: ArrayLike | None=None,
+    upper_valid: ArrayLike | None=None,
+    upper_air_separation_cells: float=-1.,
+    dx_km: float=1.,
+    dy_km: float=1.,
+    power_exponent: ArrayLike=.143,
+) -> tuple[Float32Array,Float32Array]:
     """Convert observed winds and apply PREPDI IEXTRP methods 1--4.
 
     Args:
@@ -991,11 +1166,23 @@ def wind_profiles(wind_speed,wind_direction,anemometer_height_m,z_centers_m,roug
         dx_km=dx_km,dy_km=dy_km,power_exponent=power_exponent)
 
 
-def surface_wind_profiles(record,anemometer_height_m,z_centers_m,roughness_m,iextrp=-1,
-                          factors=None,station_latitude=None,grid_convergence_degrees=None,
-                          station_xy=None,upper_xy=None,upper_valid=None,
-                          upper_air_separation_cells=-1.,dx_km=1.,dy_km=1.,
-                          power_exponent=.143):
+def surface_wind_profiles(
+    record: SurfaceRecord,
+    anemometer_height_m: ArrayLike,
+    z_centers_m: ArrayLike,
+    roughness_m: ArrayLike,
+    iextrp: int=-1,
+    factors: ArrayLike | None=None,
+    station_latitude: ArrayLike | None=None,
+    grid_convergence_degrees: ArrayLike | None=None,
+    station_xy: ArrayLike | None=None,
+    upper_xy: ArrayLike | None=None,
+    upper_valid: ArrayLike | None=None,
+    upper_air_separation_cells: float=-1.,
+    dx_km: float=1.,
+    dy_km: float=1.,
+    power_exponent: ArrayLike=.143,
+) -> tuple[Float32Array,Float32Array]:
     """Apply PREPDI wind extrapolation to one SURF.DAT record.
 
     Args:
@@ -1029,11 +1216,23 @@ def surface_wind_profiles(record,anemometer_height_m,z_centers_m,roughness_m,iex
         upper_air_separation_cells,dx_km,dy_km,power_exponent)
 
 
-def component_wind_profiles(u_component,v_component,anemometer_height_m,z_centers_m,
-                            roughness_m,iextrp=-1,factors=None,station_latitude=None,
-                            station_xy=None,upper_xy=None,upper_valid=None,
-                            upper_air_separation_cells=-1.,dx_km=1.,dy_km=1.,
-                            power_exponent=.143):
+def component_wind_profiles(
+    u_component: ArrayLike,
+    v_component: ArrayLike,
+    anemometer_height_m: ArrayLike,
+    z_centers_m: ArrayLike,
+    roughness_m: ArrayLike,
+    iextrp: int=-1,
+    factors: ArrayLike | None=None,
+    station_latitude: ArrayLike | None=None,
+    station_xy: ArrayLike | None=None,
+    upper_xy: ArrayLike | None=None,
+    upper_valid: ArrayLike | None=None,
+    upper_air_separation_cells: float=-1.,
+    dx_km: float=1.,
+    dy_km: float=1.,
+    power_exponent: ArrayLike=.143,
+) -> tuple[Float32Array,Float32Array]:
     """Profile grid-oriented DIAG.DAT U/V surface observations.
 
     Args:

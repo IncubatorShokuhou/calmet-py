@@ -6,6 +6,8 @@ should use the top-level :mod:`pycalmet` API.
 """
 from __future__ import annotations
 
+from typing import Final
+
 from ._compat.api import calmet, calwrf, ctgproc, ctrproc, makegeo, terrel
 from ._compat.readlst import readlst
 from ._compat.config import (
@@ -13,7 +15,7 @@ from ._compat.config import (
     MakegeoConfig, TerrelConfig, TerrelSource,
 )
 
-__all__ = [
+__all__: Final[list[str]] = [
     "calwrf", "terrel", "ctrproc", "ctgproc", "makegeo", "calmet", "readlst",
     "GridConfig", "CalwrfConfig", "TerrelConfig", "TerrelSource",
     "CtgprocConfig", "CtgprocSource", "MakegeoConfig", "CalmetConfig",

@@ -6,18 +6,29 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import re
+from typing import SupportsFloat, TypeAlias, cast
 import numpy as np
+from numpy.typing import ArrayLike, NDArray
 
+from .config import GridConfig
 from .surface_data import _coordinate
 from .datetime_utils import parse_calendar,parse_ordinal,parse_timezone_label
 
 
-COMPUTE_DTYPE=np.float32
-SPATIAL_DTYPE=np.float64
-DRY_ADIABATIC_LAPSE_RATE=COMPUTE_DTYPE(.0098)
+COMPUTE_DTYPE: type[np.float32]=np.float32
+SPATIAL_DTYPE: type[np.float64]=np.float64
+Float32Array: TypeAlias = NDArray[np.float32]
+Float64Array: TypeAlias = NDArray[np.float64]
+
+DRY_ADIABATIC_LAPSE_RATE: np.float32=COMPUTE_DTYPE(.0098)
 
 
-def _instant(year,day,hour,seconds=0):
+def _instant(
+    year: int | str,
+    day: int | str,
+    hour: int | str,
+    seconds: int | str=0,
+) -> datetime:
     """Build an UP.DAT datetime from ordinal-date components.
 
     Args:
@@ -36,7 +47,7 @@ def _instant(year,day,hour,seconds=0):
     except ValueError as error: raise ValueError('invalid UP.DAT timestamp') from error
 
 
-def _sounding_header(line):
+def _sounding_header(line: str) -> tuple[int,str,str,str,str,int]:
     """Decode a snapshot sounding header in delimited or fixed-column form.
 
     Args:
@@ -53,14 +64,17 @@ def _sounding_header(line):
     fields=line.replace(',',' ').split()
     try:
         if len(fields)>=6:
-            return (int(fields[0]),*fields[1:5],int(fields[5]))
+            return (int(fields[0]),fields[1],fields[2],fields[3],fields[4],
+                    int(fields[5]))
         padded=line.ljust(70)
         return (int(padded[9:17]),padded[22:24],padded[24:26],
                 padded[26:28],padded[28:30],int(padded[65:70]))
     except ValueError as error: raise ValueError('invalid fixed-column UP.DAT sounding header') from error
 
 
-def _sounding_header22(line):
+def _sounding_header22(
+    line: str,
+) -> tuple[int,str,str,str,str,str,str,str,str,str,str,int]:
     """Decode an UP.DAT 2.2 interval sounding header.
 
     Args:
@@ -76,7 +90,9 @@ def _sounding_header22(line):
     fields=line.replace(',',' ').split()
     try:
         if len(fields)>=12:
-            return (int(fields[0]),*fields[1:11],int(fields[11]))
+            return (int(fields[0]),fields[1],fields[2],fields[3],fields[4],
+                    fields[5],fields[6],fields[7],fields[8],fields[9],
+                    fields[10],int(fields[11]))
         padded=line.ljust(76)
         return (int(padded[9:17]),padded[21:25],padded[25:29],padded[29:32],
                 padded[32:35],padded[35:40],padded[44:48],padded[48:52],
@@ -84,7 +100,13 @@ def _sounding_header22(line):
     except ValueError as error: raise ValueError('invalid fixed-column UP.DAT 2.2 sounding header') from error
 
 
-def _calendar_instant(year,month,day,hour,seconds=0):
+def _calendar_instant(
+    year: int | str,
+    month: int | str,
+    day: int | str,
+    hour: int | str,
+    seconds: int | str=0,
+) -> datetime:
     """Build an UP.DAT datetime from calendar components.
 
     Args:
@@ -140,14 +162,17 @@ class Sounding:
             an instantaneous sounding.
     """
     timestamp: datetime
-    pressure_mb: np.ndarray
-    height_msl: np.ndarray
-    temperature_c: np.ndarray
-    wind_direction: np.ndarray
-    wind_speed: np.ndarray
+    pressure_mb: Float32Array
+    height_msl: Float32Array
+    temperature_c: Float32Array
+    wind_direction: Float32Array
+    wind_speed: Float32Array
     end_timestamp: datetime | None = None
 
-    def converted(self,convergence_degrees=0.):
+    def converted(
+        self,
+        convergence_degrees: ArrayLike=0.,
+    ) -> tuple[Float32Array,Float32Array,Float32Array]:
         """Convert MSL heights and meteorological winds to local U/V profiles.
 
         Args:
@@ -183,7 +208,11 @@ class Sounding:
                 v.astype(COMPUTE_DTYPE,copy=False))
 
 
-def layer_average(sounding,z_faces_m,convergence_degrees=0.):
+def layer_average(
+    sounding: Sounding,
+    z_faces_m: ArrayLike,
+    convergence_degrees: ArrayLike=0.,
+) -> tuple[Float32Array,Float32Array]:
     """Integrate a piecewise-linear sounding wind over model layers.
 
     Args:
@@ -218,8 +247,8 @@ def layer_average(sounding,z_faces_m,convergence_degrees=0.):
     profile_u=np.asarray(u,dtype=np.float64)
     profile_v=np.asarray(v,dtype=np.float64)
     boundaries=np.asarray(faces,dtype=np.float64)
-    output_u=np.empty(faces.size-1,dtype=COMPUTE_DTYPE)
-    output_v=np.empty_like(output_u)
+    output_u: Float32Array=np.empty(faces.size-1,dtype=COMPUTE_DTYPE)
+    output_v: Float32Array=np.empty_like(output_u)
     for layer,(bottom,top) in enumerate(zip(boundaries[:-1],boundaries[1:])):
         interior=(z>bottom)&(z<top)
         layer_z=np.concatenate(([bottom],z[interior],[top]))
@@ -237,7 +266,7 @@ def layer_average(sounding,z_faces_m,convergence_degrees=0.):
     return output_u,output_v
 
 
-def temperature_faces(sounding,z_faces_m):
+def temperature_faces(sounding: Sounding,z_faces_m: ArrayLike) -> Float32Array:
     """Interpolate sounding temperatures at CALMET layer faces.
 
     Args:
@@ -259,11 +288,13 @@ def temperature_faces(sounding,z_faces_m):
     raw_height=np.asarray(sounding.height_msl,dtype=COMPUTE_DTYPE)
     height=raw_height-raw_height[0]
     temperature=np.asarray(sounding.temperature_c,dtype=COMPUTE_DTYPE)
-    output=np.empty(faces.size,dtype=COMPUTE_DTYPE)
+    output: Float32Array=np.empty(faces.size,dtype=COMPUTE_DTYPE)
     for index,face in enumerate(faces):
+        upper: int | None
         upper=next((j for j in range(1,height.size)
                     if height[j]>=face and temperature[j]<999.89),None)
         if upper is None: raise ValueError('temperature interpolation face is above top valid sounding level')
+        lower: int | None
         lower=next((j for j in range(upper-1,-1,-1) if temperature[j]<999.89),None)
         if lower is None: raise ValueError('bottom of upper-air temperature sounding is missing')
         if height[lower]>face: raise ValueError('sounding below temperature interpolation face is missing')
@@ -276,7 +307,13 @@ def temperature_faces(sounding,z_faces_m):
     return output
 
 
-def grid_temperature_faces(station_faces,station_xy,grid,power=1,block_size=65536):
+def grid_temperature_faces(
+    station_faces: ArrayLike,
+    station_xy: ArrayLike,
+    grid: GridConfig,
+    power: int=1,
+    block_size: int=65536,
+) -> Float32Array:
     """Horizontally interpolate TEMP3D face temperatures from stations.
 
     Args:
@@ -296,8 +333,8 @@ def grid_temperature_faces(station_faces,station_xy,grid,power=1,block_size=6553
     Raises:
         ValueError: If station arrays do not match or ``power`` is not 1 or 2.
     """
-    values=np.asarray(station_faces,dtype=COMPUTE_DTYPE)
-    points=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
+    values: Float32Array=np.asarray(station_faces,dtype=COMPUTE_DTYPE)
+    points: Float64Array=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
     if values.ndim!=2 or points.shape!=(values.shape[0],2) or values.shape[0]<1:
         raise ValueError('upper-air temperature stations and face profiles do not match')
     if power not in {1,2}: raise ValueError('upper-air temperature power must be 1 or 2')
@@ -305,7 +342,7 @@ def grid_temperature_faces(station_faces,station_xy,grid,power=1,block_size=6553
     ty=float(grid.y_origin_km)+(np.arange(grid.ny,dtype=SPATIAL_DTYPE)+.5)*float(grid.dy_km)
     xx,yy=np.meshgrid(tx,ty)
     targets=np.column_stack((xx.ravel(),yy.ravel()))
-    output=np.empty((values.shape[1],targets.shape[0]),dtype=COMPUTE_DTYPE)
+    output: Float32Array=np.empty((values.shape[1],targets.shape[0]),dtype=COMPUTE_DTYPE)
     scale=np.array([grid.dx_km,grid.dy_km],dtype=SPATIAL_DTYPE)
     reduction_values=values.astype(np.float64,copy=False)
     for begin in range(0,targets.shape[0],block_size):
@@ -323,7 +360,12 @@ def grid_temperature_faces(station_faces,station_xy,grid,power=1,block_size=6553
     return output.reshape((values.shape[1],grid.ny,grid.nx))
 
 
-def _prepdi_time_interpolate(left,right,seconds_to_right,total_seconds):
+def _prepdi_time_interpolate(
+    left: ArrayLike,
+    right: ArrayLike,
+    seconds_to_right: SupportsFloat,
+    total_seconds: SupportsFloat,
+) -> Float32Array:
     """Linearly interpolate fields between two sounding timestamps.
 
     Args:
@@ -366,7 +408,24 @@ class UpperAirData:
         soundings: Strictly chronological tuple of :class:`Sounding` objects.
     """
 
-    def __init__(self,path,*,station_metadata=None,datum=None):
+    version: str
+    datum: str
+    timezone: str
+    start: datetime
+    end: datetime
+    top_pressure_mb: float
+    source_type: int
+    record_format: int
+    required_fields: tuple[bool,bool,bool,bool]
+    station: UpperAirStation
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        station_metadata: UpperAirStation | None=None,
+        datum: str | None=None,
+    ) -> None:
         """Parse and validate a formatted UP.DAT station file.
 
         Args:
@@ -383,7 +442,7 @@ class UpperAirData:
                 sounding rows, level counts, time ranges, or chronology are
                 invalid.
         """
-        self.path=Path(path)
+        self.path: Path=Path(path)
         if not self.path.is_file(): raise FileNotFoundError(self.path)
         lines=self.path.read_text(encoding='ascii',errors='strict').splitlines()
         if not lines: raise ValueError('empty UP.DAT')
@@ -436,8 +495,8 @@ class UpperAirData:
             self.station=UpperAirStation(int(station[0]),station[1],_coordinate(station[2],True),
                                          _coordinate(station[3],False),float(station[4]))
         else:
-            self.station=station_metadata
-        soundings=[]
+            self.station=cast(UpperAirStation,station_metadata)
+        soundings: list[Sounding]=[]
         while index<len(lines):
             if not lines[index].strip(): index+=1; continue
             header_fields=lines[index].replace(',',' ').split()
@@ -448,8 +507,11 @@ class UpperAirData:
             explicit_record=(self.version=='2.2' or
                              (self.version=='2.1' and len(header_fields)==12))
             if explicit_record:
-                values=_sounding_header22(lines[index])
-                identifier=values[0]; begin=_calendar_instant(*values[1:6]); end=_calendar_instant(*values[6:11]); levels=values[11]
+                header_values=_sounding_header22(lines[index])
+                identifier=header_values[0]
+                begin=_calendar_instant(*header_values[1:6])
+                end=_calendar_instant(*header_values[6:11])
+                levels=header_values[11]
                 # Version 2.1 always represents an instantaneous sounding at
                 # its ending time, even when its two encoded times differ.
                 # Version 2.2 alone assigns interval semantics to begin/end.
@@ -460,25 +522,29 @@ class UpperAirData:
             index+=1
             if identifier!=self.station.identifier: raise ValueError('UP.DAT sounding station ID does not match header')
             if levels<0: raise ValueError('UP.DAT sounding level count cannot be negative')
-            values=[]
-            while len(values)<5*levels and index<len(lines):
-                values.extend(float(item) for item in lines[index].replace('/',' ').replace(',',' ').split())
+            level_values: list[float]=[]
+            while len(level_values)<5*levels and index<len(lines):
+                level_values.extend(float(item) for item in lines[index].replace('/',' ').replace(',',' ').split())
                 index+=1
-            if len(values)!=5*levels: raise ValueError('UP.DAT sounding has an incomplete or overfull level list')
-            table=np.asarray(values,dtype=COMPUTE_DTYPE).reshape(levels,5)
+            if len(level_values)!=5*levels: raise ValueError('UP.DAT sounding has an incomplete or overfull level list')
+            table=np.asarray(level_values,dtype=COMPUTE_DTYPE).reshape(levels,5)
             if timestamp<self.start or timestamp>self.end: raise ValueError('UP.DAT sounding lies outside declared time span')
-            soundings.append(Sounding(timestamp,*(table[:,column].copy() for column in range(5)),
-                                      end if self.version=='2.2' and end!=begin else None))
+            soundings.append(Sounding(
+                timestamp,table[:,0].copy(),table[:,1].copy(),table[:,2].copy(),
+                table[:,3].copy(),table[:,4].copy(),
+                end if self.version=='2.2' and end!=begin else None))
         if not soundings: raise ValueError('UP.DAT contains no soundings')
         if any(right.timestamp<=left.timestamp for left,right in zip(soundings[:-1],soundings[1:])):
             raise ValueError('UP.DAT soundings must be strictly chronological')
         averaged=[item.end_timestamp is not None for item in soundings]
         if any(averaged) and not all(averaged): raise ValueError('UP.DAT 2.2 cannot mix snapshot and time-averaged soundings')
-        if all(averaged) and any(item.end_timestamp<=item.timestamp for item in soundings):
+        if all(averaged) and any(
+                cast(datetime,item.end_timestamp)<=item.timestamp
+                for item in soundings):
             raise ValueError('UP.DAT averaged sounding interval must be positive')
-        self.soundings=tuple(soundings)
+        self.soundings: tuple[Sounding,...]=tuple(soundings)
 
-    def at(self,timestamp):
+    def at(self,timestamp: datetime) -> Sounding:
         """Return the sounding at an exact stored timestamp.
 
         Args:
@@ -494,7 +560,7 @@ class UpperAirData:
         if not matches: raise ValueError(f'UP.DAT has no sounding at {timestamp!s}')
         return matches[0]
 
-    def bracket(self,timestamp):
+    def bracket(self,timestamp: datetime) -> tuple[Sounding,Sounding]:
         """Return RDUP's two snapshot soundings bracketing a timestamp.
 
         Args:
@@ -520,7 +586,12 @@ class UpperAirData:
             if left<0: raise ValueError('UP.DAT does not begin before requested time')
         return self.soundings[left],self.soundings[right]
 
-    def layer_wind_at(self,timestamp,z_faces_m,convergence_degrees=0.):
+    def layer_wind_at(
+        self,
+        timestamp: datetime,
+        z_faces_m: ArrayLike,
+        convergence_degrees: ArrayLike=0.,
+    ) -> tuple[Float32Array,Float32Array]:
         """VERTAV bracketing profiles and interpolate winds in time.
 
         Args:
@@ -542,8 +613,9 @@ class UpperAirData:
         if self.soundings[0].end_timestamp is not None:
             # RDUPN2 exposes an averaged profile unchanged at both interval
             # endpoints; at a shared boundary the earlier record is BB.
+            sounding: Sounding | None
             sounding=next((item for item in self.soundings
-                           if item.timestamp<timestamp<=item.end_timestamp),None)
+                           if item.timestamp<timestamp<=cast(datetime,item.end_timestamp)),None)
             if sounding is None: raise ValueError('UP.DAT averaged records do not cover requested time')
             return layer_average(sounding,z_faces_m,convergence_degrees)
         left,right=self.bracket(timestamp)
@@ -554,7 +626,11 @@ class UpperAirData:
         return (_prepdi_time_interpolate(ua,ub,remaining,total),
                 _prepdi_time_interpolate(va,vb,remaining,total))
 
-    def temperature_faces_at(self,timestamp,z_faces_m):
+    def temperature_faces_at(
+        self,
+        timestamp: datetime,
+        z_faces_m: ArrayLike,
+    ) -> Float32Array:
         """FACET bracketing profiles and interpolate temperatures in time.
 
         Args:
@@ -571,8 +647,9 @@ class UpperAirData:
                 soundings do not bracket it, or face interpolation fails.
         """
         if self.soundings[0].end_timestamp is not None:
+            sounding: Sounding | None
             sounding=next((item for item in self.soundings
-                           if item.timestamp<timestamp<=item.end_timestamp),None)
+                           if item.timestamp<timestamp<=cast(datetime,item.end_timestamp)),None)
             if sounding is None: raise ValueError('UP.DAT averaged records do not cover requested time')
             return temperature_faces(sounding,z_faces_m)
         left,right=self.bracket(timestamp)
@@ -581,7 +658,12 @@ class UpperAirData:
         remaining=(right.timestamp-timestamp).total_seconds()
         return _prepdi_time_interpolate(first,second,remaining,total)
 
-    def lapse_rate_at(self,timestamp,height_m,last_convective_time=None):
+    def lapse_rate_at(
+        self,
+        timestamp: datetime,
+        height_m: SupportsFloat,
+        last_convective_time: datetime | None=None,
+    ) -> float:
         """Compute the CGAMMA lapse rate with the convective-hour correction.
 
         Args:
@@ -602,14 +684,17 @@ class UpperAirData:
         """
         height=COMPUTE_DTYPE(height_m)
         if height<=0.: raise ValueError('CGAMMA height must be positive')
-        current=self.temperature_faces_at(timestamp,(0.,height))
+        current=self.temperature_faces_at(
+            timestamp,cast(ArrayLike,(0.,height)))
         ordinary=(current[1]-current[0])/height
         if last_convective_time is None or self.soundings[0].end_timestamp is not None:
             return float(ordinary)
         left,right=self.bracket(timestamp)
         if not (left.timestamp<last_convective_time<timestamp<right.timestamp):
             return float(ordinary)
-        first=temperature_faces(left,(0.,height)); second=temperature_faces(right,(0.,height))
+        face_heights=cast(ArrayLike,(0.,height))
+        first=temperature_faces(left,face_heights)
+        second=temperature_faces(right,face_heights)
         total=(right.timestamp-left.timestamp).total_seconds()
         convective_to_right=(right.timestamp-last_convective_time).total_seconds()
         convective_surface=_prepdi_time_interpolate(

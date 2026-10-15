@@ -1,12 +1,25 @@
 """Legacy wind-module disk debug output."""
 from __future__ import annotations
 
+from collections.abc import Iterator,Sequence
+from datetime import datetime
+from os import PathLike
 from pathlib import Path
+from types import TracebackType
+from typing import TextIO,TypeAlias,cast
 
 import numpy as np
+import numpy.typing as npt
+
+from .calmet_solver import HourFields
 
 
-def _fortran_exponential(value,digits,width):
+FilePath: TypeAlias=str | PathLike[str]
+NumericArray: TypeAlias=npt.NDArray[np.generic]
+RealScalar: TypeAlias=int | float | np.integer | np.floating
+
+
+def _fortran_exponential(value: RealScalar,digits: int,width: int) -> str:
     """Format a scalar like a fixed-width Fortran ``E`` field.
 
     Args:
@@ -48,7 +61,23 @@ class FinalWindDebugWriter:
         first_hour: First whole-hour timestamp seen, or ``None`` before output.
     """
 
-    def __init__(self,path,nx,ny,nz,dx_km,dy_km):
+    stream: TextIO | None
+    nx: int
+    ny: int
+    nz: int
+    dx_km: float
+    dy_km: float
+    first_hour: datetime | None
+
+    def __init__(
+        self,
+        path: FilePath,
+        nx: int,
+        ny: int,
+        nz: int,
+        dx_km: float,
+        dy_km: float,
+    ) -> None:
         """Open TEST.OUT and store its fixed grid metadata.
 
         Args:
@@ -73,7 +102,11 @@ class FinalWindDebugWriter:
         self.first_hour=None
 
     @staticmethod
-    def _rows(values,format_spec,width):
+    def _rows(
+        values: npt.ArrayLike,
+        format_spec: str,
+        width: int,
+    ) -> Iterator[str]:
         """Yield fixed-size chunks from each row of an array.
 
         Args:
@@ -88,12 +121,12 @@ class FinalWindDebugWriter:
             ValueError: If ``width`` is zero or a value cannot be formatted
                 with ``format_spec``.
         """
-        array=np.asarray(values)
+        array: NumericArray=np.asarray(values)
         for row in array:
             for first in range(0,row.size,width):
                 yield ''.join(format(value,format_spec) for value in row[first:first+width])
 
-    def append(self,hour):
+    def append(self,hour: HourFields) -> None:
         """Append final U/V/W fields from one solver hour.
 
         Args:
@@ -109,7 +142,13 @@ class FinalWindDebugWriter:
         """
         self.append_fields(hour.timestamp,hour.wind.u,hour.wind.v,hour.wind.w)
 
-    def append_fields(self,timestamp,u,v,w):
+    def append_fields(
+        self,
+        timestamp: datetime,
+        u: npt.ArrayLike,
+        v: npt.ArrayLike,
+        w: npt.ArrayLike,
+    ) -> None:
         """Append one timestamp and its final wind arrays to TEST.OUT.
 
         Args:
@@ -132,26 +171,29 @@ class FinalWindDebugWriter:
         current=timestamp.replace(minute=0,second=0,microsecond=0)
         if self.first_hour is None: self.first_hour=current
         nh=int((current-self.first_hour).total_seconds()//3600)+1
-        u=np.asarray(u); v=np.asarray(v); w=np.asarray(w)
-        if u.shape!=(self.nz,self.ny,self.nx) or v.shape!=u.shape:
+        u_values: NumericArray=np.asarray(u)
+        v_values: NumericArray=np.asarray(v)
+        w_values: NumericArray=np.asarray(w)
+        if (u_values.shape!=(self.nz,self.ny,self.nx)
+                or v_values.shape!=u_values.shape):
             raise ValueError('TEST.OUT U/V fields do not match the configured grid')
-        if w.shape!=(self.nz+1,self.ny,self.nx):
+        if w_values.shape!=(self.nz+1,self.ny,self.nx):
             raise ValueError('TEST.OUT W fields do not match the configured grid')
-        stream=self.stream
+        stream=cast(TextIO,self.stream)
         stream.write(f'{float((nh-1)*100):5.0f}.\n')
         stream.write(f'{self.nx:4d}{self.ny:4d}{self.nz:4d}\n')
         stream.write(f'{self.dx_km:3.0f}.{self.dy_km:3.0f}.\n')
-        for line in self._rows(u.reshape(-1,self.nx),'7.2f',59): stream.write(line+'\n')
-        for line in self._rows(v.reshape(-1,self.nx),'7.2f',59): stream.write(line+'\n')
-        for line in self._rows(w.reshape(-1,self.nx),'8.1E',59): stream.write(line+'\n')
+        for line in self._rows(u_values.reshape(-1,self.nx),'7.2f',59): stream.write(line+'\n')
+        for line in self._rows(v_values.reshape(-1,self.nx),'7.2f',59): stream.write(line+'\n')
+        for line in self._rows(w_values.reshape(-1,self.nx),'8.1E',59): stream.write(line+'\n')
         stream.flush()
 
-    def close(self):
+    def close(self) -> None:
         """Flush and close TEST.OUT; repeated calls are harmless."""
         if self.stream is not None:
             self.stream.close(); self.stream=None
 
-    def __enter__(self):
+    def __enter__(self) -> FinalWindDebugWriter:
         """Return this open writer for context-manager use.
 
         Returns:
@@ -159,12 +201,20 @@ class FinalWindDebugWriter:
         """
         return self
 
-    def __exit__(self,*exc):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         """Close TEST.OUT on context-manager exit.
 
         Args:
-            *exc: Exception type, value, and traceback supplied by the context
-                manager protocol.
+            exc_type: Exception class supplied by the context manager protocol.
+            exc_value: Exception instance supplied by the context manager
+                protocol.
+            traceback: Exception traceback supplied by the context manager
+                protocol.
 
         Returns:
             ``None``; exceptions are not suppressed.
@@ -172,7 +222,7 @@ class FinalWindDebugWriter:
         self.close()
 
 
-def format_wind_number_map(values):
+def format_wind_number_map(values: npt.ArrayLike) -> str:
     """Reproduce the legacy ``WNDLPT`` two-digit scaled number map.
 
     Args:
@@ -187,11 +237,12 @@ def format_wind_number_map(values):
     Raises:
         ValueError: If ``values`` is not two-dimensional or is empty.
     """
-    data=np.asarray(values,dtype=np.float32)
+    data: npt.NDArray[np.float32]=np.asarray(values,dtype=np.float32)
     if data.ndim!=2: raise ValueError('WNDLPT fields must be two-dimensional')
     maximum=float(np.max(np.abs(data)))
     if maximum==0.:
         return "\n         FIELD CONTAINS ALL ZEROS - PRINTING SUPPRESSED\n"
+    factor: np.float32
     if maximum<10.:
         factor=next(np.float32(10.)**power for power in range(1,21)
                     if int((np.float32(10.)**power)*maximum)>=10)
@@ -200,10 +251,11 @@ def format_wind_number_map(values):
                     if int((np.float32(10.)**(-power))*maximum)<100)
     else:
         factor=np.float32(1.)
-    scaled=np.asarray(data*factor,dtype=np.float32)
-    mapped=np.where(scaled>0.,np.trunc(scaled+np.float32(.5)),
-                    np.where(scaled<0.,np.trunc(scaled-np.float32(.5)),0.)).astype(int)
-    lines=[]; ny=min(data.shape[0],36)
+    scaled: npt.NDArray[np.float32]=np.asarray(data*factor,dtype=np.float32)
+    mapped: NumericArray=np.where(
+        scaled>0.,np.trunc(scaled+np.float32(.5)),
+        np.where(scaled<0.,np.trunc(scaled-np.float32(.5)),0.)).astype(int)
+    lines: list[str]=[]; ny=min(data.shape[0],36)
     for first in range(0,min(data.shape[1],72),36):
         last=min(first+36,data.shape[1],72)
         lines.append('')
@@ -227,7 +279,17 @@ class WindPrintWriter:
         first_hour: First whole-hour timestamp seen, or ``None`` before output.
     """
 
-    def __init__(self,path,fields,levels=None):
+    stream: TextIO | None
+    fields: tuple[bool | int,...]
+    levels: int | None
+    first_hour: datetime | None
+
+    def __init__(
+        self,
+        path: FilePath,
+        fields: Sequence[bool | int],
+        levels: int | None=None,
+    ) -> None:
         """Open TEST.PRT and retain its field switches.
 
         Args:
@@ -249,7 +311,13 @@ class WindPrintWriter:
         self.stream=target.open('w',encoding='ascii')
         self.fields=tuple(fields); self.levels=levels; self.first_hour=None
 
-    def _windpr(self,u,v,w,include_w):
+    def _windpr(
+        self,
+        u: NumericArray,
+        v: NumericArray,
+        w: NumericArray,
+        include_w: bool,
+    ) -> None:
         """Write component number maps for every horizontal wind level.
 
         Args:
@@ -268,22 +336,27 @@ class WindPrintWriter:
         Notes:
             Each component is passed through :func:`format_wind_number_map`.
         """
+        stream=cast(TextIO,self.stream)
         for level in range(u.shape[0]):
             if include_w and level:
-                self.stream.write(
+                stream.write(
                     f'\n     Z-COMPONENT OF WIND (W) BETWEEN LEVELS{level:4d} & {level+1:2d}'
                     '     (M/SEC)\n     '+'-'*59+'\n')
-                self.stream.write(format_wind_number_map(w[level]))
-            self.stream.write(
+                stream.write(format_wind_number_map(w[level]))
+            stream.write(
                 f'\n     X-COMPONENT OF WIND (U) AT LEVEL = {level+1:4d}     (M/SEC)\n'
                 '     '+'-'*49+'\n')
-            self.stream.write(format_wind_number_map(u[level]))
-            self.stream.write(
+            stream.write(format_wind_number_map(u[level]))
+            stream.write(
                 f'\n     Y-COMPONENT OF WIND (V) AT LEVEL = {level+1:4d}     (M/SEC)\n'
                 '     '+'-'*49+'\n')
-            self.stream.write(format_wind_number_map(v[level]))
+            stream.write(format_wind_number_map(v[level]))
 
-    def _speed_direction(self,u,v):
+    def _speed_direction(
+        self,
+        u: npt.ArrayLike,
+        v: npt.ArrayLike,
+    ) -> None:
         """Print final horizontal-wind speed and meteorological direction.
 
         Args:
@@ -300,24 +373,30 @@ class WindPrintWriter:
             Calm directions are printed as zero; non-calm northerly flow is
             printed as 360 degrees.
         """
-        u=np.asarray(u); v=np.asarray(v)
-        levels=u.shape[0] if self.levels is None else min(int(self.levels),u.shape[0])
+        u_values: NumericArray=np.asarray(u)
+        v_values: NumericArray=np.asarray(v)
+        levels=(u_values.shape[0] if self.levels is None
+                else min(int(self.levels),u_values.shape[0]))
+        stream=cast(TextIO,self.stream)
         for level in range(levels):
-            speed=np.hypot(u[level],v[level])
-            direction=np.mod(
-                270.-np.rad2deg(np.arctan2(v[level],u[level])),360.)
+            speed=cast(
+                npt.NDArray[np.floating],
+                np.hypot(u_values[level],v_values[level]))
+            direction: NumericArray=np.mod(
+                270.-np.rad2deg(
+                    np.arctan2(v_values[level],u_values[level])),360.)
             direction=np.where(
                 speed<1.e-5,0.,np.where(direction==0.,360.,direction))
-            self.stream.write(
+            stream.write(
                 f'\n\n     WIND SPEED (M/S) AT LEVEL = {level+1:4d}\n'
                 '     '+'-'*26+'\n')
-            self.stream.write(format_wind_number_map(speed))
-            self.stream.write(
+            stream.write(format_wind_number_map(speed))
+            stream.write(
                 f'\n\n     WIND DIRECTION (DEGREES) AT LEVEL = {level+1:4d}\n'
                 '     '+'-'*34+'\n')
-            self.stream.write(format_wind_number_map(direction))
+            stream.write(format_wind_number_map(direction))
 
-    def append(self,hour):
+    def append(self,hour: HourFields) -> None:
         """Append all enabled wind-stage diagnostics for one solver hour.
 
         Args:
@@ -341,68 +420,73 @@ class WindPrintWriter:
         current=hour.timestamp.replace(minute=0,second=0,microsecond=0)
         if self.first_hour is None: self.first_hour=current
         nh=int((current-self.first_hour).total_seconds()//3600)+1
-        stages=((5,'KINEMATIC EFFECTS',17,'kinematic_stage',True),
+        stream=cast(TextIO,self.stream)
+        stages: tuple[tuple[int,str,int,str,bool],...]=(
+                (5,'KINEMATIC EFFECTS',17,'kinematic_stage',True),
                 (6,'FROUDE NUMBER EFFECTS',21,'froude_stage',False),
                 (7,'SLOPE EFFECTS',13,'slope_stage',False))
         for index,title,dashes,attribute,include_w in stages:
             if self.fields[index]:
                 stage=getattr(hour.wind,attribute)
                 if stage is None: raise RuntimeError(f'missing retained wind stage {attribute}')
-                self.stream.write(f'\n          {title}\n          '+dashes*'-'+'\n')
-                self._windpr(*stage,include_w=include_w)
+                stream.write(f'\n          {title}\n          '+dashes*'-'+'\n')
+                stage_values=cast(
+                    tuple[NumericArray,NumericArray,NumericArray],stage)
+                self._windpr(*stage_values,include_w=include_w)
         if self.fields[0]:
             stage=hour.wind.interpolated_stage
             if stage is None: raise RuntimeError('missing retained interpolated wind stage')
-            self.stream.write('           INTERPOLATED WIND FIELD\n           '+23*'-'+'\n')
+            stream.write('           INTERPOLATED WIND FIELD\n           '+23*'-'+'\n')
             self._windpr(*stage,np.empty(0),include_w=False)
         if self.fields[1]:
             stage=hour.wind.terrain_adjusted_stage
             if stage is None: raise RuntimeError('missing retained terrain-adjusted wind stage')
-            self.stream.write('\n          TERRAIN ADJUSTED SURFACE WINDS\n          '+30*'-'+'\n')
+            stream.write('\n          TERRAIN ADJUSTED SURFACE WINDS\n          '+30*'-'+'\n')
             self._windpr(*stage,np.empty(0),include_w=False)
         if self.fields[2]:
             stage=hour.wind.initial_stage
             if stage is None: raise RuntimeError('missing retained initial wind stage')
             u,v,w,divergence=stage
-            self.stream.write('\n          SMOOTHED WIND AND INITIAL DIVERGENCE FIELDS\n'
+            stream.write('\n          SMOOTHED WIND AND INITIAL DIVERGENCE FIELDS\n'
                               '          '+43*'-'+'\n')
             self._windpr(u,v,w,include_w=True)
             maximum=float(np.max(np.abs(divergence)))
-            self.stream.write('\n\n                    MAXIMUM DIVERGENCE = '+
+            stream.write('\n\n                    MAXIMUM DIVERGENCE = '+
                               _fortran_exponential(maximum,4,12)+'\n')
-            for level in range(min(int(self.levels),divergence.shape[0])):
-                self.stream.write(
+            for level in range(min(
+                    int(cast(int,self.levels)),divergence.shape[0])):
+                stream.write(
                     f'\n\n     DIVERGENCE AT LEVEL = {level+1:4d}\n'
                     '     '+'-'*24+'\n')
-                self.stream.write(format_wind_number_map(divergence[level]))
+                stream.write(format_wind_number_map(divergence[level]))
         if self.fields[8]:
             time=float((nh-1)*100)
-            self.stream.write(
+            stream.write(
                 f'          FINAL WIND FIELD AT TIME = {time:6.0f}.'
                 f'     (SIMULATION HOUR NO.{nh:3d} )\n          '+63*'-'+'\n')
             self._windpr(hour.wind.u,hour.wind.v,hour.wind.w,include_w=True)
         levels=hour.wind.u.shape[0] if self.levels is None else min(
             int(self.levels),hour.wind.u.shape[0])
         if self.fields[4]:
-            self.stream.write('\n          FINAL DIVERGENCE FIELD AT TIME =\n')
+            stream.write('\n          FINAL DIVERGENCE FIELD AT TIME =\n')
             for level in range(levels):
-                self.stream.write(
+                stream.write(
                     f'\n\n     DIVERGENCE AT LEVEL = {level+1:4d}\n'
                     '     '+'-'*24+'\n')
-                self.stream.write(format_wind_number_map(hour.wind.divergence[level]))
+                stream.write(format_wind_number_map(hour.wind.divergence[level]))
         if self.fields[3]:
             time=float((nh-1)*100)
-            self.stream.write(
+            stream.write(
                 f'\n          FINAL WIND SPEED AND DIRECTION AT TIME = {time:7.0f}.'
                 f'     (SIMULATION HOUR NO.{nh:3d} )\n          '+72*'-'+'\n')
             self._speed_direction(hour.wind.u,hour.wind.v)
-        self.stream.flush()
+        stream.flush()
 
-    def close(self):
+    def close(self) -> None:
         """Flush and close TEST.PRT; repeated calls are harmless."""
         if self.stream is not None: self.stream.close(); self.stream=None
 
-    def __enter__(self):
+    def __enter__(self) -> WindPrintWriter:
         """Return this open writer for context-manager use.
 
         Returns:
@@ -410,12 +494,20 @@ class WindPrintWriter:
         """
         return self
 
-    def __exit__(self,*exc):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         """Close TEST.PRT on context-manager exit.
 
         Args:
-            *exc: Exception type, value, and traceback supplied by the context
-                manager protocol.
+            exc_type: Exception class supplied by the context manager protocol.
+            exc_value: Exception instance supplied by the context manager
+                protocol.
+            traceback: Exception traceback supplied by the context manager
+                protocol.
 
         Returns:
             ``None``; exceptions are not suppressed.

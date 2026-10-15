@@ -7,9 +7,10 @@ inverse flattening. Duplicate IDN and CAC source rows are represented once.
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import NamedTuple
+from typing import Final, NamedTuple
 
 import numpy as np
+import numpy.typing as npt
 
 from ._proj_data import configure_proj_data
 
@@ -19,7 +20,7 @@ from pyproj import CRS, Transformer
 
 # Date stamp returned by the legacy COORDLIB ``NIMADATE`` routine.  It is
 # part of every TERREL/CTGPROC/MAKEGEO formatted output datum record.
-NIMA_DATABASE_DATE = '02-21-2003'
+NIMA_DATABASE_DATE: Final[str] = '02-21-2003'
 
 
 class DatumDefinition(NamedTuple):
@@ -40,7 +41,7 @@ class DatumDefinition(NamedTuple):
     dz: float
 
 
-DATUMS: dict[str, DatumDefinition] = {
+DATUMS: Final[dict[str, DatumDefinition]] = {
     'WGS-84': DatumDefinition(6378137.0, 298.2572, 0.0, 0.0, 0.0),
     'WGS-96': DatumDefinition(6378137.0, 298.2572, 0.0, 0.0, 0.0),
     'WGS-G': DatumDefinition(6378137.0, 298.2572, 0.0, 0.0, 0.0),
@@ -287,8 +288,12 @@ def normalize_datum(datum: str) -> str:
         WGS/ESRI aliases converted to their canonical table keys.
     """
     normalized = datum.strip().upper().replace("_", "-")
-    aliases = {"WGS84": "WGS-84", "WGS96": "WGS-96", "WGS72": "WGS-72",
-               "ESR-R": "ESR-S"}
+    aliases: Final[dict[str, str]] = {
+        "WGS84": "WGS-84",
+        "WGS96": "WGS-96",
+        "WGS72": "WGS-72",
+        "ESR-R": "ESR-S",
+    }
     return aliases.get(normalized, normalized)
 
 
@@ -390,7 +395,18 @@ def _datum_transformer(source: str, target: str) -> Transformer:
     )
 
 
-def datum_shift(longitude, latitude, height=0.0, *, source="WGS-84", target="WGS-84"):
+def datum_shift(
+    longitude: npt.ArrayLike,
+    latitude: npt.ArrayLike,
+    height: npt.ArrayLike = 0.0,
+    *,
+    source: str = "WGS-84",
+    target: str = "WGS-84",
+) -> tuple[
+    npt.NDArray[np.float64],
+    npt.NDArray[np.float64],
+    npt.NDArray[np.float64],
+]:
     """Transform geodetic coordinates between CALPUFF datums.
 
     Args:
@@ -414,6 +430,9 @@ def datum_shift(longitude, latitude, height=0.0, *, source="WGS-84", target="WGS
     source_name, target_name = normalize_datum(source), normalize_datum(target)
     datum_definition(source_name)
     datum_definition(target_name)
+    lon: npt.NDArray[np.float64]
+    lat: npt.NDArray[np.float64]
+    z: npt.NDArray[np.float64]
     lon, lat, z = np.broadcast_arrays(
         np.asarray(longitude, dtype=np.float64),
         np.asarray(latitude, dtype=np.float64),
@@ -423,9 +442,15 @@ def datum_shift(longitude, latitude, height=0.0, *, source="WGS-84", target="WGS
         return lon.copy(), lat.copy(), z.copy()
     transformed = _datum_transformer(source_name, target_name).transform(
         lon.ravel(), lat.ravel(), z.ravel(), errcheck=True)
-    shifted_lon = np.asarray(transformed[0], dtype=np.float64).reshape(lon.shape)
-    shifted_lat = np.asarray(transformed[1], dtype=np.float64).reshape(lat.shape)
-    shifted_height = np.asarray(transformed[2], dtype=np.float64).reshape(z.shape)
+    shifted_lon: npt.NDArray[np.float64] = np.asarray(
+        transformed[0], dtype=np.float64
+    ).reshape(lon.shape)
+    shifted_lat: npt.NDArray[np.float64] = np.asarray(
+        transformed[1], dtype=np.float64
+    ).reshape(lat.shape)
+    shifted_height: npt.NDArray[np.float64] = np.asarray(
+        transformed[2], dtype=np.float64
+    ).reshape(z.shape)
     # PROJ normalizes geographic longitudes.  CALPUFF accepts continuous
     # longitude branches around the antimeridian, so restore the branch of
     # each source coordinate after applying the geodetic transformation.

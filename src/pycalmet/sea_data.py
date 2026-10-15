@@ -1,12 +1,16 @@
 """Formatted CALMET SEA.DAT 2.1/2.11 overwater observations."""
 from __future__ import annotations
 
+from typing import TypeAlias, TypedDict, cast
+
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import re
+from collections.abc import Iterable
 
 import numpy as np
+from numpy.typing import ArrayLike, NDArray
 
 from .config import GridConfig
 from .datetime_utils import parse_ordinal
@@ -14,11 +18,32 @@ from .projections import transform_grid,unproject_geographic
 from .surface_data import _nearest_indices
 
 
-COMPUTE_DTYPE=np.float32
-SPATIAL_DTYPE=np.float64
+COMPUTE_DTYPE: type[np.float32]=np.float32
+SPATIAL_DTYPE: type[np.float64]=np.float64
+Float32Array: TypeAlias = NDArray[np.float32]
+Float64Array: TypeAlias = NDArray[np.float64]
+IndexArray: TypeAlias = NDArray[np.intp]
 
 
-def _julian(year,day,hour):
+class _GridParameters(TypedDict,total=False):
+    """Optional projection keywords parsed from a SEA.DAT header."""
+
+    utm_zone: int
+    hemisphere: str
+    lat0: float
+    lon0: float
+    lat1: float
+    lat2: float
+    false_easting_km: float
+    false_northing_km: float
+
+
+
+def _julian(
+    year: int | float | str,
+    day: int | float | str,
+    hour: int | float | str,
+) -> datetime:
     """Convert SEA.DAT ordinal time fields to a timestamp.
 
     Args:
@@ -32,10 +57,11 @@ def _julian(year,day,hour):
     Raises:
         ValueError: If the ordinal fields do not form a valid timestamp.
     """
-    return parse_ordinal(year,day,hour)
+    return parse_ordinal(
+        cast(int | str,year),cast(int | str,day),cast(int | str,hour))
 
 
-def _angle(text):
+def _angle(text: str) -> float:
     """Parse a signed projection angle with an optional compass suffix.
 
     Args:
@@ -118,15 +144,15 @@ class GriddedSeaData:
         All fields have shape ``(ny, nx)``; numeric meteorological arrays use
         ``float32`` and station longitude uses spatial ``float64`` precision.
     """
-    air_temperature_k: np.ndarray
-    sea_temperature_k: np.ndarray
-    relative_humidity: np.ndarray
-    anemometer_height_m: np.ndarray
-    air_sensor_height_m: np.ndarray
-    water_sensor_depth_m: np.ndarray
-    wave_period_s: np.ndarray
-    wave_height_m: np.ndarray
-    station_longitude: np.ndarray
+    air_temperature_k: Float32Array
+    sea_temperature_k: Float32Array
+    relative_humidity: Float32Array
+    anemometer_height_m: Float32Array
+    air_sensor_height_m: Float32Array
+    water_sensor_depth_m: Float32Array
+    wave_period_s: Float32Array
+    wave_height_m: Float32Array
+    station_longitude: Float64Array
 
 
 class SeaData:
@@ -146,7 +172,15 @@ class SeaData:
         source_grid: One-cell grid carrying the station projection metadata.
         records: Chronologically contiguous :class:`SeaRecord` values.
     """
-    def __init__(self,path):
+
+    version: str
+    projection: str
+    datum: str
+    datum_date: str
+    identifier: int
+    name: str
+
+    def __init__(self,path: str | Path) -> None:
         """Parse and validate a formatted SEA.DAT file.
 
         Args:
@@ -158,8 +192,8 @@ class SeaData:
             ValueError: If the header, projection, time span, record width, or
                 record chronology is invalid.
         """
-        self.path=Path(path)
-        lines=self.path.read_text(encoding='ascii',errors='strict').splitlines()
+        self.path: Path=Path(path)
+        lines: list[str]=self.path.read_text(encoding='ascii',errors='strict').splitlines()
         if not lines: raise ValueError('empty SEA.DAT')
         first=lines[0].ljust(32)
         if first[:16].strip().upper()!='SEA.DAT': raise ValueError('invalid SEA.DAT dataset label')
@@ -171,28 +205,28 @@ class SeaData:
         index=1
         comments=int(lines[index].split()[0]); index+=1+comments
         self.projection=lines[index][:8].strip().upper(); index+=1
-        params={}
+        params: _GridParameters={}
         if self.projection=='UTM':
             fields=lines[index].split(); index+=1
-            params.update(utm_zone=int(fields[0]),hemisphere=fields[1].upper())
+            params['utm_zone']=int(fields[0]); params['hemisphere']=fields[1].upper()
         elif self.projection=='LCC':
             line=lines[index].ljust(64); index+=1
-            params.update(lat0=_angle(line[:16]),lon0=_angle(line[16:32]),
-                          lat1=_angle(line[32:48]),lat2=_angle(line[48:64]))
+            params['lat0']=_angle(line[:16]); params['lon0']=_angle(line[16:32])
+            params['lat1']=_angle(line[32:48]); params['lat2']=_angle(line[48:64])
             false=lines[index].split(); index+=1
-            params.update(false_easting_km=float(false[0]),false_northing_km=float(false[1]))
+            params['false_easting_km']=float(false[0]); params['false_northing_km']=float(false[1])
         elif self.projection=='PS':
             line=lines[index].ljust(48); index+=1
-            params.update(lat0=_angle(line[:16]),lon0=_angle(line[16:32]),
-                          lat1=_angle(line[32:48]))
+            params['lat0']=_angle(line[:16]); params['lon0']=_angle(line[16:32])
+            params['lat1']=_angle(line[32:48])
         elif self.projection=='EM':
             line=lines[index].ljust(32); index+=1
-            params.update(lat0=_angle(line[:16]),lon0=_angle(line[16:32]))
+            params['lat0']=_angle(line[:16]); params['lon0']=_angle(line[16:32])
         elif self.projection in {'LAZA','TTM'}:
             line=lines[index].ljust(32); index+=1
-            params.update(lat0=_angle(line[:16]),lon0=_angle(line[16:32]))
+            params['lat0']=_angle(line[:16]); params['lon0']=_angle(line[16:32])
             false=lines[index].split(); index+=1
-            params.update(false_easting_km=float(false[0]),false_northing_km=float(false[1]))
+            params['false_easting_km']=float(false[0]); params['false_northing_km']=float(false[1])
         else:
             raise ValueError('SEA.DAT projection must be UTM, LCC, PS, EM, LAZA, or TTM')
         datum_line=lines[index]; index+=1
@@ -200,6 +234,9 @@ class SeaData:
         units=lines[index][:4].strip().upper(); index+=1
         if units!='KM': raise ValueError('SEA.DAT coordinates must use KM')
         modern=version>=2.10999
+        self.timezone: str | None
+        self.start: datetime | None
+        self.end: datetime | None
         if modern:
             self.timezone=lines[index][:8].strip(); index+=1
             span=lines[index].split(); index+=1
@@ -210,8 +247,8 @@ class SeaData:
         station=lines[index].split(maxsplit=1); index+=1
         if len(station)!=2: raise ValueError('invalid SEA.DAT station identification')
         self.identifier=int(station[0]); self.name=station[1].strip()
-        self.source_grid=GridConfig(1,1,1.,1.,projection=self.projection,datum=self.datum,**params)
-        records=[]
+        self.source_grid: GridConfig=GridConfig(1,1,1.,1.,projection=self.projection,datum=self.datum,**params)
+        records: list[SeaRecord]=[]
         for line in lines[index:]:
             if not line.strip(): continue
             values=line.replace(',',' ').split()
@@ -240,12 +277,13 @@ class SeaData:
         if not records: raise ValueError('SEA.DAT contains no meteorological records')
         for left,right in zip(records[:-1],records[1:]):
             if left.end!=right.begin: raise ValueError('SEA.DAT records contain a gap or overlap')
-        if modern and (records[0].begin<self.start or records[-1].end>self.end):
+        if modern and (records[0].begin<cast(datetime,self.start) or
+                       records[-1].end>cast(datetime,self.end)):
             raise ValueError('SEA.DAT records fall outside the declared header period')
         if not modern: self.start,self.end=records[0].begin,records[-1].end
-        self.records=tuple(records)
+        self.records: tuple[SeaRecord,...]=tuple(records)
 
-    def at_begin(self,timestamp):
+    def at_begin(self,timestamp: datetime) -> SeaRecord:
         """Select the record whose half-open interval contains a timestamp.
 
         Args:
@@ -257,11 +295,12 @@ class SeaData:
         Raises:
             ValueError: If no record covers ``timestamp``.
         """
+        record: SeaRecord | None
         record=next((item for item in self.records if item.begin<=timestamp<item.end),None)
         if record is None: raise ValueError(f'SEA.DAT has no record covering {timestamp}')
         return record
 
-    def point(self,target_grid):
+    def point(self,target_grid: GridConfig) -> Float64Array:
         """Transform the station coordinate to a target grid.
 
         Args:
@@ -275,18 +314,26 @@ class SeaData:
                                          self.source_grid,target_grid,units='km'),
                           dtype=SPATIAL_DTYPE)
 
-    def longitude_latitude(self):
+    def longitude_latitude(self) -> tuple[float,float]:
         """Derive the station's WGS-84 longitude and latitude.
 
         Returns:
             Tuple ``(longitude_deg_east, latitude_deg_north)``.
         """
         record=self.records[0]
-        return unproject_geographic(record.x_km,record.y_km,self.source_grid,
-                                    'WGS-84',units='km')
+        return cast(
+            tuple[float,float],
+            unproject_geographic(record.x_km,record.y_km,self.source_grid,
+                                 'WGS-84',units='km'),
+        )
 
 
-def grid_sea_mixing_height(values,station_xy,grid,block_size=65536):
+def grid_sea_mixing_height(
+    values: ArrayLike,
+    station_xy: ArrayLike,
+    grid: GridConfig,
+    block_size: int=65536,
+) -> Float32Array:
     """Interpolate observed overwater mixing height from valid stations.
 
     Args:
@@ -303,8 +350,8 @@ def grid_sea_mixing_height(values,station_xy,grid,block_size=65536):
     Raises:
         ValueError: If station coordinates do not match ``values``.
     """
-    data=np.asarray(values,dtype=COMPUTE_DTYPE)
-    points=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
+    data: Float32Array=np.asarray(values,dtype=COMPUTE_DTYPE)
+    points: Float64Array=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
     valid=data<COMPUTE_DTYPE(9998.)
     if points.shape!=(data.size,2): raise ValueError('SEA mixing-height coordinates do not match values')
     if not valid.any(): return np.full((grid.ny,grid.nx),np.nan,dtype=COMPUTE_DTYPE)
@@ -317,7 +364,7 @@ def grid_sea_mixing_height(values,station_xy,grid,block_size=65536):
     tx=(np.arange(grid.nx,dtype=SPATIAL_DTYPE)+.5)*(float(grid.dx_km)*1000.)
     ty=(np.arange(grid.ny,dtype=SPATIAL_DTYPE)+.5)*(float(grid.dy_km)*1000.)
     xx,yy=np.meshgrid(tx,ty); targets=np.column_stack((xx.ravel(),yy.ravel()))
-    output=np.empty(targets.shape[0],dtype=COMPUTE_DTYPE)
+    output: Float32Array=np.empty(targets.shape[0],dtype=COMPUTE_DTYPE)
     for begin in range(0,targets.shape[0],block_size):
         end=min(begin+block_size,targets.shape[0])
         # These all-station sums can span many magnitudes, so accumulate in
@@ -334,7 +381,13 @@ def grid_sea_mixing_height(values,station_xy,grid,block_size=65536):
     return output.reshape(grid.ny,grid.nx)
 
 
-def grid_water_mixing_gradient(values,station_xy,grid,default,block_size=65536):
+def grid_water_mixing_gradient(
+    values: ArrayLike,
+    station_xy: ArrayLike,
+    grid: GridConfig,
+    default: float,
+    block_size: int=65536,
+) -> Float32Array:
     """Interpolate the above-mixing-height gradient from SEA stations.
 
     Args:
@@ -352,8 +405,8 @@ def grid_water_mixing_gradient(values,station_xy,grid,default,block_size=65536):
     Raises:
         ValueError: If station coordinates do not match ``values``.
     """
-    data=np.asarray(values,dtype=COMPUTE_DTYPE)
-    points=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
+    data: Float32Array=np.asarray(values,dtype=COMPUTE_DTYPE)
+    points: Float64Array=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
     if points.shape!=(data.size,2):
         raise ValueError('SEA gradient coordinates do not match values')
     fallback=COMPUTE_DTYPE(default)
@@ -368,7 +421,7 @@ def grid_water_mixing_gradient(values,station_xy,grid,default,block_size=65536):
     tx=(np.arange(grid.nx,dtype=SPATIAL_DTYPE)+.5)*(float(grid.dx_km)*1000.)
     ty=(np.arange(grid.ny,dtype=SPATIAL_DTYPE)+.5)*(float(grid.dy_km)*1000.)
     xx,yy=np.meshgrid(tx,ty); targets=np.column_stack((xx.ravel(),yy.ravel()))
-    output=np.empty(targets.shape[0],dtype=COMPUTE_DTYPE)
+    output: Float32Array=np.empty(targets.shape[0],dtype=COMPUTE_DTYPE)
     for begin in range(0,targets.shape[0],block_size):
         end=min(begin+block_size,targets.shape[0])
         xsum=np.zeros(end-begin,dtype=np.float64)
@@ -382,7 +435,11 @@ def grid_water_mixing_gradient(values,station_xy,grid,default,block_size=65536):
     return output.reshape(grid.ny,grid.nx)
 
 
-def _nearest_sea_indices(points,valid,grid):
+def _nearest_sea_indices(
+    points: ArrayLike,
+    valid: ArrayLike,
+    grid: GridConfig,
+) -> IndexArray:
     """Select the nearest valid SEA station for every target cell.
 
     Args:
@@ -411,7 +468,11 @@ def _nearest_sea_indices(points,valid,grid):
     return np.flatnonzero(valid)[selected]
 
 
-def nearest_sea_waves(records,station_xy,grid):
+def nearest_sea_waves(
+    records: Iterable[SeaRecord],
+    station_xy: ArrayLike,
+    grid: GridConfig,
+) -> tuple[Float32Array,Float32Array]:
     """Grid WATERP's independently selected valid wave observations.
 
     Args:
@@ -428,7 +489,7 @@ def nearest_sea_waves(records,station_xy,grid):
                     for item in records])
     chosen=(_nearest_sea_indices(points,valid,grid) if valid.any() else
             np.zeros(grid.nx*grid.ny,dtype=np.intp))
-    def field(name):
+    def field(name: str) -> Float32Array:
         """Gather one wave attribute at the selected station indices.
 
         Args:
@@ -442,7 +503,12 @@ def nearest_sea_waves(records,station_xy,grid):
     return field('wave_period_s'),field('wave_height_m')
 
 
-def nearest_sea_data(records,station_xy,longitudes,grid):
+def nearest_sea_data(
+    records: Iterable[SeaRecord],
+    station_xy: ArrayLike,
+    longitudes: ArrayLike,
+    grid: GridConfig,
+) -> GriddedSeaData | None:
     """Select WATER fields from the nearest station with a valid delta.
 
     Args:
@@ -466,7 +532,7 @@ def nearest_sea_data(records,station_xy,longitudes,grid):
     valid=np.array([item.air_water_delta_k<9998. for item in records])
     if not valid.any(): return None
     chosen=_nearest_sea_indices(points,valid,grid)
-    def field(name):
+    def field(name: str) -> Float32Array:
         """Gather one scalar observation at the primary selected stations.
 
         Args:
@@ -495,7 +561,7 @@ def nearest_sea_data(records,station_xy,longitudes,grid):
     else:
         # WATER leaves NOW=1 when every station has missing wave data.
         wave_chosen=np.zeros(chosen.size,dtype=np.intp)
-    def wave_field(name):
+    def wave_field(name: str) -> Float32Array:
         """Gather one wave observation at independently selected stations.
 
         Args:

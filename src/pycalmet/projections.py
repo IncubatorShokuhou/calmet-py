@@ -1,7 +1,10 @@
 """Shared CALPUFF map-projection definitions backed by PROJ/pyproj."""
 from __future__ import annotations
 
+from typing import TypeAlias
+
 import numpy as np
+import numpy.typing as npt
 
 from ._proj_data import configure_proj_data
 
@@ -12,6 +15,11 @@ from pyproj import CRS,Proj,Transformer
 from .config import GridConfig
 from .datums import (datum_definition,datum_proj4_parameters,datum_shift,
                      normalize_datum)
+
+
+_ProjectedCoordinates: TypeAlias = tuple[float, float] | tuple[
+    npt.NDArray[np.float64], npt.NDArray[np.float64]
+]
 
 
 def _earth(datum: str) -> str:
@@ -116,8 +124,14 @@ def grid_crs(grid: GridConfig, datum: str | None=None, *, units: str='m') -> CRS
     return CRS.from_proj4(definition+f' +units={units} +no_defs')
 
 
-def project_geographic(longitude,latitude,grid: GridConfig,source_datum: str,
-                       *,units: str='m'):
+def project_geographic(
+    longitude: npt.ArrayLike,
+    latitude: npt.ArrayLike,
+    grid: GridConfig,
+    source_datum: str,
+    *,
+    units: str = 'm',
+) -> _ProjectedCoordinates:
     """Project geographic coordinates onto a CALPUFF grid.
 
     Args:
@@ -149,7 +163,14 @@ def project_geographic(longitude,latitude,grid: GridConfig,source_datum: str,
     return (float(x),float(y)) if not shape else (x,y)
 
 
-def unproject_geographic(x,y,grid: GridConfig,target_datum: str,*,units: str='m'):
+def unproject_geographic(
+    x: npt.ArrayLike,
+    y: npt.ArrayLike,
+    grid: GridConfig,
+    target_datum: str,
+    *,
+    units: str = 'm',
+) -> _ProjectedCoordinates:
     """Convert CALPUFF grid coordinates to geographic coordinates.
 
     Args:
@@ -183,8 +204,14 @@ def unproject_geographic(x,y,grid: GridConfig,target_datum: str,*,units: str='m'
     return shifted_lon,shifted_lat
 
 
-def transform_grid(x,y,source_grid: GridConfig,target_grid: GridConfig,
-                   *,units: str='m'):
+def transform_grid(
+    x: npt.ArrayLike,
+    y: npt.ArrayLike,
+    source_grid: GridConfig,
+    target_grid: GridConfig,
+    *,
+    units: str = 'm',
+) -> _ProjectedCoordinates:
     """Transform projected coordinates between two CALPUFF grids.
 
     Args:
@@ -208,8 +235,15 @@ def transform_grid(x,y,source_grid: GridConfig,target_grid: GridConfig,
     return project_geographic(lon,lat,target_grid,source_grid.datum,units=units)
 
 
-def project_from_crs(x,y,source_crs: CRS,source_datum: str,target_grid: GridConfig,
-                     *,units: str='m'):
+def project_from_crs(
+    x: npt.ArrayLike,
+    y: npt.ArrayLike,
+    source_crs: CRS,
+    source_datum: str,
+    target_grid: GridConfig,
+    *,
+    units: str = 'm',
+) -> _ProjectedCoordinates:
     """Project coordinates from an external CRS to a CALPUFF grid.
 
     Args:
@@ -240,8 +274,14 @@ def project_from_crs(x,y,source_crs: CRS,source_datum: str,target_grid: GridConf
     return project_geographic(lon,lat,target_grid,source_datum,units=units)
 
 
-def project_glaz_to_lcc(x, y, source_grid: GridConfig, target_grid: GridConfig,
-                        *, units: str = 'km'):
+def project_glaz_to_lcc(
+    x: npt.ArrayLike,
+    y: npt.ArrayLike,
+    source_grid: GridConfig,
+    target_grid: GridConfig,
+    *,
+    units: str = 'km',
+) -> _ProjectedCoordinates:
     """Transform legacy GLAZ coordinates to a target LCC grid.
 
     Args:
@@ -264,8 +304,15 @@ def project_glaz_to_lcc(x, y, source_grid: GridConfig, target_grid: GridConfig,
     return transform_grid(x, y, source_grid, target_grid, units=units)
 
 
-def unproject_to_crs(x,y,source_grid: GridConfig,target_crs: CRS,target_datum: str,
-                     *,units: str='m'):
+def unproject_to_crs(
+    x: npt.ArrayLike,
+    y: npt.ArrayLike,
+    source_grid: GridConfig,
+    target_crs: CRS,
+    target_datum: str,
+    *,
+    units: str = 'm',
+) -> _ProjectedCoordinates:
     """Transform CALPUFF grid coordinates to an external projected CRS.
 
     Args:
@@ -297,7 +344,11 @@ def unproject_to_crs(x,y,source_grid: GridConfig,target_crs: CRS,target_datum: s
     return px,py
 
 
-def grid_convergence(grid: GridConfig, longitude, latitude):
+def grid_convergence(
+    grid: GridConfig,
+    longitude: npt.ArrayLike,
+    latitude: npt.ArrayLike,
+) -> npt.NDArray[np.float64]:
     """Calculate meridian convergence for a CALPUFF grid.
 
     Args:

@@ -8,6 +8,7 @@ file so every top-level stage has the same path-oriented contract.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Final
 
 from .config import TerrelConfig
 
@@ -39,4 +40,4 @@ def run(config: TerrelConfig) -> Path:
     return Path(_run(config).output)
 
 
-__all__ = ["run"]
+__all__: Final[list[str]] = ["run"]

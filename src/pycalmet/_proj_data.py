@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Final
 import warnings
 
 
@@ -32,4 +33,4 @@ def configure_proj_data() -> None:
     datadir.set_data_dir(configured)
 
 
-__all__ = ["configure_proj_data"]
+__all__: Final[list[str]] = ["configure_proj_data"]

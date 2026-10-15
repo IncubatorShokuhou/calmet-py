@@ -2,18 +2,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from os import PathLike
 from pathlib import Path
 import struct
-from typing import BinaryIO,Iterator
+from typing import BinaryIO, Iterator, TypeAlias
 
 import numpy as np
+import numpy.typing as npt
 from shapely import box,make_valid
 from shapely.geometry import Polygon
+from shapely.geometry.base import BaseGeometry
 from shapely.geometry.polygon import orient
 
 from .config import GridConfig
 from .datums import datum_shift
 from .projections import project_geographic,unproject_geographic
+
+
+_Bounds: TypeAlias = tuple[float, float, float, float]
+_FloatArray: TypeAlias = npt.NDArray[np.float64]
+_PathLike: TypeAlias = str | PathLike[str]
 
 
 @dataclass(frozen=True,slots=True)
@@ -66,12 +74,20 @@ class GshhsPolygon:
     """
 
     header: GshhsHeader
-    longitude: np.ndarray
-    latitude: np.ndarray
+    longitude: _FloatArray
+    latitude: _FloatArray
 
 
-def clip_coast_polygon(longitude,latitude,x,y,kind,geographic_bounds,
-                       projected_bounds,polygon_bounds=None):
+def clip_coast_polygon(
+    longitude: npt.ArrayLike,
+    latitude: npt.ArrayLike,
+    x: npt.ArrayLike,
+    y: npt.ArrayLike,
+    kind: int,
+    geographic_bounds: _Bounds,
+    projected_bounds: _Bounds,
+    polygon_bounds: _Bounds | None = None,
+) -> tuple[_FloatArray, ...]:
     """Clip one GSHHS ring to zero or more extraction-window polygons.
 
     Bounds use ``(xmin, xmax, ymin, ymax)``. Geographic coordinates determine
@@ -119,7 +135,7 @@ def clip_coast_polygon(longitude,latitude,x,y,kind,geographic_bounds,
     if clipped.is_empty:
         return ()
 
-    def polygon_parts(geometry):
+    def polygon_parts(geometry: BaseGeometry) -> Iterator[Polygon]:
         """Yield positive-area Polygon parts from a Shapely geometry.
 
         Args:
@@ -139,7 +155,7 @@ def clip_coast_polygon(longitude,latitude,x,y,kind,geographic_bounds,
     if not parts:
         # A boundary-only touch has no area and does not create a BLN record.
         return ()
-    result=[]
+    result: list[_FloatArray] = []
     for polygon in parts:
         polygon=orient(polygon,sign=1.0 if kind%2 else -1.0)
         points=np.asarray(polygon.exterior.coords,dtype=np.float64)
@@ -148,7 +164,7 @@ def clip_coast_polygon(longitude,latitude,x,y,kind,geographic_bounds,
     return tuple(result)
 
 
-def _packed_header(values: tuple[int,...],version: int) -> GshhsHeader:
+def _packed_header(values: tuple[int, ...], version: int) -> GshhsHeader:
     """Decode a packed v1.4/v2 flag word into normalized header fields.
 
     Args:
@@ -166,7 +182,9 @@ def _packed_header(values: tuple[int,...],version: int) -> GshhsHeader:
     )
 
 
-def _read_header(stream: BinaryIO,version: int | None) -> tuple[GshhsHeader,int]:
+def _read_header(
+    stream: BinaryIO, version: int | None
+) -> tuple[GshhsHeader, int]:
     """Read one header and detect the historical layout on the first call.
 
     Args:
@@ -232,7 +250,7 @@ def _read_header(stream: BinaryIO,version: int | None) -> tuple[GshhsHeader,int]
                        3,bool(greenwich),source),version
 
 
-def iter_gshhs(path: str | Path) -> Iterator[GshhsPolygon]:
+def iter_gshhs(path: _PathLike) -> Iterator[GshhsPolygon]:
     """Yield all polygons while enforcing one consistent file version.
 
     Args:
@@ -245,7 +263,7 @@ def iter_gshhs(path: str | Path) -> Iterator[GshhsPolygon]:
         OSError: If the file cannot be opened or read.
         ValueError: If a polygon header or point payload is malformed.
     """
-    version=None
+    version: int | None = None
     with Path(path).open('rb') as stream:
         while True:
             try:
@@ -263,7 +281,9 @@ def iter_gshhs(path: str | Path) -> Iterator[GshhsPolygon]:
             )
 
 
-def _longitude_branch(longitude,center):
+def _longitude_branch(
+    longitude: npt.ArrayLike, center: float
+) -> _FloatArray:
     """Wrap longitude values onto the branch centred on a region.
 
     Args:
@@ -277,8 +297,14 @@ def _longitude_branch(longitude,center):
     return (values-center+180.)%360.-180.+center
 
 
-def extract_gshhs(source: str | Path,output: str | Path,grid: GridConfig,
-                  *,source_datum='WGS-84',wdbii_datum='WGS-72') -> int:
+def extract_gshhs(
+    source: _PathLike,
+    output: _PathLike,
+    grid: GridConfig,
+    *,
+    source_datum: str = 'WGS-84',
+    wdbii_datum: str = 'WGS-72',
+) -> int:
     """Extract projected polygons and write a COASTEXT-compatible BLN file.
 
     Args:
@@ -312,7 +338,7 @@ def extract_gshhs(source: str | Path,output: str | Path,grid: GridConfig,
                        float(np.max(corner_lon))+longitude_margin,
                        float(np.min(corner_lat))-latitude_margin,
                        float(np.max(corner_lat))+latitude_margin)
-    records=[]
+    records: list[tuple[int, int, int, _FloatArray]] = []
     for polygon in iter_gshhs(source):
         header=polygon.header
         if header.point_count==0 or header.area_tenth_km2==0 or header.level not in {1,2,3,4}:

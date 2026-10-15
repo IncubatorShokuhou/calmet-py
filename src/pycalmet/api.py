@@ -7,7 +7,7 @@ from dataclasses import fields, replace
 from datetime import date, datetime
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, ParamSpec, TypeVar
+from typing import Any, Callable, Final, ParamSpec, TypeVar, cast
 
 from ._parameter_docs import document_stage_api
 from .config import (CalmetConfig, CalwrfConfig, CtgprocConfig, GridConfig,
@@ -17,7 +17,9 @@ from .parameters import normalize_public_parameters
 T = TypeVar("T")
 P = ParamSpec("P")
 R = TypeVar("R")
-_GRID_PARAMETER_NAMES = {field.name for field in fields(GridConfig)}
+_GRID_PARAMETER_NAMES: Final[set[str]] = {
+    field.name for field in fields(GridConfig)
+}
 _EXPLICIT_ARGUMENTS: ContextVar[frozenset[str] | None] = ContextVar(
     "pycalmet_explicit_arguments", default=None)
 
@@ -66,12 +68,12 @@ def _source_control_overrides(cls: type[T], result: T,
         The updated TERREL or CTGPROC configuration, or ``result`` unchanged
         for other stages.
     """
-    if cls is TerrelConfig and result.terrain_sources:
-        sources=tuple(replace(source,input_datum=str(special.get(
+    if isinstance(result, TerrelConfig) and result.terrain_sources:
+        terrain_sources=tuple(replace(source,input_datum=str(special.get(
             "source_datum."+source.input_type.upper(),source.input_datum)))
             for source in result.terrain_sources)
-        return replace(result,terrain_sources=sources)
-    if cls is CtgprocConfig and result.landuse_sources:
+        return cast(T, replace(result,terrain_sources=terrain_sources))
+    if isinstance(result, CtgprocConfig) and result.landuse_sources:
         def datum_key(kind: str) -> str:
             """Return the normalized legacy datum key for a source type.
 
@@ -96,17 +98,17 @@ def _source_control_overrides(cls: type[T], result: T,
             if kind=="CTG": return "mesh.CTG"
             if kind=="CORINE": return "mesh.CORINE"
             return "mesh.default"
-        sources=tuple(replace(
+        landuse_sources=tuple(replace(
             source,
             input_datum=str(special.get(datum_key(source.input_type.upper()),
                                         source.input_datum)),
             mesh_density=int(special.get(mesh_key(source.input_type.upper()),
                                          source.mesh_density)),
         ) for source in result.landuse_sources)
-        return replace(result,landuse_sources=sources,
-                       input_type=sources[0].input_type,
-                       input_datum=sources[0].input_datum,
-                       mesh_density=sources[0].mesh_density)
+        return cast(T, replace(result,landuse_sources=landuse_sources,
+                              input_type=landuse_sources[0].input_type,
+                              input_datum=landuse_sources[0].input_datum,
+                              mesh_density=landuse_sources[0].mesh_density))
     return result
 
 
@@ -163,14 +165,16 @@ def _config(cls: type[T], value: T | Mapping[str, Any] | str | Path | None,
         supplied_grid=parameters.values.pop("grid",None)
         result=loader(value,**parameters.values)
         if supplied_grid is not None or parameters.grid:
-            result=replace(result,grid=_merge_grid(
-                supplied_grid,parameters.grid,result.grid))
+            result=cast(T, replace(cast(Any, result),grid=_merge_grid(
+                supplied_grid, parameters.grid,
+                cast(GridConfig, getattr(result, "grid")))))
         return _source_control_overrides(cls,result,parameters.special)
     if value is not None and kwargs:
         raise TypeError("pass either a config/mapping or keyword parameters, not both")
     if isinstance(value, cls):
         return value
-    parameters=normalize_public_parameters(cls,dict(value or kwargs))
+    source = kwargs if value is None else cast(Mapping[str, Any], value)
+    parameters=normalize_public_parameters(cls,dict(source))
     supplied_grid=parameters.values.get("grid")
     if supplied_grid is not None or parameters.grid:
         parameters.values["grid"]=_merge_grid(supplied_grid,parameters.grid)
@@ -188,7 +192,7 @@ def _changed(value: Any, default: Any) -> bool:
         ``True`` when the values differ or cannot be compared as scalars.
     """
     try:
-        return value != default
+        return bool(value != default)
     except (TypeError, ValueError):
         return True
 

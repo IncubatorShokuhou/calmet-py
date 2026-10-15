@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Final
 
 from .config import MakegeoConfig
 
@@ -31,4 +32,4 @@ def run(config: MakegeoConfig) -> Path:
     return Path(_run(config).output)
 
 
-__all__ = ["run"]
+__all__: Final[list[str]] = ["run"]

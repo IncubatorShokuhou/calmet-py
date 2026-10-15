@@ -2,12 +2,13 @@
 """Regenerate the complete public-parameter tables in both READMEs."""
 from __future__ import annotations
 
-from dataclasses import MISSING, fields, is_dataclass
+from dataclasses import MISSING, Field, fields, is_dataclass
 import argparse
 import inspect
 import os
 from pathlib import Path
-from typing import Any
+from collections.abc import Callable
+from typing import Any, Final
 
 import pycalmet
 from pycalmet.config import GridConfig
@@ -22,11 +23,15 @@ from pycalmet.control import (
     terrel_config,
 )
 
-ROOT = Path(__file__).resolve().parents[1]
-START = "<!-- parameter-reference:start -->"
-END = "<!-- parameter-reference:end -->"
-GRID_FIELDS = {item.name: item for item in fields(GridConfig)}
-STAGES = (
+ROOT: Final[Path] = Path(__file__).resolve().parents[1]
+START: Final[str] = "<!-- parameter-reference:start -->"
+END: Final[str] = "<!-- parameter-reference:end -->"
+GRID_FIELDS: Final[dict[str, Field[Any]]] = {
+    item.name: item for item in fields(GridConfig)
+}
+STAGES: Final[
+    tuple[tuple[str, str, type[Any], Callable[..., Any], str], ...]
+] = (
     ("CALWRF", "calwrf", pycalmet.CalwrfConfig, calwrf_config, "calwrf.inp"),
     ("TERREL", "terrel", pycalmet.TerrelConfig, terrel_config, "terrel.inp"),
     ("CTRPROC / CTGPROC", "ctrproc", pycalmet.CtgprocConfig, ctgproc_config, "ctgproc.inp"),
@@ -37,7 +42,7 @@ STAGES = (
 # Parameter meanings live in ``pycalmet._parameter_docs`` so the runtime API,
 # the flattened pipeline API, and these README tables cannot drift apart.
 
-CALMET_DYNAMIC_DEFAULTS = {
+CALMET_DYNAMIC_DEFAULTS: Final[dict[str, str]] = {
     "wind_bias": "None → (0.0,) * NZ",
     "stations_per_level": "None → (99,) * NZ",
     "wind_extrapolation_factors": "None → (0.0,) * NZ",
@@ -45,12 +50,12 @@ CALMET_DYNAMIC_DEFAULTS = {
     "barrier_top_level": "None → NZ",
 }
 
-STAGE_DYNAMIC_DEFAULTS = {
+STAGE_DYNAMIC_DEFAULTS: Final[dict[tuple[str, str], str]] = {
     ("ctrproc", "fill_empty_ocean"): "None → coastline_file is not None",
     ("ctgproc", "fill_empty_ocean"): "None → coastline_file is not None",
 }
 
-ZH_WORDS = {
+ZH_WORDS: Final[dict[str, str]] = {
     "minimum": "最小", "maximum": "最大", "surface": "地面", "upper": "高空",
     "water": "水体", "temperature": "温度", "wind": "风场", "cloud": "云量",
     "precipitation": "降水", "terrain": "地形", "landuse": "土地利用", "snow": "积雪",
@@ -132,7 +137,8 @@ def _meaning(name: str, language: str, parameter: inspect.Parameter,
         text = "是否启用" + label
     else:
         text = label
-    unit = {"degrees": "度", "hours": "小时"}.get(unit, unit)
+    if unit is not None:
+        unit = {"degrees": "度", "hours": "小时"}.get(unit, unit)
     return text + (f"（单位：{unit}）。" if unit else "。")
 
 
@@ -209,7 +215,7 @@ def _table(label: str, function_name: str, config_type: type[Any], loader: Any,
         if name in {"inp", "legacy_parameters"}:
             continue
         if name == "grid":
-            default = None
+            default: Any = None
             actual = "see flattened grid fields" if language == "en" else "见下方展开的网格参数"
         else:
             default = defaults.get(name, parameter.default)
@@ -290,7 +296,7 @@ def main() -> None:
         (ROOT / "README.md", _section("en"), "The public processing API is:"),
         (ROOT / "README.zh-CN.md", _section("zh"), "公开 API："),
     )
-    stale = []
+    stale: list[str] = []
     for path, section, anchor in documents:
         expected = _updated(path, section, anchor)
         if expected == path.read_text(encoding="utf-8"):

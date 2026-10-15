@@ -1,12 +1,18 @@
 """CALMET WT.DAT station-versus-prognostic weighting grids."""
 from __future__ import annotations
 
+from typing import TypeAlias
+
 from pathlib import Path
 import re
 import numpy as np
+from numpy.typing import ArrayLike, NDArray
 
 
-def _numbers(line):
+Float32Array: TypeAlias = NDArray[np.float32]
+
+
+def _numbers(line: str) -> list[str]:
     """Extract decimal and scientific-notation tokens from one text line.
 
     Args:
@@ -18,7 +24,12 @@ def _numbers(line):
     return re.findall(r'[-+]?\d+(?:\.\d*)?(?:[EeDd][-+]?\d+)?',line)
 
 
-def read_weight_data(path,nx,ny,z_centers_m):
+def read_weight_data(
+    path: str | Path,
+    nx: int,
+    ny: int,
+    z_centers_m: ArrayLike,
+) -> Float32Array:
     """Read RDWT formatted fine-grid station/prognostic weights.
 
     Args:
@@ -39,7 +50,7 @@ def read_weight_data(path,nx,ny,z_centers_m):
         ValueError: If headers, grid dimensions, level heights, row widths, or
             weight ranges are invalid.
     """
-    lines=Path(path).read_text(encoding='ascii',errors='strict').splitlines()
+    lines: list[str]=Path(path).read_text(encoding='ascii',errors='strict').splitlines()
     if len(lines)<6: raise ValueError('WT.DAT is truncated')
     index=3
     fine=_numbers(lines[index][15:]); index+=1
@@ -47,14 +58,14 @@ def read_weight_data(path,nx,ny,z_centers_m):
     if len(fine)!=5 or len(coarse)!=5: raise ValueError('WT.DAT grid headers are invalid')
     nx_file,ny_file=int(fine[2]),int(fine[3])
     if (nx_file,ny_file)!=(nx,ny): raise ValueError('WT.DAT fine grid does not match CALMET grid')
-    centers=np.asarray(z_centers_m,dtype=np.float32)
-    output=np.empty((centers.size,ny,nx),dtype=np.float32)
+    centers: Float32Array=np.asarray(z_centers_m,dtype=np.float32)
+    output: Float32Array=np.empty((centers.size,ny,nx),dtype=np.float32)
     for level,wanted in enumerate(centers):
         if index>=len(lines): raise ValueError('WT.DAT is missing a height group')
         found=float(_numbers(lines[index])[-1]); index+=2
         if not np.isclose(found,wanted,rtol=1.e-6,atol=1.e-5):
             raise ValueError('WT.DAT levels do not match CALMET cell centers')
-        rows=[]
+        rows: list[list[float]]=[]
         for _ in range(ny):
             values=[float(item.replace('D','E').replace('d','e')) for item in _numbers(lines[index][6:])]
             index+=1

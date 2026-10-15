@@ -16,13 +16,13 @@ def _gfortran_real(value: float) -> str:
     Returns:
         Decimal or scientific-notation field without leading sign padding.
     """
-    number=float(np.float32(value))
-    magnitude=abs(number)
+    number: float=float(np.float32(value))
+    magnitude: float=abs(number)
     if magnitude==0.:
         return '-0.00000000' if np.signbit(number) else '0.00000000'
     if magnitude<.1 or magnitude>=1.e9:
         return f'{number:.8E}'
-    digits=math.floor(math.log10(magnitude))+1
+    digits: int=math.floor(math.log10(magnitude))+1
     return f'{number:.{max(0,9-digits)}f}'
 
 
@@ -36,7 +36,7 @@ def gfortran_real_pair(first: float, second: float) -> str:
     Returns:
         One 34-column, newline-terminated list-directed output record.
     """
-    def signed(value):
+    def signed(value: float) -> str:
         """Prefix a non-negative formatted value with one blank.
 
         Args:
@@ -45,8 +45,8 @@ def gfortran_real_pair(first: float, second: float) -> str:
         Returns:
             Signed or blank-prefixed text field.
         """
-        text=_gfortran_real(value)
+        text: str=_gfortran_real(value)
         return text if text.startswith('-') else ' '+text
 
-    left=('  '+signed(first)).ljust(17)
+    left: str=('  '+signed(first)).ljust(17)
     return (left+'  '+signed(second)).ljust(34)+'\n'

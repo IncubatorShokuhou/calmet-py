@@ -1,32 +1,156 @@
 """Composable state and grid mapping for the Python CALMET solver."""
 from __future__ import annotations
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass,replace
 from datetime import datetime,timedelta
 from itertools import chain
+from typing import (Any, Literal, Protocol, SupportsFloat, TypeAlias, TypedDict,
+                    cast)
 import numpy as np
+from numpy.typing import ArrayLike, DTypeLike, NDArray
 from scipy.spatial import cKDTree
+from ._calmet_types import SourceThermalState
 from .datetime_utils import parse_timestamp
 from .config import GridConfig
-from .coare import (advance_warm_layer,distance_to_coast,downward_longwave,
-                    initial_warm_layer_state,surface_flux,update_warm_layer_fluxes)
+from .coare import (WarmLayerState,advance_warm_layer,distance_to_coast,
+                    downward_longwave,initial_warm_layer_state,surface_flux,
+                    update_warm_layer_fluxes)
 from .projections import (grid_convergence,project_geographic,
                           unproject_geographic)
 from .calmet_numerics import (cloud_cover_mm5,cloud_fraction,cloud_liquid_water_profile,coriolis_parameter,density_from_pressure_temperature,heat_flux,mixing_height_batchvarova_gryning,mixing_height_maul_carson,
     convective_height_batchvarova_gryning,convective_height_maul_carson,
     convective_velocity_scale,delta_temperature_flux,divergence_and_vertical_velocity,froude_adjustment,lapse_rate,minimize_divergence,
     neutral_water_parameters,slope_flow,smooth_wind,solar_sine,surface_similarity,water_mechanical_height,
-    overwater_delta_temperature_state,prognostic_temperature_3d,saturation_vapor_pressure_lowe,terrain_extrema,topographic_vertical_velocity,upwind_mixing_average,
+    overwater_delta_temperature_state,profile_temperature_layer,prognostic_temperature_3d,saturation_vapor_pressure_lowe,terrain_extrema,topographic_vertical_velocity,upwind_mixing_average,
     barrier_blocked_pairs,terrain_adjust_surface_wind)
+from .mm4_data import MM4Data, MM4Record
+from .prog_data import ProgData, ProgRecord
+from .sea_data import GriddedSeaData
+from .surface_data import SurfaceRecord, SurfaceStation
+
+class MixingHeightOptions(TypedDict):
+    """Shared keyword controls for land mixing-height calculations.
+
+    Attributes:
+        depth_m: Profile depth used for lapse-rate diagnosis, in metres.
+        minimum_lapse: Minimum potential-temperature lapse rate in K/m.
+        minimum_height_m: Lower mixing-height bound in metres.
+        maximum_height_m: Upper mixing-height bound in metres.
+        threshold_flux_per_m: Heat-flux-per-height threshold in W/m3.
+        constb: Maul-Carson mechanical-height coefficient.
+        constn: Batchvarova-Gryning neutral-height constant in metres.
+        relaxation: Whether weak-flux convective height is relaxed.
+        relaxation_time_s: Relaxation e-folding time in seconds.
+        land_mask: Boolean target-grid land mask.
+        timestep_s: Model timestep in seconds.
+    """
+
+    depth_m: float
+    minimum_lapse: float
+    minimum_height_m: float
+    maximum_height_m: float
+    threshold_flux_per_m: float
+    constb: float
+    constn: float
+    relaxation: bool
+    relaxation_time_s: float
+    land_mask: BoolArray
+    timestep_s: float
+
+
+Float32Array: TypeAlias = NDArray[np.float32]
+Float64Array: TypeAlias = NDArray[np.float64]
+BoolArray: TypeAlias = NDArray[np.bool_]
+Int32Array: TypeAlias = NDArray[np.int32]
+IndexArray: TypeAlias = NDArray[np.intp]
+Shape2D: TypeAlias = tuple[int, int]
+WaterRange: TypeAlias = tuple[int, int]
+Barrier: TypeAlias = tuple[float, float, float, float]
+TerrainContext: TypeAlias = tuple[
+    Float32Array, Float32Array, Float32Array, Float32Array,
+]
+TargetCoordinates: TypeAlias = tuple[Float64Array, Float64Array]
+VerticalGrid: TypeAlias = Sequence[float] | Float32Array | Float64Array
+PrognosticCloudMethod: TypeAlias = Literal[3, 4]
+CloudMethod: TypeAlias = Literal[1, 2, 3, 4]
+PrecipitationMethod: TypeAlias = Literal[1, 2, 3]
+MixingMethod: TypeAlias = Literal[-2, -1, 1, 2]
+
+
+class VariableLike(Protocol):
+    """Array variable exposed by a NetCDF-like meteorology dataset.
+
+    Attributes:
+        shape: Variable dimension lengths in storage order.
+    """
+
+    shape: tuple[int, ...]
+
+    def __getitem__(self, key: object, /) -> ArrayLike:
+        """Read a scalar or array selection.
+
+        Args:
+            key: NumPy-style scalar, slice, or tuple selection.
+
+        Returns:
+            Scalar or array-like variable data selected by ``key``.
+        """
+        ...
+
+
+class DatasetLike(Protocol):
+    """Minimum mapping interface consumed by the CALMET solver.
+
+    Attributes:
+        variables: Read-only mapping from canonical variable names to array
+            variables.
+    """
+
+    variables: Mapping[str, VariableLike]
+
+    def __getitem__(self, name: str, /) -> VariableLike:
+        """Look up one canonical meteorological variable.
+
+        Args:
+            name: Canonical variable name.
+
+        Returns:
+            NetCDF-like array variable associated with ``name``.
+        """
+        ...
+
+
+class LapseRateProvider(Protocol):
+    """Observation adapter that can select an effective lapse rate."""
+
+    def lapse_rate_at(
+        self,
+        timestamp: datetime | None,
+        height_m: float,
+        selected_convective_time: datetime | None,
+    ) -> float:
+        """Select the effective lapse rate for one model interval.
+
+        Args:
+            timestamp: Observation timestamp, or ``None`` when unavailable.
+            height_m: Evaluation height above ground in metres.
+            selected_convective_time: Previously selected convective
+                transition time, when one is being carried.
+
+        Returns:
+            Effective temperature lapse rate in kelvins per metre.
+        """
+        ...
 
 
 # Keep model fields in single precision.  Geographic coordinates and the
 # explicitly documented reduction/convergence paths remain double precision.
-MODEL_DTYPE = np.float32
-ACCUMULATION_DTYPE = np.float64
-COORDINATE_DTYPE = np.float64
+MODEL_DTYPE: type[np.float32] = np.float32
+ACCUMULATION_DTYPE: type[np.float64] = np.float64
+COORDINATE_DTYPE: type[np.float64] = np.float64
 
 
-def _model_array(value):
+def _model_array(value: ArrayLike) -> Float32Array:
     """Convert a physical field or model state to solver precision.
 
     Args:
@@ -37,7 +161,13 @@ def _model_array(value):
     """
     return np.asarray(value,dtype=MODEL_DTYPE)
 
-def solar_at_step_midpoint(begin,timestep_seconds,base_timezone,latitude,longitude):
+def solar_at_step_midpoint(
+    begin: datetime,
+    timestep_seconds: float,
+    base_timezone: int,
+    latitude: ArrayLike,
+    longitude: ArrayLike,
+) -> Float32Array:
     """Interpolate half-hour solar samples at a model-step midpoint.
 
     Args:
@@ -61,11 +191,16 @@ def solar_at_step_midpoint(begin,timestep_seconds,base_timezone,latitude,longitu
     lower=int(sample_position)
     fraction=sample_position-lower
     if fraction==0.:
-        return samples[lower]
+        return _model_array(samples[lower])
     return _model_array(samples[lower]*(1.-fraction)+
                         samples[lower+1]*fraction)
 
-def _prognostic_record_solar(record_time,base_timezone,latitude,longitude):
+def _prognostic_record_solar(
+    record_time: datetime,
+    base_timezone: int,
+    latitude: ArrayLike,
+    longitude: ArrayLike,
+) -> Float32Array:
     """Return the half-hour solar sample for an ending-time prognostic record.
 
     ``solar_sine`` index zero represents 23:30 on the preceding day, so an
@@ -84,9 +219,9 @@ def _prognostic_record_solar(record_time,base_timezone,latitude,longitude):
     """
     samples=solar_sine(record_time.timetuple().tm_yday,base_timezone,
                        latitude,longitude)
-    return samples[record_time.hour]
+    return _model_array(samples[record_time.hour])
 
-def _coare_ending_gmt_hour(ending,base_timezone):
+def _coare_ending_gmt_hour(ending: datetime, base_timezone: int) -> float:
     """Convert a local interval ending to a UTC decimal hour.
 
     Args:
@@ -101,7 +236,11 @@ def _coare_ending_gmt_hour(ending,base_timezone):
     return (utc.hour+utc.minute/60.+utc.second/3600.+
             utc.microsecond/3_600_000_000.)
 
-def _nearest_indices(source,target,count):
+def _nearest_indices(
+    source: ArrayLike,
+    target: ArrayLike,
+    count: int,
+) -> IndexArray:
     """Find nearest source points for each target coordinate.
 
     Args:
@@ -145,15 +284,15 @@ class PrognosticMapper:
         grid_origin: Projected CALMET southwest origin in kilometres, used to
             create local metric coordinates for precipitation mapping.
     """
-    source_shape: tuple[int,int]
-    indices: np.ndarray
-    weights: np.ndarray
-    target_shape: tuple[int,int]
-    source_coordinates: np.ndarray
-    target_coordinates: np.ndarray
+    source_shape: Shape2D
+    indices: IndexArray
+    weights: Float64Array
+    target_shape: Shape2D
+    source_coordinates: Float64Array
+    target_coordinates: Float64Array
     grid_origin: tuple[float,float]=(0.,0.)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Normalize coordinate arrays to double precision.
 
         The frozen dataclass is updated with ``object.__setattr__``; field
@@ -165,7 +304,14 @@ class PrognosticMapper:
             self.target_coordinates,dtype=COORDINATE_DTYPE))
 
     @classmethod
-    def build(cls,latitude,longitude,grid: GridConfig,*,validate_domain=False):
+    def build(
+        cls,
+        latitude: ArrayLike,
+        longitude: ArrayLike,
+        grid: GridConfig,
+        *,
+        validate_domain: bool = False,
+    ) -> PrognosticMapper:
         """Construct four-neighbour mapping geometry from a source grid.
 
         Args:
@@ -186,7 +332,8 @@ class PrognosticMapper:
         """
         lat=np.asarray(latitude); lon=np.asarray(longitude)
         if lat.shape!=lon.shape: raise ValueError('latitude/longitude shape mismatch')
-        sx,sy=project_geographic(lon,lat,grid,'WGS-84',units='km')
+        sx,sy=cast(tuple[Float64Array, Float64Array],
+                   project_geographic(lon,lat,grid,'WGS-84',units='km'))
         source=np.asarray(np.column_stack((np.ravel(sx,order='F'),
                                            np.ravel(sy,order='F'))),
                           dtype=COORDINATE_DTYPE)
@@ -232,7 +379,12 @@ class PrognosticMapper:
         return cls(lat.shape,indices,weights,(grid.ny,grid.nx),source,target,
                    (grid.x_origin_km,grid.y_origin_km))
 
-    def interpolate(self,field,*,ignore_zero=False):
+    def interpolate(
+        self,
+        field: ArrayLike,
+        *,
+        ignore_zero: bool = False,
+    ) -> Float32Array:
         """Map a source-grid field with four-neighbour inverse-distance weights.
 
         Args:
@@ -266,7 +418,14 @@ class PrognosticMapper:
         mapped=np.divide(total,denominator,out=np.zeros_like(total),where=denominator>0.)
         return _model_array(mapped.reshape(leading+self.target_shape))
 
-    def interpolate_observations(self,field,rmin_km,*,barriers=(),barrier_top_level=0):
+    def interpolate_observations(
+        self,
+        field: ArrayLike,
+        rmin_km: float,
+        *,
+        barriers: Sequence[Barrier] = (),
+        barrier_top_level: int = 0,
+    ) -> tuple[Float32Array, Float32Array]:
         """Map prognostic pseudo-observations and retain their weight strength.
 
         Args:
@@ -322,7 +481,7 @@ class PrognosticMapper:
                          where=strength>0.).reshape(leading+self.target_shape)
         return _model_array(mapped),_model_array(strength.reshape(self.target_shape))
 
-    def nearest(self,field):
+    def nearest(self, field: ArrayLike) -> Float32Array:
         """Map a field with RDMM5's closest prognostic cell.
 
         Args:
@@ -341,7 +500,13 @@ class PrognosticMapper:
         return _model_array(np.take(flat,self.indices[:,0],axis=-1).reshape(
             leading+self.target_shape))
 
-    def nearest_masked(self,field,source_mask,*,dtype=MODEL_DTYPE):
+    def nearest_masked(
+        self,
+        field: ArrayLike,
+        source_mask: ArrayLike,
+        *,
+        dtype: DTypeLike = MODEL_DTYPE,
+    ) -> NDArray[np.generic]:
         """Map to the nearest masked source.
 
         Physical fields use the model dtype by default.  Callers mapping a
@@ -376,7 +541,14 @@ class PrognosticMapper:
         mapped=np.take(flat,selected,axis=-1).reshape(leading+self.target_shape)
         return np.asarray(mapped,dtype=dtype)
 
-    def radius_interpolate(self,field,radius_km,*,cutoff=0.,method=2):
+    def radius_interpolate(
+        self,
+        field: ArrayLike,
+        radius_km: float,
+        *,
+        cutoff: float = 0.,
+        method: PrecipitationMethod = 2,
+    ) -> Float32Array:
         """Radius-limited precipitation objective mapping.
 
         Coordinate distances and weighted reductions use double precision;
@@ -434,8 +606,9 @@ class PrognosticMapper:
             maximum=np.finfo(np.float64).max/cutoff_ratio
             limit2=np.inf if sigma2>maximum else cutoff_ratio*sigma2
         search_radius=np.sqrt(float(limit2))
-        result=np.empty(self.target_coordinates.shape[0],dtype=np.float64)
-        weighted=np.zeros(result.size,dtype=bool)
+        result: Float64Array=np.empty(
+            self.target_coordinates.shape[0],dtype=np.float64)
+        weighted: BoolArray=np.zeros(result.size,dtype=bool)
         # A whole-domain sparse distance matrix can contain tens of millions
         # of pairs on the 610x499 Zhejiang grid.  Chunk targets while retaining
         # INTERPQR's exact all-points-inside-radius weighted average.
@@ -487,19 +660,6 @@ class PrognosticMapper:
         apply_cutoff=np.ones(result.size,dtype=bool) if method==3 else weighted
         result=np.where(apply_cutoff&(result<float(cutoff)),0.,result)
         return _model_array(result.reshape(self.target_shape))
-
-@dataclass(frozen=True,slots=True)
-class SourceThermalState:
-    """RDMM5 potential temperatures retained from the last daylight hour.
-
-    Attributes:
-        pt20: ``float32 (source_y, source_x)`` lower reference-level potential
-            temperature in kelvins.
-        pt30: ``float32 (source_y, source_x)`` upper reference-level potential
-            temperature in kelvins.
-    """
-    pt20: np.ndarray
-    pt30: np.ndarray
 
 @dataclass(frozen=True,slots=True)
 class Step1Fields:
@@ -583,55 +743,55 @@ class Step1Fields:
         debug_domain_v: Optional domain-mean V wind in m/s.
         debug_upper_data: Upper-air diagnostic records retained for listings.
     """
-    u: np.ndarray
-    v: np.ndarray
-    temperature: np.ndarray
-    surface_temperature: np.ndarray
-    surface_pressure_mb: np.ndarray
-    surface_density: np.ndarray
-    relative_humidity: np.ndarray
-    pbl_height: np.ndarray
-    sensible_heat_flux: np.ndarray
-    friction_velocity: np.ndarray
-    cloud_fraction: np.ndarray
-    ceiling_height: np.ndarray
-    profile_temperature: np.ndarray
-    profile_height: np.ndarray
-    surface_relative_humidity: np.ndarray
-    precipitation_rate: np.ndarray
-    precipitation_code: np.ndarray
+    u: Float32Array
+    v: Float32Array
+    temperature: Float32Array
+    surface_temperature: Float32Array
+    surface_pressure_mb: Float32Array
+    surface_density: Float32Array
+    relative_humidity: Float32Array
+    pbl_height: Float32Array
+    sensible_heat_flux: Float32Array
+    friction_velocity: Float32Array
+    cloud_fraction: Float32Array
+    ceiling_height: Float32Array
+    profile_temperature: Float32Array
+    profile_height: Float32Array
+    surface_relative_humidity: Float32Array
+    precipitation_rate: Float32Array
+    precipitation_code: Int32Array
     thermal_state: SourceThermalState | None = None
-    cloud_relative_humidity_850: np.ndarray | None = None
-    integrated_cloud_water: np.ndarray | None = None
-    observed_temperature_faces: np.ndarray | None = None
-    water_gradient_below: np.ndarray | None = None
-    water_gradient_above: np.ndarray | None = None
-    water_mixing_gradient_above: np.ndarray | None = None
-    observed_water_mixing_height: np.ndarray | None = None
-    diagnostic_surface_temperature: np.ndarray | None = None
-    diagnostic_lapse_rate: np.ndarray | None = None
+    cloud_relative_humidity_850: Float32Array | None = None
+    integrated_cloud_water: Float32Array | None = None
+    observed_temperature_faces: Float32Array | None = None
+    water_gradient_below: Float32Array | None = None
+    water_gradient_above: Float32Array | None = None
+    water_mixing_gradient_above: Float32Array | None = None
+    observed_water_mixing_height: Float32Array | None = None
+    diagnostic_surface_temperature: Float32Array | None = None
+    diagnostic_lapse_rate: Float32Array | None = None
     diagnostic_lapse_station_index: tuple[int,int] | None = None
-    diagnostic_lapse_data: object | None = None
+    diagnostic_lapse_data: LapseRateProvider | None = None
     diagnostic_lapse_timestamp: datetime | None = None
-    prognostic_observation_u: np.ndarray | None = None
-    prognostic_observation_v: np.ndarray | None = None
-    prognostic_observation_strength: np.ndarray | None = None
-    roughness_override: np.ndarray | None = None
-    overwater_data: object | None = None
-    prognostic_temperature: np.ndarray | None = None
-    cloud_liquid_water_3d: np.ndarray | None = None
-    cloud_liquid_water_above: np.ndarray | None = None
-    cloud_liquid_water_above_bottom: np.ndarray | None = None
-    cloud_liquid_water_above_top: np.ndarray | None = None
-    debug_surface_record: object | None = None
-    debug_surface_stations: tuple = ()
+    prognostic_observation_u: Float32Array | None = None
+    prognostic_observation_v: Float32Array | None = None
+    prognostic_observation_strength: Float32Array | None = None
+    roughness_override: Float32Array | None = None
+    overwater_data: GriddedSeaData | None = None
+    prognostic_temperature: Float32Array | None = None
+    cloud_liquid_water_3d: Float32Array | None = None
+    cloud_liquid_water_above: Float32Array | None = None
+    cloud_liquid_water_above_bottom: Float32Array | None = None
+    cloud_liquid_water_above_top: Float32Array | None = None
+    debug_surface_record: SurfaceRecord | None = None
+    debug_surface_stations: tuple[SurfaceStation, ...] = ()
     debug_station_names: tuple[str,...] = ()
-    debug_station_u: np.ndarray | None = None
-    debug_station_v: np.ndarray | None = None
+    debug_station_u: Float32Array | None = None
+    debug_station_v: Float32Array | None = None
     debug_domain_temperature: float | None = None
     debug_domain_u: float | None = None
     debug_domain_v: float | None = None
-    debug_upper_data: tuple = ()
+    debug_upper_data: tuple[object, ...] = ()
 
 
 @dataclass(slots=True)
@@ -649,16 +809,16 @@ class StepTransformContext:
             may replace it in place on this context.
         gmt_hour: Optional interval-ending UTC decimal hour.
     """
-    solar_elevation_sine: np.ndarray
-    previous_convective_height: np.ndarray
-    previous_mixing_height: np.ndarray
-    previous_temperature_jump: np.ndarray
-    coriolis: np.ndarray
-    warm_layer_state: object | None = None
+    solar_elevation_sine: Float32Array
+    previous_convective_height: Float32Array
+    previous_mixing_height: Float32Array
+    previous_temperature_jump: Float32Array
+    coriolis: Float32Array
+    warm_layer_state: WarmLayerState | None = None
     gmt_hour: float | None = None
 
 
-def _domain_mean(field):
+def _domain_mean(field: ArrayLike) -> np.float64:
     """Calculate a stable mean for a domain-scale diagnostic.
 
     Args:
@@ -670,7 +830,11 @@ def _domain_mean(field):
     return np.mean(np.asarray(field,dtype=ACCUMULATION_DTYPE),
                    dtype=ACCUMULATION_DTYPE)
 
-def _interpolate_ceiling(left,right,fraction):
+def _interpolate_ceiling(
+    left: ArrayLike,
+    right: ArrayLike,
+    fraction: SupportsFloat,
+) -> Float32Array:
     """Interpolate cloud ceiling while retaining a lone nonzero endpoint.
 
     Args:
@@ -688,8 +852,14 @@ def _interpolate_ceiling(left,right,fraction):
     return _model_array(np.where(
         (left!=0.)&(right!=0.),interpolated,np.maximum(left,right)))
 
-def interpolate_step1_fields(left: Step1Fields,right: Step1Fields,fraction,*,cloud_method=4,
-                             cloud_condensate_threshold_g_kg=.005):
+def interpolate_step1_fields(
+    left: Step1Fields,
+    right: Step1Fields,
+    fraction: float,
+    *,
+    cloud_method: PrognosticCloudMethod = 4,
+    cloud_condensate_threshold_g_kg: float = .005,
+) -> Step1Fields:
     """Interpolate model fields between two prognostic endpoint records.
 
     Args:
@@ -713,7 +883,7 @@ def interpolate_step1_fields(left: Step1Fields,right: Step1Fields,fraction,*,clo
     """
     f=MODEL_DTYPE(fraction)
     if not 0.<=f<=1.: raise ValueError('prognostic interpolation fraction must be between zero and one')
-    def lerp(a,b):
+    def lerp(a: ArrayLike, b: ArrayLike) -> Float32Array:
         """Linearly interpolate one same-shaped model field.
 
         Args:
@@ -734,7 +904,7 @@ def interpolate_step1_fields(left: Step1Fields,right: Step1Fields,fraction,*,clo
     else:
         raise ValueError('cloud_method must be MCLOUD 3 or 4')
     ceiling=_interpolate_ceiling(left.ceiling_height,right.ceiling_height,f)
-    cloud_water=None
+    cloud_water: Float32Array | None=None
     if left.integrated_cloud_water is not None and right.integrated_cloud_water is not None:
         cloud_water=lerp(left.integrated_cloud_water,right.integrated_cloud_water)
         cloudy=cloud_water>=cloud_condensate_threshold_g_kg
@@ -747,7 +917,7 @@ def interpolate_step1_fields(left: Step1Fields,right: Step1Fields,fraction,*,clo
     prognostic_temperature=(
         None if left.prognostic_temperature is None or right.prognostic_temperature is None
         else lerp(left.prognostic_temperature,right.prognostic_temperature))
-    auxiliary_cloud=[]
+    auxiliary_cloud: list[Float32Array | None]=[]
     for name in ('cloud_liquid_water_3d','cloud_liquid_water_above',
                  'cloud_liquid_water_above_bottom','cloud_liquid_water_above_top'):
         left_value=getattr(left,name); right_value=getattr(right,name)
@@ -766,9 +936,11 @@ def interpolate_step1_fields(left: Step1Fields,right: Step1Fields,fraction,*,clo
         lerp(left.surface_relative_humidity,right.surface_relative_humidity),
         precipitation,precipitation_code,right.thermal_state,rh850,cloud_water,
         prognostic_observation_u=(None if left.prognostic_observation_u is None else
-                                  lerp(left.prognostic_observation_u,right.prognostic_observation_u)),
+                                  lerp(left.prognostic_observation_u,cast(
+                                      Float32Array,right.prognostic_observation_u))),
         prognostic_observation_v=(None if left.prognostic_observation_v is None else
-                                  lerp(left.prognostic_observation_v,right.prognostic_observation_v)),
+                                  lerp(left.prognostic_observation_v,cast(
+                                      Float32Array,right.prognostic_observation_v))),
         prognostic_observation_strength=(None if right.prognostic_observation_strength is None else
                                           np.asarray(right.prognostic_observation_strength,
                                                      dtype=MODEL_DTYPE)),
@@ -779,9 +951,18 @@ def interpolate_step1_fields(left: Step1Fields,right: Step1Fields,fraction,*,clo
         cloud_liquid_water_above_top=auxiliary_cloud[3])
 
 
-def observed_temperature_3d(surface_temperature,face_temperature,convective_height,z_faces_m,
-                            *,landuse=None,water_range=(55,55),mixing_height=None,
-                            water_gradient_below=None,water_gradient_above=None):
+def observed_temperature_3d(
+    surface_temperature: ArrayLike,
+    face_temperature: ArrayLike,
+    convective_height: ArrayLike,
+    z_faces_m: ArrayLike,
+    *,
+    landuse: ArrayLike | None = None,
+    water_range: WaterRange = (55,55),
+    mixing_height: ArrayLike | None = None,
+    water_gradient_below: ArrayLike | None = None,
+    water_gradient_above: ArrayLike | None = None,
+) -> Float32Array:
     """Construct observed-mode layer-mean temperatures with continuous overlap.
 
     Args:
@@ -843,7 +1024,12 @@ def observed_temperature_3d(surface_temperature,face_temperature,convective_heig
             result[k]=np.where(water,water_value,result[k])
     return _model_array(result)
 
-def map_prognostic_cloud(source_cloud,source_rh850,mapper,cloud_method):
+def map_prognostic_cloud(
+    source_cloud: ArrayLike,
+    source_rh850: ArrayLike | None,
+    mapper: PrognosticMapper,
+    cloud_method: PrognosticCloudMethod,
+) -> tuple[Float32Array, Float32Array | None]:
     """Apply RDMM5's method-specific cloud interpolation order.
 
     Args:
@@ -862,7 +1048,7 @@ def map_prognostic_cloud(source_cloud,source_rh850,mapper,cloud_method):
     """
     if cloud_method==4: return mapper.interpolate(source_cloud),None
     if cloud_method==3:
-        mapped_rh850=mapper.interpolate(source_rh850)
+        mapped_rh850=mapper.interpolate(cast(Float32Array,source_rh850))
         return cloud_fraction(mapped_rh850),mapped_rh850
     raise ValueError('cloud_method must be MCLOUD 3 or 4')
 
@@ -893,20 +1079,20 @@ class SurfaceFields:
         unaveraged_convective_mixing_height: Optional convective height before
             upwind spatial averaging.
     """
-    roughness: np.ndarray
-    density: np.ndarray
-    shortwave_flux: np.ndarray
-    sensible_heat_flux: np.ndarray
-    friction_velocity: np.ndarray
-    monin_obukhov_length: np.ndarray
-    mixing_height: np.ndarray
-    convective_mixing_height: np.ndarray
-    temperature_jump: np.ndarray
-    warm_layer_state: object | None = None
-    water_convective_velocity_scale: np.ndarray | None = None
-    water_convective_height_state: np.ndarray | None = None
-    unaveraged_mixing_height: np.ndarray | None = None
-    unaveraged_convective_mixing_height: np.ndarray | None = None
+    roughness: Float32Array
+    density: Float32Array
+    shortwave_flux: Float32Array
+    sensible_heat_flux: Float32Array
+    friction_velocity: Float32Array
+    monin_obukhov_length: Float32Array
+    mixing_height: Float32Array
+    convective_mixing_height: Float32Array
+    temperature_jump: Float32Array
+    warm_layer_state: WarmLayerState | None = None
+    water_convective_velocity_scale: Float32Array | None = None
+    water_convective_height_state: Float32Array | None = None
+    unaveraged_mixing_height: Float32Array | None = None
+    unaveraged_convective_mixing_height: Float32Array | None = None
 
 @dataclass(frozen=True,slots=True)
 class DiagnosticWindFields:
@@ -930,18 +1116,18 @@ class DiagnosticWindFields:
         initial_stage: Optional ``(u, v, w, divergence)`` snapshot before
             divergence minimisation.
     """
-    u: np.ndarray
-    v: np.ndarray
-    w: np.ndarray
-    divergence: np.ndarray
-    lapse_rate: np.ndarray
-    preliminary_heat_flux: np.ndarray
-    kinematic_stage: tuple[np.ndarray,np.ndarray,np.ndarray] | None = None
-    froude_stage: tuple[np.ndarray,np.ndarray,np.ndarray] | None = None
-    slope_stage: tuple[np.ndarray,np.ndarray,np.ndarray] | None = None
-    interpolated_stage: tuple[np.ndarray,np.ndarray] | None = None
-    terrain_adjusted_stage: tuple[np.ndarray,np.ndarray] | None = None
-    initial_stage: tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray] | None = None
+    u: Float32Array
+    v: Float32Array
+    w: Float32Array
+    divergence: Float32Array
+    lapse_rate: Float32Array
+    preliminary_heat_flux: Float32Array
+    kinematic_stage: tuple[Float32Array,Float32Array,Float32Array] | None = None
+    froude_stage: tuple[Float32Array,Float32Array,Float32Array] | None = None
+    slope_stage: tuple[Float32Array,Float32Array,Float32Array] | None = None
+    interpolated_stage: tuple[Float32Array,Float32Array] | None = None
+    terrain_adjusted_stage: tuple[Float32Array,Float32Array] | None = None
+    initial_stage: tuple[Float32Array,Float32Array,Float32Array,Float32Array] | None = None
 
 @dataclass(frozen=True,slots=True)
 class HourFields:
@@ -963,11 +1149,24 @@ class HourFields:
     step1: Step1Fields
     wind: DiagnosticWindFields
     surface: SurfaceFields
-    temperature: np.ndarray
+    temperature: Float32Array
     selected_lapse_convective_time: datetime | None = None
     source_step: Step1Fields | None = None
 
-def target_latitude_longitude(grid: GridConfig):
+StepTransform: TypeAlias = (
+    Callable[[Step1Fields, datetime], Step1Fields]
+    | Callable[[Step1Fields, datetime, StepTransformContext], Step1Fields]
+)
+StepProvider: TypeAlias = Callable[[datetime], Step1Fields]
+TimeSample: TypeAlias = tuple[int | None, int, float, datetime]
+IntervalSample: TypeAlias = tuple[int | None, int, float, datetime, bool]
+CloudOverride: TypeAlias = (
+    ArrayLike | tuple[ArrayLike, ArrayLike | None] | None
+)
+CloudProvider: TypeAlias = Callable[[datetime], CloudOverride]
+
+
+def target_latitude_longitude(grid: GridConfig) -> TargetCoordinates:
     """Calculate geographic coordinates at CALMET cell centres.
 
     Args:
@@ -985,7 +1184,13 @@ def target_latitude_longitude(grid: GridConfig):
     longitude,latitude=unproject_geographic(xx,yy,grid,'WGS-84',units='km')
     return np.asarray(latitude),np.asarray(longitude)
 
-def _vertical_centers(field,height,centers,*,wind=False):
+def _vertical_centers(
+    field: ArrayLike,
+    height: ArrayLike,
+    centers: ArrayLike,
+    *,
+    wind: bool = False,
+) -> Float32Array:
     """Interpolate source columns to CALMET layer-centre heights.
 
     Args:
@@ -1005,7 +1210,7 @@ def _vertical_centers(field,height,centers,*,wind=False):
     data=np.asarray(field,dtype=MODEL_DTYPE)
     z=np.asarray(height,dtype=MODEL_DTYPE)
     if data.shape!=z.shape or data.ndim!=3: raise ValueError('vertical fields must have shape (level,y,x)')
-    levels,y,x=data.shape; flat=data.reshape(levels,-1); zflat=z.reshape(levels,-1); columns=np.arange(flat.shape[1]); out=[]
+    levels,y,x=data.shape; flat=data.reshape(levels,-1); zflat=z.reshape(levels,-1); columns=np.arange(flat.shape[1]); out: list[Float32Array]=[]
     for center in np.asarray(centers,dtype=MODEL_DTYPE):
         above=np.sum(zflat<=center,axis=0); lower=np.clip(above-1,0,levels-1); upper=np.clip(above,0,levels-1)
         zl,zu=zflat[lower,columns],zflat[upper,columns]; vl,vu=flat[lower,columns],flat[upper,columns]
@@ -1022,7 +1227,11 @@ def _vertical_centers(field,height,centers,*,wind=False):
         out.append(value.reshape(y,x))
     return _model_array(np.stack(out))
 
-def _prognostic_wind_components(speed,direction,convergence):
+def _prognostic_wind_components(
+    speed: ArrayLike,
+    direction: ArrayLike,
+    convergence: ArrayLike,
+) -> tuple[Float32Array, Float32Array]:
     """Rotate meteorological wind from true north into grid components.
 
     Args:
@@ -1043,7 +1252,11 @@ def _prognostic_wind_components(speed,direction,convergence):
     return (_model_array(-velocity*np.sin(radians)),
             _model_array(-velocity*np.cos(radians)))
 
-def _relative_humidity(qvapor,pressure_hpa,temperature_k):
+def _relative_humidity(
+    qvapor: ArrayLike,
+    pressure_hpa: ArrayLike,
+    temperature_k: ArrayLike,
+) -> Float32Array:
     """Diagnose RH from WRF water-vapour mixing ratio.
 
     ``QVAPOR`` is the mass ratio of water vapour to dry air.  Convert it to
@@ -1068,7 +1281,7 @@ def _relative_humidity(qvapor,pressure_hpa,temperature_k):
     vapor_pressure=pressure*vapor/(.622+vapor)
     return _model_array(np.clip(100.*vapor_pressure/es,0.,100.))
 
-def _cloud_water_g_kg(values):
+def _cloud_water_g_kg(values: ArrayLike) -> Float32Array:
     """Convert canonical cloud condensate to nonnegative g/kg.
 
     Args:
@@ -1082,7 +1295,13 @@ def _cloud_water_g_kg(values):
     return _model_array(np.maximum(values,0.)*1000.)
 
 
-def _source_relative_humidity(dataset,time_index,qvapor,pressure,temperature):
+def _source_relative_humidity(
+    dataset: DatasetLike,
+    time_index: int,
+    qvapor: ArrayLike,
+    pressure: ArrayLike,
+    temperature: ArrayLike,
+) -> Float32Array:
     """Read source relative humidity or diagnose it from thermodynamics.
 
     Args:
@@ -1103,7 +1322,11 @@ def _source_relative_humidity(dataset,time_index,qvapor,pressure,temperature):
     return _model_array(np.clip(values,0.,100.))
 
 
-def _rdmm5_surface_density(pressure_mb,temperature_k,height_agl_m):
+def _rdmm5_surface_density(
+    pressure_mb: ArrayLike,
+    temperature_k: ArrayLike,
+    height_agl_m: ArrayLike,
+) -> Float32Array:
     """Calculate RDMM5 surface density from the first above-ground level.
 
     Args:
@@ -1131,7 +1354,10 @@ def _rdmm5_surface_density(pressure_mb,temperature_k,height_agl_m):
                                              temperature[level,yy,xx])
 
 
-def _rdmm5_above_ground_profiles(height_agl_m,*fields):
+def _rdmm5_above_ground_profiles(
+    height_agl_m: ArrayLike,
+    *fields: ArrayLike,
+) -> tuple[Float32Array, ...]:
     """Pack each RDMM5 column from its first above-ground level upward.
 
     Args:
@@ -1162,7 +1388,13 @@ def _rdmm5_above_ground_profiles(height_agl_m,*fields):
     return tuple(np.take_along_axis(value,packed_index,axis=0) for value in values)
 
 
-def _rdmm5_sst_profile(centers_m,lowest_height_m,lowest_temperature_k,sst_k,ocean):
+def _rdmm5_sst_profile(
+    centers_m: ArrayLike,
+    lowest_height_m: ArrayLike,
+    lowest_temperature_k: ArrayLike,
+    sst_k: ArrayLike,
+    ocean: ArrayLike,
+) -> tuple[Float32Array, BoolArray]:
     """Interpolate ocean temperature from SST to the lowest source level.
 
     Args:
@@ -1187,7 +1419,15 @@ def _rdmm5_sst_profile(centers_m,lowest_height_m,lowest_temperature_k,sst_k,ocea
     use=(centers[:,None,None]<height[None,:,:])&np.asarray(ocean,dtype=bool)[None,:,:]
     return _model_array(profile),use
 
-def _stull_temperature(theta2,z2,theta3,z3,theta20,theta30,z1):
+def _stull_temperature(
+    theta2: ArrayLike,
+    z2: ArrayLike,
+    theta3: ArrayLike,
+    z3: ArrayLike,
+    theta20: ArrayLike,
+    theta30: ArrayLike,
+    z1: ArrayLike,
+) -> Float32Array:
     """Apply STULL nighttime potential-temperature extrapolation.
 
     Args:
@@ -1221,14 +1461,27 @@ def _stull_temperature(theta2,z2,theta3,z3,theta20,theta30,z1):
     drop=np.where(dt2>0.,dt2,drop)
     return _model_array(t20+drop)
 
-def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp=None,
-                       base_timezone=0,thermal_state: SourceThermalState | None=None,
-                       mapper: PrognosticMapper | None=None,prognostic_ocean_category=16,
-                       water_temperature_mode=0,
-                       cloud_method=4,cloud_condensate_threshold_g_kg=.005,
-                       precipitation_interpolation=2,precipitation_radius_km=50.,
-                       precipitation_cutoff=.01,prognostic_observation_rmin_km=None,
-                       prognostic_observation_barriers=(),prognostic_observation_barrier_top_level=0):
+def build_step1_fields(
+    dataset: DatasetLike,
+    time_index: int,
+    grid: GridConfig,
+    z_faces_m: ArrayLike,
+    *,
+    timestamp: datetime | None = None,
+    base_timezone: int = 0,
+    thermal_state: SourceThermalState | None = None,
+    mapper: PrognosticMapper | None = None,
+    prognostic_ocean_category: int = 16,
+    water_temperature_mode: int = 0,
+    cloud_method: PrognosticCloudMethod = 4,
+    cloud_condensate_threshold_g_kg: float = .005,
+    precipitation_interpolation: PrecipitationMethod = 2,
+    precipitation_radius_km: float = 50.,
+    precipitation_cutoff: float = .01,
+    prognostic_observation_rmin_km: float | None = None,
+    prognostic_observation_barriers: Sequence[Barrier] = (),
+    prognostic_observation_barrier_top_level: int = 0,
+) -> Step1Fields:
     """Read one canonical CALWRF record and construct Step-1 fields.
 
     Args:
@@ -1281,7 +1534,7 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
             terrain[None,:,:])
     speed=np.asarray(dataset['wind_speed'][time_index],dtype=MODEL_DTYPE)
     direction=np.asarray(dataset['wind_direction'][time_index],dtype=MODEL_DTYPE)
-    source_sun=None
+    source_sun: Float32Array | None=None
     if timestamp is not None:
         source_sun=_prognostic_record_solar(timestamp,base_timezone,lat,lon)
     convergence=np.asarray(grid_convergence(grid,lon,lat),dtype=MODEL_DTYPE)
@@ -1293,6 +1546,9 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
     source_u_centers=_vertical_centers(source_u_above,wind_height,centers,wind=True)
     source_v_centers=_vertical_centers(source_v_above,wind_height,centers,wind=True)
     u=mapper.interpolate(source_u_centers); v=mapper.interpolate(source_v_centers)
+    prognostic_u: Float32Array | None
+    prognostic_v: Float32Array | None
+    prognostic_strength: Float32Array | None
     prognostic_u=prognostic_v=prognostic_strength=None
     if prognostic_observation_rmin_km is not None:
         prognostic_u,prognostic_strength=mapper.interpolate_observations(
@@ -1332,7 +1588,7 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
     next_thermal_state=SourceThermalState(theta20.copy(),theta30.copy())
     source_temperature_centers=_vertical_centers(
         source_temperature_above,thermo_height,centers)
-    source_sst=None
+    source_sst: Float32Array | None=None
     if water_temperature_mode==2:
         if 'sst' not in dataset.variables:
             raise ValueError('ITWPROG=2 requires SST in prognostic data')
@@ -1369,7 +1625,7 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
     source_rh=_source_relative_humidity(
         dataset,time_index,source_q,source_pressure,source_temperature)
     _,source_rh_above=_rdmm5_above_ground_profiles(height,source_rh)
-    rh850=None
+    rh850: Float32Array | None=None
     if cloud_method==4:
         source_cloud,source_ceiling=cloud_cover_mm5(source_rh,source_pressure,height)
     elif cloud_method==3:
@@ -1381,6 +1637,7 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
         raise ValueError('cloud_method must be MCLOUD 3 or 4')
     has_qcloud='qcloud' in dataset.variables
     has_qice='qice' in dataset.variables
+    cloud_water: Float32Array | None
     if has_qcloud or has_qice:
         source_qcloud=(_cloud_water_g_kg(dataset['qcloud'][time_index])
                        if has_qcloud else np.zeros_like(height,dtype=MODEL_DTYPE))
@@ -1401,6 +1658,10 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
         cloudy=np.ones(mapper.target_shape,dtype=bool)
         cloud_water=None
         mapped_ceiling=mapper.interpolate(source_ceiling,ignore_zero=True)
+    auxiliary_cloud: tuple[
+        Float32Array | None, Float32Array | None,
+        Float32Array | None, Float32Array | None,
+    ]
     if has_qcloud:
         source_aux=cloud_liquid_water_profile(source_qcloud,height,z_faces_m)
         auxiliary_cloud=(mapper.nearest(source_aux[0]),mapper.nearest(source_aux[1]),
@@ -1440,14 +1701,15 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
     surface_rh=mapper.interpolate(source_rh[0])
     precipitation=mapper.radius_interpolate(np.asarray(dataset['precipitation'][time_index]),
         precipitation_radius_km,cutoff=precipitation_cutoff,method=precipitation_interpolation)
-    overwater_data=None
+    overwater_data: GriddedSeaData | None=None
     if source_sst is not None:
         from .sea_data import GriddedSeaData
         source_ocean=np.asarray(dataset['landuse'][:])==prognostic_ocean_category
-        nearest_ocean=lambda field: mapper.nearest_masked(field,source_ocean)
+        nearest_ocean: Callable[[ArrayLike], Float32Array]=lambda field: cast(
+            Float32Array,mapper.nearest_masked(field,source_ocean))
         ocean_height=nearest_ocean(z2)
-        ocean_longitude=mapper.nearest_masked(
-            lon,source_ocean,dtype=COORDINATE_DTYPE)
+        ocean_longitude=cast(Float64Array,mapper.nearest_masked(
+            lon,source_ocean,dtype=COORDINATE_DTYPE))
         shape=mapper.target_shape
         overwater_data=GriddedSeaData(
             nearest_ocean(source_temperature_above[0]),nearest_ocean(source_sst),
@@ -1486,7 +1748,14 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
     )
 
 
-def build_prog_step_fields(prog_data,ending_hour,grid: GridConfig,z_faces_m,*,record=None):
+def build_prog_step_fields(
+    prog_data: ProgData,
+    ending_hour: float,
+    grid: GridConfig,
+    z_faces_m: ArrayLike,
+    *,
+    record: ProgRecord | None = None,
+) -> Step1Fields:
     """Create the wind-only Step-1 scaffold used by legacy ``PROG.DAT``.
 
     Args:
@@ -1525,13 +1794,23 @@ def build_prog_step_fields(prog_data,ending_hour,grid: GridConfig,z_faces_m,*,re
             level_shape,288.7,dtype=MODEL_DTYPE))
 
 
-def build_mm4_step_fields(mm4_data,record,grid: GridConfig,z_faces_m,*,cloud_method=4,
-                          precipitation_interpolation=2,precipitation_radius_km=50.,
-                          precipitation_cutoff=.01,base_timezone=0,thermal_state=None,
-                          prognostic_observation_rmin_km=None,
-                          prognostic_observation_barriers=(),
-                          prognostic_observation_barrier_top_level=0,
-                          prognostic_ocean_category=16):
+def build_mm4_step_fields(
+    mm4_data: MM4Data,
+    record: MM4Record,
+    grid: GridConfig,
+    z_faces_m: ArrayLike,
+    *,
+    cloud_method: PrognosticCloudMethod = 4,
+    precipitation_interpolation: PrecipitationMethod = 2,
+    precipitation_radius_km: float = 50.,
+    precipitation_cutoff: float = .01,
+    base_timezone: int = 0,
+    thermal_state: SourceThermalState | None = None,
+    prognostic_observation_rmin_km: float | None = None,
+    prognostic_observation_barriers: Sequence[Barrier] = (),
+    prognostic_observation_barrier_top_level: int = 0,
+    prognostic_ocean_category: int = 16,
+) -> Step1Fields:
     """Create Step-1 fields from a native MM4 meteorological record.
 
     Args:
@@ -1587,33 +1866,60 @@ def build_mm4_step_fields(mm4_data,record,grid: GridConfig,z_faces_m,*,cloud_met
         prognostic_observation_strength=fields.prognostic_observation_strength,
         prognostic_temperature=fields.temperature_k)
 
-def build_surface_fields(step: Step1Fields, landuse, roughness, albedo,
-                         bowen_ratio, soil_heat_flux_parameter,
-                         anthropogenic_heat_flux, solar_elevation_sine,
-                         coriolis, previous_convective_height,
-                         previous_temperature_jump, *, first_level_height_m=10.,
-                         minimum_height_m=50., maximum_height_m=2500.,
-                         minimum_water_height_m=50., maximum_water_height_m=2500.,
-                         water_range=(50,55),
-                         turbidity_coefficient_1=990.,turbidity_coefficient_2=-30.,
-                         cloudiness_coefficient_1=-.75,cloudiness_coefficient_2=3.4,
-                         net_radiation_coefficient_1=5.31e-13,
-                         net_radiation_coefficient_2=60.,net_radiation_coefficient_3=.12,
-                         mixing_method=1, minimum_lapse=.001, lapse_depth_m=200.,
-                         threshold_flux_per_m=0., constb=1.41, conste=.15,
-                         constn=2400., constw=.16, relaxation=True,
-                         relaxation_time_s=800.,
-                         timestep_s=3600.,
-                         surface_temperature=None,
-                         overwater_flux_method=0,coastal_shelf_length_km=0.,
-                         cool_skin=False,dx_km=1.,dy_km=1.,
-                         water_flux_threshold=0.,water_temperature_mode=0,
-                         default_water_gradient_above=-.0045,
-                         warm_layer=False,warm_layer_state=None,
-                         longitude=None,gmt_hour=0.,
-                         observed_water_mixing_height=None,
-                         previous_water_convective_height=None,
-                         previous_water_mixing_height=None):
+def build_surface_fields(
+    step: Step1Fields,
+    landuse: ArrayLike,
+    roughness: ArrayLike,
+    albedo: ArrayLike,
+    bowen_ratio: ArrayLike,
+    soil_heat_flux_parameter: ArrayLike,
+    anthropogenic_heat_flux: ArrayLike,
+    solar_elevation_sine: ArrayLike,
+    coriolis: ArrayLike,
+    previous_convective_height: ArrayLike,
+    previous_temperature_jump: ArrayLike,
+    *,
+    first_level_height_m: float = 10.,
+    minimum_height_m: float = 50.,
+    maximum_height_m: float = 2500.,
+    minimum_water_height_m: float = 50.,
+    maximum_water_height_m: float = 2500.,
+    water_range: WaterRange = (50,55),
+    turbidity_coefficient_1: float = 990.,
+    turbidity_coefficient_2: float = -30.,
+    cloudiness_coefficient_1: float = -.75,
+    cloudiness_coefficient_2: float = 3.4,
+    net_radiation_coefficient_1: float = 5.31e-13,
+    net_radiation_coefficient_2: float = 60.,
+    net_radiation_coefficient_3: float = .12,
+    mixing_method: MixingMethod = 1,
+    minimum_lapse: float = .001,
+    lapse_depth_m: float = 200.,
+    threshold_flux_per_m: float = 0.,
+    constb: float = 1.41,
+    conste: float = .15,
+    constn: float = 2400.,
+    constw: float = .16,
+    relaxation: bool = True,
+    relaxation_time_s: float = 800.,
+    timestep_s: float = 3600.,
+    surface_temperature: ArrayLike | None = None,
+    overwater_flux_method: int = 0,
+    coastal_shelf_length_km: float = 0.,
+    cool_skin: bool = False,
+    dx_km: float = 1.,
+    dy_km: float = 1.,
+    water_flux_threshold: float = 0.,
+    water_temperature_mode: int = 0,
+    default_water_gradient_above: float = -.0045,
+    warm_layer: bool = False,
+    warm_layer_state: WarmLayerState | None = None,
+    longitude: ArrayLike | None = None,
+    gmt_hour: float = 0.,
+    observed_water_mixing_height: ArrayLike | None = None,
+    previous_water_convective_height: ArrayLike | None = None,
+    previous_water_mixing_height: ArrayLike | None = None,
+) -> SurfaceFields:
     """Calculate COMP surface similarity and mixing-height fields.
 
     Args:
@@ -1703,7 +2009,7 @@ def build_surface_fields(step: Step1Fields, landuse, roughness, albedo,
         net_radiation_coefficient_3=net_radiation_coefficient_3)
     ustar,length,qh=surface_similarity(step.u[0],step.v[0],roughness,first_level_height_m,
         density,temp,step.cloud_fraction,qh,landuse,water_range=water_range)
-    common=dict(depth_m=lapse_depth_m,minimum_lapse=minimum_lapse,
+    common: MixingHeightOptions=dict(depth_m=lapse_depth_m,minimum_lapse=minimum_lapse,
         minimum_height_m=minimum_height_m,maximum_height_m=maximum_height_m,
         threshold_flux_per_m=threshold_flux_per_m,constb=constb,constn=constn,
         relaxation=relaxation,relaxation_time_s=relaxation_time_s,land_mask=land,
@@ -1727,7 +2033,7 @@ def build_surface_fields(step: Step1Fields, landuse, roughness, albedo,
     # prognostic profile.  SEA.DAT may still be open for wave observations,
     # but its ZIOW records are not consulted on this path.
     if water_temperature_mode==2:
-        observed_water_mixing_height=None
+        observed_water_mixing_height=cast(ArrayLike | None,None)
     if observed_water_mixing_height is None:
         observed_water=np.zeros_like(water,dtype=bool)
         observed_zi=np.zeros_like(water_zi,dtype=MODEL_DTYPE)
@@ -1813,7 +2119,8 @@ def build_surface_fields(step: Step1Fields, landuse, roughness, albedo,
             water_wt=np.asarray(flux.buoyancy_flux_k_m_s,dtype=MODEL_DTYPE)
             water_qh=_model_array(water_wt*1195.2)
             if warm_layer:
-                next_warm_state=update_warm_layer_fluxes(next_warm_state,flux)
+                next_warm_state=update_warm_layer_fluxes(
+                    cast(WarmLayerState,next_warm_state),flux)
         mechanical=water_mechanical_height(water_ustar,coriolis,constw=constw,
             minimum_height_m=minimum_water_height_m,
             maximum_height_m=maximum_water_height_m)
@@ -1895,27 +2202,50 @@ def build_surface_fields(step: Step1Fields, landuse, roughness, albedo,
         _model_array(water_state),
     )
 
-def build_diagnostic_wind(step: Step1Fields, terrain_m, landuse, roughness,
-                          albedo, bowen_ratio, soil_heat_flux_parameter,
-                          anthropogenic_heat_flux, solar_elevation_sine,
-                          previous_convective_height, z_faces_m,
-                          *, dx_m=1000., dy_m=1000., terrain_radius_km=15.,
-                          terrain_context=None,
-                          lapse_height_m=200.,spatial_lapse=True,spatial_surface_temperature=True,
-                          temperature_mode=0,
-                          lapse_rate_override=None,
-                          minimum_average_radius=10,half_average_angle=30.,
-                          water_range=(50,55),
-                          turbidity_coefficient_1=990.,turbidity_coefficient_2=-30.,
-                          cloudiness_coefficient_1=-.75,cloudiness_coefficient_2=3.4,
-                          net_radiation_coefficient_1=5.31e-13,
-                          net_radiation_coefficient_2=60.,net_radiation_coefficient_3=.12,
-                          critical_froude=1.,use_froude=True,use_kinematic=False,use_slope=True,use_obrien=False,
-                          kinematic_alpha=.1,
-                          timestep_s=3600.,
-                          divergence_limit=5.e-6,divergence_iterations=50,
-                          smoothing_passes=(2,4,4,4,4,4,4,4,4,4),
-                          retain_debug_stages=False):
+def build_diagnostic_wind(
+    step: Step1Fields,
+    terrain_m: ArrayLike,
+    landuse: ArrayLike,
+    roughness: ArrayLike,
+    albedo: ArrayLike,
+    bowen_ratio: ArrayLike,
+    soil_heat_flux_parameter: ArrayLike,
+    anthropogenic_heat_flux: ArrayLike,
+    solar_elevation_sine: ArrayLike,
+    previous_convective_height: ArrayLike,
+    z_faces_m: ArrayLike,
+    *,
+    dx_m: float = 1000.,
+    dy_m: float = 1000.,
+    terrain_radius_km: float = 15.,
+    terrain_context: TerrainContext | None = None,
+    lapse_height_m: float = 200.,
+    spatial_lapse: bool = True,
+    spatial_surface_temperature: bool = True,
+    temperature_mode: int = 0,
+    lapse_rate_override: ArrayLike | None = None,
+    minimum_average_radius: int = 10,
+    half_average_angle: float = 30.,
+    water_range: WaterRange = (50,55),
+    turbidity_coefficient_1: float = 990.,
+    turbidity_coefficient_2: float = -30.,
+    cloudiness_coefficient_1: float = -.75,
+    cloudiness_coefficient_2: float = 3.4,
+    net_radiation_coefficient_1: float = 5.31e-13,
+    net_radiation_coefficient_2: float = 60.,
+    net_radiation_coefficient_3: float = .12,
+    critical_froude: float = 1.,
+    use_froude: bool = True,
+    use_kinematic: bool = False,
+    use_slope: bool = True,
+    use_obrien: bool = False,
+    kinematic_alpha: float = .1,
+    timestep_s: float = 3600.,
+    divergence_limit: float = 5.e-6,
+    divergence_iterations: int = 50,
+    smoothing_passes: Sequence[int] = (2,4,4,4,4,4,4,4,4,4),
+    retain_debug_stages: bool = False,
+) -> DiagnosticWindFields:
     """Apply CALMET diagnostic terrain effects to a Step-1 wind field.
 
     Args:
@@ -2046,13 +2376,23 @@ def build_diagnostic_wind(step: Step1Fields, terrain_m, landuse, roughness,
         kinematic_stage,froude_stage,slope_stage,interpolated_stage,
         terrain_adjusted_stage,initial_stage)
 
-def build_objective_wind(step: Step1Fields, terrain_m, previous_convective_height,
-                         z_faces_m, *, dx_m, dy_m, lapse_height_m=200.,
-                         spatial_lapse=True, lapse_rate_override=None,
-                         use_obrien=False, divergence_limit=5.e-6,
-                         divergence_iterations=50,
-                         smoothing_passes=(2,4,4,4,4,4,4,4,4,4),
-                         retain_debug_stages=False):
+def build_objective_wind(
+    step: Step1Fields,
+    terrain_m: ArrayLike,
+    previous_convective_height: ArrayLike,
+    z_faces_m: VerticalGrid,
+    *,
+    dx_m: float,
+    dy_m: float,
+    lapse_height_m: float = 200.,
+    spatial_lapse: bool = True,
+    lapse_rate_override: ArrayLike | None = None,
+    use_obrien: bool = False,
+    divergence_limit: float = 5.e-6,
+    divergence_iterations: int = 50,
+    smoothing_passes: Sequence[int] = (2,4,4,4,4,4,4,4,4,4),
+    retain_debug_stages: bool = False,
+) -> DiagnosticWindFields:
     """Finalize an IWFCOD=0 objective-analysis wind field.
 
     Args:
@@ -2084,7 +2424,8 @@ def build_objective_wind(step: Step1Fields, terrain_m, previous_convective_heigh
     interpolated=((np.asarray(step.u,dtype=MODEL_DTYPE).copy(),
                    np.asarray(step.v,dtype=MODEL_DTYPE).copy())
                   if retain_debug_stages else None)
-    u,v=terrain_adjust_surface_wind(step.u,step.v,terrain_m,z_faces_m[-1],dx_m,dy_m)
+    u,v=terrain_adjust_surface_wind(
+        step.u,step.v,terrain_m,cast(float,z_faces_m[-1]),dx_m,dy_m)
     adjusted=((u.copy(),v.copy()) if retain_debug_stages else None)
     boundaries=(u[:,:,0].copy(),u[:,:,-1].copy(),v[:,0,:].copy(),v[:,-1,:].copy())
     u,v=smooth_wind(u,v,smoothing_passes)
@@ -2100,50 +2441,95 @@ def build_objective_wind(step: Step1Fields, terrain_m, previous_convective_heigh
         np.zeros_like(terrain_m,dtype=MODEL_DTYPE),interpolated_stage=interpolated,
         terrain_adjusted_stage=adjusted,initial_stage=initial)
 
-def solve_hour(dataset, time_index, grid: GridConfig, z_faces_m, geophysical,
-               timestamp: datetime, previous_convective_height,
-               previous_temperature_jump, *, base_timezone=0,source_thermal_state=None,
-               mapper=None,terrain_context=None,target_coordinates=None,
-               selected_lapse_convective_time=None,
-               terrain_radius_km=15., minimum_average_radius=10,
-               half_average_angle=30.,critical_froude=1.,
-               use_froude=True,use_kinematic=False,use_slope=True,use_obrien=False,
-               kinematic_alpha=.1,
-               average_temperature=True,average_mixing_height=True,mixing_wind_level=1,
-               mixing_method=1,minimum_lapse=.001,lapse_depth_m=200.,
-               minimum_mixing_height_m=50.,maximum_mixing_height_m=2500.,
-               minimum_water_mixing_height_m=50.,maximum_water_mixing_height_m=2500.,
-               land_flux_threshold=0.,constb=1.41,conste=.15,constn=2400.,constw=.16,
-               coriolis_value=1.e-4,convective_relaxation=True,convective_relaxation_time_s=800.,
-               precipitation_interpolation=2,precipitation_radius_km=50.,precipitation_cutoff=.01,
-               turbidity_coefficient_1=990.,turbidity_coefficient_2=-30.,
-               cloudiness_coefficient_1=-.75,cloudiness_coefficient_2=3.4,
-               net_radiation_coefficient_1=5.31e-13,
-               net_radiation_coefficient_2=60.,net_radiation_coefficient_3=.12,
-               surface_temperature_option=-1,upper_temperature_option=-1,lapse_height_m=200.,
-               temperature_mode=2,
-               prognostic_observation_mode=False,prognostic_observation_rmin_km=.1,
-               prognostic_observation_barriers=(),prognostic_observation_barrier_top_level=0,
-               water_range=(50,55),cloud_method=4,
-               cloud_condensate_threshold_g_kg=.005,
-               overwater_flux_method=0,coastal_shelf_length_km=0.,cool_skin=False,
-               water_flux_threshold=0.,water_temperature_mode=0,
-               prognostic_ocean_category=16,
-               default_water_gradient_above=-.0045,
-               warm_layer=False,warm_layer_state=None,
-               previous_water_convective_height=None,
-               previous_water_mixing_height=None,
-               diagnostic_wind=True,
-               wind_only=False,
-               cloud_fraction_override=None,cloud_ceiling_override=None,
-               step_transform=None,
-               step_override=None,
-               step_provider=None,
-               timestep_s=3600.,
-               divergence_limit=5.e-6,divergence_iterations=50,
-               smoothing_passes=(2,4,4,4,4,4,4,4,4,4),
-               retain_debug_stages=False,
-               retain_micrometeorology_debug=False):
+def solve_hour(
+    dataset: DatasetLike,
+    time_index: int,
+    grid: GridConfig,
+    z_faces_m: VerticalGrid,
+    geophysical: Mapping[str, ArrayLike],
+    timestamp: datetime,
+    previous_convective_height: Float32Array,
+    previous_temperature_jump: Float32Array,
+    *,
+    base_timezone: int = 0,
+    source_thermal_state: SourceThermalState | None = None,
+    mapper: PrognosticMapper | None = None,
+    terrain_context: TerrainContext | None = None,
+    target_coordinates: TargetCoordinates | None = None,
+    selected_lapse_convective_time: datetime | None = None,
+    terrain_radius_km: float = 15.,
+    minimum_average_radius: int = 10,
+    half_average_angle: float = 30.,
+    critical_froude: float = 1.,
+    use_froude: bool = True,
+    use_kinematic: bool = False,
+    use_slope: bool = True,
+    use_obrien: bool = False,
+    kinematic_alpha: float = .1,
+    average_temperature: bool = True,
+    average_mixing_height: bool = True,
+    mixing_wind_level: int = 1,
+    mixing_method: MixingMethod = 1,
+    minimum_lapse: float = .001,
+    lapse_depth_m: float = 200.,
+    minimum_mixing_height_m: float = 50.,
+    maximum_mixing_height_m: float = 2500.,
+    minimum_water_mixing_height_m: float = 50.,
+    maximum_water_mixing_height_m: float = 2500.,
+    land_flux_threshold: float = 0.,
+    constb: float = 1.41,
+    conste: float = .15,
+    constn: float = 2400.,
+    constw: float = .16,
+    coriolis_value: float = 1.e-4,
+    convective_relaxation: bool = True,
+    convective_relaxation_time_s: float = 800.,
+    precipitation_interpolation: PrecipitationMethod = 2,
+    precipitation_radius_km: float = 50.,
+    precipitation_cutoff: float = .01,
+    turbidity_coefficient_1: float = 990.,
+    turbidity_coefficient_2: float = -30.,
+    cloudiness_coefficient_1: float = -.75,
+    cloudiness_coefficient_2: float = 3.4,
+    net_radiation_coefficient_1: float = 5.31e-13,
+    net_radiation_coefficient_2: float = 60.,
+    net_radiation_coefficient_3: float = .12,
+    surface_temperature_option: int = -1,
+    upper_temperature_option: int = -1,
+    lapse_height_m: float = 200.,
+    temperature_mode: int = 2,
+    prognostic_observation_mode: bool = False,
+    prognostic_observation_rmin_km: float = .1,
+    prognostic_observation_barriers: Sequence[Barrier] = (),
+    prognostic_observation_barrier_top_level: int = 0,
+    water_range: WaterRange = (50,55),
+    cloud_method: CloudMethod = 4,
+    cloud_condensate_threshold_g_kg: float = .005,
+    overwater_flux_method: int = 0,
+    coastal_shelf_length_km: float = 0.,
+    cool_skin: bool = False,
+    water_flux_threshold: float = 0.,
+    water_temperature_mode: int = 0,
+    prognostic_ocean_category: int = 16,
+    default_water_gradient_above: float = -.0045,
+    warm_layer: bool = False,
+    warm_layer_state: WarmLayerState | None = None,
+    previous_water_convective_height: Float32Array | None = None,
+    previous_water_mixing_height: Float32Array | None = None,
+    diagnostic_wind: bool = True,
+    wind_only: bool = False,
+    cloud_fraction_override: ArrayLike | None = None,
+    cloud_ceiling_override: ArrayLike | None = None,
+    step_transform: StepTransform | None = None,
+    step_override: Step1Fields | None = None,
+    step_provider: StepProvider | None = None,
+    timestep_s: float = 3600.,
+    divergence_limit: float = 5.e-6,
+    divergence_iterations: int = 50,
+    smoothing_passes: Sequence[int] = (2,4,4,4,4,4,4,4,4,4),
+    retain_debug_stages: bool = False,
+    retain_micrometeorology_debug: bool = False,
+) -> HourFields:
     """Solve one current-config CALMET timestep and return its new state.
 
     ``timestamp`` is the beginning of the timestep in the CALMET base time
@@ -2283,7 +2669,9 @@ def solve_hour(dataset, time_index, grid: GridConfig, z_faces_m, geophysical,
             dataset,time_index,base_timezone)
         step=build_step1_fields(dataset,time_index,grid,z_faces_m,
               timestamp=record_time,base_timezone=base_timezone,
-              thermal_state=source_thermal_state,mapper=mapper,cloud_method=4 if cloud_method in {1,2} else cloud_method,
+              thermal_state=source_thermal_state,mapper=mapper,
+              cloud_method=cast(PrognosticCloudMethod,
+                                4 if cloud_method in {1,2} else cloud_method),
               cloud_condensate_threshold_g_kg=cloud_condensate_threshold_g_kg,
               precipitation_interpolation=precipitation_interpolation,
               precipitation_radius_km=precipitation_radius_km,
@@ -2296,7 +2684,9 @@ def solve_hour(dataset, time_index, grid: GridConfig, z_faces_m, geophysical,
     if prognostic_observation_mode:
         if step.prognostic_observation_u is None:
             raise ValueError('IPROG=15 requires prognostic observation mapping fields')
-        step=replace(step,u=step.prognostic_observation_u,v=step.prognostic_observation_v)
+        step=replace(
+            step,u=step.prognostic_observation_u,
+            v=cast(Float32Array,step.prognostic_observation_v))
     if cloud_fraction_override is not None:
         cloud=np.asarray(cloud_fraction_override,dtype=MODEL_DTYPE)
         if cloud.shape!=(grid.ny,grid.nx): raise ValueError('CLOUD.DAT field does not match CALMET grid')
@@ -2322,10 +2712,14 @@ def solve_hour(dataset, time_index, grid: GridConfig, z_faces_m, geophysical,
                 np.asarray(previous_mixing,dtype=MODEL_DTYPE),
                 np.asarray(previous_temperature_jump,dtype=MODEL_DTYPE),coriolis,
                 warm_layer_state,gmt_hour)
-            step=step_transform(step,timestamp,context)
+            step=cast(
+                Callable[[Step1Fields, datetime, StepTransformContext],
+                         Step1Fields],step_transform)(step,timestamp,context)
             warm_layer_state=context.warm_layer_state
         else:
-            step=step_transform(step,timestamp)
+            step=cast(
+                Callable[[Step1Fields, datetime],Step1Fields],
+                step_transform)(step,timestamp)
     roughness=(geo['roughness_length'] if step.roughness_override is None else
                np.asarray(step.roughness_override,dtype=MODEL_DTYPE))
     if roughness.shape!=(grid.ny,grid.nx):
@@ -2382,7 +2776,8 @@ def solve_hour(dataset, time_index, grid: GridConfig, z_faces_m, geophysical,
         surface=replace(surface,mixing_height=zi,convective_mixing_height=zic)
     else:
         zic=surface.convective_mixing_height
-    temperature=(observed_temperature_3d(final_temp,step.observed_temperature_faces,zic,z_faces_m,
+    temperature=(observed_temperature_3d(final_temp,cast(
+                    Float32Array,step.observed_temperature_faces),zic,z_faces_m,
                     landuse=geo['dominant_landuse'],water_range=water_range,
                     mixing_height=surface.mixing_height,water_gradient_below=step.water_gradient_below,
                     water_gradient_above=step.water_gradient_above)
@@ -2392,7 +2787,7 @@ def solve_hour(dataset, time_index, grid: GridConfig, z_faces_m, geophysical,
     return HourFields(timestamp,final_step,wind,surface,temperature,
                       selected_lapse_convective_time,step)
 
-def dataset_timestamp(dataset, time_index):
+def dataset_timestamp(dataset: DatasetLike, time_index: int) -> datetime:
     """Decode a canonical CALWRF ``time_text`` record.
 
     Args:
@@ -2412,7 +2807,11 @@ def dataset_timestamp(dataset, time_index):
     else: text=''.join(chr(int(value)) for value in raw.ravel())
     return parse_timestamp(text)
 
-def _prognostic_local_timestamp(dataset,time_index,base_timezone):
+def _prognostic_local_timestamp(
+    dataset: DatasetLike,
+    time_index: int,
+    base_timezone: int,
+) -> datetime:
     """Convert a canonical CALWRF UTC record to CALMET local time.
 
     Args:
@@ -2425,9 +2824,18 @@ def _prognostic_local_timestamp(dataset,time_index,base_timezone):
     """
     return dataset_timestamp(dataset,time_index)-timedelta(hours=base_timezone)
 
-def iter_hours(dataset, grid: GridConfig, z_faces_m, geophysical, *,
-               time_indices=None,time_samples=None,initial_convective_height=None,
-               initial_temperature_jump=None, **solver_options):
+def iter_hours(
+    dataset: DatasetLike,
+    grid: GridConfig,
+    z_faces_m: VerticalGrid,
+    geophysical: Mapping[str, ArrayLike],
+    *,
+    time_indices: Iterable[int] | None = None,
+    time_samples: Iterable[TimeSample] | None = None,
+    initial_convective_height: ArrayLike | None = None,
+    initial_temperature_jump: ArrayLike | None = None,
+    **solver_options: Any,
+) -> Iterator[HourFields]:
     """Stream CALMET intervals while carrying prognostic state.
 
     CALMET labels the first output interval ``00:00--01:00``, while RDMM5
@@ -2464,20 +2872,25 @@ def iter_hours(dataset, grid: GridConfig, z_faces_m, geophysical, *,
             validation fails.
     """
     shape=(grid.ny,grid.nx)
-    convective=(np.zeros(shape,dtype=MODEL_DTYPE) if initial_convective_height is None else
-                np.asarray(initial_convective_height,dtype=MODEL_DTYPE))
-    jump=(np.zeros(shape,dtype=MODEL_DTYPE) if initial_temperature_jump is None else
-          np.asarray(initial_temperature_jump,dtype=MODEL_DTYPE))
-    source_thermal_state=None
-    warm_layer_state=solver_options.pop('warm_layer_state',None)
-    water_convective_state=np.zeros(shape,dtype=MODEL_DTYPE)
-    water_mixing_state=np.zeros(shape,dtype=MODEL_DTYPE)
-    selected_lapse_convective_time=None
+    convective: Float32Array=(
+        np.zeros(shape,dtype=MODEL_DTYPE)
+        if initial_convective_height is None else
+        np.asarray(initial_convective_height,dtype=MODEL_DTYPE))
+    jump: Float32Array=(
+        np.zeros(shape,dtype=MODEL_DTYPE)
+        if initial_temperature_jump is None else
+        np.asarray(initial_temperature_jump,dtype=MODEL_DTYPE))
+    source_thermal_state: SourceThermalState | None=None
+    warm_layer_state: WarmLayerState | None=solver_options.pop(
+        'warm_layer_state',None)
+    water_convective_state: Float32Array=np.zeros(shape,dtype=MODEL_DTYPE)
+    water_mixing_state: Float32Array=np.zeros(shape,dtype=MODEL_DTYPE)
+    selected_lapse_convective_time: datetime | None=None
     if convective.shape!=shape or jump.shape!=shape: raise ValueError('initial CALMET state does not match output grid')
-    step_provider=solver_options.get('step_provider')
+    step_provider: StepProvider | None=solver_options.get('step_provider')
     use_endpoints=(time_samples is not None or step_provider is None)
-    base_timezone=solver_options.get('base_timezone',0)
-    def timeline_timestamp(index):
+    base_timezone: int=solver_options.get('base_timezone',0)
+    def timeline_timestamp(index: int) -> datetime:
         """Return one endpoint timestamp on the active local timeline.
 
         Args:
@@ -2491,9 +2904,13 @@ def iter_hours(dataset, grid: GridConfig, z_faces_m, geophysical, *,
         # Native MM4/PROG adapters synthesize an already-local timeline.
         return (dataset_timestamp(dataset,index) if step_provider is not None else
                 _prognostic_local_timestamp(dataset,index,base_timezone))
+    iterator: Iterable[IntervalSample]
+    indices: Iterable[int]
     if use_endpoints:
-        endpoint_cache={}; endpoint_state=None; last_endpoint=-1
-        def endpoint(index):
+        endpoint_cache: dict[int, Step1Fields]={}
+        endpoint_state: SourceThermalState | None=None
+        last_endpoint: int=-1
+        def endpoint(index: int) -> Step1Fields:
             """Build and cache one chronological prognostic endpoint.
 
             Args:
@@ -2533,7 +2950,7 @@ def iter_hours(dataset, grid: GridConfig, z_faces_m, geophysical, *,
                 endpoint_cache[current]=value; endpoint_state=value.thermal_state; last_endpoint=current
             return endpoint_cache[index]
         if time_samples is not None:
-            samples=list(time_samples)
+            samples: list[TimeSample]=list(time_samples)
             iterator=((*sample,index==len(samples)-1)
                       for index,sample in enumerate(samples))
         else:
@@ -2553,7 +2970,8 @@ def iter_hours(dataset, grid: GridConfig, z_faces_m, geophysical, *,
         indices=range(1,dataset['time_text'].shape[0]) if time_indices is None else time_indices
         indices=list(range(1,dataset['time_text'].shape[0]) if time_indices is None else time_indices)
         iterator=((None,time_index,1.,timeline_timestamp(time_index),
-                  index==len(indices)-1) for index,time_index in enumerate(indices))
+                  index==len(cast(Sequence[int],indices))-1)
+                  for index,time_index in enumerate(indices))
     for left_index,time_index,fraction,end,final_input in iterator:
         timestep_s=float(solver_options.get('timestep_s',3600.))
         begin=end-timedelta(seconds=timestep_s)
@@ -2566,15 +2984,17 @@ def iter_hours(dataset, grid: GridConfig, z_faces_m, geophysical, *,
                 cloud_method=4 if method in {1,2} else method,
                 cloud_condensate_threshold_g_kg=solver_options.get(
                     'cloud_condensate_threshold_g_kg',.005))
-        cloud_provider=solver_options.get('cloud_provider')
-        supplied=None if cloud_provider is None else cloud_provider(end)
+        cloud_provider: CloudProvider | None=solver_options.get('cloud_provider')
+        supplied: CloudOverride=(
+            None if cloud_provider is None else cloud_provider(end))
         if isinstance(supplied,tuple): cloud_override,ceiling_override=supplied
         else: cloud_override,ceiling_override=supplied,None
-        solve_options={key:value for key,value in solver_options.items()
-                       if key not in {'prognostic_timestep_s','cloud_provider'}}
+        solve_options: dict[str, Any]={
+            key:value for key,value in solver_options.items()
+            if key not in {'prognostic_timestep_s','cloud_provider'}}
         solve_options['cloud_fraction_override']=cloud_override
         solve_options['cloud_ceiling_override']=ceiling_override
-        result=solve_hour(dataset,time_index,grid,z_faces_m,geophysical,begin,convective,jump,source_thermal_state=source_thermal_state,warm_layer_state=warm_layer_state,previous_water_convective_height=water_convective_state,previous_water_mixing_height=water_mixing_state,step_override=step_override,selected_lapse_convective_time=selected_lapse_convective_time,**solve_options)
+        result: HourFields=solve_hour(dataset,time_index,grid,z_faces_m,geophysical,begin,convective,jump,source_thermal_state=source_thermal_state,warm_layer_state=warm_layer_state,previous_water_convective_height=water_convective_state,previous_water_mixing_height=water_mixing_state,step_override=step_override,selected_lapse_convective_time=selected_lapse_convective_time,**solve_options)
         convective=result.surface.convective_mixing_height.copy(); jump=result.surface.temperature_jump.copy()
         next_water_state=getattr(result.surface,'water_convective_height_state',None)
         if next_water_state is not None:

@@ -7,14 +7,16 @@ from datetime import datetime,timedelta
 from pathlib import Path
 import re
 import shlex
-from typing import Any
+from typing import Any, Callable, Final, Literal, Sequence, overload
 
 from .config import (CalmetConfig,CalwrfConfig,CtgprocConfig,CtgprocSource,
                      GridConfig,MakegeoConfig,TerrelConfig,TerrelSource)
 from .datetime_utils import (exact_integer,format_timezone_label,parse_calendar,
                              parse_date,parse_timestamp,parse_timezone_label)
 
-_ASSIGNMENT = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$")
+_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
+    r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$"
+)
 
 
 def assignments(path: str | Path) -> dict[str, list[str]]:
@@ -83,7 +85,7 @@ def _control_source(path: str | Path) -> Path:
     if not text.strip():
         raise ValueError(f'list file is empty: {source}')
     lines=text.splitlines()
-    candidates=[]
+    candidates: list[str] = []
     for index,line in enumerate(lines):
         if 'control file used' in line.casefold():
             candidates.extend(item.strip() for item in lines[index+1:index+5] if item.strip())
@@ -108,7 +110,9 @@ def _control_source(path: str | Path) -> Path:
     raise ValueError(f'cannot locate the control file recorded by {source}')
 
 
-def _one(values: dict[str,list[str]], name: str, default: Any=None):
+def _one(
+    values: dict[str, list[str]], name: str, default: Any = None
+) -> Any:
     """Read the last active value for one case-insensitive control name.
 
     Args:
@@ -225,7 +229,9 @@ def _path(parent: Path, value: str | Path) -> Path:
     return resolved if matched is None else matched
 
 
-def _station_rows(values, prefix, count, fields):
+def _station_rows(
+    values: dict[str, list[str]], prefix: str, count: int, fields: int
+) -> tuple[tuple[str | int | float, ...], ...]:
     """Decode an optional CALMET Group 7, 8, or 9 station table.
 
     Args:
@@ -246,7 +252,7 @@ def _station_rows(values, prefix, count, fields):
     if not present: return ()
     if present!=list(range(1,count+1)):
         raise ValueError(f'{prefix} station rows must cover 1..{count}')
-    rows=[]
+    rows: list[tuple[str | int | float, ...]] = []
     for index in present:
         tokens=shlex.split(_one(values,f'{prefix}{index}'))
         if len(tokens)!=fields:
@@ -290,8 +296,14 @@ def grid_from_assignments(values: dict[str,list[str]]) -> GridConfig:
     )
 
 
-def _require_projection_grid(values,program,x_name,y_name,
-                             latitude_1='RLAT1',latitude_2='RLAT2'):
+def _require_projection_grid(
+    values: dict[str, list[str]],
+    program: str,
+    x_name: str,
+    y_name: str,
+    latitude_1: str = 'RLAT1',
+    latitude_2: str = 'RLAT2',
+) -> None:
     """Check the projection-dependent mandatory control fields.
 
     Args:
@@ -320,7 +332,7 @@ def _require_projection_grid(values,program,x_name,y_name,
         raise ValueError(f'{program} control lacks mandatory grid fields: '+', '.join(missing))
 
 
-def calwrf_config(path: str | Path, **overrides) -> CalwrfConfig:
+def calwrf_config(path: str | Path, **overrides: Any) -> CalwrfConfig:
     """Read CALWRF's compact line-oriented control file.
 
     Negative or zero start/end selectors request the full timestamp range
@@ -349,7 +361,7 @@ def calwrf_config(path: str | Path, **overrides) -> CalwrfConfig:
     # list-directed numeric reads accept ``!`` comments.  Treat wholly
     # commented records as inactive as well; this supports the commented
     # alternate WRF paths shipped with the repository.
-    records=[]
+    records: list[str] = []
     for line in raw_lines[1:]:
         stripped=line.strip()
         if not stripped or stripped.startswith('!'):
@@ -369,7 +381,7 @@ def calwrf_config(path: str | Path, **overrides) -> CalwrfConfig:
                    else configured_output)
     bounds=[int(item.strip()) for item in lines[3].split(',')]
     if len(bounds)!=6: raise ValueError('CALWRF I/J/K selection must contain six integers')
-    def selected(first,last):
+    def selected(first: int, last: int) -> tuple[int, int] | None:
         """Convert a one-based inclusive bound pair to its optional form.
 
         Args:
@@ -409,7 +421,7 @@ def calwrf_config(path: str | Path, **overrides) -> CalwrfConfig:
 
     if all_available(raw_start) or all_available(raw_end):
         from netCDF4 import Dataset,chartostring
-        available=[]
+        available: list[datetime] = []
         for wrf_path in requested_files:
             with Dataset(wrf_path) as dataset:
                 if 'Times' not in dataset.variables:
@@ -424,7 +436,7 @@ def calwrf_config(path: str | Path, **overrides) -> CalwrfConfig:
         control_start=parse_timestamp(raw_start)
         control_end=parse_timestamp(raw_end)
 
-    data=dict(wrf_files=wrf_files,start=control_start,end=control_end,
+    data: dict[str, Any] = dict(wrf_files=wrf_files,start=control_start,end=control_end,
               output=canonical_output,create_surface=create_surface,
               title=title,listing_output=_path(source.parent,lines[1]),
               legacy_output=legacy_output,surface_output=(surface_output if create_surface else None),
@@ -440,7 +452,7 @@ def calwrf_config(path: str | Path, **overrides) -> CalwrfConfig:
     data.update(overrides); return CalwrfConfig(**data)
 
 
-def terrel_config(path: str | Path, **overrides) -> TerrelConfig:
+def terrel_config(path: str | Path, **overrides: Any) -> TerrelConfig:
     """Read a TERREL control file into typed terrain-processing settings.
 
     Args:
@@ -482,7 +494,7 @@ def terrel_config(path: str | Path, **overrides) -> TerrelConfig:
               'DMDF':'NAS-C','CDED':'NAR-C','SRTM1':'WGS-96','SRTM3':'WGS-96',
               'GTOPO30':'WGS-84','USGSLA':'ESR-S','NZGEN':'WGS-84',
               'GEN':'WGS-84','GEOTIFF':'WGS-84'}
-    sources=[]
+    sources: list[TerrelSource] = []
     for kind in order:
         for item in values.get(kind,[]):
             sources.append(TerrelSource(terrel_path(item),kind,
@@ -535,7 +547,11 @@ def terrel_config(path: str | Path, **overrides) -> TerrelConfig:
     sheet_method=int(_number(_one(values,'MSHEET','0')))
     if sheet_method not in {0,1}:
         raise ValueError('TERREL MSHEET must be 0 or 1')
-    def pair(name,defaults,integer=False):
+    def pair(
+        name: str,
+        defaults: Sequence[int | float],
+        integer: bool = False,
+    ) -> tuple[int | float, ...]:
         """Parse a two-value TERREL replacement record and add defaults.
 
         Traditional controls specify the first two source classes; defaults
@@ -573,7 +589,7 @@ def terrel_config(path: str | Path, **overrides) -> TerrelConfig:
     threshold=int(_number(_one(values,'ITHRES','75')))
     if not 0<=threshold<=100:
         raise ValueError('TERREL ITHRES must be in the range 0..100')
-    data=dict(srtm_dir=source.parent,output=terrel_path(_one(values,"OUTFIL","TERR.DAT")),
+    data: dict[str, Any] = dict(srtm_dir=source.parent,output=terrel_path(_one(values,"OUTFIL","TERR.DAT")),
               grid=grid,datum=str(_one(values,"DATUM","WGS-84")),
               sampling=("direct" if sheet_method==1 else "legacy"),
               terrain_files=[item.path for item in sources],terrain_sources=tuple(sources),
@@ -630,7 +646,7 @@ def terrel_config(path: str | Path, **overrides) -> TerrelConfig:
     data.update(overrides); return TerrelConfig(**data)
 
 
-def ctgproc_config(path: str | Path, **overrides) -> CtgprocConfig:
+def ctgproc_config(path: str | Path, **overrides: Any) -> CtgprocConfig:
     """Read a CTGPROC control file into typed land-use settings.
 
     Args:
@@ -667,7 +683,7 @@ def ctgproc_config(path: str | Path, **overrides) -> CtgprocConfig:
     if declared_sources<0:
         raise ValueError('CTGPROC NDBF cannot be negative')
     kinds=[name for name in order if name in values]
-    def datum(kind):
+    def datum(kind: str) -> str:
         """Return the configured or traditional datum for an input type.
 
         Args:
@@ -685,7 +701,7 @@ def ctgproc_config(path: str | Path, **overrides) -> CtgprocConfig:
                 str(_one(values,'DMODIS','ESR-S')) if kind=='MODIS' else
                 str(_one(values,'DUSGSLA','ESR-S')) if kind.startswith('GLAZ') else
                 str(_one(values,'DATUM','WGS-84')))
-    def mesh(kind):
+    def mesh(kind: str) -> int:
         """Return the mesh subdivision count for an input type.
 
         Args:
@@ -697,6 +713,7 @@ def ctgproc_config(path: str | Path, **overrides) -> CtgprocConfig:
         return int(_number(_one(values,'MESHCTG','1') if kind=='CTG' else
                            _one(values,'MESHCORN','1') if kind=='CORINE' else
                            _one(values,'MESHGLAZ','1')))
+    sources: tuple[CtgprocSource, ...]
     if declared_sources==0:
         legacy_types={1:'CTG',3:'NZGEN',4:'NLCD92',5:'NLCD01',6:'NLCDTF',
                       7:'CORINE',8:'GLC2K',9:'UMDGLC',10:'MODIS',11:'GEN'}
@@ -727,7 +744,7 @@ def ctgproc_config(path: str | Path, **overrides) -> CtgprocConfig:
     read_bln=_logical(str(_one(values,'LBLNREAD','F')))
     continuation=_logical(str(_one(values,'LPREV','F')))
     previous_value=_one(values,'PREVDAT') or 'PREV.DAT'
-    data=dict(landuse_files=[item.path for item in sources],landuse_sources=sources,
+    data: dict[str, Any] = dict(landuse_files=[item.path for item in sources],landuse_sources=sources,
               output=ctgproc_path(_one(values,"LUDAT","LU.DAT")),grid=grid_from_assignments(values),
               input_type=kind,mesh_density=sources[0].mesh_density,
               input_datum=input_datum,
@@ -766,7 +783,7 @@ def ctgproc_config(path: str | Path, **overrides) -> CtgprocConfig:
     data.update(overrides); return CtgprocConfig(**data)
 
 
-def makegeo_config(path: str | Path, **overrides) -> MakegeoConfig:
+def makegeo_config(path: str | Path, **overrides: Any) -> MakegeoConfig:
     """Read a MAKEGEO control file into typed geophysical settings.
 
     Args:
@@ -806,18 +823,31 @@ def makegeo_config(path: str | Path, **overrides) -> MakegeoConfig:
         """
         spelling=str(value).lower() if lowercase_files else str(value).upper()
         return _path(source.parent,spelling)
-    properties={}
+    properties: dict[
+        int, tuple[float, float, float, float, float, float, int]
+    ] = {}
     for record in values.get('X',[]):
         parts=[item.strip() for item in record.split(',')]
         if len(parts)!=8: raise ValueError(f'invalid MAKEGEO X record: {record!r}')
-        properties[int(_number(parts[0]))]=tuple(float(_number(item)) for item in parts[1:7])+(int(_number(parts[7])),)
-    snow_properties={}
+        properties[int(_number(parts[0]))] = (
+            float(_number(parts[1])), float(_number(parts[2])),
+            float(_number(parts[3])), float(_number(parts[4])),
+            float(_number(parts[5])), float(_number(parts[6])),
+            int(_number(parts[7])),
+        )
+    snow_properties: dict[
+        int, tuple[float, float, float, float, float, float, int]
+    ] = {}
     for record in values.get('XS',[]):
         parts=[item.strip() for item in record.split(',')]
         if len(parts)!=8: raise ValueError(f'invalid MAKEGEO XS record: {record!r}')
-        snow_properties[int(_number(parts[0]))]=(tuple(
-            float(_number(item)) for item in parts[1:7])+(int(_number(parts[7])),))
-    snow_age_parameters={}
+        snow_properties[int(_number(parts[0]))] = (
+            float(_number(parts[1])), float(_number(parts[2])),
+            float(_number(parts[3])), float(_number(parts[4])),
+            float(_number(parts[5])), float(_number(parts[6])),
+            int(_number(parts[7])),
+        )
+    snow_age_parameters: dict[int, tuple[int, float]] = {}
     for record in values.get('XF',[]):
         parts=[item.strip() for item in record.split(',')]
         if len(parts)!=3: raise ValueError(f'invalid MAKEGEO XF record: {record!r}')
@@ -827,7 +857,7 @@ def makegeo_config(path: str | Path, **overrides) -> MakegeoConfig:
                        for item in record.split(',') if item.strip()
                        for category in (int(_number(item)),) if category!=0]
     water_categories=[int(_number(item)) for item in values.get('IWAT',[])]
-    splits=[]
+    splits: list[tuple[int, int, float]] = []
     for record in values.get('XSPLIT',[]):
         parts=[item.strip() for item in record.split(',')]
         if len(parts)!=3: raise ValueError(f'invalid MAKEGEO XSPLIT record: {record!r}')
@@ -854,7 +884,7 @@ def makegeo_config(path: str | Path, **overrides) -> MakegeoConfig:
                 raise ValueError('MAKEGEO snow and no-snow output category maps must match')
     ixqa=int(_number(_one(values,'IXQA','0')))
     iyqa=int(_number(_one(values,'IYQA','0')))
-    data=dict(terrain=makegeo_path(_one(values,"TERRDAT","TERR.DAT")),
+    data: dict[str, Any] = dict(terrain=makegeo_path(_one(values,"TERRDAT","TERR.DAT")),
               landuse=makegeo_path(_one(values,"LUDAT","LU.DAT")),
               output=makegeo_path(_one(values,"GEODAT","GEO.DAT")),grid=grid_from_assignments(values),
               water_threshold=float(_number(_one(values,"CFRACT","0.5"))),
@@ -895,7 +925,7 @@ def makegeo_config(path: str | Path, **overrides) -> MakegeoConfig:
     data.update(overrides); return MakegeoConfig(**data)
 
 
-def _date(values,prefix):
+def _date(values: dict[str, list[str]], prefix: str) -> datetime:
     """Parse a CALMET begin or end timestamp from control assignments.
 
     Args:
@@ -915,7 +945,9 @@ def _date(values,prefix):
             for suffix in ("YR","MO","DY","HR")]
     seconds=_integer_number(_one(values,prefix+"SEC","0"),prefix+"SEC")
     try:
-        return parse_calendar(*fields,seconds)
+        return parse_calendar(
+            fields[0], fields[1], fields[2], fields[3], seconds
+        )
     except ValueError as error:
         if 'invalid hour' in str(error):
             raise ValueError(f'{prefix}HR must be between 0 and 24') from error
@@ -940,7 +972,9 @@ def _calmet_version(source: Path) -> str:
     return lines[0][16:32].strip() if len(lines[0])>=32 else ''
 
 
-def _calmet_period(version: str, values: dict[str,list[str]]):
+def _calmet_period(
+    version: str, values: dict[str, list[str]]
+) -> tuple[datetime, datetime, int, str]:
     """Decode CALMET's version-dependent run period and base time zone.
 
     Version 2.1 and 2.2 controls contain explicit beginning and ending fields
@@ -989,7 +1023,7 @@ def _calmet_period(version: str, values: dict[str,list[str]]):
     return begin,end,base_timezone,timezone
 
 
-def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
+def calmet_config(path: str | Path, **overrides: Any) -> CalmetConfig:
     """Read a CALMET control file into the complete typed configuration.
 
     The loader supports both current and pre-2.1/2.2 period and cloud-control
@@ -1082,7 +1116,7 @@ def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
         ('STABILITY','USTAR','MONIN','MIXHT','WSTAR','PRECIP','SENSHEAT','CONVZI'))
     wind_debug_fields=tuple(int(_number(_one(values,f'IPR{index}','0')))
                             for index in range(9))
-    barrier_columns=[]
+    barrier_columns: list[list[float]] = []
     for name in ('XBBAR','YBBAR','XEBAR','YEBAR'):
         barrier_columns.append([float(_number(item)) for item in re.split(r"\s*,\s*",_one(values,name,'')) if item])
     barrier_count=int(_number(_one(values,'NBAR','0')))
@@ -1091,7 +1125,35 @@ def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
     barriers=tuple(zip(*barrier_columns)) if barrier_count else ()
     lake_enabled=_logical(_one(values,'LLBREZE','F'))
     lake_count=int(_number(_one(values,'NBOX','0')))
-    def lake_values(name,integer=False):
+    @overload
+    def lake_values(name: str, integer: Literal[True]) -> list[int]:
+        """Type the integer form of a repeated lake-breeze control array.
+
+        Args:
+            name: Lake-breeze control variable to collect.
+            integer: Literal selecting integer conversion.
+
+        Returns:
+            Flattened integer values from all active assignments.
+        """
+        ...
+
+    @overload
+    def lake_values(name: str, integer: Literal[False] = False) -> list[float]:
+        """Type the floating-point form of a lake-breeze control array.
+
+        Args:
+            name: Lake-breeze control variable to collect.
+            integer: Literal selecting floating-point conversion.
+
+        Returns:
+            Flattened floating-point values from all active assignments.
+        """
+        ...
+
+    def lake_values(
+        name: str, integer: bool = False
+    ) -> list[int] | list[float]:
         """Collect repeated lake-breeze array assignments.
 
         Args:
@@ -1113,7 +1175,14 @@ def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
             raise ValueError('LLBREZE requires NBOX matching all lake-breeze coordinate arrays')
         if len(lake_station_counts)!=lake_count or sum(lake_station_counts)!=len(lake_station_ids):
             raise ValueError('lake-breeze NLB counts do not match NBOX/METBXID')
-        lake_regions=[]; station_offset=0
+        lake_region_list: list[
+            tuple[
+                float, float, float, float,
+                float, float, float, float,
+                tuple[int, ...],
+            ]
+        ] = []
+        station_offset = 0
         for index,count in enumerate(lake_station_counts):
             if count<1: raise ValueError('each lake-breeze region requires at least one station')
             coordinates=[column[index] for column in lake_columns]
@@ -1122,8 +1191,12 @@ def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
                 coordinates[offset]=(coordinates[offset]-origin)*1000.
             selected=tuple(lake_station_ids[station_offset:station_offset+count])
             station_offset+=count
-            lake_regions.append((*coordinates,selected))
-        lake_regions=tuple(lake_regions)
+            lake_region_list.append((
+                coordinates[0], coordinates[1], coordinates[2], coordinates[3],
+                coordinates[4], coordinates[5], coordinates[6], coordinates[7],
+                selected,
+            ))
+        lake_regions = tuple(lake_region_list)
     else:
         lake_regions=()
     surface_count=int(_number(_one(values,'NSSTA','0')))
@@ -1137,6 +1210,7 @@ def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
     declared_sea=int(_number(_one(values,'NOWSTA','0')))
     sea_files=numbered_files('SEADAT',declared_sea,'sea')
     iprog=int(_number(_one(values,'IPROG','0')))
+    meteorology_files: tuple[Path, ...]
     if iprog in {1,2}:
         meteorology_files=(calmet_path(_one(values,'PRGDAT','PROG.DAT')),)
     else:
@@ -1171,7 +1245,7 @@ def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
     if prognostic_step_seconds==0:
         prognostic_step_seconds=3600*_integer_number(
             _one(values,'ISTEPPG','1'),'ISTEPPG')
-    data=dict(meteorology=(meteorology_files[0] if len(meteorology_files)==1 else meteorology_files),
+    data: dict[str, Any] = dict(meteorology=(meteorology_files[0] if len(meteorology_files)==1 else meteorology_files),
               geophysical=calmet_path(_one(values,"GEODAT","GEO.DAT")),
               output=calmet_path(_one(values,"METDAT","CALMET.DAT")),
               start=start,end=end,grid=grid,z_faces_m=faces,
@@ -1361,8 +1435,12 @@ def readlst(path: str | Path, component: str | None = None) -> dict[str, Any]:
         selected = aliases[key]
     except KeyError as error:
         raise ValueError(f"unknown CALMET workflow component: {component!r}") from error
-    loaders = {"calwrf":calwrf_config, "terrel":terrel_config,
-               "ctgproc":ctgproc_config, "makegeo":makegeo_config,
-               "calmet":calmet_config}
-    config = loaders[selected](path)
+    loaders: dict[str, Callable[..., Any]] = {
+        "calwrf": calwrf_config,
+        "terrel": terrel_config,
+        "ctgproc": ctgproc_config,
+        "makegeo": makegeo_config,
+        "calmet": calmet_config,
+    }
+    config: Any = loaders[selected](path)
     return {field.name:getattr(config, field.name) for field in fields(config)}

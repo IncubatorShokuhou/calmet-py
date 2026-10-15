@@ -12,13 +12,16 @@ import textwrap
 import types
 from dataclasses import MISSING, fields
 from pathlib import Path
+from typing import Final
 
 
-ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "src"
-OUTPUT = SOURCE / "pycalmet" / "_pipeline_api.py"
-STAGES = ("calwrf", "terrel", "ctgproc", "makegeo", "calmet")
-_SOURCE_PACKAGE = "_pycalmet_pipeline_api_codegen"
+ROOT: Final[Path] = Path(__file__).resolve().parents[1]
+SOURCE: Final[Path] = ROOT / "src"
+OUTPUT: Final[Path] = SOURCE / "pycalmet" / "_pipeline_api.py"
+STAGES: Final[tuple[str, ...]] = (
+    "calwrf", "terrel", "ctgproc", "makegeo", "calmet"
+)
+_SOURCE_PACKAGE: Final[str] = "_pycalmet_pipeline_api_codegen"
 
 
 def _annotation(parameter: inspect.Parameter) -> str:
@@ -130,7 +133,7 @@ def render() -> str:
         "from collections.abc import Mapping, Sequence",
         "from datetime import date, datetime",
         "from pathlib import Path",
-        "from typing import Any, TypeAlias",
+        "from typing import Any, Final, TypeAlias",
         "",
         "from .api import _EXPLICIT_ARGUMENTS, _capture_explicit_arguments",
         "from .config import (",
@@ -146,17 +149,20 @@ def render() -> str:
         "MakegeoSpec: TypeAlias = MakegeoConfig | StageSpec",
         "CalmetSpec: TypeAlias = CalmetConfig | StageSpec",
         "",
-        "_STAGE_PARAMETERS = {",
+        "_STAGE_PARAMETERS: Final[dict[str, tuple[str, ...]]] = {",
     ]
     for stage in STAGES:
         names = tuple(parameter.name for parameter in parameters[stage])
         lines.append(f"    {stage!r}: {names!r},")
-    lines.extend(["}", "_OMITTED_PARAMETERS = {"])
+    lines.extend([
+        "}",
+        "_OMITTED_PARAMETERS: Final[dict[str, tuple[str, ...]]] = {",
+    ])
     for stage in STAGES:
         omitted = _omitted_parameters(config_types[stage], GridConfig)
         # Only public parameters can be selected by the generated wrapper.
-        names = {parameter.name for parameter in parameters[stage]}
-        omitted = tuple(name for name in omitted if name in names)
+        public_names = {parameter.name for parameter in parameters[stage]}
+        omitted = tuple(name for name in omitted if name in public_names)
         lines.append(f"    {stage!r}: {omitted!r},")
     lines.extend([
         "}",
@@ -228,9 +234,9 @@ def render() -> str:
         "        OSError: If a required input cannot be read or the final output cannot",
         "            be written.",
         '    """',
-        "    values = locals()",
-        "    supplied = _EXPLICIT_ARGUMENTS.get() or frozenset()",
-        "    parameter_only = (",
+        "    values: dict[str, Any] = locals()",
+        "    supplied: frozenset[str] = _EXPLICIT_ARGUMENTS.get() or frozenset()",
+        "    parameter_only: bool = (",
         "        inp is None",
         "        and calwrf is None",
         "        and terrel is None",
@@ -240,7 +246,7 @@ def render() -> str:
         "    )",
         "    from .pipeline import _run_pipeline, _select_stage_parameters",
         "",
-        "    stage_parameters = {",
+        "    stage_parameters: dict[str, dict[str, Any]] = {",
         "        stage: _select_stage_parameters(",
         "            stage, values, supplied, _STAGE_PARAMETERS[stage],",
         "            _OMITTED_PARAMETERS[stage], parameter_only=parameter_only,",
@@ -259,7 +265,7 @@ def render() -> str:
         "    )",
         "",
         "",
-        '__all__ = ["run_pipeline"]',
+        '__all__: Final[list[str]] = ["run_pipeline"]',
         "",
     ])
     return "\n".join(lines)

@@ -4,16 +4,33 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime,timedelta
 from pathlib import Path
+from collections.abc import Callable, Sequence
+from typing import Literal, SupportsFloat, TextIO, TypeAlias, cast
 
 import numpy as np
+from numpy.typing import ArrayLike, NDArray
 
+from ._calmet_types import SourceThermalState
+from .config import GridConfig
 from .datetime_utils import expand_year
 
 
-MODEL_DTYPE=np.float32
+MODEL_DTYPE: type[np.float32]=np.float32
+Float32Array: TypeAlias = NDArray[np.float32]
+Float64Array: TypeAlias = NDArray[np.float64]
+Int32Array: TypeAlias = NDArray[np.int32]
+IndexArray: TypeAlias = NDArray[np.intp]
+MM4Scalar: TypeAlias = int | float
+MM4Converter: TypeAlias = Callable[[str], MM4Scalar]
 
 
-def _fields(line: str, widths, converters, label: str):
+
+def _fields(
+    line: str,
+    widths: Sequence[int],
+    converters: Sequence[MM4Converter],
+    label: str,
+) -> list[MM4Scalar]:
     """Decode adjacent fixed-width fields from one MM4.DAT line.
 
     Args:
@@ -28,7 +45,7 @@ def _fields(line: str, widths, converters, label: str):
     Raises:
         ValueError: If any field cannot be converted.
     """
-    values=[]; begin=0
+    values: list[MM4Scalar]=[]; begin=0
     try:
         for width,convert in zip(widths,converters):
             values.append(convert(line[begin:begin+width]))
@@ -62,14 +79,14 @@ class MM4Header:
     hours: int
     model_nx: int
     model_ny: int
-    sigma_levels: np.ndarray
+    sigma_levels: Float32Array
     top_pressure_mb: float
     i_start: int
     j_start: int
-    latitude: np.ndarray
-    longitude: np.ndarray
-    terrain_height_m: np.ndarray
-    landuse: np.ndarray
+    latitude: Float64Array
+    longitude: Float64Array
+    terrain_height_m: Float32Array
+    landuse: Int32Array
 
 
 @dataclass(frozen=True,slots=True)
@@ -89,15 +106,15 @@ class MM4Record:
         wind_speed_m_s: Wind speed in metres per second.
     """
     timestamp: datetime
-    sea_level_pressure_mb: np.ndarray
-    precipitation_mm_h: np.ndarray
-    snow_code: np.ndarray
-    pressure_mb: np.ndarray
-    height_agl_m: np.ndarray
-    temperature_k: np.ndarray
-    relative_humidity: np.ndarray
-    wind_direction_deg: np.ndarray
-    wind_speed_m_s: np.ndarray
+    sea_level_pressure_mb: Float32Array
+    precipitation_mm_h: Float32Array
+    snow_code: Int32Array
+    pressure_mb: Float32Array
+    height_agl_m: Float32Array
+    temperature_k: Float32Array
+    relative_humidity: Float32Array
+    wind_direction_deg: Float32Array
+    wind_speed_m_s: Float32Array
 
 
 @dataclass(frozen=True,slots=True)
@@ -130,25 +147,25 @@ class MM4Interpolated:
         Unless stated otherwise, gridded numeric fields use ``float32`` and
         horizontal shape ``(ny, nx)``.
     """
-    u: np.ndarray
-    v: np.ndarray
-    temperature_k: np.ndarray
-    relative_humidity: np.ndarray
-    pressure_mb: np.ndarray
-    profile_height_m: np.ndarray
-    profile_temperature_k: np.ndarray
-    surface_density: np.ndarray
-    precipitation_mm_h: np.ndarray
-    surface_pressure_mb: np.ndarray
-    surface_relative_humidity: np.ndarray
-    cloud_fraction: np.ndarray
-    ceiling_height_m: np.ndarray
-    precipitation_code: np.ndarray
-    surface_temperature_k: np.ndarray
-    thermal_state: object
-    prognostic_observation_u: np.ndarray | None = None
-    prognostic_observation_v: np.ndarray | None = None
-    prognostic_observation_strength: np.ndarray | None = None
+    u: Float32Array
+    v: Float32Array
+    temperature_k: Float32Array
+    relative_humidity: Float32Array
+    pressure_mb: Float32Array
+    profile_height_m: Float32Array
+    profile_temperature_k: Float32Array
+    surface_density: Float32Array
+    precipitation_mm_h: Float32Array
+    surface_pressure_mb: Float32Array
+    surface_relative_humidity: Float32Array
+    cloud_fraction: Float32Array
+    ceiling_height_m: Float32Array
+    precipitation_code: Int32Array
+    surface_temperature_k: Float32Array
+    thermal_state: SourceThermalState
+    prognostic_observation_u: Float32Array | None = None
+    prognostic_observation_v: Float32Array | None = None
+    prognostic_observation_strength: Float32Array | None = None
 
 
 class MM4Data:
@@ -160,7 +177,7 @@ class MM4Data:
         records: Ordered hourly meteorological records.
     """
 
-    def __init__(self,path):
+    def __init__(self,path: str | Path) -> None:
         """Read and validate a fixed-column MM4.DAT file.
 
         Args:
@@ -171,14 +188,14 @@ class MM4Data:
             UnicodeError: If the source is not ASCII.
             ValueError: If the header or a meteorological record is malformed.
         """
-        self.path=Path(path)
+        self.path: Path=Path(path)
         with self.path.open(encoding='ascii') as stream:
-            self.header=self._read_header(stream)
-            self.records=self._read_records(stream)
+            self.header: MM4Header=self._read_header(stream)
+            self.records: tuple[MM4Record,...]=self._read_records(stream)
         if not self.records: raise ValueError('MM4.DAT contains no meteorological records')
 
     @staticmethod
-    def _line(stream,label):
+    def _line(stream: TextIO,label: str) -> str:
         """Read one required text line without its newline.
 
         Args:
@@ -196,7 +213,7 @@ class MM4Data:
         return line.rstrip('\r\n')
 
     @classmethod
-    def _read_header(cls,stream):
+    def _read_header(cls,stream: TextIO) -> MM4Header:
         """Decode the MM4 model header and static subdomain grid.
 
         Args:
@@ -210,24 +227,29 @@ class MM4Data:
                 invalid.
         """
         label=cls._line(stream,'creation label')[:36]
-        values=_fields(cls._line(stream,'grid header'),(2,2,2,2,4,4,4,4,6),
-                       (int,int,int,int,int,int,int,int,float),'grid header')
-        year,month,day,hour,hours,model_nx,model_ny,nzp,top=values
-        i_start,j_start,nx,ny=_fields(cls._line(stream,'subdomain header'),(4,4,4,4),
-                                     (int,int,int,int),'subdomain header')
+        grid_fields=cast(tuple[int,int,int,int,int,int,int,int,float],tuple(
+            _fields(cls._line(stream,'grid header'),(2,2,2,2,4,4,4,4,6),
+                    (int,int,int,int,int,int,int,int,float),'grid header')))
+        year,month,day,hour,hours,model_nx,model_ny,nzp,top=grid_fields
+        subdomain_fields=cast(tuple[int,int,int,int],tuple(
+            _fields(cls._line(stream,'subdomain header'),(4,4,4,4),
+                    (int,int,int,int),'subdomain header')))
+        i_start,j_start,nx,ny=subdomain_fields
         if min(hours,model_nx,model_ny,nzp,nx,ny)<=0:
             raise ValueError('MM4.DAT header dimensions and duration must be positive')
-        sigma=np.array([float(cls._line(stream,f'sigma level {index+1}')[:6])
-                        for index in range(nzp)],dtype=MODEL_DTYPE)
-        latitude=np.empty((ny,nx),dtype=np.float64)
-        longitude=np.empty((ny,nx),dtype=np.float64)
-        terrain=np.empty((ny,nx),dtype=MODEL_DTYPE)
-        landuse=np.empty((ny,nx),dtype=np.int32)
+        sigma: Float32Array=np.array(
+            [float(cls._line(stream,f'sigma level {index+1}')[:6])
+             for index in range(nzp)],dtype=MODEL_DTYPE)
+        latitude: Float64Array=np.empty((ny,nx),dtype=np.float64)
+        longitude: Float64Array=np.empty((ny,nx),dtype=np.float64)
+        terrain: Float32Array=np.empty((ny,nx),dtype=MODEL_DTYPE)
+        landuse: Int32Array=np.empty((ny,nx),dtype=np.int32)
         for j in range(ny):
             for i in range(nx):
-                values=_fields(cls._line(stream,'static grid'),(3,3,7,8,5,3),
-                               (int,int,float,float,int,int),'static grid')
-                ii,jj,latitude[j,i],longitude[j,i],terrain[j,i],landuse[j,i]=values
+                static_fields=cast(tuple[int,int,float,float,int,int],tuple(
+                    _fields(cls._line(stream,'static grid'),(3,3,7,8,5,3),
+                            (int,int,float,float,int,int),'static grid')))
+                ii,jj,latitude[j,i],longitude[j,i],terrain[j,i],landuse[j,i]=static_fields
                 if (ii,jj)!=(i_start+i,j_start+j):
                     raise ValueError(f'MM4.DAT static grid index {(ii,jj)} does not match '
                                      f'expected {(i_start+i,j_start+j)}')
@@ -235,7 +257,7 @@ class MM4Data:
                          model_ny,sigma,top,i_start,j_start,latitude,longitude,
                          terrain,landuse)
 
-    def _read_records(self,stream):
+    def _read_records(self,stream: TextIO) -> tuple[MM4Record,...]:
         """Decode all remaining hourly surface and vertical records.
 
         Args:
@@ -249,21 +271,23 @@ class MM4Data:
                 unexpected grid index.
         """
         header=self.header; ny,nx=header.latitude.shape; levels=8+header.sigma_levels.size
-        records=[]
+        records: list[MM4Record]=[]
         while True:
             first=stream.readline()
             if not first: break
-            surface=np.empty((ny,nx,3),dtype=MODEL_DTYPE)
-            pressure=np.empty((levels,ny,nx),dtype=MODEL_DTYPE); height=np.empty_like(pressure)
-            encoded_temperature=np.empty_like(pressure); depression=np.empty_like(pressure)
-            direction=np.empty_like(pressure); speed=np.empty_like(pressure)
-            timestamp=None
+            surface: Float32Array=np.empty((ny,nx,3),dtype=MODEL_DTYPE)
+            pressure: Float32Array=np.empty((levels,ny,nx),dtype=MODEL_DTYPE); height: Float32Array=np.empty_like(pressure)
+            encoded_temperature: Float32Array=np.empty_like(pressure); depression: Float32Array=np.empty_like(pressure)
+            direction: Float32Array=np.empty_like(pressure); speed: Float32Array=np.empty_like(pressure)
+            timestamp: datetime | None=None
             for j in range(ny):
                 for i in range(nx):
                     line=first.rstrip('\r\n') if i==0 and j==0 else self._line(stream,'surface data')
-                    values=_fields(line,(2,2,2,2,3,3,7,5,2),
-                                   (int,int,int,int,int,int,float,float,int),'surface data')
-                    year,month,day,hour,ii,jj,pmsl,rain,snow=values
+                    surface_fields=cast(
+                        tuple[int,int,int,int,int,int,float,float,int],
+                        tuple(_fields(line,(2,2,2,2,3,3,7,5,2),
+                            (int,int,int,int,int,int,float,float,int),'surface data')))
+                    year,month,day,hour,ii,jj,pmsl,rain,snow=surface_fields
                     current=datetime(expand_year(year),month,day,hour)
                     if timestamp is None: timestamp=current
                     if current!=timestamp: raise ValueError('MM4.DAT grid cells have inconsistent timestamps')
@@ -272,10 +296,11 @@ class MM4Data:
                         raise ValueError(f'MM4.DAT data grid index {(ii,jj)} does not match expected {expected}')
                     surface[j,i]=(pmsl,rain*10.,snow)
                     for level in range(levels):
-                        values=_fields(self._line(stream,'vertical data'),(5,6,4,2,4,2),
-                                       (float,float,int,int,float,float),'vertical data')
+                        vertical_fields=cast(tuple[float,float,int,int,float,float],tuple(
+                            _fields(self._line(stream,'vertical data'),(5,6,4,2,4,2),
+                                    (float,float,int,int,float,float),'vertical data')))
                         pressure[level,j,i],height[level,j,i],encoded_temperature[level,j,i],\
-                            depression[level,j,i],direction[level,j,i],speed[level,j,i]=values
+                            depression[level,j,i],direction[level,j,i],speed[level,j,i]=vertical_fields
             negative=(encoded_temperature.astype(np.int64)%2)!=0
             temperature_c=(np.where(negative,-encoded_temperature,
                                     encoded_temperature)/MODEL_DTYPE(10.))
@@ -293,13 +318,13 @@ class MM4Data:
                 MODEL_DTYPE(100.),
                 (numerator/denominator)**8*MODEL_DTYPE(100.),
             )
-            records.append(MM4Record(timestamp,surface[...,0],surface[...,1],
+            records.append(MM4Record(cast(datetime,timestamp),surface[...,0],surface[...,1],
                 surface[...,2].astype(np.int32),pressure,height-header.terrain_height_m,
-                temperature_c+MODEL_DTYPE(273.15),relative_humidity,direction,
+                cast(Float32Array,temperature_c+MODEL_DTYPE(273.15)),relative_humidity,direction,
                 speed*MODEL_DTYPE(.51444)))
         return tuple(records)
 
-    def at_time(self,timestamp):
+    def at_time(self,timestamp: datetime) -> MM4Record:
         """Select the record with an exact timestamp.
 
         Args:
@@ -316,7 +341,9 @@ class MM4Data:
         raise ValueError(f'MM4.DAT has no record for {timestamp}')
 
     @staticmethod
-    def _sorted_above_ground_profiles(**fields):
+    def _sorted_above_ground_profiles(
+        **fields: ArrayLike,
+    ) -> dict[str,NDArray[np.generic]]:
         """Sort profiles, discard underground levels, and remove duplicates.
 
         Args:
@@ -335,8 +362,9 @@ class MM4Data:
         if any(np.asarray(values).shape!=height.shape for values in fields.values()):
             raise ValueError('MM4.DAT profile fields must have identical shapes')
         levels,ny,nx=height.shape
-        packed={name:np.empty_like(np.asarray(values))
-                for name,values in fields.items()}
+        packed: dict[str,NDArray[np.generic]]={
+            name:np.empty_like(np.asarray(values)) for name,values in fields.items()
+        }
         for j in range(ny):
             for i in range(nx):
                 order=np.argsort(height[:,j,i],kind='stable')
@@ -353,7 +381,11 @@ class MM4Data:
         return packed
 
     @staticmethod
-    def _interpolate_pressure_level(values,pressure_mb,target_pressure_mb):
+    def _interpolate_pressure_level(
+        values: ArrayLike,
+        pressure_mb: ArrayLike,
+        target_pressure_mb: SupportsFloat,
+    ) -> Float32Array:
         """Interpolate columns to pressure using nearest endpoint extrapolation.
 
         Args:
@@ -372,7 +404,7 @@ class MM4Data:
         pressure=np.asarray(pressure_mb)
         if values.shape!=pressure.shape or values.ndim!=3:
             raise ValueError('MM4 pressure interpolation fields must share a 3-D shape')
-        result=np.empty(values.shape[1:],dtype=MODEL_DTYPE)
+        result: Float32Array=np.empty(values.shape[1:],dtype=MODEL_DTYPE)
         for j in range(values.shape[1]):
             for i in range(values.shape[2]):
                 column_pressure=np.asarray(pressure[:,j,i],dtype=np.float64)
@@ -394,13 +426,23 @@ class MM4Data:
                 result[j,i]=np.interp(float(target_pressure_mb),unique,averaged)
         return result
 
-    def interpolate_record(self,record,grid,target_height_m,*,cloud_method=4,
-                           precipitation_method=2,precipitation_radius_km=50.,
-                           precipitation_cutoff=.01,base_timezone=0,
-                           thermal_state=None,prognostic_observation_rmin_km=None,
-                           prognostic_observation_barriers=(),
-                           prognostic_observation_barrier_top_level=0,
-                           prognostic_ocean_category=16):
+    def interpolate_record(
+        self,
+        record: MM4Record,
+        grid: GridConfig,
+        target_height_m: ArrayLike,
+        *,
+        cloud_method: int=4,
+        precipitation_method: Literal[1,2,3]=2,
+        precipitation_radius_km: float=50.,
+        precipitation_cutoff: float=.01,
+        base_timezone: int=0,
+        thermal_state: SourceThermalState | None=None,
+        prognostic_observation_rmin_km: float | None=None,
+        prognostic_observation_barriers: Sequence[tuple[float,float,float,float]]=(),
+        prognostic_observation_barrier_top_level: int=0,
+        prognostic_ocean_category: int=16,
+    ) -> MM4Interpolated:
         """Apply RDHD4/RDMM4 vertical and four-neighbour interpolation.
 
         Args:
@@ -435,7 +477,7 @@ class MM4Data:
                 target heights or thermal state are invalid, or
                 ``cloud_method`` is outside the supported values 3 and 4.
         """
-        from .calmet_solver import (PrognosticMapper,SourceThermalState,
+        from .calmet_solver import (PrognosticMapper,
                                     _prognostic_wind_components,_stull_temperature,_vertical_centers,
                                     solar_at_step_midpoint)
         from .calmet_numerics import (cloud_cover_mm5,cloud_fraction,
@@ -449,16 +491,19 @@ class MM4Data:
             height=record.height_agl_m,temperature=record.temperature_k,
             humidity=record.relative_humidity,pressure=record.pressure_mb,
             direction=record.wind_direction_deg,speed=record.wind_speed_m_s)
-        height=profiles['height']; temperature=profiles['temperature']
-        humidity=profiles['humidity']; pressure=profiles['pressure']
-        direction=profiles['direction']; speed=profiles['speed']
+        height=cast(Float32Array,profiles['height'])
+        temperature=cast(Float32Array,profiles['temperature'])
+        humidity=cast(Float32Array,profiles['humidity'])
+        pressure=cast(Float32Array,profiles['pressure'])
+        direction=cast(Float32Array,profiles['direction'])
+        speed=cast(Float32Array,profiles['speed'])
         convergence=grid_convergence(grid,self.header.longitude,self.header.latitude)
         source_u,source_v=_prognostic_wind_components(
             speed,direction,convergence[None,:,:])
-        centers=np.asarray(target_height_m,dtype=MODEL_DTYPE)
+        centers: Float32Array=np.asarray(target_height_m,dtype=MODEL_DTYPE)
         if centers.ndim!=1 or centers.size<1:
             raise ValueError('target MM4 heights must be a non-empty vector')
-        def wind_centers(field):
+        def wind_centers(field: Float32Array) -> Float32Array:
             """Interpolate a wind component vertically with surface log law.
 
             Args:
@@ -487,6 +532,9 @@ class MM4Data:
             return base
         source_u_centers=wind_centers(source_u); source_v_centers=wind_centers(source_v)
         u=mapper.interpolate(source_u_centers); v=mapper.interpolate(source_v_centers)
+        observation_u: Float32Array | None
+        observation_v: Float32Array | None
+        observation_strength: Float32Array | None
         observation_u=observation_v=observation_strength=None
         if prognostic_observation_rmin_km is not None:
             observation_u,observation_strength=mapper.interpolate_observations(
@@ -504,7 +552,10 @@ class MM4Data:
         for level in range(2,height.shape[0]):
             duplicate=zflat[following,columns]==zflat[anchor,columns]
             following=np.where(duplicate,np.minimum(following+1,height.shape[0]-1),following)
-        def gather(values,index):
+        def gather(
+            values: Float32Array,
+            index: IndexArray,
+        ) -> Float32Array:
             """Gather a different vertical index in every source column.
 
             Args:
@@ -609,7 +660,7 @@ class MM4Data:
             precipitation_radius_km,method=precipitation_method,cutoff=precipitation_cutoff)
         precipitation_code=np.where(precipitation>0.,
             np.where(mapped_temperature[0]<273.15,20,10),0).astype(np.int32)
-        def as_model(value):
+        def as_model(value: ArrayLike) -> Float32Array:
             """Cast a result field to the model's ``float32`` dtype.
 
             Args:

@@ -1,15 +1,24 @@
 """Reader for CALMET.AUX 1.1 cloud-liquid-water files."""
 from __future__ import annotations
 
+from typing import ClassVar, TypeAlias, cast
+
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import struct
+from types import TracebackType
 
 import numpy as np
+from numpy.typing import NDArray
 
 from .legacy_io import FortranSequentialReader
 from .datetime_utils import parse_calendar,parse_ordinal_code
+
+
+Float32Array: TypeAlias = NDArray[np.float32]
+BoolArray: TypeAlias = NDArray[np.bool_]
+Int64Array: TypeAlias = NDArray[np.int64]
 
 
 @dataclass(frozen=True,slots=True)
@@ -68,7 +77,7 @@ class AuxiliaryHeader:
     longitude_origin: float
     standard_parallel_1: float
     standard_parallel_2: float
-    z_faces_m: np.ndarray
+    z_faces_m: Float32Array
 
 
 @dataclass(frozen=True,slots=True)
@@ -92,10 +101,10 @@ class AuxiliaryCloudHour:
     begin: datetime
     end: datetime
     wire_time_bounds: tuple[int,int,int,int]
-    cloud_water_above_g_kg: np.ndarray
-    cloud_bottom_above_m: np.ndarray
-    cloud_top_above_m: np.ndarray
-    cloud_water_3d_g_kg: np.ndarray
+    cloud_water_above_g_kg: Float32Array
+    cloud_bottom_above_m: Float32Array
+    cloud_top_above_m: Float32Array
+    cloud_water_3d_g_kg: Float32Array
 
 
 class AuxiliaryData:
@@ -107,9 +116,11 @@ class AuxiliaryData:
             most recently consumed record.
         header: Validated static file metadata.
     """
-    _fields_2d=('CLDMRUP','ZCLDBOT','ZCLDTOP')
+    _fields_2d: ClassVar[tuple[str, str, str]] = (
+        'CLDMRUP', 'ZCLDBOT', 'ZCLDTOP'
+    )
 
-    def __init__(self,path: str | Path):
+    def __init__(self,path: str | Path) -> None:
         """Open a CALMET.AUX file and read its static header.
 
         Args:
@@ -120,12 +131,12 @@ class AuxiliaryData:
             ValueError: If the declaration, grid metadata, variable table, or
                 vertical coordinates are invalid or unsupported.
         """
-        self.path=Path(path)
-        self.reader=FortranSequentialReader(self.path)
-        self.header=self._read_header()
+        self.path: Path=Path(path)
+        self.reader: FortranSequentialReader=FortranSequentialReader(self.path)
+        self.header: AuxiliaryHeader=self._read_header()
 
     @staticmethod
-    def _text(value):
+    def _text(value: bytes) -> str:
         """Decode one fixed-width ASCII field and remove trailing spaces.
 
         Args:
@@ -139,7 +150,7 @@ class AuxiliaryData:
         """
         return value.decode('ascii').rstrip()
 
-    def _record(self,description):
+    def _record(self,description: str) -> bytes:
         """Read one required Fortran record.
 
         Args:
@@ -155,7 +166,7 @@ class AuxiliaryData:
         if record is None: raise ValueError(f'truncated CALMET.AUX {description}')
         return record
 
-    def _read_header(self):
+    def _read_header(self) -> AuxiliaryHeader:
         """Decode and validate the declaration and static metadata records.
 
         Returns:
@@ -190,14 +201,14 @@ class AuxiliaryData:
         datum_date=self._text(run[92:104])
         false_easting,false_northing=struct.unpack('<2f',run[104:112])
         hemisphere=self._text(run[112:116]); utm_zone=struct.unpack('<i',run[116:120])[0]
-        angles=struct.unpack('<4f',run[120:136])
+        angles=cast(tuple[float,float,float,float],struct.unpack('<4f',run[120:136]))
         naux2d,naux3d=struct.unpack('<2i',run[136:144])
         if (nx<=0 or ny<=0 or nz<=0 or naux2d!=3 or naux3d!=1):
             raise ValueError('unsupported CALMET.AUX grid or variable counts')
         zface=self._record('ZFACE')
         if len(zface)!=24+4*(nz+1) or self._text(zface[:8])!='ZFACE':
             raise ValueError('invalid CALMET.AUX ZFACE record')
-        faces=np.frombuffer(zface[24:],dtype='<f4').copy()
+        faces: Float32Array=np.frombuffer(zface[24:],dtype='<f4').copy()
         if faces[0]!=0. or np.any(np.diff(faces)<=0.):
             raise ValueError('invalid CALMET.AUX vertical faces')
         expected_2d=(b'2D_VARS '+b''.join(name.encode().ljust(8,b' ') for name in self._fields_2d)+
@@ -207,13 +218,15 @@ class AuxiliaryData:
             raise ValueError('unsupported CALMET.AUX 2-D variable table')
         if self._record('3-D variables')!=expected_3d:
             raise ValueError('unsupported CALMET.AUX 3-D variable table')
-        return AuxiliaryHeader(comments,start,end,dates[:5],dates[5:],timezone,
+        return AuxiliaryHeader(comments,start,end,
+            cast(tuple[int,int,int,int,int],dates[:5]),
+            cast(tuple[int,int,int,int,int],dates[5:]),timezone,
             run_hours,nx,ny,nz,
             spacing,x_origin,y_origin,projection,datum,datum_date,false_easting,
             false_northing,hemisphere,utm_zone,*angles,faces)
 
     @staticmethod
-    def _decode_timestamp(record):
+    def _decode_timestamp(record: bytes) -> tuple[datetime,datetime,tuple[int,int,int,int]]:
         """Decode one CALMET.AUX interval timestamp record.
 
         Args:
@@ -240,7 +253,7 @@ class AuxiliaryData:
             raise ValueError('CALMET.AUX interval does not advance')
         return begin,end,(begin_code,begin_seconds,end_code,end_seconds)
 
-    def _timestamp(self):
+    def _timestamp(self) -> tuple[datetime,datetime]:
         """Read the next timestamp record.
 
         Returns:
@@ -251,7 +264,7 @@ class AuxiliaryData:
         """
         return self._decode_timestamp(self._record('timestamp'))[:2]
 
-    def _compressed(self,label):
+    def _compressed(self,label: str) -> Float32Array:
         """Decode one CALMET zero-run-compressed two-dimensional field.
 
         Args:
@@ -271,18 +284,18 @@ class AuxiliaryData:
         record=self._record(label)
         if len(record)!=12+4*count or self._text(record[:12])!=label:
             raise ValueError(f'invalid CALMET.AUX {label} record')
-        encoded=np.frombuffer(record[12:],dtype='<f4')
-        negative=encoded<0.
-        lengths=np.where(negative,np.trunc(-encoded).astype(np.int64),1)
-        ends=np.cumsum(lengths)
+        encoded: Float32Array=np.frombuffer(record[12:],dtype='<f4')
+        negative: BoolArray=encoded<0.
+        lengths: Int64Array=np.where(negative,np.trunc(-encoded).astype(np.int64),1)
+        ends: Int64Array=np.cumsum(lengths)
         size=self.header.nx*self.header.ny
         if count<1 or ends[-1]!=size:
             raise ValueError(f'CALMET.AUX {label} compression length mismatch')
-        values=np.zeros(size,dtype=np.float32)
+        values: Float32Array=np.zeros(size,dtype=np.float32)
         values[ends[~negative]-1]=encoded[~negative]
         return values.reshape(self.header.ny,self.header.nx)
 
-    def read_hour(self):
+    def read_hour(self) -> AuxiliaryCloudHour | None:
         """Read the next complete cloud-water interval.
 
         Returns:
@@ -298,22 +311,24 @@ class AuxiliaryData:
         if first is None: return None
         begin,end,wire_time_bounds=self._decode_timestamp(first)
         stamp=begin,end
-        fields=[]
+        fields: list[Float32Array]=[]
         for index,label in enumerate(self._fields_2d):
             if index and self._timestamp()!=stamp:
                 raise ValueError('CALMET.AUX 2-D timestamps are inconsistent')
             fields.append(self._compressed(label))
         if self._timestamp()!=stamp:
             raise ValueError('CALMET.AUX 3-D timestamp is inconsistent')
-        layers=np.stack([self._compressed(f'CLDMR3D {level:04d}')
-                         for level in range(1,self.header.nz+1)])
-        return AuxiliaryCloudHour(begin,end,wire_time_bounds,*fields,layers)
+        layers: Float32Array=np.stack([self._compressed(f'CLDMR3D {level:04d}')
+                                              for level in range(1,self.header.nz+1)])
+        typed_fields=cast(
+            tuple[Float32Array,Float32Array,Float32Array],fields)
+        return AuxiliaryCloudHour(begin,end,wire_time_bounds,*typed_fields,layers)
 
-    def close(self):
+    def close(self) -> None:
         """Close the underlying sequential-record stream."""
         self.reader.close()
 
-    def __enter__(self):
+    def __enter__(self) -> AuxiliaryData:
         """Return this reader for use as a context manager.
 
         Returns:
@@ -321,12 +336,20 @@ class AuxiliaryData:
         """
         return self
 
-    def __exit__(self,*exc):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         """Close the reader when leaving a context-manager block.
 
         Args:
-            *exc: Exception type, value, and traceback supplied by the context
-                manager protocol.
+            exc_type: Exception class supplied by the context manager protocol.
+            exc_value: Exception instance supplied by the context manager
+                protocol.
+            traceback: Exception traceback supplied by the context manager
+                protocol.
 
         Returns:
             ``None``; exceptions are not suppressed.

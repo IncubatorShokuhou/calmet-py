@@ -4,20 +4,69 @@ Array axes follow the Python convention ``(..., y, x)``.  These routines are
 kept free of model-global state so the main solver can compose them directly.
 """
 from __future__ import annotations
+from collections.abc import Callable, Iterable, Sequence
 from functools import lru_cache
+from typing import TypeAlias, TypeVar, cast
+
 import numpy as np
+from numpy.typing import ArrayLike, NDArray
+
+from .coare import WarmLayerState
 
 
 # Physical fields and model state use single precision throughout the modern
 # solver.  Double precision is reserved for coordinates, reductions, and
 # nonlinear convergence work where single-precision cancellation can change
 # a grid-cell classification or prevent convergence.
-MODEL_DTYPE = np.float32
-ACCUMULATION_DTYPE = np.float64
-COORDINATE_DTYPE = np.float64
+_FloatT = TypeVar("_FloatT", np.float32, np.float64)
+
+Float32Array: TypeAlias = NDArray[np.float32]
+Float64Array: TypeAlias = NDArray[np.float64]
+FloatingArray: TypeAlias = Float32Array | Float64Array
+FloatingDType: TypeAlias = (
+    type[np.float32] | np.dtype[np.float32]
+    | type[np.float64] | np.dtype[np.float64]
+)
+FloatPair: TypeAlias = tuple[Float32Array, Float32Array]
+FloatTriple: TypeAlias = tuple[Float32Array, Float32Array, Float32Array]
+FloatQuad: TypeAlias = tuple[
+    Float32Array, Float32Array, Float32Array, Float32Array
+]
+FloatSix: TypeAlias = tuple[
+    Float32Array, Float32Array, Float32Array, Float32Array, Float32Array,
+    Float32Array,
+]
+FloatEight: TypeAlias = tuple[
+    Float32Array, Float32Array, Float32Array, Float32Array, Float32Array,
+    Float32Array, Float32Array, Float32Array,
+]
+FloatNine: TypeAlias = tuple[
+    Float32Array, Float32Array, Float32Array, Float32Array, Float32Array,
+    Float32Array, Float32Array, Float32Array, Float32Array,
+]
+CoareStationResult: TypeAlias = tuple[
+    Float32Array, Float32Array, Float32Array, Float32Array, Float32Array,
+    Float32Array, Float32Array, Float32Array, Float32Array,
+    WarmLayerState | None,
+]
+BoolArray: TypeAlias = NDArray[np.bool_]
+Int8Array: TypeAlias = NDArray[np.int8]
+Int32Array: TypeAlias = NDArray[np.int32]
+IntArray: TypeAlias = NDArray[np.int_]
+WarmStateArray: TypeAlias = Float64Array | BoolArray
+WaterRange: TypeAlias = tuple[int, int]
+GridBoundaries: TypeAlias = tuple[ArrayLike, ArrayLike, ArrayLike, ArrayLike]
+LakeBreezeRegion: TypeAlias = tuple[
+    float, float, float, float, float, float, float, float, Sequence[int]
+]
+MixingOption: TypeAlias = ArrayLike | float | int | bool | None
+
+MODEL_DTYPE: type[np.float32] = np.float32
+ACCUMULATION_DTYPE: type[np.float64] = np.float64
+COORDINATE_DTYPE: type[np.float64] = np.float64
 
 
-def _model_array(value):
+def _model_array(value: ArrayLike) -> Float32Array:
     """Convert a numerical result to the model-state precision.
 
     Args:
@@ -30,7 +79,11 @@ def _model_array(value):
     return np.asarray(value, dtype=MODEL_DTYPE)
 
 
-def _psiud(z_over_l,*,dtype=MODEL_DTYPE):
+def _psiud(
+    z_over_l: ArrayLike,
+    *,
+    dtype: FloatingDType = MODEL_DTYPE,
+) -> FloatingArray:
     """Evaluate CALMET's COARE/Dyer momentum stability function.
 
     Args:
@@ -45,7 +98,13 @@ def _psiud(z_over_l,*,dtype=MODEL_DTYPE):
     return psi_momentum_dyer(z_over_l,dtype=dtype)
 
 
-def _psiuc(height,monin_obukhov,fit=16,*,dtype=MODEL_DTYPE):
+def _psiuc(
+    height: ArrayLike,
+    monin_obukhov: ArrayLike,
+    fit: int = 16,
+    *,
+    dtype: FloatingDType = MODEL_DTYPE,
+) -> FloatingArray:
     """Evaluate the PSIUC momentum correction used when ``IPSIFCN=1``.
 
     Args:
@@ -78,12 +137,12 @@ def _psiuc(height,monin_obukhov,fit=16,*,dtype=MODEL_DTYPE):
         second=np.log(.5*(1.+x*x))
         output[unstable]=(2.*first[unstable]+second[unstable]-
                           2.*np.arctan(x[unstable])+np.pi/2.)
-    return output
+    return cast(FloatingArray, output)
 
 
-def similarity_wind_profiles(u,v,anemometer_height_m,z_centers_m,z_faces_m,
-        roughness_m,monin_obukhov_m,mixing_height_m,station_latitude,*,
-        ipsifcn=0,minimum_mixing_height_m=50.):
+def similarity_wind_profiles(u: ArrayLike,v: ArrayLike,anemometer_height_m: ArrayLike,z_centers_m: ArrayLike,z_faces_m: ArrayLike,
+        roughness_m: ArrayLike,monin_obukhov_m: ArrayLike,mixing_height_m: ArrayLike,station_latitude: ArrayLike,*,
+        ipsifcn: int=0,minimum_mixing_height_m: float=50.) -> tuple[Float32Array, Float32Array]:
     """Construct vectorized CALMET SIMILT station wind profiles.
 
     Args:
@@ -174,7 +233,7 @@ def similarity_wind_profiles(u,v,anemometer_height_m,z_centers_m,z_faces_m,
     return output_u,output_v
 
 def cloud_liquid_water_profile(
-        cloud_water_g_kg,height_agl_m,z_faces_m,threshold_g_kg=.005):
+        cloud_water_g_kg: ArrayLike,height_agl_m: ArrayLike,z_faces_m: ArrayLike,threshold_g_kg: float=.005) -> tuple[Float32Array, Float32Array, Float32Array, Float32Array]:
     """Map source cloud liquid water to CALMET layers and above-model fields.
 
     Args:
@@ -241,11 +300,11 @@ def cloud_liquid_water_profile(
         top=np.where(selected,np.maximum(top,upper),top)
     average=np.divide(weighted,weight,out=np.zeros_like(weighted),where=weight>0.)
     reported=average>=threshold
-    return tuple(_model_array(value) for value in (
+    return cast(FloatQuad,tuple(_model_array(value) for value in (
         mapped,np.where(reported,average,0.),np.where(reported,bottom,0.),
-        np.where(reported,top,0.)))
+        np.where(reported,top,0.))))
 
-def density_from_pressure_temperature(pressure_mb,temperature_k):
+def density_from_pressure_temperature(pressure_mb: ArrayLike,temperature_k: ArrayLike) -> Float32Array:
     """Calculate dry-air density with CALMET's AIRDEN ideal-gas expression.
 
     Args:
@@ -260,7 +319,7 @@ def density_from_pressure_temperature(pressure_mb,temperature_k):
     temperature=np.asarray(temperature_k,dtype=MODEL_DTYPE)
     return _model_array(.3484321*pressure/temperature)
 
-def coriolis_parameter(latitude_degrees, configured_value=999.):
+def coriolis_parameter(latitude_degrees: ArrayLike, configured_value: float=999.) -> Float32Array:
     """Calculate CALMET's absolute Coriolis field with an equatorial floor.
 
     Args:
@@ -281,7 +340,7 @@ def coriolis_parameter(latitude_degrees, configured_value=999.):
         value=np.full_like(latitude,np.float64(configured_value))
     return _model_array(np.maximum(np.abs(value),np.float64(.25e-4)))
 
-def inverse_distance_squared(values, point_x, point_y, sample_x, sample_y, *, ignore_zero=False):
+def inverse_distance_squared(values: ArrayLike, point_x: ArrayLike, point_y: ArrayLike, sample_x: ArrayLike, sample_y: ArrayLike, *, ignore_zero: bool=False) -> Float32Array:
     """Interpolate samples with CALMET R2INTERP inverse-square weighting.
 
     Args:
@@ -312,8 +371,8 @@ def inverse_distance_squared(values, point_x, point_y, sample_x, sample_y, *, ig
     return _model_array(result)
 
 
-def lake_breeze_adjust(u, v, station_u, station_v, station_xy_m,
-                       station_ids, regions, dx_m, dy_m):
+def lake_breeze_adjust(u: ArrayLike, v: ArrayLike, station_u: ArrayLike, station_v: ArrayLike, station_xy_m: ArrayLike,
+                       station_ids: ArrayLike, regions: Iterable[LakeBreezeRegion], dx_m: float, dy_m: float) -> tuple[Float32Array, Float32Array]:
     """Apply LLBREEZ coast-distance interpolation to the lowest wind layer.
 
     Args:
@@ -359,12 +418,12 @@ def lake_breeze_adjust(u, v, station_u, station_v, station_xy_m,
         xg1,xg2,yg1,yg2,x_begin,y_begin,x_end,y_end=(
             np.float64(value) for value in region[:8])
         selected=region[8]
-        selected=np.asarray(selected,dtype=np.int64)
-        if selected.size==0:
+        selected=cast(Sequence[int],np.asarray(selected,dtype=np.int64))
+        if cast(IntArray,selected).size==0:
             raise ValueError('lake-breeze region must contain at least one station')
-        lookup={}
+        lookup: dict[int, int] = {}
         for index,value in enumerate(ids): lookup.setdefault(int(value),index)
-        try: indices=np.asarray([lookup[int(value)] for value in selected],dtype=np.intp)
+        try: indices=np.asarray([lookup[int(value)] for value in cast(IntArray,selected)],dtype=np.intp)
         except KeyError as error:
             raise ValueError(f'lake-breeze station ID {error.args[0]} is not available') from error
         xcd=np.float64(x_begin-x_end); ycd=np.float64(y_begin-y_end)
@@ -406,7 +465,7 @@ def lake_breeze_adjust(u, v, station_u, station_v, station_xy_m,
         values_u=su[indices]; values_v=sv[indices]
         valid_u=values_u<990.; valid_v=values_v<990.
         if valid_u.any() and valid_v.any():
-            def interpolate(values,valid):
+            def interpolate(values: Float32Array,valid: BoolArray) -> Float64Array:
                 """Interpolate one station component to active region cells.
 
                 Args:
@@ -430,7 +489,7 @@ def lake_breeze_adjust(u, v, station_u, station_v, station_xy_m,
             result_v[0,target_y,target_x]=interpolated_v
     return result_u,result_v
 
-def wind_speed_direction(u,v):
+def wind_speed_direction(u: ArrayLike,v: ArrayLike) -> tuple[Float32Array, Float32Array]:
     """Convert vector wind to CALMET RTHETA speed and direction.
 
     Args:
@@ -450,7 +509,7 @@ def wind_speed_direction(u,v):
                        np.where(direction==0.,360.,direction))
     return _model_array(speed),_model_array(direction)
 
-def cloud_fraction(relative_humidity_percent):
+def cloud_fraction(relative_humidity_percent: ArrayLike) -> Float32Array:
     """Diagnose CLOUD3 cloud fraction with the Teixeira relation.
 
     Args:
@@ -469,7 +528,7 @@ def cloud_fraction(relative_humidity_percent):
     result[active]=.02*(-1.+root)/gap[active]
     return result
 
-def cloud_cover_teixeira_850(relative_humidity_percent,pressure_mb):
+def cloud_cover_teixeira_850(relative_humidity_percent: ArrayLike,pressure_mb: ArrayLike) -> Float32Array:
     """Diagnose CLOUD3 cover at the last level at or above 850 mb.
 
     Args:
@@ -493,7 +552,7 @@ def cloud_cover_teixeira_850(relative_humidity_percent,pressure_mb):
     rh850=np.where(below.any(axis=0),rh[level,yy,xx],0.)
     return cloud_fraction(rh850)
 
-def cloud_cover_mm5(relative_humidity_percent, pressure_mb, height_m):
+def cloud_cover_mm5(relative_humidity_percent: ArrayLike, pressure_mb: ArrayLike, height_m: ArrayLike) -> tuple[Float32Array, Float32Array]:
     """Diagnose CLOUD4 low, middle, and high cloud cover and ceiling.
 
     Args:
@@ -516,7 +575,7 @@ def cloud_cover_mm5(relative_humidity_percent, pressure_mb, height_m):
     height=np.asarray(height_m,dtype=MODEL_DTYPE)
     if rh.shape!=pressure.shape or rh.shape!=height.shape or rh.ndim!=3: raise ValueError('cloud profiles must share shape (z,y,x)')
     nz=rh.shape[0]; levels=np.arange(nz)[:,None,None]
-    def first_below(threshold):
+    def first_below(threshold: float) -> IntArray:
         """Find the first level whose pressure is below a threshold.
 
         Args:
@@ -529,7 +588,7 @@ def cloud_cover_mm5(relative_humidity_percent, pressure_mb, height_m):
         mask=pressure<threshold
         return np.where(mask.any(axis=0),mask.argmax(axis=0),nz)
     klo,kmid,khi=first_below(970.),first_below(800.),first_below(450.)
-    def band_max(start,stop=None):
+    def band_max(start: IntArray,stop: IntArray | None=None) -> Float32Array:
         """Find maximum relative humidity within column-specific level bands.
 
         Args:
@@ -557,7 +616,7 @@ def cloud_cover_mm5(relative_humidity_percent, pressure_mb, height_m):
     yy,xx=np.indices(cover.shape); ceiling[valid]=height[ceiling_level[valid],yy[valid],xx[valid]]
     return cover,ceiling
 
-def lapse_rate(temperature_k, previous_convective_height_m, z_centers_m, height_m=200., *, spatial=True):
+def lapse_rate(temperature_k: ArrayLike, previous_convective_height_m: ArrayLike, z_centers_m: ArrayLike, height_m: float=200., *, spatial: bool=True) -> Float32Array:
     """Diagnose the CGAMMA2 near-surface potential-temperature lapse rate.
 
     Args:
@@ -595,9 +654,9 @@ def lapse_rate(temperature_k, previous_convective_height_m, z_centers_m, height_
     average=np.mean(gamma,dtype=ACCUMULATION_DTYPE)
     return np.full_like(gamma,average)
 
-def froude_adjustment(u, v, terrain_m, maximum_terrain_m, gamma_k_per_m,
-                      temperature_k, z_centers_m, critical_froude,
-                      dx_m, dy_m):
+def froude_adjustment(u: ArrayLike, v: ArrayLike, terrain_m: ArrayLike, maximum_terrain_m: ArrayLike, gamma_k_per_m: ArrayLike,
+                      temperature_k: ArrayLike, z_centers_m: ArrayLike, critical_froude: ArrayLike,
+                      dx_m: float, dy_m: float) -> tuple[Float32Array, Float32Array]:
     """Apply CALMET FRADJ terrain blocking while conserving wind speed.
 
     Args:
@@ -657,7 +716,7 @@ def froude_adjustment(u, v, terrain_m, maximum_terrain_m, gamma_k_per_m,
     v=np.where(active,tangent_v*speed,v)
     return _model_array(u),_model_array(v)
 
-def profile_temperature_layer(temperature_k, height_m, bottom_m, depth_m=200., *, minimum_lapse=.001):
+def profile_temperature_layer(temperature_k: ArrayLike, height_m: ArrayLike, bottom_m: ArrayLike, depth_m: float=200., *, minimum_lapse: float=.001) -> tuple[Float32Array, Float32Array, Float32Array]:
     """Interpolate MIXDT2 layer temperatures and potential lapse.
 
     Args:
@@ -682,7 +741,7 @@ def profile_temperature_layer(temperature_k, height_m, bottom_m, depth_m=200., *
     bottom=np.asarray(bottom_m,dtype=MODEL_DTYPE)
     if temperature.shape!=height.shape or temperature.ndim!=3 or temperature.shape[1:]!=bottom.shape: raise ValueError('profiles must be (z,y,x) and bottom must match their grid')
     flat_t=temperature.reshape(temperature.shape[0],-1); flat_z=height.reshape(height.shape[0],-1); columns=np.arange(flat_t.shape[1])
-    def interpolate(target):
+    def interpolate(target: ArrayLike) -> Float32Array:
         """Interpolate all flattened temperature columns at target heights.
 
         Args:
@@ -702,18 +761,18 @@ def profile_temperature_layer(temperature_k, height_m, bottom_m, depth_m=200., *
         if np.any(zu<=zl): raise ValueError('temperature profile heights must increase strictly')
         value=(flat_t[upper,columns]-
                (flat_t[upper,columns]-flat_t[lower,columns])*(zu-target)/(zu-zl))
-        return value.reshape(bottom.shape)
+        return _model_array(value.reshape(bottom.shape))
     lower=interpolate(bottom); upper=interpolate(bottom+depth_m)
     lapse=np.maximum((upper-lower)/depth_m+.0098,minimum_lapse)
-    return tuple(_model_array(value) for value in (lower,upper,lapse))
+    return cast(FloatTriple,tuple(_model_array(value) for value in (lower,upper,lapse)))
 
-def mixing_height_maul_carson(temperature_profile_k, profile_height_m, previous_convective_height_m,
-                               temperature_jump_k, friction_velocity, monin_obukhov_m,
-                               sensible_heat_flux, density, coriolis,
-                               *, timestep_s=3600., depth_m=200., minimum_lapse=.001,
-                               minimum_height_m=50., maximum_height_m=2500.,
-                               threshold_flux_per_m=0., conste=.15, constn=2400.,
-                               constb=1.41, relaxation=True, relaxation_time_s=800., land_mask=None):
+def mixing_height_maul_carson(temperature_profile_k: ArrayLike, profile_height_m: ArrayLike, previous_convective_height_m: ArrayLike,
+                               temperature_jump_k: ArrayLike, friction_velocity: ArrayLike, monin_obukhov_m: ArrayLike,
+                               sensible_heat_flux: ArrayLike, density: ArrayLike, coriolis: ArrayLike,
+                               *, timestep_s: float=3600., depth_m: float=200., minimum_lapse: float=.001,
+                               minimum_height_m: float=50., maximum_height_m: float=2500.,
+                               threshold_flux_per_m: float=0., conste: float=.15, constn: float=2400.,
+                               constb: float=1.41, relaxation: bool=True, relaxation_time_s: float=800., land_mask: ArrayLike | None=None) -> tuple[Float32Array, Float32Array, Float32Array]:
     """Calculate MIXHT2/MIXHMC land mixing heights for ``IMIXH=1``.
 
     Args:
@@ -786,14 +845,14 @@ def mixing_height_maul_carson(temperature_profile_k, profile_height_m, previous_
     next_jump=np.where(daytime,next_jump,0.)
     if land_mask is not None:
         land=np.asarray(land_mask,dtype=bool); total=np.where(land,total,np.nan); convective=np.where(land,convective,np.nan); next_jump=np.where(land,next_jump,np.nan)
-    return tuple(_model_array(value) for value in (total,convective,next_jump))
+    return cast(FloatTriple,tuple(_model_array(value) for value in (total,convective,next_jump)))
 
 
-def convective_height_maul_carson(previous_convective_height_m,temperature_jump_k,
-                                  buoyancy_flux_k_m_s,potential_lapse_k_m,*,
-                                  timestep_s=3600.,threshold_flux_per_m=0.,
-                                  maximum_height_m=2500.,minimum_lapse=.001,conste=.15,
-                                  relaxation=True,relaxation_time_s=800.):
+def convective_height_maul_carson(previous_convective_height_m: ArrayLike,temperature_jump_k: ArrayLike,
+                                  buoyancy_flux_k_m_s: ArrayLike,potential_lapse_k_m: ArrayLike,*,
+                                  timestep_s: float=3600.,threshold_flux_per_m: float=0.,
+                                  maximum_height_m: float=2500.,minimum_lapse: float=.001,conste: float=.15,
+                                  relaxation: bool=True,relaxation_time_s: float=800.) -> tuple[Float32Array, Float32Array]:
     """Calculate CALMET MIXHMC from a supplied surface buoyancy flux.
 
     Args:
@@ -838,11 +897,11 @@ def convective_height_maul_carson(previous_convective_height_m,temperature_jump_
 
 
 def convective_height_batchvarova_gryning(
-        previous_convective_height_m,buoyancy_flux_k_m_s,potential_lapse_k_m,
-        friction_velocity,monin_obukhov_m,surface_temperature_k,*,
-        timestep_s=3600.,minimum_height_m=50.,maximum_height_m=2500.,
-        threshold_flux_per_m=0.,minimum_lapse=.001,relaxation=True,
-        relaxation_time_s=800.):
+        previous_convective_height_m: ArrayLike,buoyancy_flux_k_m_s: ArrayLike,potential_lapse_k_m: ArrayLike,
+        friction_velocity: ArrayLike,monin_obukhov_m: ArrayLike,surface_temperature_k: ArrayLike,*,
+        timestep_s: float=3600.,minimum_height_m: float=50.,maximum_height_m: float=2500.,
+        threshold_flux_per_m: float=0.,minimum_lapse: float=.001,relaxation: bool=True,
+        relaxation_time_s: float=800.) -> Float32Array:
     """Solve vectorized CALMET MIXHBG convective heights.
 
     Args:
@@ -903,7 +962,7 @@ def convective_height_batchvarova_gryning(
     r4=np.asarray(np.float64(1.)/(np.float64(2.)*a*d3),dtype=np.float64)
     r5=np.asarray(e/d,dtype=np.float64)
 
-    def fbg(zeta,zetap):
+    def fbg(zeta: Float64Array,zetap: Float64Array) -> Float64Array:
         """Evaluate the Batchvarova-Gryning implicit height function.
 
         Args:
@@ -972,16 +1031,16 @@ def convective_height_batchvarova_gryning(
     return _model_array(result)
 
 
-def mixing_height_batchvarova_gryning(temperature_profile_k, profile_height_m,
-                                      previous_convective_height_m, temperature_jump_k,
-                                      friction_velocity, monin_obukhov_m,
-                                      sensible_heat_flux, density, coriolis,
-                                      *, surface_temperature_k, timestep_s=3600.,
-                                      depth_m=200., minimum_lapse=.001,
-                                      minimum_height_m=50., maximum_height_m=2500.,
-                                      threshold_flux_per_m=0., constn=2400.,
-                                      constb=1.41, relaxation=True,
-                                      relaxation_time_s=800., land_mask=None):
+def mixing_height_batchvarova_gryning(temperature_profile_k: ArrayLike, profile_height_m: ArrayLike,
+                                      previous_convective_height_m: ArrayLike, temperature_jump_k: ArrayLike,
+                                      friction_velocity: ArrayLike, monin_obukhov_m: ArrayLike,
+                                      sensible_heat_flux: ArrayLike, density: ArrayLike, coriolis: ArrayLike,
+                                      *, surface_temperature_k: ArrayLike, timestep_s: float=3600.,
+                                      depth_m: float=200., minimum_lapse: float=.001,
+                                      minimum_height_m: float=50., maximum_height_m: float=2500.,
+                                      threshold_flux_per_m: float=0., constn: float=2400.,
+                                      constb: float=1.41, relaxation: bool=True,
+                                      relaxation_time_s: float=800., land_mask: ArrayLike | None=None) -> tuple[Float32Array, Float32Array, Float32Array]:
     """Calculate MIXHBG plus common MIXHT2 mechanical mixing heights.
 
     Args:
@@ -1056,9 +1115,9 @@ def mixing_height_batchvarova_gryning(temperature_profile_k, profile_height_m,
     if land_mask is not None:
         land=np.asarray(land_mask,dtype=bool)
         total=np.where(land,total,np.nan); convective=np.where(land,convective,np.nan)
-    return tuple(_model_array(value) for value in (total,convective,jump))
+    return cast(FloatTriple,tuple(_model_array(value) for value in (total,convective,jump)))
 
-def hosker_roughness(speed_m_s):
+def hosker_roughness(speed_m_s: ArrayLike) -> Float32Array:
     """Calculate Hosker wind-dependent water roughness.
 
     Args:
@@ -1072,8 +1131,8 @@ def hosker_roughness(speed_m_s):
     return _model_array(np.maximum(2.e-6,2.e-6*np.power(speed,2.5)))
 
 
-def neutral_water_parameters(u10, v10, coriolis, *, constw=.16,
-                             minimum_height_m=50., maximum_height_m=2500.):
+def neutral_water_parameters(u10: ArrayLike, v10: ArrayLike, coriolis: ArrayLike, *, constw: float=.16,
+                             minimum_height_m: float=50., maximum_height_m: float=2500.) -> tuple[Float32Array, Float32Array, Float32Array, Float32Array, Float32Array, Float32Array]:
     """Calculate WATER's neutral ``NOWSTA=0`` state for NOOBS runs.
 
     Args:
@@ -1104,9 +1163,9 @@ def neutral_water_parameters(u10, v10, coriolis, *, constw=.16,
             np.zeros_like(speed),mixing,np.zeros_like(speed))
 
 
-def neutral_water_station_profiles(u,v,anemometer_height_m,current_mixing_height_m,
-        coriolis,z_centers_m,z_faces_m,station_latitude,*,constw=.16,
-        minimum_height_m=50.,maximum_height_m=2500.,ipsifcn=0):
+def neutral_water_station_profiles(u: ArrayLike,v: ArrayLike,anemometer_height_m: ArrayLike,current_mixing_height_m: ArrayLike,
+        coriolis: ArrayLike,z_centers_m: ArrayLike,z_faces_m: ArrayLike,station_latitude: ArrayLike,*,constw: float=.16,
+        minimum_height_m: float=50.,maximum_height_m: float=2500.,ipsifcn: int=0) -> tuple[Float32Array, Float32Array, Float32Array, Float32Array, Float32Array, Float32Array]:
     """Run WATER2's neutral station path followed by SIMILT profiles.
 
     Args:
@@ -1144,10 +1203,12 @@ def neutral_water_station_profiles(u,v,anemometer_height_m,current_mixing_height
     centers=np.asarray(z_centers_m,dtype=MODEL_DTYPE)
     output_u=np.full((centers.size,u.size),9999.,dtype=MODEL_DTYPE)
     output_v=np.full_like(output_u,9999.); output_u[0]=u; output_v[0]=v
-    state=[np.full(u.shape,np.nan,dtype=MODEL_DTYPE) for _ in range(4)]
+    state: list[Float32Array] = [
+        np.full(u.shape,np.nan,dtype=MODEL_DTYPE) for _ in range(4)
+    ]
     speed=np.sqrt(u*u+v*v)
     active=(u<=990.)&(v<=990.)&(speed>=.0001)
-    if not active.any(): return (output_u,output_v,*state)
+    if not active.any(): return cast(FloatSix,(output_u,output_v,*state))
     selected_speed=speed[active]; selected_height=anemometer[active]
     roughness=hosker_roughness(selected_speed)
     rescale=np.trunc(selected_height).astype(np.int32)!=10
@@ -1168,11 +1229,11 @@ def neutral_water_station_profiles(u,v,anemometer_height_m,current_mixing_height
     output_u[:,active]=profile_u; output_v[:,active]=profile_v
     for destination,source in zip(state,(roughness,friction,length,mixing),strict=True):
         destination[active]=source
-    return (output_u,output_v,*state)
+    return cast(FloatSix,(output_u,output_v,*state))
 
 
-def water_mechanical_height(friction_velocity,coriolis,*,constw=.16,
-                            minimum_height_m=50.,maximum_height_m=2500.):
+def water_mechanical_height(friction_velocity: ArrayLike,coriolis: ArrayLike,*,constw: float=.16,
+                            minimum_height_m: float=50.,maximum_height_m: float=2500.) -> Float32Array:
     """Calculate WATER mechanical mixing height ``CONSTW*USTAR/FCORI``.
 
     Args:
@@ -1192,7 +1253,7 @@ def water_mechanical_height(friction_velocity,coriolis,*,constw=.16,
                                 minimum_height_m,maximum_height_m))
 
 
-def saturation_vapor_pressure_lowe(temperature_c):
+def saturation_vapor_pressure_lowe(temperature_c: ArrayLike) -> Float32Array:
     """Evaluate the CALMET ESAT Lowe saturation-vapour-pressure polynomial.
 
     Args:
@@ -1213,9 +1274,9 @@ def saturation_vapor_pressure_lowe(temperature_c):
     return _model_array(result)
 
 
-def overwater_delta_temperature_state(air_temperature_k,sea_temperature_k,
-                                      relative_humidity_percent,
-                                      measurement_height_m):
+def overwater_delta_temperature_state(air_temperature_k: ArrayLike,sea_temperature_k: ArrayLike,
+                                      relative_humidity_percent: ArrayLike,
+                                      measurement_height_m: ArrayLike) -> tuple[Float32Array, Float32Array, Float32Array, Float32Array]:
     """Prepare WATER virtual-potential-temperature inputs for DELTAT.
 
     Args:
@@ -1250,16 +1311,16 @@ def overwater_delta_temperature_state(air_temperature_k,sea_temperature_k,
     difference=theta-surface_theta
     difference_10m=difference*11.512925/(np.log(height)+9.2103404)
     theta_10m=surface_theta+difference_10m
-    return tuple(_model_array(value) for value in
-                 (theta,difference,difference_10m,theta_10m))
+    return cast(FloatQuad,tuple(_model_array(value) for value in
+                 (theta,difference,difference_10m,theta_10m)))
 
 
-def delta_temperature_flux(wind_speed_10m,measurement_height_m,
-                           measurement_minus_surface_virtual_potential_k,
-                           ten_m_minus_surface_virtual_potential_k,
-                           virtual_potential_temperature_10m_k,
-                           measurement_virtual_potential_temperature_k,
-                           roughness_m):
+def delta_temperature_flux(wind_speed_10m: ArrayLike,measurement_height_m: ArrayLike,
+                           measurement_minus_surface_virtual_potential_k: ArrayLike,
+                           ten_m_minus_surface_virtual_potential_k: ArrayLike,
+                           virtual_potential_temperature_10m_k: ArrayLike,
+                           measurement_virtual_potential_temperature_k: ArrayLike,
+                           roughness_m: ArrayLike) -> tuple[Float32Array, Float32Array, Float32Array]:
     """Solve CALMET DELTAT surface-layer fluxes by nonlinear iteration.
 
     Args:
@@ -1344,17 +1405,17 @@ def delta_temperature_flux(wind_speed_10m,measurement_height_m,
         old=np.where(active,length,old)
     buoyancy_flux_w_m2=np.asarray(-r(1195.2)*theta*ustar**3/(vkg*length),
                                   dtype=np.float64)
-    return tuple(_model_array(value) for value in
-                 (length,ustar,buoyancy_flux_w_m2))
+    return cast(FloatTriple,tuple(_model_array(value) for value in
+                 (length,ustar,buoyancy_flux_w_m2)))
 
 
-def delta_temperature_water_station_profiles(u,v,anemometer_height_m,
-        air_temperature_k,air_minus_sea_temperature_k,relative_humidity_percent,
-        observed_mixing_height_m,current_mixing_height_m,coriolis,
-        potential_lapse_k_m,previous_temperature_jump_k,z_centers_m,z_faces_m,
-        station_latitude,*,mixing_method=1,constw=.16,minimum_height_m=50.,
-        maximum_height_m=2500.,threshold_flux_per_m=.05,ipsifcn=0,
-        temperature_measurement_height_m=None,sea_temperature_k=None,**mixing_options):
+def delta_temperature_water_station_profiles(u: ArrayLike,v: ArrayLike,anemometer_height_m: ArrayLike,
+        air_temperature_k: ArrayLike,air_minus_sea_temperature_k: ArrayLike,relative_humidity_percent: ArrayLike,
+        observed_mixing_height_m: ArrayLike,current_mixing_height_m: ArrayLike,coriolis: ArrayLike,
+        potential_lapse_k_m: ArrayLike,previous_temperature_jump_k: ArrayLike,z_centers_m: ArrayLike,z_faces_m: ArrayLike,
+        station_latitude: ArrayLike,*,mixing_method: int=1,constw: float=.16,minimum_height_m: float=50.,
+        maximum_height_m: float=2500.,threshold_flux_per_m: float=.05,ipsifcn: int=0,
+        temperature_measurement_height_m: ArrayLike | None=None,sea_temperature_k: ArrayLike | None=None,**mixing_options: MixingOption) -> tuple[Float32Array, Float32Array, Float32Array, Float32Array, Float32Array, Float32Array, Float32Array, Float32Array, Float32Array]:
     """Run WATER2's DELTAT station branch through mixing and SIMILT.
 
     Args:
@@ -1414,10 +1475,10 @@ def delta_temperature_water_station_profiles(u,v,anemometer_height_m,
      previous_jump,latitude)=station_inputs
     speed=np.sqrt(u*u+v*v)
     active=(u<=990.)&(v<=990.)&(speed>=.0001)&(delta<990.)
-    state=[np.array(value,copy=True) for value in base[2:]]
+    state: list[Float32Array] = [np.array(value,copy=True) for value in base[2:]]
     # DeltaT-specific state: convective height, jump, and buoyancy heat flux.
     state.extend(np.full(u.shape,np.nan,dtype=MODEL_DTYPE) for _ in range(3))
-    if not active.any(): return (output_u,output_v,*state)
+    if not active.any(): return cast(FloatNine,(output_u,output_v,*state))
     height=anemometer[active]
     thermal_height=(height if temperature_measurement_height_m is None else
         np.broadcast_to(np.asarray(temperature_measurement_height_m,dtype=MODEL_DTYPE),u.shape)[active])
@@ -1445,14 +1506,16 @@ def delta_temperature_water_station_profiles(u,v,anemometer_height_m,
     initial=np.maximum(np.minimum(initial,current[active]),minimum_height_m)
     convective=np.zeros_like(initial); next_jump=previous_jump[active].copy()
     buoyancy=flux/1195.2
-    options=dict(mixing_options)
+    options: dict[str, MixingOption] = dict(mixing_options)
     if int(mixing_method)==1:
-        convective,next_jump=convective_height_maul_carson(
+        convective,next_jump=cast(Callable[..., FloatPair],
+            convective_height_maul_carson)(
             initial,previous_jump[active],buoyancy,lapse[active],
             threshold_flux_per_m=threshold_flux_per_m,
             maximum_height_m=maximum_height_m,**options)
     elif int(mixing_method)==2:
-        convective=convective_height_batchvarova_gryning(
+        convective=cast(Callable[..., Float32Array],
+            convective_height_batchvarova_gryning)(
             initial,buoyancy,lapse[active],friction,length,selected_air,
             minimum_height_m=minimum_height_m,maximum_height_m=maximum_height_m,
             threshold_flux_per_m=threshold_flux_per_m,**options)
@@ -1469,20 +1532,20 @@ def delta_temperature_water_station_profiles(u,v,anemometer_height_m,
     output_u[:,active]=profile_u; output_v[:,active]=profile_v
     sources=(roughness,friction,length,mixing,convective,next_jump,flux)
     for destination,source in zip(state,sources,strict=True): destination[active]=source
-    return (output_u,output_v,*state)
+    return cast(FloatNine,(output_u,output_v,*state))
 
 
-def coare_water_station_profiles(u,v,anemometer_height_m,air_sensor_height_m,
-        air_temperature_k,air_minus_sea_temperature_k,relative_humidity_percent,
-        observed_mixing_height_m,current_mixing_height_m,coriolis,
-        potential_lapse_k_m,previous_temperature_jump_k,z_centers_m,z_faces_m,
-        station_latitude,shortwave_down_w_m2,longwave_down_w_m2,rainfall_mm_h,
-        *,mixing_method=1,coare_method=10,wave_period_s=-999.,wave_height_m=-999.,
-        coastal_shelf_length_km=0.,distance_to_coast_km=0.,cool_skin=False,
-        constw=.16,minimum_height_m=50.,maximum_height_m=2500.,
-        threshold_flux_per_m=.05,ipsifcn=0,sea_temperature_k=None,
-        warm_layer_state=None,solar_time_s=None,water_sensor_depth_m=.6,
-        **mixing_options):
+def coare_water_station_profiles(u: ArrayLike,v: ArrayLike,anemometer_height_m: ArrayLike,air_sensor_height_m: ArrayLike,
+        air_temperature_k: ArrayLike,air_minus_sea_temperature_k: ArrayLike,relative_humidity_percent: ArrayLike,
+        observed_mixing_height_m: ArrayLike,current_mixing_height_m: ArrayLike,coriolis: ArrayLike,
+        potential_lapse_k_m: ArrayLike,previous_temperature_jump_k: ArrayLike,z_centers_m: ArrayLike,z_faces_m: ArrayLike,
+        station_latitude: ArrayLike,shortwave_down_w_m2: ArrayLike,longwave_down_w_m2: ArrayLike,rainfall_mm_h: ArrayLike,
+        *,mixing_method: int=1,coare_method: int=10,wave_period_s: ArrayLike=-999.,wave_height_m: ArrayLike=-999.,
+        coastal_shelf_length_km: ArrayLike=0.,distance_to_coast_km: ArrayLike=0.,cool_skin: bool=False,
+        constw: float=.16,minimum_height_m: float=50.,maximum_height_m: float=2500.,
+        threshold_flux_per_m: float=.05,ipsifcn: int=0,sea_temperature_k: ArrayLike | None=None,
+        warm_layer_state: WarmLayerState | None=None,solar_time_s: ArrayLike | None=None,water_sensor_depth_m: ArrayLike=.6,
+        **mixing_options: MixingOption) -> tuple[Float32Array, Float32Array, Float32Array, Float32Array, Float32Array, Float32Array, Float32Array, Float32Array, Float32Array, WarmLayerState | None]:
     """Run WATER2's COARE branch through mixing-height and SIMILT steps.
 
     Args:
@@ -1563,21 +1626,22 @@ def coare_water_station_profiles(u,v,anemometer_height_m,air_sensor_height_m,
      previous_jump,latitude,shortwave,longwave,rainfall)=values
     speed=np.sqrt(u*u+v*v)
     active=(u<=990.)&(v<=990.)&(speed>=.0001)&(delta<990.)
-    state=[np.array(value,copy=True) for value in base[2:]]
+    state: list[Float32Array] = [np.array(value,copy=True) for value in base[2:]]
     state.extend(np.full(u.shape,np.nan,dtype=MODEL_DTYPE) for _ in range(3))
-    if not active.any(): return (output_u,output_v,*state,warm_layer_state)
+    if not active.any():
+        return cast("CoareStationResult",(output_u,output_v,*state,warm_layer_state))
     selected_air=np.where(air[active]<990.,air[active],288.7)
     selected_rh=np.where(rh[active]<990.,rh[active],100.)
     sea=(selected_air-delta[active]
          if sea_temperature_k is None else
          np.broadcast_to(np.asarray(sea_temperature_k,dtype=MODEL_DTYPE),u.shape)[active])
     sea=np.maximum(sea,270.15)
-    next_warm_state=warm_layer_state
+    next_warm_state: WarmLayerState | None = warm_layer_state
     if warm_layer_state is not None:
         if solar_time_s is None:
             raise ValueError('COARE warm-layer station profiles require solar_time_s')
         full_warm_state=np.shape(warm_layer_state.initialized)==u.shape
-        selected_warm_state=(WarmLayerState(*(
+        selected_warm_state: WarmLayerState = (WarmLayerState(*(
             np.asarray(getattr(warm_layer_state,name))[active]
             for name in WarmLayerState.__dataclass_fields__))
             if full_warm_state else warm_layer_state)
@@ -1611,12 +1675,13 @@ def coare_water_station_profiles(u,v,anemometer_height_m,air_sensor_height_m,
     if next_warm_state is not None:
         selected_warm_state=update_warm_layer_fluxes(selected_warm_state,flux)
         if full_warm_state:
-            merged=[]
+            merged: list[WarmStateArray] = []
             for name in WarmLayerState.__dataclass_fields__:
-                values=np.array(getattr(warm_layer_state,name),copy=True)
-                values[active]=getattr(selected_warm_state,name)
-                merged.append(values)
-            next_warm_state=WarmLayerState(*merged)
+                field_values: WarmStateArray = np.array(
+                    getattr(warm_layer_state,name),copy=True)
+                field_values[active]=getattr(selected_warm_state,name)
+                merged.append(field_values)
+            next_warm_state=cast(Callable[..., WarmLayerState],WarmLayerState)(*merged)
         else:
             next_warm_state=selected_warm_state
     roughness=np.asarray(flux.roughness_m,dtype=MODEL_DTYPE)
@@ -1627,14 +1692,16 @@ def coare_water_station_profiles(u,v,anemometer_height_m,air_sensor_height_m,
     mechanical=water_mechanical_height(friction,coriolis_value[active],constw=constw,
         minimum_height_m=minimum_height_m,maximum_height_m=maximum_height_m)
     convective=np.zeros_like(initial); next_jump=previous_jump[active].copy()
-    options=dict(mixing_options)
+    options: dict[str, MixingOption] = dict(mixing_options)
     if int(mixing_method)==1:
-        convective,next_jump=convective_height_maul_carson(
+        convective,next_jump=cast(Callable[..., FloatPair],
+            convective_height_maul_carson)(
             initial,previous_jump[active],buoyancy,lapse[active],
             threshold_flux_per_m=threshold_flux_per_m,
             maximum_height_m=maximum_height_m,**options)
     elif int(mixing_method)==2:
-        convective=convective_height_batchvarova_gryning(
+        convective=cast(Callable[..., Float32Array],
+            convective_height_batchvarova_gryning)(
             initial,buoyancy,lapse[active],friction,length,selected_air,
             minimum_height_m=minimum_height_m,maximum_height_m=maximum_height_m,
             threshold_flux_per_m=threshold_flux_per_m,**options)
@@ -1653,13 +1720,13 @@ def coare_water_station_profiles(u,v,anemometer_height_m,air_sensor_height_m,
     buoyancy_flux=buoyancy*1195.2
     for destination,source in zip(state,(roughness,friction,length,mixing,convective,
             next_jump,buoyancy_flux),strict=True): destination[active]=source
-    return (output_u,output_v,*state,next_warm_state)
+    return cast("CoareStationResult",(output_u,output_v,*state,next_warm_state))
 
 
-def upwind_mixing_average(u, v, mixing_height, convective_height, dx_m=None,
-                          dy_m=None, *, grid_spacing_m=None,
-                          minimum_radius_cells=10, half_angle_degrees=30.,
-                          timestep_s=3600.):
+def upwind_mixing_average(u: ArrayLike, v: ArrayLike, mixing_height: ArrayLike, convective_height: ArrayLike, dx_m: float | None=None,
+                          dy_m: float | None=None, *, grid_spacing_m: float | None=None,
+                          minimum_radius_cells: int=10, half_angle_degrees: float=30.,
+                          timestep_s: float=3600.) -> tuple[Float32Array, Float32Array]:
     """Apply AVEMIX upwind-cone averaging to mixing-height grids.
 
     Args:
@@ -1700,7 +1767,7 @@ def upwind_mixing_average(u, v, mixing_height, convective_height, dx_m=None,
     elif grid_spacing_m is not None:
         raise TypeError('pass dx_m or grid_spacing_m, not both')
     if dy_m is None: dy_m=dx_m
-    dx_m=float(dx_m); dy_m=float(dy_m); timestep_s=float(timestep_s)
+    dx_m=float(cast(float,dx_m)); dy_m=float(cast(float,dy_m)); timestep_s=float(timestep_s)
     if (not np.isfinite(timestep_s) or timestep_s<=0. or
             not np.isfinite(dx_m) or dx_m<=0. or
             not np.isfinite(dy_m) or dy_m<=0.):
@@ -1717,7 +1784,7 @@ def upwind_mixing_average(u, v, mixing_height, convective_height, dx_m=None,
     # constant, so normalized square-grid results retain their scale.
     softening_m=np.sqrt(dx_m)*np.sqrt(dy_m)
     @lru_cache(maxsize=4096)
-    def window_geometry(left,right,down,up):
+    def window_geometry(left: int,right: int,down: int,up: int) -> tuple[Float64Array, Float64Array, BoolArray, BoolArray]:
         """Build and cache relative coordinates for a clipped search window.
 
         Args:
@@ -1795,8 +1862,8 @@ def upwind_mixing_average(u, v, mixing_height, convective_height, dx_m=None,
     return _model_array(result),_model_array(result_convective)
 
 
-def mesopac_layer_average(u, v, mixing_height_m, z_faces_m, *,
-                          upper_top_m=3000., minimum_upper_depth_m=300.):
+def mesopac_layer_average(u: ArrayLike, v: ArrayLike, mixing_height_m: ArrayLike, z_faces_m: ArrayLike, *,
+                          upper_top_m: float=3000., minimum_upper_depth_m: float=300.) -> tuple[Float32Array, Float32Array, Float32Array, Float32Array]:
     """Vectorized PACAVE lower- and upper-layer wind averages.
 
     The lower layer extends from the ground to ``max(ZI, 10 m)``.  The
@@ -1844,7 +1911,7 @@ def mesopac_layer_average(u, v, mixing_height_m, z_faces_m, *,
     lower_depth=np.maximum(np.minimum(ceiling,zi)-bottom,np.float64(0.))
     upper_depth=np.maximum(np.minimum(ceiling,top)-np.maximum(bottom,zi),np.float64(0.))
 
-    def average(values,depth):
+    def average(values: Float64Array,depth: Float64Array) -> Float64Array:
         """Average one wind component using per-layer overlap depths.
 
         Args:
@@ -1871,11 +1938,11 @@ def mesopac_layer_average(u, v, mixing_height_m, z_faces_m, *,
     layer_v=np.take_along_axis(v,ksav[None,:,:],axis=0)[0]
     upper_u=np.where(direct,layer_u,upper_u).astype(np.float64)
     upper_v=np.where(direct,layer_v,upper_v).astype(np.float64)
-    return tuple(_model_array(value) for value in
-                 (lower_u,lower_v,upper_u,upper_v))
+    return cast(FloatQuad,tuple(_model_array(value) for value in
+                 (lower_u,lower_v,upper_u,upper_v)))
 
-def prognostic_temperature_3d(prognostic_temperature_k, surface_temperature_k,
-                              convective_height_m, z_faces_m):
+def prognostic_temperature_3d(prognostic_temperature_k: ArrayLike, surface_temperature_k: ArrayLike,
+                              convective_height_m: ArrayLike, z_faces_m: ArrayLike) -> Float32Array:
     """Blend prognostic temperatures through the convective-layer boundary.
 
     The lowest CALMET layer remains anchored to the final SURFVAR/AVETMP
@@ -1929,8 +1996,8 @@ def prognostic_temperature_3d(prognostic_temperature_k, surface_temperature_k,
                             np.where(fraction>=1.,adiabatic,blended))
     return result
 
-def pgt_stability(u10, v10, solar_elevation_sine, cloud_fraction_field,
-                  ceiling_height_m, landuse, monin_obukhov_m, water_range=(50,55)):
+def pgt_stability(u10: ArrayLike, v10: ArrayLike, solar_elevation_sine: ArrayLike, cloud_fraction_field: ArrayLike,
+                  ceiling_height_m: ArrayLike, landuse: ArrayLike, monin_obukhov_m: ArrayLike, water_range: WaterRange=(50,55)) -> Int8Array:
     """Diagnose Pasquill-Gifford-Turner stability over land and water.
 
     Args:
@@ -1981,8 +2048,8 @@ def pgt_stability(u10, v10, solar_elevation_sine, cloud_fraction_field,
         np.where(length<=10.,6,5))))
     return np.where(water,water_class,result).astype(np.int8)
 
-def convective_velocity_scale(convective_height_m, sensible_heat_flux, temperature_k,
-                              density, landuse, water_range=(50,55)):
+def convective_velocity_scale(convective_height_m: ArrayLike, sensible_heat_flux: ArrayLike, temperature_k: ArrayLike,
+                              density: ArrayLike, landuse: ArrayLike, water_range: WaterRange=(50,55)) -> Float32Array:
     """Calculate the convective velocity scale used by WATER/WSTARR.
 
     Args:
@@ -2023,7 +2090,7 @@ def convective_velocity_scale(convective_height_m, sensible_heat_flux, temperatu
     value=np.cbrt(np.maximum(argument,0.))
     return _model_array(np.where((qh>0.)&(zi>0.),value,0.))
 
-def solar_sine(julian_day, base_timezone, latitude, longitude_east):
+def solar_sine(julian_day: int, base_timezone: float, latitude: ArrayLike, longitude_east: ArrayLike) -> Float32Array:
     """Calculate CALMET's half-hour solar-elevation sine fields.
 
     Args:
@@ -2059,9 +2126,9 @@ def solar_sine(julian_day, base_timezone, latitude, longitude_east):
         np.deg2rad(solha))
     return _model_array(result)
 
-def terrain_adjust_surface_wind(u, v, terrain_m, top_height_m, dx_m, dy_m,
-                                *, maximum_iterations=75, tolerance=.02,
-                                relaxation=1.5):
+def terrain_adjust_surface_wind(u: ArrayLike, v: ArrayLike, terrain_m: ArrayLike, top_height_m: float, dx_m: float, dy_m: float,
+                                *, maximum_iterations: int=75, tolerance: float=.02,
+                                relaxation: float=1.5) -> tuple[Float32Array, Float32Array]:
     """ADJUST terrain-potential correction for objective-analysis winds.
 
     CALMET applies this Poisson solve only to the first wind layer when
@@ -2149,7 +2216,7 @@ def terrain_adjust_surface_wind(u, v, terrain_m, top_height_m, dx_m, dy_m,
     v[0]=(above-below)*dyi+v[0]
     return _model_array(u),_model_array(v)
 
-def terrain_extrema(terrain_m, radius_km, dx_m, dy_m):
+def terrain_extrema(terrain_m: ArrayLike, radius_km: float, dx_m: float, dy_m: float) -> tuple[Float32Array, Float32Array, Float32Array, Float32Array]:
     """Return local terrain extrema and their nearest physical distances.
 
     The circular search and all comparisons use double precision.  When an
@@ -2220,10 +2287,10 @@ def terrain_extrema(terrain_m, radius_km, dx_m, dy_m):
             lo[update]=candidate[update]
             dlo[update]=distance
             slo[update]=candidate_source[update]
-    return tuple(_model_array(value) for value in (
-        highest,lowest,distance_high,distance_low))
+    return cast(FloatQuad,tuple(_model_array(value) for value in (
+        highest,lowest,distance_high,distance_low)))
 
-def topographic_vertical_velocity(u,v,terrain_m,z_faces_m,gamma_k_per_m,temperature_k,alpha,dx_m,dy_m):
+def topographic_vertical_velocity(u: ArrayLike,v: ArrayLike,terrain_m: ArrayLike,z_faces_m: ArrayLike,gamma_k_per_m: ArrayLike,temperature_k: ArrayLike,alpha: float,dx_m: float,dy_m: float) -> Float32Array:
     """Calculate TOPOF2 terrain-following vertical velocity.
 
     Args:
@@ -2273,7 +2340,7 @@ def topographic_vertical_velocity(u,v,terrain_m,z_faces_m,gamma_k_per_m,temperat
     w[1:]=w[1:]-u*gx[None,:,:]-v*gy[None,:,:]
     return _model_array(w)
 
-def slope_flow(terrain_m,highest_m,lowest_m,distance_high_m,distance_low_m,sensible_heat_flux,temperature_k,landuse,z_faces_m,dx_m,dy_m,water_range=(50,55)):
+def slope_flow(terrain_m: ArrayLike,highest_m: ArrayLike,lowest_m: ArrayLike,distance_high_m: ArrayLike,distance_low_m: ArrayLike,sensible_heat_flux: ArrayLike,temperature_k: ArrayLike,landuse: ArrayLike,z_faces_m: ArrayLike,dx_m: float,dy_m: float,water_range: WaterRange=(50,55)) -> tuple[Float32Array, Float32Array]:
     """Calculate Mahrt/Horst-Doran terrain-slope wind components.
 
     Args:
@@ -2344,7 +2411,7 @@ def slope_flow(terrain_m,highest_m,lowest_m,distance_high_m,distance_low_m,sensi
                    np.diff(faces)[:,None,None],0.,1.)
     return _model_array(ratios*ux[None,:,:]),_model_array(ratios*vy[None,:,:])
 
-def vertical_layer_average(values, heights_m, faces_m, *, missing=998.99):
+def vertical_layer_average(values: ArrayLike, heights_m: ArrayLike, faces_m: ArrayLike, *, missing: float=998.99) -> Float32Array:
     """VERTAV exact piecewise-linear layer mean for arbitrary profiles.
 
     The final axis is the source sounding level. All preceding axes identify
@@ -2375,7 +2442,7 @@ def vertical_layer_average(values, heights_m, faces_m, *, missing=998.99):
     if values.shape[-1]<2 or faces.ndim!=1 or faces.size<2: raise ValueError('at least two source levels and two faces are required')
     z0,z1=heights[...,:-1],heights[...,1:]; v0,v1=values[...,:-1],values[...,1:]
     valid=(v0<missing)&(v1<missing)&(z1>z0)
-    output=[]
+    output: list[Float64Array] = []
     for bottom,top in zip(faces[:-1],faces[1:]):
         lo=np.maximum(z0,bottom); hi=np.minimum(z1,top); width=np.maximum(hi-lo,0.); use=valid&(width>0.)
         fraction_lo=np.divide(lo-z0,z1-z0,out=np.zeros_like(lo),where=z1>z0)
@@ -2387,7 +2454,7 @@ def vertical_layer_average(values, heights_m, faces_m, *, missing=998.99):
         output.append(integral/(top-bottom))
     return _model_array(np.stack(output,axis=-1))
 
-def vertical_interpolate(values, heights_m, targets_m, *, missing=998.99):
+def vertical_interpolate(values: ArrayLike, heights_m: ArrayLike, targets_m: ArrayLike, *, missing: float=998.99) -> Float32Array:
     """Interpolate profiles linearly while skipping missing source levels.
 
     Args:
@@ -2417,7 +2484,7 @@ def vertical_interpolate(values, heights_m, targets_m, *, missing=998.99):
         result[index]=np.interp(targets,z,v)
     return _model_array(result)
 
-def smooth_wind(u,v,passes):
+def smooth_wind(u: ArrayLike,v: ArrayLike,passes: ArrayLike) -> tuple[Float32Array, Float32Array]:
     """Apply CALMET's sequential Gauss-Seidel wind-smoothing stencil.
 
     Args:
@@ -2461,7 +2528,7 @@ def smooth_wind(u,v,passes):
                     v[k,j,i]=MODEL_DTYPE(.5)*vc+MODEL_DTYPE(.125)*total
     return u,v
 
-def divergence_and_vertical_velocity(u,v,z_faces_m,dx_m,dy_m,*,obrien=False,boundaries=None):
+def divergence_and_vertical_velocity(u: ArrayLike,v: ArrayLike,z_faces_m: ArrayLike,dx_m: float,dy_m: float,*,obrien: bool=False,boundaries: GridBoundaries | None=None) -> tuple[Float32Array, Float32Array]:
     """Calculate horizontal divergence and integrate vertical velocity.
 
     Args:
@@ -2503,8 +2570,8 @@ def divergence_and_vertical_velocity(u,v,z_faces_m,dx_m,dy_m,*,obrien=False,boun
             w[k+1]=np.asarray(w[k+1]-ratio*top,dtype=work_dtype)
     return _model_array(divergence),_model_array(w)
 
-def minimize_divergence(u,v,w,z_faces_m,dx_m,dy_m,*,boundaries=None,
-                        maximum_iterations=50,limit=5.e-6):
+def minimize_divergence(u: ArrayLike,v: ArrayLike,w: ArrayLike,z_faces_m: ArrayLike,dx_m: float,dy_m: float,*,boundaries: GridBoundaries | None=None,
+                        maximum_iterations: int=50,limit: float=5.e-6) -> tuple[Float32Array, Float32Array, Float32Array, Int32Array]:
     """Adjust horizontal winds to reduce three-dimensional divergence.
 
     Args:
@@ -2541,7 +2608,7 @@ def minimize_divergence(u,v,w,z_faces_m,dx_m,dy_m,*,boundaries=None,
     west,east,south,north=(np.array(value,dtype=work_dtype,copy=True) for value in boundaries)
     divergence=np.empty_like(u); iterations=np.zeros(u.shape[0],dtype=np.int32)
 
-    def layer_divergence(k):
+    def layer_divergence(k: int) -> Float64Array:
         """Evaluate total divergence for one model layer.
 
         Args:
@@ -2583,12 +2650,12 @@ def minimize_divergence(u,v,w,z_faces_m,dx_m,dy_m,*,boundaries=None,
             if np.max(np.abs(divergence[k]))<=limit: break
     return (_model_array(u),_model_array(v),_model_array(divergence),iterations)
 
-def heat_flux(solar_sine_field,cloud_fraction_field,temperature_k,landuse,albedo,
-              bowen,soil_heat_flux,anthropogenic_heat,water_range=(50,55),*,
-              turbidity_coefficient_1=990.,turbidity_coefficient_2=-30.,
-              cloudiness_coefficient_1=-.75,cloudiness_coefficient_2=3.4,
-              net_radiation_coefficient_1=5.31e-13,
-              net_radiation_coefficient_2=60.,net_radiation_coefficient_3=.12):
+def heat_flux(solar_sine_field: ArrayLike,cloud_fraction_field: ArrayLike,temperature_k: ArrayLike,landuse: ArrayLike,albedo: ArrayLike,
+              bowen: ArrayLike,soil_heat_flux: ArrayLike,anthropogenic_heat: ArrayLike,water_range: WaterRange=(50,55),*,
+              turbidity_coefficient_1: float=990.,turbidity_coefficient_2: float=-30.,
+              cloudiness_coefficient_1: float=-.75,cloudiness_coefficient_2: float=3.4,
+              net_radiation_coefficient_1: float=5.31e-13,
+              net_radiation_coefficient_2: float=60.,net_radiation_coefficient_3: float=.12) -> tuple[Float32Array, Float32Array]:
     """Calculate short-wave radiation and land sensible heat flux.
 
     Args:
@@ -2643,7 +2710,11 @@ def heat_flux(solar_sine_field,cloud_fraction_field,temperature_k,landuse,albedo
     water=(np.asarray(landuse)>=water_range[0])&(np.asarray(landuse)<=water_range[1])
     return _model_array(np.where(water,0.,qh)),_model_array(qsw)
 
-def psi_momentum_dyer(z_over_l,*,dtype=MODEL_DTYPE):
+def psi_momentum_dyer(
+    z_over_l: ArrayLike,
+    *,
+    dtype: FloatingDType = MODEL_DTYPE,
+) -> FloatingArray:
     """Return the Dyer momentum stability correction.
 
     Model calls default to single precision.  Nonlinear convergence routines
@@ -2661,7 +2732,7 @@ def psi_momentum_dyer(z_over_l,*,dtype=MODEL_DTYPE):
         input is not modified.
     """
     work_dtype=np.dtype(dtype).type
-    zl=np.asarray(z_over_l,dtype=work_dtype)
+    zl=cast(FloatingArray,np.asarray(z_over_l,dtype=work_dtype))
     result=np.empty_like(zl,dtype=work_dtype)
     unstable=zl<0.
     zu=zl[unstable]
@@ -2679,12 +2750,12 @@ def psi_momentum_dyer(z_over_l,*,dtype=MODEL_DTYPE):
     c=np.minimum(50.,.35*zl[stable])
     result[stable]=-((1.+zl[stable])+(2./3.)*(
         zl[stable]-14.28)/np.exp(c)+8.525)
-    return result
+    return cast(FloatingArray, result)
 
-def surface_similarity(u,v,roughness_m,height_m,density,temperature_k,
-                       cloud_fraction_field,sensible_heat_flux,landuse,
-                       water_range=(50,55),*,wind_measurement_height_m=None,
-                       ipsifcn=0,minimum_stable_wind_m_s=.5):
+def surface_similarity(u: ArrayLike,v: ArrayLike,roughness_m: ArrayLike,height_m: float,density: ArrayLike,temperature_k: ArrayLike,
+                       cloud_fraction_field: ArrayLike,sensible_heat_flux: ArrayLike,landuse: ArrayLike,
+                       water_range: WaterRange=(50,55),*,wind_measurement_height_m: ArrayLike | None=None,
+                       ipsifcn: int=0,minimum_stable_wind_m_s: float=.5) -> tuple[Float32Array, Float32Array, Float32Array]:
     """Calculate ELUSTR surface-layer state over land cells.
 
     Args:
@@ -2796,13 +2867,13 @@ def surface_similarity(u,v,roughness_m,height_m,density,temperature_k,
                         dtype=np.float64)
     ustar=np.where(night,stable_u,ustar); qh=np.where(night,stable_qh,qh); length=np.where(night,stable_l,length)
     water=(np.asarray(landuse)>=water_range[0])&(np.asarray(landuse)<=water_range[1])
-    return tuple(_model_array(value) for value in (
-        np.where(water,0.,ustar),np.where(water,0.,length),np.where(water,0.,qh)))
+    return cast(FloatTriple,tuple(_model_array(value) for value in (
+        np.where(water,0.,ustar),np.where(water,0.,length),np.where(water,0.,qh))))
 
 
-def land_station_surface_similarity(u,v,roughness_m,anemometer_height_m,
-                                    first_level_height_m,density,temperature_k,
-                                    cloud_fraction,sensible_heat_flux,*,ipsifcn=0):
+def land_station_surface_similarity(u: ArrayLike,v: ArrayLike,roughness_m: ArrayLike,anemometer_height_m: ArrayLike,
+                                    first_level_height_m: float,density: ArrayLike,temperature_k: ArrayLike,
+                                    cloud_fraction: ArrayLike,sensible_heat_flux: ArrayLike,*,ipsifcn: int=0) -> tuple[Float32Array, Float32Array, Float32Array]:
     """Calculate ELUSTR2 surface-layer state for land stations.
 
     Args:
@@ -2839,10 +2910,10 @@ def land_station_surface_similarity(u,v,roughness_m,anemometer_height_m,
         ipsifcn=ipsifcn,minimum_stable_wind_m_s=0.)
 
 
-def land_station_mixing_height(temperature_profile_k,profile_height_m,
-        previous_convective_height_m,temperature_jump_k,friction_velocity,
-        monin_obukhov_m,sensible_heat_flux,density,coriolis,*,mixing_method=1,
-        surface_temperature_k=None,**options):
+def land_station_mixing_height(temperature_profile_k: ArrayLike,profile_height_m: ArrayLike,
+        previous_convective_height_m: ArrayLike,temperature_jump_k: ArrayLike,friction_velocity: ArrayLike,
+        monin_obukhov_m: ArrayLike,sensible_heat_flux: ArrayLike,density: ArrayLike,coriolis: ArrayLike,*,mixing_method: int=1,
+        surface_temperature_k: ArrayLike | None=None,**options: MixingOption) -> tuple[Float32Array, Float32Array, Float32Array]:
     """Calculate MIXHT2ST mixing heights for land-station columns.
 
     Args:
@@ -2892,23 +2963,24 @@ def land_station_mixing_height(temperature_profile_k,profile_height_m,
         shaped(friction_velocity),shaped(monin_obukhov_m),
         shaped(sensible_heat_flux),shaped(density),shaped(coriolis))
     if abs(int(mixing_method))==1:
-        result=mixing_height_maul_carson(*arguments,**options)
+        result=cast(Callable[..., FloatTriple],
+            mixing_height_maul_carson)(*arguments,**options)
     elif abs(int(mixing_method))==2:
         if surface_temperature_k is None:
             raise ValueError('MIXHBG station profiles require surface temperature')
-        result=mixing_height_batchvarova_gryning(
+        result=cast(Callable[..., FloatTriple],mixing_height_batchvarova_gryning)(
             *arguments,surface_temperature_k=shaped(surface_temperature_k),**options)
     else:
         raise ValueError('mixing_method must be one of -2, -1, 1, or 2')
-    return tuple(_model_array(value[0]) for value in result)
+    return cast(FloatTriple,tuple(_model_array(value[0]) for value in result))
 
 
-def land_station_similarity_theory(u,v,roughness_m,anemometer_height_m,
-        first_level_height_m,density,temperature_k,cloud_fraction,
-        sensible_heat_flux,temperature_profile_k,profile_height_m,
-        previous_convective_height_m,temperature_jump_k,coriolis,
-        z_centers_m,z_faces_m,station_latitude,*,mixing_method=1,ipsifcn=0,
-        minimum_mixing_height_m=50.,**mixing_options):
+def land_station_similarity_theory(u: ArrayLike,v: ArrayLike,roughness_m: ArrayLike,anemometer_height_m: ArrayLike,
+        first_level_height_m: float,density: ArrayLike,temperature_k: ArrayLike,cloud_fraction: ArrayLike,
+        sensible_heat_flux: ArrayLike,temperature_profile_k: ArrayLike,profile_height_m: ArrayLike,
+        previous_convective_height_m: ArrayLike,temperature_jump_k: ArrayLike,coriolis: ArrayLike,
+        z_centers_m: ArrayLike,z_faces_m: ArrayLike,station_latitude: ArrayLike,*,mixing_method: int=1,ipsifcn: int=0,
+        minimum_mixing_height_m: float=50.,**mixing_options: MixingOption) -> tuple[Float32Array, Float32Array, Float32Array, Float32Array, Float32Array, Float32Array, Float32Array, Float32Array]:
     """Vectorized land branch of STHEOR: ELUSTR2, MIXHT2ST, then SIMILT.
 
     Missing and calm station winds retain their first-level observation and
@@ -2991,12 +3063,12 @@ def land_station_similarity_theory(u,v,roughness_m,anemometer_height_m,
     speed=np.sqrt(u*u+v*v)
     active=(u<=990.)&(v<=990.)&(speed>=.001)
     if not active.any():
-        return (output_u,output_v,*state)
+        return cast(FloatEight,(output_u,output_v,*state))
     ustar,length,station_heat=land_station_surface_similarity(
         u[active],v[active],roughness[active],anemometer[active],
         first_level_height_m,rho[active],temperature[active],cloud[active],
         heat[active],ipsifcn=ipsifcn)
-    mix_options=dict(mixing_options)
+    mix_options: dict[str, MixingOption] = dict(mixing_options)
     if abs(int(mixing_method))==2:
         mix_options.setdefault('surface_temperature_k',temperature[active])
     mixing,convective,next_jump=land_station_mixing_height(
@@ -3011,15 +3083,15 @@ def land_station_similarity_theory(u,v,roughness_m,anemometer_height_m,
     for destination,source in zip(
             state,(ustar,length,station_heat,mixing,convective,next_jump),strict=True):
         destination[active]=source
-    return (output_u,output_v,*state)
+    return cast(FloatEight,(output_u,output_v,*state))
 
 
-def objective_analysis_component(station_values,station_xy,first_guess,landuse,dx_km,dy_km,
-                                 *,rmin_km=.1,rmax_surface_km=50.,rmax_upper_km=100.,
-                                 rmax_water_km=100.,surface_scale_km=10.,upper_scale_km=20.,
-                                 stations_per_level=5,observation_weight=1.,vary_radius=True,
-                                 water_range=(50,55),barriers=(),barrier_top_level=0,
-                                 background_weight=None,block_size=32768):
+def objective_analysis_component(station_values: ArrayLike,station_xy: ArrayLike,first_guess: ArrayLike,landuse: ArrayLike,dx_km: float,dy_km: float,
+                                 *,rmin_km: float=.1,rmax_surface_km: float=50.,rmax_upper_km: float=100.,
+                                 rmax_water_km: float=100.,surface_scale_km: float=10.,upper_scale_km: float=20.,
+                                 stations_per_level: ArrayLike=5,observation_weight: ArrayLike=1.,vary_radius: bool=True,
+                                 water_range: WaterRange=(50,55),barriers: ArrayLike=(),barrier_top_level: int=0,
+                                 background_weight: ArrayLike | None=None,block_size: int=32768) -> Float32Array:
     """Analyze one wind component with CALMET's INTER2 interpolation.
 
     Args:
@@ -3083,8 +3155,10 @@ def objective_analysis_component(station_values,station_xy,first_guess,landuse,d
     counts=np.broadcast_to(np.asarray(stations_per_level,dtype=int),(nz,))
     if np.any(counts<1): raise ValueError('stations_per_level/NINTRP must be positive')
     wo=np.broadcast_to(np.asarray(observation_weight,dtype=work_dtype),guess.shape)
-    background_grid=(None if background_weight is None else
-                     np.broadcast_to(np.asarray(background_weight,dtype=work_dtype),guess.shape))
+    background_grid: Float64Array | None = (
+        None if background_weight is None else
+        np.broadcast_to(np.asarray(background_weight,dtype=work_dtype),guess.shape)
+    )
     x=np.asarray((np.arange(nx,dtype=work_dtype)+work_dtype(.5))*work_dtype(dx_km),dtype=work_dtype)
     y=np.asarray((np.arange(ny,dtype=work_dtype)+work_dtype(.5))*work_dtype(dy_km),dtype=work_dtype)
     xx,yy=np.meshgrid(x,y); targets=np.column_stack((xx.ravel(),yy.ravel()))
@@ -3141,9 +3215,9 @@ def objective_analysis_component(station_values,station_xy,first_guess,landuse,d
     return _model_array(output)
 
 
-def wind1_initial_guess(station_u,station_v,station_xy,surface_station_count,
-                        nx,ny,dx_km,dy_km,*,bias=0.,extrapolate_calm=True,
-                        barriers=(),barrier_top_level=0,block_size=32768):
+def wind1_initial_guess(station_u: ArrayLike,station_v: ArrayLike,station_xy: ArrayLike,surface_station_count: int,
+                        nx: int,ny: int,dx_km: float,dy_km: float,*,bias: ArrayLike=0.,extrapolate_calm: bool=True,
+                        barriers: ArrayLike=(),barrier_top_level: int=0,block_size: int=32768) -> tuple[Float32Array, Float32Array]:
     """Vectorized WIND1 all-station first-guess interpolation.
 
     Surface (including SEA) profiles precede upper-air profiles. Distances use
@@ -3222,7 +3296,7 @@ def wind1_initial_guess(station_u,station_v,station_xy,surface_station_count,
     surface_valid=(u[0,:nsurface]<=work_dtype(900.))&(v[0,:nsurface]<=work_dtype(900.))
     valid=(u<=work_dtype(900.))&(v<=work_dtype(900.))
     calm=np.sqrt(np.asarray(u[0,:nsurface]**2+v[0,:nsurface]**2,dtype=work_dtype))<work_dtype(1.e-4)
-    def stable_sum(items):
+    def stable_sum(items: Float64Array) -> Float64Array:
         """Reduce station contributions in accumulation precision.
 
         Args:
@@ -3234,7 +3308,7 @@ def wind1_initial_guess(station_u,station_v,station_xy,surface_station_count,
             ``items``. The input is not modified.
         """
         return np.sum(items,axis=1,dtype=ACCUMULATION_DTYPE)
-    def discard_weights(weights,remove):
+    def discard_weights(weights: Float64Array,remove: BoolArray) -> None:
         """Remove unavailable observations and renormalize target weights.
 
         Args:
@@ -3304,7 +3378,7 @@ def wind1_initial_guess(station_u,station_v,station_xy,surface_station_count,
             _model_array(output_v.reshape(nz,ny,nx)))
 
 
-def _barrier_blocked(targets,stations,barriers):
+def _barrier_blocked(targets: ArrayLike,stations: ArrayLike,barriers: ArrayLike) -> BoolArray:
     """Test every target-to-station segment against CALMET barriers.
 
     Args:
@@ -3330,7 +3404,7 @@ def _barrier_blocked(targets,stations,barriers):
         a=np.column_stack((np.full(target.shape[0],xb,dtype=work_dtype)-target[:,0],np.full(target.shape[0],yb,dtype=work_dtype)-target[:,1]))
         b=np.column_stack((np.full(target.shape[0],xe,dtype=work_dtype)-target[:,0],np.full(target.shape[0],ye,dtype=work_dtype)-target[:,1]))
         c=station[None,:,:]-target[:,None,:]
-        def cosine(left,right):
+        def cosine(left: Float64Array,right: Float64Array) -> Float64Array:
             """Calculate cosines between broadcast two-component vectors.
 
             Args:
@@ -3355,7 +3429,7 @@ def _barrier_blocked(targets,stations,barriers):
     return blocked
 
 
-def barrier_blocked_pairs(targets, stations, barriers):
+def barrier_blocked_pairs(targets: ArrayLike, stations: ArrayLike, barriers: ArrayLike) -> BoolArray:
     """Return BARIER flags for target-specific candidate points.
 
     ``stations`` has shape ``(target, candidate, 2)``.  This is the layout
@@ -3397,7 +3471,7 @@ def barrier_blocked_pairs(targets, stations, barriers):
         b=np.column_stack((np.full(target.shape[0],xe,dtype=work_dtype)-target[:,0],
                            np.full(target.shape[0],ye,dtype=work_dtype)-target[:,1]))
         c=station-target[:,None,:]
-        def cosine(left,right):
+        def cosine(left: Float64Array,right: Float64Array) -> Float64Array:
             """Calculate cosines between broadcast two-component vectors.
 
             Args:

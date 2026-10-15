@@ -27,4 +27,4 @@ def run(config: CalmetConfig) -> Path:
     return Path(_run(config))
 
 
-__all__ = ["run"]
+__all__: list[str] = ["run"]

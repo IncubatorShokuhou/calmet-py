@@ -1,22 +1,57 @@
 #!/usr/bin/env python3
 """Compare WRF and CALMET terrain/10 m wind fields for one output hour."""
 
+from __future__ import annotations
+
 import argparse
 import struct
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Final, TypeAlias, TypedDict
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import netCDF4
 import numpy as np
+import numpy.typing as npt
 from pyproj import CRS, Transformer
 
 
-DIAGNOSTICS_ROOT = Path(__file__).resolve().parents[1]
+NumericArray: TypeAlias = (
+    npt.NDArray[np.float32]
+    | npt.NDArray[np.float64]
+    | npt.NDArray[np.int32]
+)
+DIAGNOSTICS_ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 
 
-def records(path):
+class CalmetFields(TypedDict):
+    """Fields decoded from one legacy CALMET output hour."""
+
+    lon: NumericArray
+    lat: NumericArray
+    elevation: NumericArray
+    u: NumericArray
+    v: NumericArray
+    timestamp: int | None
+    height: float
+    start: tuple[int, int, int, int, int]
+    surface: dict[str, NumericArray]
+
+
+class WrfFields(TypedDict):
+    """WRF fields used by the downscaling comparison."""
+
+    lon: NumericArray
+    lat: NumericArray
+    elevation: NumericArray
+    u: NumericArray
+    v: NumericArray
+    timestamp: str
+
+
+def records(path: str | Path) -> Iterator[bytes]:
     with open(path, "rb") as stream:
         while marker := stream.read(4):
             size = struct.unpack("<i", marker)[0]
@@ -27,7 +62,7 @@ def records(path):
             yield payload
 
 
-def read_calmet(path, hour_index):
+def read_calmet(path: str | Path, hour_index: int) -> CalmetFields:
     rec = records(path)
     first = next(rec)
     if not first.startswith(b"CALMET.DAT"):
@@ -50,13 +85,17 @@ def read_calmet(path, hour_index):
     elev_rec = next(rec)
     next(rec)  # leaf area index
 
-    def grid(payload, dtype="<f4"):
+    def grid(
+        payload: bytes, dtype: npt.DTypeLike = "<f4"
+    ) -> NumericArray:
         values = np.frombuffer(payload, dtype=dtype, offset=24, count=nx * ny)
         return values.reshape((nx, ny), order="F").T.copy()
 
     elevation = grid(elev_rec)
-    u = v = timestamp = None
-    surface = {}
+    u: NumericArray | None = None
+    v: NumericArray | None = None
+    timestamp: int | None = None
+    surface: dict[str, NumericArray] = {}
     records_per_hour = 2 * nz + 11
     for index in range((hour_index + 1) * records_per_hour):
         payload = next(rec)
@@ -89,12 +128,12 @@ def read_calmet(path, hour_index):
     return {
         "lon": lon, "lat": lat, "elevation": elevation,
         "u": u, "v": v, "timestamp": timestamp,
-        "height": 0.5 * (zfaces[0] + zfaces[1]), "start": start,
+        "height": float(0.5 * (zfaces[0] + zfaces[1])), "start": start,
         "surface": surface,
     }
 
 
-def read_wrf(path, hour_index):
+def read_wrf(path: str | Path, hour_index: int) -> WrfFields:
     with netCDF4.Dataset(path) as ds:
         lat = np.asarray(ds.variables["XLAT"][hour_index])
         lon = np.asarray(ds.variables["XLONG"][hour_index])
@@ -102,21 +141,34 @@ def read_wrf(path, hour_index):
         u = np.asarray(ds.variables["U10"][hour_index])
         v = np.asarray(ds.variables["V10"][hour_index])
         raw_time = ds.variables["Times"][hour_index]
-        timestamp = netCDF4.chartostring(raw_time).item()
+        raw_timestamp = netCDF4.chartostring(raw_time).item()
+        timestamp = (
+            raw_timestamp.decode("ascii")
+            if isinstance(raw_timestamp, bytes)
+            else str(raw_timestamp)
+        )
     return {"lon": lon, "lat": lat, "elevation": elevation,
             "u": u, "v": v, "timestamp": timestamp}
 
 
-def stats(speed, spacing_km):
-    valid = speed[np.isfinite(speed)]
+def stats(
+    speed: npt.ArrayLike, spacing_km: float
+) -> tuple[float, float, float, float]:
+    values = np.asarray(speed, dtype=np.float64)
+    valid = values[np.isfinite(values)]
     roughness = 0.5 * (
-        np.nanmean(np.abs(np.diff(speed, axis=0))) +
-        np.nanmean(np.abs(np.diff(speed, axis=1)))
+        np.nanmean(np.abs(np.diff(values, axis=0))) +
+        np.nanmean(np.abs(np.diff(values, axis=1)))
     ) / spacing_km
-    return np.mean(valid), np.std(valid), np.percentile(valid, 95), roughness
+    return (
+        float(np.mean(valid)),
+        float(np.std(valid)),
+        float(np.percentile(valid, 95)),
+        float(roughness),
+    )
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--wrf", required=True)
     parser.add_argument("--calmet", required=True)

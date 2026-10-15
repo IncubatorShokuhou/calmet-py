@@ -1,17 +1,25 @@
 """Formatted PRECIP.DAT observations and CALMET GRIDE interpolation."""
 from __future__ import annotations
+
+from typing import TypeAlias, cast
 from dataclasses import dataclass
 from datetime import datetime,timedelta
 from pathlib import Path
 import struct
+from collections.abc import Sequence
 import numpy as np
+from numpy.typing import ArrayLike, NDArray
 
+from .config import GridConfig
 from .legacy_io import FortranSequentialReader
 from .surface_data import SurfaceStation,_coded_instant,_coordinate,_instant
 
 
-MODEL_DTYPE=np.float32
-ACCUM_DTYPE=np.float64
+MODEL_DTYPE: type[np.float32]=np.float32
+ACCUM_DTYPE: type[np.float64]=np.float64
+
+Float32Array: TypeAlias = NDArray[np.float32]
+Float64Array: TypeAlias = NDArray[np.float64]
 
 
 @dataclass(frozen=True,slots=True)
@@ -27,7 +35,7 @@ class PrecipitationRecord:
     """
     begin: datetime
     end: datetime
-    rate_mm_h: np.ndarray
+    rate_mm_h: Float32Array
 
 
 class PrecipitationData:
@@ -45,7 +53,18 @@ class PrecipitationData:
         records: Chronological tuple of :class:`PrecipitationRecord` objects.
     """
 
-    def __init__(self,path,*,station_metadata=None,datum=None):
+    version: str
+    datum: str
+    start: datetime
+    end: datetime
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        station_metadata: Sequence[SurfaceStation] | None=None,
+        datum: str | None=None,
+    ) -> None:
         """Parse formatted PRECIP.DAT text and validate its timeline.
 
         Args:
@@ -61,7 +80,7 @@ class PrecipitationData:
             ValueError: If header metadata, station definitions, timestamps,
                 record widths, or interval continuity are invalid.
         """
-        self.path=Path(path)
+        self.path: Path=Path(path)
         if not self.path.is_file(): raise FileNotFoundError(self.path)
         lines=self.path.read_text(encoding='ascii',errors='strict').splitlines()
         if not lines: raise ValueError('empty PRECIP.DAT')
@@ -84,19 +103,21 @@ class PrecipitationData:
             if station_metadata is None or datum is None:
                 raise ValueError('PRECIP.DAT NONE requires control-file station metadata and datum')
             self.datum=str(datum)
+        self.timezone: str | int
         if explicit:
             self.timezone=lines[index][:8].strip(); index+=1
         span=[int(item) for item in lines[index].replace(',',' ').split()]; index+=1
         expected=9 if explicit else 8
         if len(span)!=expected: raise ValueError(f'PRECIP.DAT time-span header must contain {expected} integers')
         if explicit:
-            self.start=_instant(*span[:4]); self.end=_instant(*span[4:8]); count=span[8]
+            self.start=_instant(span[0],span[1],span[2],span[3])
+            self.end=_instant(span[4],span[5],span[6],span[7]); count=span[8]
         else:
-            first_end=_instant(*span[:3],0)
+            first_end=_instant(span[0],span[1],span[2],0)
             self.start=first_end-timedelta(hours=1)
-            self.end=_instant(*span[3:6],0); self.timezone=span[6]; count=span[7]
+            self.end=_instant(span[3],span[4],span[5],0); self.timezone=span[6]; count=span[7]
         if count<1: raise ValueError('PRECIP.DAT must contain at least one station')
-        stations=[]
+        stations: list[SurfaceStation]=[]
         if projection=='LL':
             for _ in range(count):
                 fields=lines[index].replace(',',' ').split(); index+=1
@@ -104,15 +125,15 @@ class PrecipitationData:
                 stations.append(SurfaceStation(int(fields[0]),fields[1],_coordinate(fields[2],True),
                                                _coordinate(fields[3],False),0.))
         else:
-            stations=list(station_metadata)
+            stations=list(cast(Sequence[SurfaceStation],station_metadata))
             if len(stations)!=count: raise ValueError('PRECIP.DAT station count does not match control-file metadata')
-            identifiers=[]
+            identifiers: list[int]=[]
             while len(identifiers)<count and index<len(lines):
                 identifiers.extend(int(item) for item in lines[index].replace(',',' ').split()); index+=1
             if len(identifiers)!=count or identifiers!=[item.identifier for item in stations]:
                 raise ValueError('PRECIP.DAT station IDs do not match control-file metadata')
-        self.stations=tuple(stations)
-        records=[]
+        self.stations: tuple[SurfaceStation,...]=tuple(stations)
+        records: list[PrecipitationRecord]=[]
         while index<len(lines):
             if not lines[index].strip(): index+=1; continue
             fields=lines[index].replace(',',' ').split(); index+=1
@@ -120,18 +141,19 @@ class PrecipitationData:
             if len(fields)!=time_width+count: raise ValueError('PRECIP.DAT record has wrong field count')
             times=[int(item) for item in fields[:time_width]]
             if explicit:
-                begin=_instant(*times[:4]); end=_instant(*times[4:])
+                begin=_instant(times[0],times[1],times[2],times[3])
+                end=_instant(times[4],times[5],times[6],times[7])
             else:
-                end=_instant(*times,0); begin=end-timedelta(hours=1)
+                end=_instant(times[0],times[1],times[2],0); begin=end-timedelta(hours=1)
             if not begin<end or (end-begin).total_seconds()>3600: raise ValueError('PRECIP.DAT record interval must be positive and at most one hour')
             records.append(PrecipitationRecord(
                 begin,end,np.asarray(fields[time_width:],dtype=MODEL_DTYPE)))
         if not records: raise ValueError('PRECIP.DAT contains no records')
         if records[0].begin<self.start or records[-1].end>self.end: raise ValueError('PRECIP.DAT records lie outside declared span')
         if any(left.end!=right.begin for left,right in zip(records[:-1],records[1:])): raise ValueError('PRECIP.DAT records are not contiguous')
-        self.records=tuple(records)
+        self.records: tuple[PrecipitationRecord,...]=tuple(records)
 
-    def at_begin(self,timestamp):
+    def at_begin(self,timestamp: datetime) -> PrecipitationRecord:
         """Return the record whose half-open interval contains a timestamp.
 
         Args:
@@ -149,7 +171,7 @@ class PrecipitationData:
         raise ValueError(f'PRECIP.DAT has no record covering {timestamp!s}')
 
 
-def unpack_precipitation(words,count):
+def unpack_precipitation(words: ArrayLike,count: int) -> Float32Array:
     """Expand CALMET PACK zero runs.
 
     Args:
@@ -165,7 +187,7 @@ def unpack_precipitation(words,count):
         ValueError: If the encoded sequence does not expand to ``count``
             values.
     """
-    output=[]
+    output: list[float]=[]
     for word in np.asarray(words,dtype=MODEL_DTYPE):
         if word>=0.: output.append(float(word))
         else: output.extend([0.]*int(abs(word)+.1))
@@ -173,7 +195,12 @@ def unpack_precipitation(words,count):
     return np.asarray(output,dtype=MODEL_DTYPE)
 
 
-def read_unformatted_precipitation(path,*,station_metadata=None,datum=None):
+def read_unformatted_precipitation(
+    path: str | Path,
+    *,
+    station_metadata: Sequence[SurfaceStation] | None=None,
+    datum: str | None=None,
+) -> PrecipitationData:
     """Read a GNU-Fortran sequential-unformatted PRECIP.DAT file.
 
     Args:
@@ -193,7 +220,7 @@ def read_unformatted_precipitation(path,*,station_metadata=None,datum=None):
     """
     source=Path(path); result=object.__new__(PrecipitationData); result.path=source
     with FortranSequentialReader(source) as reader:
-        def record(size=None,label='record'):
+        def record(size: int | None=None,label: str='record') -> bytes:
             """Read and optionally size-check one required binary record.
 
             Args:
@@ -254,10 +281,10 @@ def read_unformatted_precipitation(path,*,station_metadata=None,datum=None):
                 _coordinate(latitudes[16*i:16*i+16].decode('ascii'),True),
                 _coordinate(longitudes[16*i:16*i+16].decode('ascii'),False),0.) for i in range(count))
         else:
-            result.stations=tuple(station_metadata)
+            result.stations=tuple(cast(Sequence[SurfaceStation],station_metadata))
             if len(result.stations)!=count or identifiers.tolist()!=[item.identifier for item in result.stations]:
                 raise ValueError('PRECIP.DAT station IDs do not match control-file metadata')
-        records=[]
+        records: list[PrecipitationRecord]=[]
         while (payload:=reader.read_record()) is not None:
             if explicit and packing:
                 if len(payload)!=20: raise ValueError('packed PRECIP.DAT record header has wrong size')
@@ -291,7 +318,13 @@ def read_unformatted_precipitation(path,*,station_metadata=None,datum=None):
     result.records=tuple(records); return result
 
 
-def load_precipitation(path,format=2,*,station_metadata=None,datum=None):
+def load_precipitation(
+    path: str | Path,
+    format: int=2,
+    *,
+    station_metadata: Sequence[SurfaceStation] | None=None,
+    datum: str | None=None,
+) -> PrecipitationData:
     """Load PRECIP.DAT using the CALMET ``IFORMP`` selector.
 
     Args:
@@ -314,7 +347,14 @@ def load_precipitation(path,format=2,*,station_metadata=None,datum=None):
     raise ValueError('PRECIP.DAT format/IFORMP must be 1 or 2')
 
 
-def grid_precipitation(values,station_xy,grid,method=2,radius_km=50.,cutoff=.01):
+def grid_precipitation(
+    values: ArrayLike,
+    station_xy: ArrayLike,
+    grid: GridConfig,
+    method: int=2,
+    radius_km: float=50.,
+    cutoff: float=.01,
+) -> Float32Array:
     """Interpolate station precipitation with CALMET GRIDE methods 1--3.
 
     Args:
@@ -342,10 +382,10 @@ def grid_precipitation(values,station_xy,grid,method=2,radius_km=50.,cutoff=.01)
             is not 1, 2, or 3.
     """
     f32=MODEL_DTYPE
-    rates=np.asarray(values,dtype=f32)
+    rates: Float32Array=np.asarray(values,dtype=f32)
     # Spatial distances and weighted station accumulations are the deliberate
     # FP64 boundary; precipitation fields enter and leave as FP32.
-    points=np.asarray(station_xy,dtype=ACCUM_DTYPE)*ACCUM_DTYPE(1000.)
+    points: Float64Array=np.asarray(station_xy,dtype=ACCUM_DTYPE)*ACCUM_DTYPE(1000.)
     if points.shape!=(rates.size,2): raise ValueError('precipitation station coordinates have wrong shape')
     valid=rates<9998.
     if not valid.any(): return np.zeros((grid.ny,grid.nx),dtype=f32)
@@ -363,7 +403,7 @@ def grid_precipitation(values,station_xy,grid,method=2,radius_km=50.,cutoff=.01)
     y=(np.arange(grid.ny,dtype=ACCUM_DTYPE)+ACCUM_DTYPE(.5))*ACCUM_DTYPE(
         grid.dy_km)*ACCUM_DTYPE(1000.)
     xx,yy=np.meshgrid(x,y); targets=np.column_stack((xx.ravel(),yy.ravel()))
-    output=np.empty(targets.shape[0],dtype=f32)
+    output: Float32Array=np.empty(targets.shape[0],dtype=f32)
     for start in range(0,targets.shape[0],65536):
         delta=targets[start:start+65536,None,:]-points[None,:,:]
         d2=delta[...,0]*delta[...,0]+delta[...,1]*delta[...,1]

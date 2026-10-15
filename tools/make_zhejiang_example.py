@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Any, Final
 
 import netCDF4 as nc
 
 
-CALWRF_VARIABLES = (
+CALWRF_VARIABLES: Final[tuple[str, ...]] = (
     "Times", "XLAT", "XLONG", "HGT", "LU_INDEX", "ZNU",
     "U", "V", "W", "PH", "PHB", "T", "P", "PB", "QVAPOR",
     "QCLOUD", "QRAIN", "QICE", "QSNOW", "QGRAUP",
@@ -34,7 +35,7 @@ def create_example(source: Path, output: Path, time_index: int) -> None:
             source_variable = src.variables[name]
             fill = (source_variable.getncattr("_FillValue")
                     if "_FillValue" in source_variable.ncattrs() else None)
-            options = {}
+            options: dict[str, Any] = {}
             if source_variable.dtype.kind not in "SU":
                 options.update(zlib=True, complevel=9, shuffle=True)
             if fill is not None:

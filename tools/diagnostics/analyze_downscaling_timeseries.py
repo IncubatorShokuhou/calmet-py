@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """Plot regional-mean WRF/CALMET evolution for all CALMET output hours."""
 
+from __future__ import annotations
+
 import argparse
 import csv
 from pathlib import Path
+from typing import Final, TypeAlias
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import netCDF4
 import numpy as np
+import numpy.typing as npt
 
 from visualize_downscaling import read_calmet
 
 
-DIAGNOSTICS_ROOT = Path(__file__).resolve().parents[1]
+FloatArray: TypeAlias = npt.NDArray[np.float64]
+RowValue: TypeAlias = int | float | str
+DIAGNOSTICS_ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 
 
-def wrf_fields(ds, hour):
+def wrf_fields(
+    ds: netCDF4.Dataset, hour: int
+) -> tuple[FloatArray, FloatArray, FloatArray, FloatArray, FloatArray]:
     get = lambda name, t=hour: np.asarray(ds.variables[name][t], dtype=float)
     u, v = get("U10"), get("V10")
     t = get("T2") - 273.15
@@ -31,7 +39,7 @@ def wrf_fields(ds, hour):
     return np.hypot(u, v), t, rh, get("PBLH"), np.maximum(rain, 0)
 
 
-def main():
+def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--wrf", required=True)
     p.add_argument("--calmet", required=True)
@@ -45,7 +53,7 @@ def main():
     )
     args = p.parse_args()
 
-    rows = []
+    rows: list[dict[str, RowValue]] = []
     with netCDF4.Dataset(args.wrf) as ds:
         # CALMET writes one record for each modeled interval start.  A run
         # bounded by 00 and 12 therefore has records stamped 00..11, while
@@ -61,15 +69,17 @@ def main():
                     (lat >= extent[2]) & (lat <= extent[3]))
             w = wrf_fields(ds, hour)
             c = (np.hypot(cal["u"], cal["v"]),
-                 cal["surface"]["TEMPK"] - 273.15,
+                 np.asarray(cal["surface"]["TEMPK"],dtype=np.float64) - 273.15,
                  cal["surface"]["IRH"].astype(float),
                  cal["surface"]["ZI"], cal["surface"]["RMM"])
             stamp = netCDF4.chartostring(ds.variables["Times"][hour]).item()
-            row = {"hour": hour, "time": stamp}
+            row: dict[str, RowValue] = {"hour": hour, "time": str(stamp)}
             for name, wa, ca in zip(("wind", "temperature", "rh", "mixing", "rain"), w, c):
-                row[f"wrf_{name}"] = float(np.nanmean(np.where(mask, wa, np.nan)))
-                row[f"calmet_{name}"] = float(np.nanmean(ca))
-                row[f"delta_{name}"] = row[f"calmet_{name}"] - row[f"wrf_{name}"]
+                wrf_mean = float(np.nanmean(np.where(mask, wa, np.nan)))
+                calmet_mean = float(np.nanmean(ca))
+                row[f"wrf_{name}"] = wrf_mean
+                row[f"calmet_{name}"] = calmet_mean
+                row[f"delta_{name}"] = calmet_mean - wrf_mean
             rows.append(row)
 
     csv_path = Path(args.csv)
@@ -78,7 +88,7 @@ def main():
         writer = csv.DictWriter(f, fieldnames=rows[0].keys())
         writer.writeheader(); writer.writerows(rows)
 
-    hours = np.array([r["hour"] for r in rows])
+    hours = np.array([int(r["hour"]) for r in rows])
     specs = (("wind", "Wind speed", "m/s"),
              ("temperature", "Temperature", "°C"),
              ("rh", "Relative humidity", "%"),
@@ -86,11 +96,11 @@ def main():
              ("rain", "Hourly precipitation", "mm/h"))
     fig, axes = plt.subplots(5, 2, figsize=(13, 17), constrained_layout=True)
     for row_idx, (key, title, unit) in enumerate(specs):
-        wrf = np.array([r[f"wrf_{key}"] for r in rows])
-        cal = np.array([r[f"calmet_{key}"] for r in rows])
-        delta = cal - wrf
-        axes[row_idx, 0].plot(hours, wrf, "o-", label="WRF 9 km")
-        axes[row_idx, 0].plot(hours, cal, "o-", label="CALMET 1 km")
+        wrf_values = np.array([float(r[f"wrf_{key}"]) for r in rows])
+        calmet_values = np.array([float(r[f"calmet_{key}"]) for r in rows])
+        delta = calmet_values - wrf_values
+        axes[row_idx, 0].plot(hours, wrf_values, "o-", label="WRF 9 km")
+        axes[row_idx, 0].plot(hours, calmet_values, "o-", label="CALMET 1 km")
         axes[row_idx, 0].set(title=title, ylabel=unit)
         axes[row_idx, 0].grid(alpha=.25); axes[row_idx, 0].legend()
         axes[row_idx, 1].axhline(0, color="black", lw=.8)
@@ -104,7 +114,7 @@ def main():
 
     print(f"wrote={out}\nwrote={csv_path}")
     for key, _, unit in specs:
-        d = np.array([r[f"delta_{key}"] for r in rows])
+        d = np.array([float(r[f"delta_{key}"]) for r in rows])
         use = d[1:] if key == "rain" else d
         print(f"{key}: mean_delta={np.mean(use):.3f} {unit}, "
               f"range={np.min(use):.3f}..{np.max(use):.3f}")

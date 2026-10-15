@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from datetime import datetime,timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING, Literal, TypeAlias, cast
 
 import netCDF4 as nc
 import numpy as np
+from numpy.typing import ArrayLike, NDArray
 
 from ._common import fortran_inclusive_slice
 from ._calwrf_listing import write_calwrf_listing
@@ -16,14 +19,36 @@ from .config import CalwrfConfig
 from .legacy_calwrf import write_m3d
 from .datetime_utils import parse_timestamp
 
-_LIMITS_3D = {
+Float32Array: TypeAlias = NDArray[np.float32]
+Float64Array: TypeAlias = NDArray[np.float64]
+BoolArray: TypeAlias = NDArray[np.bool_]
+Shape2D: TypeAlias = tuple[int, int]
+Shape3D: TypeAlias = tuple[int, int, int]
+IndexRange: TypeAlias = tuple[int, int] | None
+WrfRecord: TypeAlias = tuple[Path, int, str]
+RainState: TypeAlias = tuple[Float32Array, Float32Array]
+ValueLimits: TypeAlias = dict[str, tuple[float, float]]
+NetCDFDType: TypeAlias = Literal["f4", "f8", "i2"]
+NetCDFScalar: TypeAlias = np.float32 | np.float64 | np.int16
+CompressionLevel: TypeAlias = Literal[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+if TYPE_CHECKING:
+    NetCDFBytesVariable: TypeAlias = nc.Variable[np.bytes_]
+    NetCDFNumericVariable: TypeAlias = nc.Variable[NetCDFScalar]
+else:
+    # netCDF4's compiled runtime class is not subscriptable, while its stubs
+    # model Variable as generic.  These aliases keep runtime reflection valid.
+    NetCDFBytesVariable = nc.Variable
+    NetCDFNumericVariable = nc.Variable
+
+_LIMITS_3D: ValueLimits = {
     "pressure": (10.0, 1100.0), "temperature": (150.0, 330.0),
     "wind_direction": (0.0, 360.0), "wind_speed": (0.0, 150.0),
     "vertical_velocity": (-50.0, 50.0), "qvapor": (0.0, 0.05),
     "qcloud": (0.0, 0.05), "qrain": (0.0, 0.05),
     "qice": (0.0, 0.05), "qsnow": (0.0, 0.05), "qgraupel": (0.0, 0.05),
 }
-_LIMITS_2D = {
+_LIMITS_2D: ValueLimits = {
     "surface_pressure": (50000.0, 110000.0), "precipitation": (0.0, 500.0),
     "snow_cover": (0.0, 1.1), "shortwave_down": (0.0, 1500.0),
     "longwave_down": (0.0, 1000.0), "temperature_2m": (210.0, 330.0),
@@ -32,7 +57,13 @@ _LIMITS_2D = {
 }
 
 
-def _horizontal_range_check(values, low, high, ys, xs):
+def _horizontal_range_check(
+    values: ArrayLike,
+    low: float,
+    high: float,
+    ys: slice,
+    xs: slice,
+) -> Float32Array:
     """Replace out-of-range values from valid horizontal neighbours.
 
     Args:
@@ -49,8 +80,8 @@ def _horizontal_range_check(values, low, high, ys, xs):
         by the mean of valid north, south, east, and west neighbours, or by
         the nearest range bound when no valid neighbour exists.
     """
-    original = np.asarray(values, dtype="f4")
-    result = original[..., ys, xs].copy()
+    original: Float32Array = np.asarray(values, dtype="f4")
+    result: Float32Array = original[..., ys, xs].copy()
     ny, nx = original.shape[-2:]
     jb, je, ib, ie = ys.start + 1, ys.stop, xs.start + 1, xs.stop
     jb_edge, je_edge = min(jb, 2), max(je, ny - 1)
@@ -60,21 +91,28 @@ def _horizontal_range_check(values, low, high, ys, xs):
     j2 = np.minimum(jj + 1, je_edge) - 1
     i1 = np.maximum(ii - 1, ib_edge) - 1
     i2 = np.minimum(ii + 1, ie_edge) - 1
-    neighbours = np.stack((
+    neighbours: Float32Array = np.stack((
         original[..., jj[:, None] - 1, i1[None, :]],
         original[..., jj[:, None] - 1, i2[None, :]],
         original[..., j1[:, None], ii[None, :] - 1],
         original[..., j2[:, None], ii[None, :] - 1],
     ), axis=0)
-    good = (neighbours >= low) & (neighbours <= high)
+    good: BoolArray = (neighbours >= low) & (neighbours <= high)
     count = good.sum(axis=0)
-    total = np.where(good, neighbours, 0.0).sum(axis=0, dtype="f4")
-    fallback = np.where(result < low, low, high).astype("f4")
+    total: Float32Array = np.where(good, neighbours, 0.0).sum(axis=0, dtype="f4")
+    fallback: Float32Array = np.where(result < low, low, high).astype("f4")
     replacement = np.divide(total, count, out=fallback, where=count > 0)
     return np.where((result < low) | (result > high), replacement, result).astype("f4")
 
 
-def _vertical_range_check(values, low, high, zs, ys, xs):
+def _vertical_range_check(
+    values: ArrayLike,
+    low: float,
+    high: float,
+    zs: slice,
+    ys: slice,
+    xs: slice,
+) -> Float32Array:
     """Replace invalid hydrometeors from adjacent vertical mass levels.
 
     Args:
@@ -90,17 +128,17 @@ def _vertical_range_check(values, low, high, zs, ys, xs):
         Invalid values are replaced by the mean of valid levels immediately
         above and below, or by the nearest bound when neither is valid.
     """
-    original = np.asarray(values, dtype="f4")
-    result = original[zs, ys, xs].copy()
+    original: Float32Array = np.asarray(values, dtype="f4")
+    result: Float32Array = original[zs, ys, xs].copy()
     kk = np.arange(zs.start, zs.stop)
-    neighbours = np.stack((
+    neighbours: Float32Array = np.stack((
         original[np.maximum(kk - 1, 0), ys, xs],
         original[np.minimum(kk + 1, original.shape[0] - 1), ys, xs],
     ), axis=0)
-    good = (neighbours >= low) & (neighbours <= high)
+    good: BoolArray = (neighbours >= low) & (neighbours <= high)
     count = good.sum(axis=0)
-    total = np.where(good, neighbours, 0.0).sum(axis=0, dtype="f4")
-    fallback = np.where(result < low, low, high).astype("f4")
+    total: Float32Array = np.where(good, neighbours, 0.0).sum(axis=0, dtype="f4")
+    fallback: Float32Array = np.where(result < low, low, high).astype("f4")
     replacement = np.divide(total, count, out=fallback, where=count > 0)
     return np.where((result < low) | (result > high), replacement, result).astype("f4")
 
@@ -119,7 +157,9 @@ def _times(ds: nc.Dataset) -> list[str]:
     Raises:
         KeyError: If the dataset has no ``Times`` variable.
     """
-    values = nc.chartostring(ds.variables["Times"][:])
+    values: NDArray[np.str_] = cast(
+        NDArray[np.str_], nc.chartostring(ds.variables["Times"][:])
+    )
     return [str(x) for x in np.asarray(values).tolist()]
 
 
@@ -141,7 +181,9 @@ def _wrf_timestamp(value: str) -> datetime:
     except ValueError as error: raise ValueError(f"invalid CALWRF timestamp: {value!r}") from error
 
 
-def _write_time_text(variable,index,text):
+def _write_time_text(
+    variable: NetCDFBytesVariable, index: int, text: str
+) -> None:
     """Write one WRF-style timestamp without scalar-string coercion.
 
     Args:
@@ -164,7 +206,7 @@ def _write_time_text(variable,index,text):
         raise ValueError('CALWRF time_text values must contain 19 ASCII bytes')
     variable[index]=np.frombuffer(encoded,dtype='S1')
 
-def _selection(value,size,label):
+def _selection(value: IndexRange, size: int, label: str) -> slice:
     """Convert an inclusive one-based CALWRF range to a Python slice.
 
     Args:
@@ -182,7 +224,7 @@ def _selection(value,size,label):
     return fortran_inclusive_slice(value,size,label=f'CALWRF {label}')
 
 
-def destagger_x(a: np.ndarray) -> np.ndarray:
+def destagger_x(a: ArrayLike) -> Float32Array:
     """Average adjacent points along the WRF west-east staggered axis.
 
     Args:
@@ -193,13 +235,13 @@ def destagger_x(a: np.ndarray) -> np.ndarray:
         A float32 array with the same leading dimensions and last-axis length
         ``nx``. Values are arithmetic means of adjacent staggered points.
     """
-    values = np.asarray(a, dtype=np.float32)
+    values: Float32Array = np.asarray(a, dtype=np.float32)
     return (np.float32(0.5) * (values[..., :-1] + values[..., 1:])).astype(
         np.float32, copy=False,
     )
 
 
-def destagger_y(a: np.ndarray) -> np.ndarray:
+def destagger_y(a: ArrayLike) -> Float32Array:
     """Average adjacent points along the WRF south-north staggered axis.
 
     Args:
@@ -210,13 +252,13 @@ def destagger_y(a: np.ndarray) -> np.ndarray:
         A float32 array with penultimate-axis length ``ny`` and all other
         dimensions unchanged.
     """
-    values = np.asarray(a, dtype=np.float32)
+    values: Float32Array = np.asarray(a, dtype=np.float32)
     return (np.float32(0.5) * (values[..., :-1, :] + values[..., 1:, :])).astype(
         np.float32, copy=False,
     )
 
 
-def destagger_z(a: np.ndarray) -> np.ndarray:
+def destagger_z(a: ArrayLike) -> Float32Array:
     """Average adjacent points along the leading WRF vertical-stagger axis.
 
     Args:
@@ -227,13 +269,13 @@ def destagger_z(a: np.ndarray) -> np.ndarray:
         A float32 mass-level array with leading-axis length ``nz`` and all
         remaining dimensions unchanged.
     """
-    values = np.asarray(a, dtype=np.float32)
+    values: Float32Array = np.asarray(a, dtype=np.float32)
     return (np.float32(0.5) * (values[:-1, ...] + values[1:, ...])).astype(
         np.float32, copy=False,
     )
 
 
-def _geopotential_height(ph: np.ndarray, phb: np.ndarray) -> np.ndarray:
+def _geopotential_height(ph: ArrayLike, phb: ArrayLike) -> Float32Array:
     """Convert WRF staggered geopotential to mass-level geometric height.
 
     Args:
@@ -245,7 +287,7 @@ def _geopotential_height(ph: np.ndarray, phb: np.ndarray) -> np.ndarray:
         Float32 geometric height in metres on mass levels, with one fewer
         element along the leading vertical axis.
     """
-    geopotential = np.asarray(ph, dtype=np.float32) + np.asarray(
+    geopotential: Float32Array = np.asarray(ph, dtype=np.float32) + np.asarray(
         phb, dtype=np.float32,
     )
     return destagger_z(geopotential / np.float32(9.81))
@@ -272,7 +314,11 @@ def _cone(truelat1: float, truelat2: float) -> float:
     return float(numerator/denominator)
 
 
-def rotation_angle(ds: nc.Dataset, lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
+def rotation_angle(
+    ds: nc.Dataset,
+    lat: ArrayLike,
+    lon: ArrayLike,
+) -> Float32Array:
     """Calculate the CALWRF grid-to-earth wind rotation angle.
 
     Args:
@@ -301,8 +347,8 @@ def rotation_angle(ds: nc.Dataset, lat: np.ndarray, lon: np.ndarray) -> np.ndarr
         raise ValueError(f"CALWRF does not support WRF MAP_PROJ={map_projection}")
     # Keep coordinate arithmetic in double precision, then cross into the
     # model's FP32 boundary once the angle has been calculated.
-    latitude=np.asarray(lat,dtype=np.float64)
-    longitude=np.asarray(lon,dtype=np.float64)
+    latitude: Float64Array = np.asarray(lat,dtype=np.float64)
+    longitude: Float64Array = np.asarray(lon,dtype=np.float64)
     stand_lon=float(getattr(ds,"STAND_LON"))
     cone=1.0 if map_projection==2 else _cone(
         getattr(ds,"TRUELAT1"),getattr(ds,"TRUELAT2"),
@@ -314,7 +360,11 @@ def rotation_angle(ds: nc.Dataset, lat: np.ndarray, lon: np.ndarray) -> np.ndarr
     return np.asarray(np.where(latitude<0.0,-alpha,alpha),dtype=np.float32)
 
 
-def earth_wind(u: np.ndarray, v: np.ndarray, alpha: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def earth_wind(
+    u: ArrayLike,
+    v: ArrayLike,
+    alpha: ArrayLike,
+) -> tuple[Float32Array, Float32Array]:
     """Rotate WRF grid-relative wind to earth-relative components.
 
     Args:
@@ -327,18 +377,21 @@ def earth_wind(u: np.ndarray, v: np.ndarray, alpha: np.ndarray) -> tuple[np.ndar
         A pair ``(eastward, northward)`` of float32 arrays in m s-1 with the
         broadcast input shape.
     """
-    u=np.asarray(u,dtype=np.float32)
-    v=np.asarray(v,dtype=np.float32)
-    angle=np.asarray(alpha,dtype=np.float32)
+    u_values: Float32Array = np.asarray(u,dtype=np.float32)
+    v_values: Float32Array = np.asarray(v,dtype=np.float32)
+    angle: Float32Array = np.asarray(alpha,dtype=np.float32)
     cosine=np.cos(angle)
     sine=np.sin(angle)
-    east=v*sine+u*cosine
-    north=v*cosine-u*sine
+    east=v_values*sine+u_values*cosine
+    north=v_values*cosine-u_values*sine
     return (np.asarray(east,dtype=np.float32),
             np.asarray(north,dtype=np.float32))
 
 
-def speed_direction(u: np.ndarray, v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def speed_direction(
+    u: ArrayLike,
+    v: ArrayLike,
+) -> tuple[Float32Array, Float32Array]:
     """Convert earth-relative vector wind to meteorological polar form.
 
     Args:
@@ -351,10 +404,10 @@ def speed_direction(u: np.ndarray, v: np.ndarray) -> tuple[np.ndarray, np.ndarra
         degrees in ``(0, 360]``. The historical CALWRF wrapping rule reports
         calm cells as 360 degrees.
     """
-    u=np.asarray(u,dtype=np.float32)
-    v=np.asarray(v,dtype=np.float32)
-    speed=np.hypot(u,v).astype(np.float32,copy=False)
-    calculated=np.float32(270.0)-np.rad2deg(np.arctan2(v,u))
+    u_values: Float32Array = np.asarray(u,dtype=np.float32)
+    v_values: Float32Array = np.asarray(v,dtype=np.float32)
+    speed=np.hypot(u_values,v_values).astype(np.float32,copy=False)
+    calculated=np.float32(270.0)-np.rad2deg(np.arctan2(v_values,u_values))
     direction=np.where(speed>=np.float32(1.e-9),calculated,np.float32(0.0))
     direction=np.mod(direction,np.float32(360.0))
     direction=np.where(direction<=np.float32(0.0),
@@ -364,8 +417,8 @@ def speed_direction(u: np.ndarray, v: np.ndarray) -> tuple[np.ndarray, np.ndarra
 
 def _var(
     dst: nc.Dataset, name: str, dims: tuple[str, ...], units: str,
-    compression=1, dtype="f4",
-) -> nc.Variable:
+    compression: int = 1, dtype: NetCDFDType = "f4",
+) -> NetCDFNumericVariable:
     """Create a compressed NetCDF variable and assign its physical units.
 
     Args:
@@ -384,14 +437,18 @@ def _var(
         RuntimeError: If the variable cannot be created, for example because
             its name already exists or a dimension is missing.
     """
-    var=dst.createVariable(name,dtype,dims,
-                           zlib=compression>0,complevel=compression,
-                           shuffle=compression>0)
+    level=cast(CompressionLevel,compression)
+    var=cast("NetCDFNumericVariable",dst.createVariable(
+        name,dtype,dims,zlib=level>0,complevel=level,shuffle=level>0))
     var.units = units
     return var
 
 
-def _mass_coordinate(source: nc.Dataset,name: str,time_index=0) -> np.ndarray:
+def _mass_coordinate(
+    source: nc.Dataset,
+    name: str,
+    time_index: int = 0,
+) -> Float64Array:
     """Read a WRF mass-point coordinate using CALWRF's alias fallback.
 
     Args:
@@ -414,7 +471,10 @@ def _mass_coordinate(source: nc.Dataset,name: str,time_index=0) -> np.ndarray:
     raise ValueError(f'WRF file has neither {name} nor {name}_M')
 
 
-def _rain_increment(current,previous):
+def _rain_increment(
+    current: ArrayLike,
+    previous: ArrayLike | None,
+) -> Float32Array:
     """Calculate a precipitation accumulation increment across one record.
 
     Args:
@@ -427,14 +487,18 @@ def _rain_increment(current,previous):
         differences are treated as accumulation-counter resets, in which case
         the current cumulative value is returned.
     """
-    values=np.asarray(current,dtype='f4')
+    values: Float32Array = np.asarray(current,dtype='f4')
     if previous is None:
         return values.copy()
-    delta=values-np.asarray(previous,dtype='f4')
+    delta: Float32Array = values-np.asarray(previous,dtype='f4')
     return np.where(delta>=0.,delta,values).astype('f4',copy=False)
 
 
-def _rain_increments(rainnc,rainc,previous):
+def _rain_increments(
+    rainnc: ArrayLike,
+    rainc: ArrayLike,
+    previous: tuple[ArrayLike, ArrayLike] | None,
+) -> tuple[Float32Array, Float32Array, Float32Array]:
     """Calculate reset-aware total and component precipitation increments.
 
     Args:
@@ -447,16 +511,27 @@ def _rain_increments(rainnc,rainc,previous):
         A tuple ``(total, grid, convective)`` of float32 arrays in millimetres
         with the broadcast input shape.
     """
-    nonconvective=np.asarray(rainnc,dtype='f4')
-    convective=np.asarray(rainc,dtype='f4')
-    previous_nonconvective=None if previous is None else previous[0]
-    previous_convective=None if previous is None else previous[1]
+    nonconvective: Float32Array = np.asarray(rainnc,dtype='f4')
+    convective: Float32Array = np.asarray(rainc,dtype='f4')
+    previous_nonconvective: ArrayLike | None = (
+        None if previous is None else previous[0]
+    )
+    previous_convective: ArrayLike | None = (
+        None if previous is None else previous[1]
+    )
     grid=_rain_increment(nonconvective,previous_nonconvective)
     convective_increment=_rain_increment(convective,previous_convective)
     return np.asarray(grid+convective_increment,dtype='f4'),grid,convective_increment
 
 
-def _surface_variable(source,index,name,shape,*,required=False):
+def _surface_variable(
+    source: nc.Dataset,
+    index: int,
+    name: str,
+    shape: Shape2D,
+    *,
+    required: bool = False,
+) -> Float32Array:
     """Read one WRF surface field using CALWRF's missing-field policy.
 
     Args:
@@ -483,7 +558,14 @@ def _surface_variable(source,index,name,shape,*,required=False):
     return np.zeros(shape,dtype='f4')
 
 
-def _volume_variable(source,index,name,shape,*,required=False):
+def _volume_variable(
+    source: nc.Dataset,
+    index: int,
+    name: str,
+    shape: Shape3D,
+    *,
+    required: bool = False,
+) -> Float32Array:
     """Read one WRF volume field using CALWRF's missing-field policy.
 
     Args:
@@ -508,7 +590,12 @@ def _volume_variable(source,index,name,shape,*,required=False):
     return np.zeros(shape,dtype='f4')
 
 
-def _surface_wind(source,index,shape,alpha):
+def _surface_wind(
+    source: nc.Dataset,
+    index: int,
+    shape: Shape2D,
+    alpha: ArrayLike,
+) -> tuple[Float32Array, Float32Array]:
     """Read and rotate WRF 10-m wind into CALWRF speed and direction.
 
     Args:
@@ -523,7 +610,7 @@ def _surface_wind(source,index,shape,alpha):
         absent, both arrays are zero without requiring ``V10``.
     """
     if 'U10' not in source.variables:
-        zeros=np.zeros(shape,dtype='f4')
+        zeros: Float32Array = np.zeros(shape,dtype='f4')
         return zeros.copy(),zeros
     u10=_surface_variable(source,index,'U10',shape)
     v10=_surface_variable(source,index,'V10',shape)
@@ -532,7 +619,11 @@ def _surface_wind(source,index,shape,alpha):
     return speed,direction
 
 
-def _pressure_temperature(perturbation_pressure,base_pressure,perturbation_theta):
+def _pressure_temperature(
+    perturbation_pressure: ArrayLike,
+    base_pressure: ArrayLike,
+    perturbation_theta: ArrayLike,
+) -> tuple[Float32Array, Float32Array]:
     """Convert WRF pressure and potential temperature to CALWRF fields.
 
     Args:
@@ -545,16 +636,24 @@ def _pressure_temperature(perturbation_pressure,base_pressure,perturbation_theta
         A pair ``(pressure, temperature)`` of float32 arrays with the broadcast
         input shape. Pressure is in hectopascals and temperature is in kelvins.
     """
-    pressure=(np.asarray(perturbation_pressure,dtype=np.float32)+
-              np.asarray(base_pressure,dtype=np.float32))*np.float32(0.01)
-    theta=np.asarray(perturbation_theta,dtype=np.float32)+np.float32(300.0)
+    pressure: Float32Array = (
+        np.asarray(perturbation_pressure,dtype=np.float32)+
+        np.asarray(base_pressure,dtype=np.float32)
+    )*np.float32(0.01)
+    theta: Float32Array = (
+        np.asarray(perturbation_theta,dtype=np.float32)+np.float32(300.0)
+    )
     exponent=np.float32(287.04/1004.0)
     temperature=theta*np.power(pressure/np.float32(1000.0),exponent)
     return (np.asarray(pressure,dtype=np.float32),
             np.asarray(temperature,dtype=np.float32))
 
 
-def _select_wrf_times(paths,begin,end):
+def _select_wrf_times(
+    paths: Sequence[Path],
+    begin: datetime,
+    end: datetime,
+) -> tuple[list[WrfRecord], WrfRecord | None]:
     """Select unique hourly WRF records in an inclusive time interval.
 
     Args:
@@ -573,9 +672,10 @@ def _select_wrf_times(paths,begin,end):
         KeyError: If a file has no ``Times`` variable.
         ValueError: If a source timestamp cannot be parsed.
     """
-    selected_by_time={}
-    baseline=None
+    selected_by_time: dict[datetime, WrfRecord] = {}
+    baseline: WrfRecord | None = None
     baseline_time=begin-timedelta(hours=1)
+    dataset: nc.Dataset
     for path in paths:
         with nc.Dataset(path) as dataset:
             for index,text in enumerate(_times(dataset)):
@@ -585,11 +685,20 @@ def _select_wrf_times(paths,begin,end):
                     baseline=(path,index,canonical)
                 if begin<=when<=end:
                     selected_by_time.setdefault(when,(path,index,canonical))
-    selected=[selected_by_time[when] for when in sorted(selected_by_time)]
+    selected: list[WrfRecord] = [
+        selected_by_time[when] for when in sorted(selected_by_time)
+    ]
     return selected,baseline
 
 
-def _copy_static(src: nc.Dataset,dst: nc.Dataset,ys,xs,zs,compression=1) -> None:
+def _copy_static(
+    src: nc.Dataset,
+    dst: nc.Dataset,
+    ys: slice,
+    xs: slice,
+    zs: slice,
+    compression: int = 1,
+) -> None:
     """Copy time-invariant WRF grid fields into a CALWRF NetCDF dataset.
 
     Args:
@@ -621,7 +730,19 @@ def _copy_static(src: nc.Dataset,dst: nc.Dataset,ys,xs,zs,compression=1) -> None
     _var(dst,"sigma",("level",),"1",compression)[:]=np.asarray(src["ZNU"][0,zs],dtype="f4")
 
 
-def _create_output(path: Path,src: nc.Dataset,nt: int,ny: int,nx: int,nz: int,ys,xs,zs,*,compression=1) -> nc.Dataset:
+def _create_output(
+    path: Path,
+    src: nc.Dataset,
+    nt: int,
+    ny: int,
+    nx: int,
+    nz: int,
+    ys: slice,
+    xs: slice,
+    zs: slice,
+    *,
+    compression: int = 1,
+) -> nc.Dataset:
     """Create and initialize the canonical CALWRF NetCDF product.
 
     Args:
@@ -648,7 +769,7 @@ def _create_output(path: Path,src: nc.Dataset,nt: int,ny: int,nx: int,nz: int,ys
         RuntimeError: If NetCDF dimensions or variables cannot be created.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    dst = nc.Dataset(path, "w", format="NETCDF4")
+    dst: nc.Dataset = nc.Dataset(path, "w", format="NETCDF4")
     dst.createDimension("time", nt)
     dst.createDimension("level", nz)
     dst.createDimension("y", ny)
@@ -656,14 +777,14 @@ def _create_output(path: Path,src: nc.Dataset,nt: int,ny: int,nx: int,nz: int,ys
     dst.createDimension("date_strlen", 19)
     dst.createVariable("time_text", "S1", ("time", "date_strlen"))
     _copy_static(src,dst,ys,xs,zs,compression)
-    fields3 = {
+    fields3: dict[str, str] = {
         "pressure": "hPa", "height": "m", "temperature": "K",
         "wind_speed": "m s-1", "wind_direction": "degree",
         "vertical_velocity": "m s-1", "qvapor": "kg kg-1",
         "qcloud": "kg kg-1", "qrain": "kg kg-1", "qice": "kg kg-1",
         "qsnow": "kg kg-1", "qgraupel": "kg kg-1",
     }
-    fields2 = {
+    fields2: dict[str, str] = {
         "surface_pressure": "Pa", "precipitation": "mm", "snow_cover": "1",
         "shortwave_down": "W m-2", "longwave_down": "W m-2",
         "temperature_2m": "K", "qvapor_2m": "kg kg-1",
@@ -689,8 +810,8 @@ def _create_output(path: Path,src: nc.Dataset,nt: int,ny: int,nx: int,nz: int,ys
     dst.source_grid_nx=len(src.dimensions["west_east"])
     dst.source_grid_ny=len(src.dimensions["south_north"])
     dst.source_grid_nz=len(src.dimensions["bottom_top"])
-    source_latitude=_mass_coordinate(src,"XLAT")
-    source_longitude=_mass_coordinate(src,"XLONG")
+    source_latitude: Float64Array = _mass_coordinate(src,"XLAT")
+    source_longitude: Float64Array = _mass_coordinate(src,"XLONG")
     dst.source_latitude_1_1=np.float64(source_latitude[0,0])
     dst.source_longitude_1_1=np.float64(source_longitude[0,0])
     for attr in ("MAP_PROJ", "TRUELAT1", "TRUELAT2", "STAND_LON", "CEN_LAT", "CEN_LON",
@@ -700,7 +821,9 @@ def _create_output(path: Path,src: nc.Dataset,nt: int,ny: int,nx: int,nz: int,ys
     for attr in ('MP_PHYSICS','CU_PHYSICS','BL_PBL_PHYSICS','RA_SW_PHYSICS',
                  'SF_SURFACE_PHYSICS','GRID_FDDA','OBS_NUDGE_OPT'):
         if hasattr(src,attr): dst.setncattr(attr.lower(),getattr(src,attr))
-    present=[name in src.variables for name in ('QCLOUD','QRAIN','QICE','QSNOW','QGRAUP')]
+    present: list[bool] = [
+        name in src.variables for name in ('QCLOUD','QRAIN','QICE','QSNOW','QGRAUP')
+    ]
     dst.legacy_cloud_component_count=(5 if present[4] else 4 if present[2] and present[3]
                                       else 2 if present[1] else 1 if present[0] else 1)
     return dst
@@ -729,14 +852,16 @@ def run(config: CalwrfConfig) -> Path:
         this function also writes legacy M3D/M2D files and a text listing.
         Existing destination files may be replaced.
     """
-    active_surface_output=(config.surface_output
-                           if config.create_surface and config.legacy_output is not None
-                           else None)
+    active_surface_output: str | Path | None = (
+        config.surface_output
+        if config.create_surface and config.legacy_output is not None
+        else None
+    )
     validate_calwrf_paths(
         config.wrf_files, config.output, config.legacy_output,
         active_surface_output, config.listing_output,
     )
-    paths = [Path(p) for p in config.wrf_files]
+    paths: list[Path] = [Path(p) for p in config.wrf_files]
     if not paths:
         raise ValueError("wrf_files is empty")
     for path in paths:
@@ -751,53 +876,79 @@ def run(config: CalwrfConfig) -> Path:
     selected,rain_baseline=_select_wrf_times(paths,begin,end)
     if not selected:
         raise ValueError("no WRF times fall inside requested interval")
-    selected_times=[_wrf_timestamp(item[2]) for item in selected]
+    selected_times: list[datetime] = [_wrf_timestamp(item[2]) for item in selected]
     if selected_times[0]!=begin or selected_times[-1]!=end or any(
             right-left!=timedelta(hours=1) for left,right in zip(selected_times[:-1],selected_times[1:])):
         raise ValueError('selected CALWRF output times must cover the requested interval hourly')
 
+    first: nc.Dataset
     with nc.Dataset(selected[0][0]) as first:
         source_ny=len(first.dimensions["south_north"]); source_nx=len(first.dimensions["west_east"])
         source_nz=len(first.dimensions["bottom_top"])
         xs=_selection(config.i_range,source_nx,'I'); ys=_selection(config.j_range,source_ny,'J')
         zs=_selection(config.k_range,source_nz,'K')
         nx=xs.stop-xs.start; ny=ys.stop-ys.start; nz=zs.stop-zs.start
-        dst=_create_output(Path(config.output),first,len(selected),ny,nx,nz,ys,xs,zs,
-                           compression=config.compression)
+        dst: nc.Dataset = _create_output(
+            Path(config.output),first,len(selected),ny,nx,nz,ys,xs,zs,
+            compression=config.compression,
+        )
         dst.title=config.title
-    previous_rain=None
+    previous_rain: RainState | None = None
     if rain_baseline is not None:
         baseline_path,baseline_index,_=rain_baseline
+        baseline_source: nc.Dataset
         with nc.Dataset(baseline_path) as baseline_source:
-            baseline_shape=(len(baseline_source.dimensions['south_north']),
-                            len(baseline_source.dimensions['west_east']))
+            baseline_shape: Shape2D = (
+                len(baseline_source.dimensions['south_north']),
+                len(baseline_source.dimensions['west_east']),
+            )
             rainnc=_surface_variable(baseline_source,baseline_index,'RAINNC',baseline_shape,
                                      required=True)
             rainc=_surface_variable(baseline_source,baseline_index,'RAINC',baseline_shape)
             previous_rain=(rainnc,rainc)
     try:
         for out_index, (path, time_index, text) in enumerate(selected):
+            src: nc.Dataset
             with nc.Dataset(path) as src:
-                take = lambda name: np.asarray(src[name][time_index], dtype="f4")
-                crop2=lambda values: np.asarray(values)[ys,xs]
-                crop3=lambda values: np.asarray(values)[zs,ys,xs]
+                take: Callable[[str], Float32Array] = lambda name: np.asarray(
+                    src[name][time_index], dtype="f4",
+                )
+                crop2: Callable[[Float32Array], Float32Array] = (
+                    lambda values: np.asarray(values)[ys,xs]
+                )
+                crop3: Callable[[Float32Array], Float32Array] = (
+                    lambda values: np.asarray(values)[zs,ys,xs]
+                )
+                lat: Float64Array
+                lon: Float64Array
                 lat,lon=_mass_coordinate(src,"XLAT",time_index),_mass_coordinate(
                     src,"XLONG",time_index)
-                alpha = rotation_angle(src, lat, lon)
+                alpha: Float32Array = rotation_angle(src, lat, lon)
+                pressure_hpa: Float32Array
+                temperature: Float32Array
                 pressure_hpa,temperature=_pressure_temperature(take("P"),take("PB"),take("T"))
-                height = _geopotential_height(take("PH"), take("PHB"))
-                vertical = destagger_z(take("W"))
-                u = destagger_x(take("U")); v = destagger_y(take("V"))
+                height: Float32Array = _geopotential_height(take("PH"), take("PHB"))
+                vertical: Float32Array = destagger_z(take("W"))
+                u: Float32Array = destagger_x(take("U"))
+                v: Float32Array = destagger_y(take("V"))
+                ue: Float32Array
+                vn: Float32Array
                 ue, vn = earth_wind(u, v, alpha[None, ...])
+                speed: Float32Array
+                direction: Float32Array
                 speed, direction = speed_direction(ue, vn)
-                surface_shape=alpha.shape
+                surface_shape: Shape2D = alpha.shape
+                speed10: Float32Array
+                direction10: Float32Array
                 speed10,direction10=_surface_wind(
                     src,time_index,surface_shape,alpha)
 
                 _write_time_text(dst["time_text"],out_index,text)
-                fields3={"pressure":pressure_hpa, "temperature":temperature,
-                         "wind_speed":speed, "wind_direction":direction,
-                         "vertical_velocity":vertical}
+                fields3: dict[str, Float32Array] = {
+                    "pressure":pressure_hpa, "temperature":temperature,
+                    "wind_speed":speed, "wind_direction":direction,
+                    "vertical_velocity":vertical,
+                }
                 fields3["qvapor"]=_volume_variable(
                     src,time_index,"QVAPOR",pressure_hpa.shape,required=True)
                 for source, target in (("QCLOUD", "qcloud"), ("QRAIN", "qrain"),
@@ -817,7 +968,7 @@ def run(config: CalwrfConfig) -> Path:
                 increment,grid_increment,convective_increment=_rain_increments(
                     rainnc,rainc,previous_rain)
                 previous_rain=(rainnc.copy(),rainc.copy())
-                surface={
+                surface: dict[str, Float32Array] = {
                     "surface_pressure":_surface_variable(
                         src,time_index,'PSFC',surface_shape,required=True),
                     "precipitation":increment,

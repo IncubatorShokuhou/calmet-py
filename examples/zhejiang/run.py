@@ -1,18 +1,23 @@
 """Run the complete Zhejiang example from the bundled source datasets."""
 
+from __future__ import annotations
+
+from collections.abc import Callable
 from pathlib import Path
+from typing import Final, TypeAlias
 
 import pycalmet
 
 
-ROOT = Path(__file__).resolve().parents[2]
-CONFIG = ROOT / "examples" / "zhejiang" / "config"
-OUTPUT = ROOT / "output" / "zhejiang"
+ROOT: Final[Path] = Path(__file__).resolve().parents[2]
+CONFIG: Final[Path] = ROOT / "examples" / "zhejiang" / "config"
+OUTPUT: Final[Path] = ROOT / "output" / "zhejiang"
+StageRunner: TypeAlias = Callable[[Path], Path]
 
 
 def main() -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    stages = (
+    stages: tuple[tuple[str, StageRunner, Path], ...] = (
         ("CALWRF", pycalmet.calwrf, CONFIG / "calwrf.inp"),
         ("TERREL", pycalmet.terrel, CONFIG / "terrel.inp"),
         ("CTGPROC", pycalmet.ctrproc, CONFIG / "ctgproc.inp"),

@@ -9,12 +9,12 @@ from __future__ import annotations
 from collections.abc import Callable
 import inspect
 import textwrap
-from typing import Any, TypeVar
+from typing import Any, Final, TypeVar
 
 
 # Canonical bilingual meanings shared by runtime help and generated reference
 # material. Stage-specific entries below override these shared descriptions.
-MEANING_OVERRIDES = {
+MEANING_OVERRIDES: Final[dict[str, tuple[str, str]]] = {
     "wrf_files": ("WRF NetCDF files, in chronological order.", "按时间顺序排列的 WRF NetCDF 文件。"),
     "start": ("First naive, second-precision timestamp included in the run; accepts datetime or YYYYMMDDHH/ISO-like text.", "计算开始时刻；使用无时区且精确到秒的时间，接受 datetime 或 YYYYMMDDHH/ISO 风格文本。"),
     "end": ("Last naive, second-precision timestamp included in the run; accepts datetime or YYYYMMDDHH/ISO-like text.", "计算结束时刻；使用无时区且精确到秒的时间，接受 datetime 或 YYYYMMDDHH/ISO 风格文本。"),
@@ -275,7 +275,9 @@ MEANING_OVERRIDES.update({
     "net_radiation_coefficient_3": ("Dimensionless HC3 denominator correction in the net-radiation equation `(…)/(1+HC3)`.", "净辐射方程 `(…)/(1+HC3)` 中的无量纲分母修正 HC3。"),
 })
 
-STAGE_MEANING_OVERRIDES = {
+STAGE_MEANING_OVERRIDES: Final[
+    dict[tuple[str, str], tuple[str, str]]
+] = {
     ("calmet", "start"): ("Inclusive lower boundary of the CALMET output interval `[start, end)`; meteorological boundary times are selected with `start < t <= end`, and each output timestamp is `t - timestep_seconds`.", "CALMET 输出区间 `[start, end)` 的闭合下界；实现选择满足 `start < t <= end` 的气象边界时刻，并将输出时间戳记为 `t - timestep_seconds`。"),
     ("calmet", "end"): ("Exclusive upper boundary of the CALMET output interval `[start, end)`; meteorological boundary times are selected with `start < t <= end`, and each output timestamp is `t - timestep_seconds`.", "CALMET 输出区间 `[start, end)` 的开放上界；实现选择满足 `start < t <= end` 的气象边界时刻，并将输出时间戳记为 `t - timestep_seconds`。"),
     ("terrel", "save_output"): ("Write a TERREL binary accumulator containing sample sums and hit counts for a later continuation pass.", "是否写出包含样本总和及命中数的 TERREL 二进制累积文件，供后续轮次继续。"),
@@ -290,7 +292,7 @@ STAGE_MEANING_OVERRIDES = {
 }
 
 
-_STAGE_SUMMARIES = {
+_STAGE_SUMMARIES: Final[dict[str, str]] = {
     "calwrf": "Convert WRF-ARW data into canonical CALWRF meteorology.",
     "terrel": "Generate a gridded terrain product.",
     "ctrproc": "Generate a gridded land-use product using the CTRPROC spelling.",
@@ -299,7 +301,7 @@ _STAGE_SUMMARIES = {
     "calmet": "Run the CALMET diagnostic meteorological model.",
 }
 
-_STAGE_RETURNS = {
+_STAGE_RETURNS: Final[dict[str, str]] = {
     "calwrf": "Path to the canonical CALWRF NetCDF meteorological file.",
     "terrel": "Path to the generated terrain file.",
     "ctrproc": "Path to the generated land-use file.",
@@ -311,13 +313,13 @@ _STAGE_RETURNS = {
     "calmet": "Path to the final CALMET meteorological output.",
 }
 
-_INPUT_DESCRIPTION = (
+_INPUT_DESCRIPTION: Final[str] = (
     "Configuration input. Pass a typed configuration object or mapping by "
     "itself, pass a traditional control-file path with optional explicit "
     "keyword overrides, or leave this as None to configure the stage entirely "
     "with typed keyword arguments."
 )
-_LEGACY_DESCRIPTION = (
+_LEGACY_DESCRIPTION: Final[str] = (
     "Additional overrides using traditional control-file variable names. "
     "Canonical and legacy aliases for the same setting cannot be supplied "
     "together."
@@ -459,7 +461,7 @@ def document_stage_api(stage: str) -> Callable[[_F], _F]:
     return decorate
 
 
-__all__ = [
+__all__: Final[list[str]] = [
     "MEANING_OVERRIDES",
     "STAGE_MEANING_OVERRIDES",
     "document_stage_api",

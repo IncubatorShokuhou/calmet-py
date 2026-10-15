@@ -1,11 +1,15 @@
 """Land-use preprocessing for standard rasters and CALMET source formats."""
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass,replace
+from os import PathLike
 from pathlib import Path
 import re
 import tempfile
+from typing import Final, SupportsInt, TypeAlias, TypeVar, cast
 import numpy as np
+from numpy.typing import ArrayLike, NDArray
 from netCDF4 import Dataset
 import rasterio
 from rasterio.enums import ColorInterp
@@ -27,52 +31,66 @@ from .projections import (geographic_crs,grid_crs,project_geographic,
                           project_from_crs,project_glaz_to_lcc,transform_grid,unproject_geographic,
                           unproject_to_crs)
 
-USGS38 = np.array([11,12,13,14,15,16,17,21,22,23,24,31,32,33,41,42,43,51,52,53,54,55,61,62,71,72,73,74,75,76,77,81,82,83,84,85,91,92], dtype=np.int16)
-GLOBAL_MERGE_TYPES={'GLAZNA','GLAZSA','GLAZEU','GLAZAS','GLAZAF','GLAZAP',
+Float32Array: TypeAlias = NDArray[np.float32]
+Float64Array: TypeAlias = NDArray[np.float64]
+Int64Array: TypeAlias = NDArray[np.int64]
+Int16Array: TypeAlias = NDArray[np.int16]
+Int8Array: TypeAlias = NDArray[np.int8]
+BoolArray: TypeAlias = NDArray[np.bool_]
+RasterArray: TypeAlias = NDArray[np.generic]
+PathInput: TypeAlias = str | PathLike[str]
+SnowRecord: TypeAlias = tuple[int, int]
+SnowGrouped: TypeAlias = dict[tuple[int, int], list[SnowRecord]]
+SnowRow: TypeAlias = tuple[int, int, int, np.float32, int]
+AccumulationResult: TypeAlias = tuple[Int64Array, int, int]
+_ReaderResultT = TypeVar('_ReaderResultT')
+
+USGS38: Final[Int16Array] = np.array([11,12,13,14,15,16,17,21,22,23,24,31,32,33,41,42,43,51,52,53,54,55,61,62,71,72,73,74,75,76,77,81,82,83,84,85,91,92], dtype=np.int16)
+GLOBAL_MERGE_TYPES: Final[set[str]] = {'GLAZNA','GLAZSA','GLAZEU','GLAZAS','GLAZAF','GLAZAP',
                     'GLC2K','UMDGLC','MODIS'}
-GLAZ_LIMITS={
+GLAZ_LIMITS: Final[dict[str, tuple[float, float, float, float]]] = {
     'GLAZNA':(90.,8.5,-20.,-180.),'GLAZSA':(13.,-60.,-32.,-100.),
     'GLAZEU':(90.,8.8,60.,-25.),'GLAZAS':(90.,-6.,200.,60.),
     'GLAZAF':(46.,-39.,60.,-30.),'GLAZAP':(22.,-51.,175.,88.),
 }
-GLAZ_TO_USGS = np.array([0,16,21,21,21,21,21,31,32,33,33,41,41,42,42,43,52,62,61,77,82,81,85,83,91], dtype=np.int16)
-NZ_TO_USGS = np.array([
+GLAZ_TO_USGS: Final[Int16Array] = np.array([0,16,21,21,21,21,21,31,32,33,33,41,41,42,42,43,52,62,61,77,82,81,85,83,91], dtype=np.int16)
+NZ_TO_USGS: Final[Int16Array] = np.array([
     0,55,0,0,0,0,0,0,0,0,16,14,0,0,0,0,0,0,0,0,21,22,0,0,0,0,0,0,0,0,
     43,43,0,0,0,0,0,0,0,0,32,0,0,61,0,0,0,0,0,0,52,0,0,0,0,0,0,0,0,0,
     62,62,0,0,0,0,0,0,0,0,75,72,74],dtype=np.int16)
-NLCD92_TO_USGS=np.zeros(256,dtype=np.int16)
+NLCD92_TO_USGS: Final[Int16Array] = np.zeros(256,dtype=np.int16)
 NLCD92_TO_USGS[[11,12,21,22,23,31,32,33,41,42,43,51,61,71,81,82,83,84,85,91,92]]=(
     52,91,11,11,13,74,75,76,41,42,43,32,22,31,21,21,21,21,21,61,62)
-NLCD01_TO_USGS=np.zeros(256,dtype=np.int16)
+NLCD01_TO_USGS: Final[Int16Array] = np.zeros(256,dtype=np.int16)
 NLCD01_TO_USGS[[11,12,21,22,23,24,31,32,41,42,43,51,52,71,72,73,74,81,82,
                 91,92,93,94,95,96,97,98,99,100]]=(
     52,91,30,11,11,13,74,72,41,42,43,32,32,31,82,82,82,21,21,
     61,61,61,61,61,62,62,62,62,62)
-GLC2K_TO_USGS=np.array([0,42,41,41,42,41,43,61,61,43,33,32,32,21,31,
+GLC2K_TO_USGS: Final[Int16Array] = np.array([0,42,41,41,42,41,43,61,61,43,33,32,32,21,31,
                          62,21,22,22,77,55,91,11,55,0],dtype=np.int16)
-UMDGLC_TO_USGS=np.array([55,42,42,41,41,43,32,33,32,32,31,21,21,16,77],
+UMDGLC_TO_USGS: Final[Int16Array] = np.array([55,42,42,41,41,43,32,33,32,32,31,21,21,16,77],
                          dtype=np.int16)
-MODIS_TO_USGS=np.array([0,52,42,42,41,41,43,43,33,43,32,31,62,21,16,21,
+MODIS_TO_USGS: Final[Int16Array] = np.array([0,52,42,42,41,41,43,43,33,43,32,31,62,21,16,21,
                         91,77,52],dtype=np.int16)
-CORINE_TO_USGS=np.array([0,16,16,13,14,14,14,75,75,75,22,22,24,24,21,22,
+CORINE_TO_USGS: Final[Int16Array] = np.array([0,16,16,13,14,14,14,75,75,75,22,22,24,24,21,22,
     22,22,21,21,21,21,43,41,42,43,31,82,32,81,72,74,83,74,91,61,61,62,
     62,72,51,52,54,54,55],dtype=np.int16)
-CORINE_CLASSES=np.array([111,112,121,122,123,124,131,132,133,141,142,211,
+CORINE_CLASSES: Final[NDArray[np.int32]] = np.array([111,112,121,122,123,124,131,132,133,141,142,211,
     212,213,221,222,223,231,241,242,243,244,311,312,313,321,322,323,324,
     331,332,333,334,335,411,412,421,422,423,511,512,521,522,523],dtype=np.int32)
-CORINE_RGB=np.array([230000077,255000000,204077242,204000000,230204204,
+CORINE_RGB: Final[NDArray[np.int32]] = np.array([230000077,255000000,204077242,204000000,230204204,
     230204230,166000204,166077000,255077255,255166255,255230255,255255168,
     255255000,230230000,230128000,242166077,230166000,230230077,255230166,
     255230077,230204077,242204166,128255000,166000,77255000,204242077,
     166255128,166230077,166242000,230230230,204204204,204255204,0,
     166230204,166166255,77077255,204204255,230230255,166166230,204242,
     128242230,255166,166255230,230242255],dtype=np.int32)
-QA_FILENAMES=('qamesh.dat','qactg.dat','qaglaz.dat','qanzgen.dat',
+QA_FILENAMES: Final[tuple[str, ...]] = ('qamesh.dat','qactg.dat','qaglaz.dat','qanzgen.dat',
               'qanlcd.dat','qacorine.dat','qagcl2k.dat','qaumdglc.dat','qamodis.dat',
               'qageneric.dat')
 
-COMPUTE_DTYPE=np.float32
-COORD_DTYPE=np.float64
+COMPUTE_DTYPE: Final[type[np.float32]] = np.float32
+COORD_DTYPE: Final[type[np.float64]] = np.float64
 
 @dataclass(frozen=True,slots=True)
 class GlazSpec:
@@ -96,7 +114,7 @@ class GlazSpec:
     latitude_origin: float
     longitude_origin: float
 
-GLAZ_SPECS={
+GLAZ_SPECS: Final[dict[str, GlazSpec]] = {
     'GLAZNA':GlazSpec(9223,8996,-4487.,-4515.,50.,-100.),
     'GLAZSA':GlazSpec(6000,8000,-3000.,-4899.,-15.,-60.),
     'GLAZEU':GlazSpec(13000,13000,-3000.,-4999.,55.,20.),
@@ -140,11 +158,13 @@ class CoastPolygon:
     """
 
     kind: int
-    x: np.ndarray
-    y: np.ndarray
+    x: Float64Array
+    y: Float64Array
 
 
-def _grid_indices(x, y, grid):
+def _grid_indices(
+    x: ArrayLike, y: ArrayLike, grid: GridConfig
+) -> tuple[Int64Array, Int64Array]:
     """Convert projected coordinates to zero-based target-cell indices.
 
     Args:
@@ -164,7 +184,9 @@ def _grid_indices(x, y, grid):
     return ix,iy
 
 
-def _inside_grid(x, y, grid):
+def _inside_grid(
+    x: ArrayLike, y: ArrayLike, grid: GridConfig
+) -> tuple[Int64Array, Int64Array, BoolArray]:
     """Locate projected samples and flag those inside the target grid.
 
     Args:
@@ -180,7 +202,7 @@ def _inside_grid(x, y, grid):
     return ix,iy,(ix>=0)&(ix<grid.nx)&(iy>=0)&(iy<grid.ny)
 
 
-def _grid_centers_1d(origin, spacing, count):
+def _grid_centers_1d(origin: float, spacing: float, count: int) -> Float64Array:
     """Construct regularly spaced one-dimensional cell-centre coordinates.
 
     Args:
@@ -195,7 +217,9 @@ def _grid_centers_1d(origin, spacing, count):
     return float(origin)+float(spacing)*index
 
 
-def _snow_grid_indices(longitude, latitude):
+def _snow_grid_indices(
+    longitude: ArrayLike, latitude: ArrayLike
+) -> tuple[Int64Array, Int64Array]:
     """Map geographic coordinates to CTGPROC's fixed SNODAS grid.
 
     Args:
@@ -229,7 +253,7 @@ class SnowGridInfo:
     order: dict[tuple[int, int], list[int]]
 
     @classmethod
-    def create(cls, grid):
+    def create(cls, grid: GridConfig) -> SnowGridInfo:
         """Create an empty sparse snow mapping.
 
         Args:
@@ -240,7 +264,13 @@ class SnowGridInfo:
         """
         return cls(grid, {}, {})
 
-    def add_hits(self, cell, category, snow_grid, count=1):
+    def add_hits(
+        self,
+        cell: SupportsInt,
+        category: SupportsInt,
+        snow_grid: SupportsInt,
+        count: SupportsInt = 1,
+    ) -> None:
         """Accumulate one sparse snow-grid record without fixed array limits.
 
         Args:
@@ -259,7 +289,7 @@ class SnowGridInfo:
         key=(group[0],group[1],snow_grid)
         self.hits[key]=self.hits.get(key,0)+int(count)
 
-    def merge(self, other):
+    def merge(self, other: SnowGridInfo) -> None:
         """Merge sparse records from a continuation dataset.
 
         Args:
@@ -273,7 +303,7 @@ class SnowGridInfo:
                 self.add_hits(cell,category,snow_grid,
                               other.hits[cell,category,snow_grid])
 
-    def remap(self, mapping):
+    def remap(self, mapping: Mapping[int, int]) -> SnowGridInfo:
         """Remap snow-record land-use categories like the main grid.
 
         Args:
@@ -290,7 +320,13 @@ class SnowGridInfo:
                                   self.hits[cell,category,snow_grid])
         return remapped
 
-    def add(self, x, y, categories, good):
+    def add(
+        self,
+        x: ArrayLike,
+        y: ArrayLike,
+        categories: Int16Array,
+        good: BoolArray,
+    ) -> None:
         """Add accepted projected samples to the sparse SNODAS mapping.
 
         Args:
@@ -316,7 +352,7 @@ class SnowGridInfo:
         for raw_cell,raw_category,raw_snow in zip(cell,category,snow,strict=True):
             self.add_hits(raw_cell,raw_category,raw_snow)
 
-    def records(self, categories):
+    def records(self, categories: Int16Array) -> tuple[SnowGrouped, Int64Array]:
         """Encode sparse snow hits using the output category ordering.
 
         Args:
@@ -332,7 +368,7 @@ class SnowGridInfo:
             ValueError: If a recorded category is absent from ``categories``.
         """
         lookup={int(value):index+1 for index,value in enumerate(categories)}
-        grouped={}
+        grouped: SnowGrouped = {}
         totals=np.zeros(self.grid.nx*self.grid.ny,dtype=np.int64)
         for (cell,category,snow),count in self.hits.items():
             if category not in lookup:
@@ -349,7 +385,16 @@ class SnowGridInfo:
         return grouped,totals
 
 
-def _bin_samples(counts,columns,x,y,categories,good,config,snow=None):
+def _bin_samples(
+    counts: Int64Array,
+    columns: Mapping[int, int],
+    x: ArrayLike,
+    y: ArrayLike,
+    categories: Int16Array,
+    good: BoolArray,
+    config: CtgprocConfig,
+    snow: SnowGridInfo | None = None,
+) -> None:
     """Accumulate accepted source samples into target land-use counts.
 
     Args:
@@ -376,7 +421,12 @@ def _bin_samples(counts,columns,x,y,categories,good,config,snow=None):
             cells[selected],minlength=counts.shape[1]).astype(counts.dtype,copy=False)
 
 
-def _read_with_optional_snow(function,*args,snow=None,**kwargs):
+def _read_with_optional_snow(
+    function: Callable[..., _ReaderResultT],
+    *args: object,
+    snow: SnowGridInfo | None = None,
+    **kwargs: object,
+) -> _ReaderResultT:
     """Call a source reader with snow bookkeeping only when enabled.
 
     Args:
@@ -393,7 +443,7 @@ def _read_with_optional_snow(function,*args,snow=None,**kwargs):
     return function(*args,snow=snow,**kwargs)
 
 
-def _qa_directory(config):
+def _qa_directory(config: CtgprocConfig) -> Path:
     """Resolve the directory for CTGPROC sample-coordinate QA files.
 
     Args:
@@ -406,7 +456,9 @@ def _qa_directory(config):
             else Path(config.output).parent)
 
 
-def _qa_write(config,name,*columns):
+def _qa_write(
+    config: CtgprocConfig, name: str, *columns: ArrayLike
+) -> None:
     """Append projected sample columns to one optional QA text file.
 
     Args:
@@ -430,7 +482,9 @@ def _qa_write(config,name,*columns):
         np.savetxt(stream,values,fmt='%.8g')
 
 
-def _read_coastline_bln(path,grid,*,allow_empty=False):
+def _read_coastline_bln(
+    path: PathInput, grid: GridConfig, *, allow_empty: bool = False
+) -> tuple[CoastPolygon, ...]:
     """Read COASTRD's pre-extracted target-grid BLN polygons.
 
     Args:
@@ -449,7 +503,7 @@ def _read_coastline_bln(path,grid,*,allow_empty=False):
     """
     source=Path(path)
     lines=source.read_text(encoding='ascii',errors='strict').splitlines()
-    polygons=[]; index=0
+    polygons: list[CoastPolygon] = []; index=0
     while index<len(lines):
         if not lines[index].strip():
             index+=1; continue
@@ -465,7 +519,7 @@ def _read_coastline_bln(path,grid,*,allow_empty=False):
         if count<3 or not identifiers or identifiers[0] not in {1,2,3,4}:
             raise ValueError(f'invalid coastline polygon at {source}:{index}')
         if index+count>len(lines): raise ValueError(f'truncated coastline polygon at {source}:{index}')
-        points=[]
+        points: list[tuple[float, float]] = []
         for number,line in enumerate(lines[index:index+count],start=index+1):
             try: point=tuple(float(value) for value in line.replace(',',' ').split()[:2])
             except ValueError as error:
@@ -487,7 +541,9 @@ def _read_coastline_bln(path,grid,*,allow_empty=False):
     return tuple(polygons)
 
 
-def _polygon_membership(px,py,polygon):
+def _polygon_membership(
+    px: ArrayLike, py: ArrayLike, polygon: CoastPolygon
+) -> Int8Array:
     """Classify points relative to one coastline polygon.
 
     Args:
@@ -510,7 +566,9 @@ def _polygon_membership(px,py,polygon):
     return np.where(inside,1,np.where(intersects,0,-1)).astype(np.int8,copy=False)
 
 
-def _coastline_types(x,y,polygons):
+def _coastline_types(
+    x: ArrayLike, y: ArrayLike, polygons: Sequence[CoastPolygon]
+) -> Int8Array:
     """Apply IPTYPE's nested coastline classification to projected points.
 
     Args:
@@ -537,7 +595,9 @@ def _coastline_types(x,y,polygons):
     return result
 
 
-def _fill_empty_ocean(counts,categories,config):
+def _fill_empty_ocean(
+    counts: Int64Array, categories: ArrayLike, config: CtgprocConfig
+) -> int:
     """Seed unsampled marine target cells with one ocean-category hit.
 
     Args:
@@ -567,7 +627,7 @@ def _fill_empty_ocean(counts,categories,config):
     return int(ocean.sum())
 
 
-def _coastline_polygons(config):
+def _coastline_polygons(config: CtgprocConfig) -> tuple[CoastPolygon, ...]:
     """Load coastline polygons when land/marine category swapping is enabled.
 
     Args:
@@ -588,7 +648,13 @@ def _coastline_polygons(config):
                                allow_empty=config.gshhs_file is not None)
 
 
-def _swap_coastline_categories(categories,x,y,config,polygons):
+def _swap_coastline_categories(
+    categories: ArrayLike,
+    x: ArrayLike,
+    y: ArrayLike,
+    config: CtgprocConfig,
+    polygons: Sequence[CoastPolygon],
+) -> tuple[Int16Array, BoolArray]:
     """Apply LUGRID's LMARSWAP rule to projected source samples.
 
     Args:
@@ -613,7 +679,9 @@ def _swap_coastline_categories(categories,x,y,config,polygons):
     swapped=np.where(present&marine&(values!=54),config.ocean_category,values)
     return swapped,keep
 
-def _remap_categories(categories,counts,mapping):
+def _remap_categories(
+    categories: ArrayLike, counts: Int64Array, mapping: Mapping[int, int]
+) -> tuple[Int16Array, Int64Array]:
     """Apply a category map and merge source classes sharing one target.
 
     Args:
@@ -641,7 +709,12 @@ def _remap_categories(categories,counts,mapping):
     return output,merged
 
 
-def _merge_global_counts(accumulated,current,categories,excluded_water=52):
+def _merge_global_counts(
+    accumulated: Int64Array,
+    current: Int64Array,
+    categories: ArrayLike,
+    excluded_water: int = 52,
+) -> None:
     """Merge one global-region count grid with GMERGE water precedence.
 
     Args:
@@ -669,8 +742,14 @@ def _merge_global_counts(accumulated,current,categories,excluded_water=52):
     accumulated[:,add]+=current[:,add]
 
 
-def _select_glaz_markers(center_lon,center_lat,left_lon,right_lon,
-                         lower_lat,upper_lat):
+def _select_glaz_markers(
+    center_lon: float,
+    center_lat: float,
+    left_lon: float,
+    right_lon: float,
+    lower_lat: float,
+    upper_lat: float,
+) -> set[str]:
     """Select global GLAZ regions using legacy GSELECT overlap tests.
 
     Args:
@@ -688,7 +767,7 @@ def _select_glaz_markers(center_lon,center_lat,left_lon,right_lon,
     center_lon=float(center_lon); center_lat=float(center_lat)
     left_lon=float(left_lon); right_lon=float(right_lon)
     lower_lat=float(lower_lat); upper_lat=float(upper_lat)
-    keep=set()
+    keep: set[str] = set()
     for kind,limits in GLAZ_LIMITS.items():
         north,south,east,west=map(float,limits)
         center_hits=int(south<=center_lat<=north)+int(west<=center_lon<=east)
@@ -705,7 +784,7 @@ def _select_glaz_markers(center_lon,center_lat,left_lon,right_lon,
     return keep
 
 
-def _select_glaz_regions(grid):
+def _select_glaz_regions(grid: GridConfig) -> set[str]:
     """Transform a target grid and select overlapping GLAZ source regions.
 
     Args:
@@ -769,7 +848,11 @@ def _glaz_crs(spec: GlazSpec) -> CRS:
     """
     return CRS.from_proj4(f"+proj=laea +lat_0={spec.latitude_origin:g} +lon_0={spec.longitude_origin:g} +R=6370997 +units=km +no_defs")
 
-def _window(g, reverse, spec):
+def _window(
+    g: GridConfig,
+    reverse: Callable[[Float64Array, Float64Array], tuple[ArrayLike, ArrayLike]],
+    spec: GlazSpec,
+) -> tuple[range, range]:
     """Estimate a buffered GLAZ source window covering the target grid.
 
     Args:
@@ -793,7 +876,7 @@ def _window(g, reverse, spec):
     return range(max(0,ix0-buf),min(spec.nx,ix1+buf+1)),range(max(0,iy0-buf),min(spec.ny,iy1+buf+1))
 
 
-def _mesh_offsets(mesh,cell_size=1.):
+def _mesh_offsets(mesh: int, cell_size: float = 1.) -> Float64Array:
     """Construct evenly spaced subpixel offsets about a cell centre.
 
     Args:
@@ -810,7 +893,9 @@ def _mesh_offsets(mesh,cell_size=1.):
     return (np.arange(int(mesh),dtype=COORD_DTYPE)+.5)*step-float(cell_size)/2.
 
 
-def _mesh_coordinates(centers,mesh,cell_size=1.):
+def _mesh_coordinates(
+    centers: ArrayLike, mesh: int, cell_size: float = 1.
+) -> Float64Array:
     """Expand source-cell centres into regularly spaced mesh coordinates.
 
     Args:
@@ -825,7 +910,9 @@ def _mesh_coordinates(centers,mesh,cell_size=1.):
     return center[...,None]+_mesh_offsets(mesh,cell_size)
 
 
-def _source_centers(origin,spacing,indices):
+def _source_centers(
+    origin: float, spacing: float, indices: ArrayLike
+) -> Float64Array:
     """Convert zero-based source indices to pixel-centre coordinates.
 
     Args:
@@ -839,7 +926,9 @@ def _source_centers(origin,spacing,indices):
     return float(origin)+float(spacing)*np.asarray(indices,dtype=COORD_DTYPE)
 
 
-def _read_categorical_raster(path, *, fallback_crs=None):
+def _read_categorical_raster(
+    path: PathInput, *, fallback_crs: CRS | str | int | None = None
+) -> tuple[CRS, float, float, float, float, RasterArray, int, BoolArray]:
     """Read categorical raster pixels and affine geometry with Rasterio.
 
     Args:
@@ -891,7 +980,11 @@ def _read_categorical_raster(path, *, fallback_crs=None):
     return source_crs,float(x0),float(y0),dx,dy,data,photometric,valid
 
 
-def _accumulate_glazas(path, config, snow=None):
+def _accumulate_glazas(
+    path: Path,
+    config: CtgprocConfig,
+    snow: SnowGridInfo | None = None,
+) -> AccumulationResult:
     """Window, mesh-sample, and accumulate one raw GLAZ regional raster.
 
     Args:
@@ -918,7 +1011,9 @@ def _accumulate_glazas(path, config, snow=None):
     source_grid=GridConfig(1,1,1.,1.,projection='LAZA',
                            lat0=spec.latitude_origin,lon0=spec.longitude_origin,
                            datum=config.input_datum)
-    def reverse(x,y):
+    def reverse(
+        x: ArrayLike, y: ArrayLike
+    ) -> tuple[Float64Array, Float64Array]:
         """Transform target-grid coordinates back to the GLAZ source CRS.
 
         Args:
@@ -928,7 +1023,10 @@ def _accumulate_glazas(path, config, snow=None):
         Returns:
             Pair of ``float64`` GLAZ x/y arrays in kilometres.
         """
-        return unproject_to_crs(x,y,g,source_crs,config.input_datum,units='km')
+        return cast(
+            tuple[Float64Array, Float64Array],
+            unproject_to_crs(x,y,g,source_crs,config.input_datum,units='km'),
+        )
     irange,jrange=_window(g,reverse,spec)
     counts=np.zeros((USGS38.size,g.ny*g.nx),dtype=np.int64)
     columns={int(v):i for i,v in enumerate(USGS38)}
@@ -961,7 +1059,7 @@ def _accumulate_glazas(path, config, snow=None):
     return counts.reshape(USGS38.size,g.ny,g.nx),read,inside
 
 
-def _ctg_record(line,path,number):
+def _ctg_record(line: str, path: Path, number: int) -> tuple[int, int, int, int]:
     """Parse one free-form or fixed-column compressed CTG record.
 
     Args:
@@ -977,7 +1075,8 @@ def _ctg_record(line,path,number):
     """
     fields=line.split()
     try:
-        if len(fields)==4: return tuple(int(value) for value in fields)
+        if len(fields)==4:
+            return cast(tuple[int, int, int, int], tuple(int(value) for value in fields))
         padded=line.ljust(24)
         return (int(padded[0:4]),int(padded[4:7]),
                 int(padded[7:15]),int(padded[15:24]))
@@ -985,7 +1084,11 @@ def _ctg_record(line,path,number):
         raise ValueError(f'invalid CTG record at {path}:{number}') from error
 
 
-def _accumulate_ctg(path,config,snow=None):
+def _accumulate_ctg(
+    path: Path,
+    config: CtgprocConfig,
+    snow: SnowGridInfo | None = None,
+) -> AccumulationResult:
     """Expand USGS 200 m CTG run records and bin their mesh samples.
 
     Args:
@@ -1013,7 +1116,10 @@ def _accumulate_ctg(path,config,snow=None):
     counts=np.zeros((USGS38.size,config.grid.ny*config.grid.nx),dtype=np.int64)
     columns={int(value):index for index,value in enumerate(USGS38)}
     polygons=_coastline_polygons(config)
-    x_anchor=y_anchor=None; read=inside=0
+    x_anchor: int | None
+    y_anchor: int | None
+    x_anchor=y_anchor=None
+    read=inside=0
     for number,line in enumerate(lines[5:],start=6):
         if not line.strip(): continue
         run,category,x_value,y_value=_ctg_record(line,path,number)
@@ -1035,7 +1141,10 @@ def _accumulate_ctg(path,config,snow=None):
         # IMESH is the outer loop and JMESH the inner loop in LOADOTHER.
         sx=np.broadcast_to(mesh_x[:,:,None],(run,mesh,mesh)).ravel()
         sy=np.broadcast_to(mesh_y[None,None,:],(run,mesh,mesh)).ravel()
-        gx,gy=transform_grid(sx,sy,source_grid,config.grid,units='km')
+        gx,gy=cast(
+            tuple[Float64Array, Float64Array],
+            transform_grid(sx,sy,source_grid,config.grid,units='km'),
+        )
         ix,iy,in_grid=_inside_grid(gx,gy,config.grid)
         categories=np.full(gx.shape,category,dtype=np.int16)
         categories,coastal=_swap_coastline_categories(categories,gx,gy,config,polygons)
@@ -1043,16 +1152,23 @@ def _accumulate_ctg(path,config,snow=None):
         _qa_write(config,'qamesh.dat',gx[good],gy[good])
         used=good.reshape(run,mesh*mesh).any(axis=1)
         if used.any():
-            center_x,center_y=transform_grid(centers_x[used],
-                np.full(np.count_nonzero(used),center_y,dtype=np.float64),source_grid,
-                config.grid,units='km')
+            center_x,center_y=cast(
+                tuple[Float64Array, Float64Array],
+                transform_grid(centers_x[used],
+                    np.full(np.count_nonzero(used),center_y,dtype=np.float64),source_grid,
+                    config.grid,units='km'),
+            )
             _qa_write(config,'qactg.dat',center_x,center_y,
                       np.full(np.count_nonzero(used),category))
         _bin_samples(counts,columns,gx,gy,categories,good,config,snow)
         inside+=int(good.sum())
     return counts.reshape(USGS38.size,config.grid.ny,config.grid.nx),read,inside
 
-def _read_generic(path,config,snow=None):
+def _read_generic(
+    path: Path,
+    config: CtgprocConfig,
+    snow: SnowGridInfo | None = None,
+) -> tuple[Int16Array, Int64Array, int, int]:
     """Read ``GENERIC.LANDUSE`` point records and bin them by target cell.
 
     Args:
@@ -1084,12 +1200,12 @@ def _read_generic(path,config,snow=None):
         raise ValueError(f'incomplete generic land-use header: {path}') from error
     if projection!='LL' or units!='DEG':
         raise ValueError('generic land-use coordinates must use LL projection and DEG units')
-    categories=[]
+    categories: list[int] = []
     while len(categories)<count and index<len(lines):
         categories.extend(int(item) for item in lines[index].split()); index+=1
     if len(categories)!=count or len(set(categories))!=count:
         raise ValueError('generic land-use category list is incomplete or contains duplicates')
-    records=[]
+    records: list[tuple[int, float, float]] = []
     for number,line in enumerate(lines[index:],start=index+1):
         if not line.strip(): continue
         fields=line.split()
@@ -1121,7 +1237,11 @@ def _read_generic(path,config,snow=None):
     return np.asarray(categories,dtype=np.int16),counts,len(records),int(good.sum())
 
 
-def _read_nzgen(path,config,snow=None):
+def _read_nzgen(
+    path: Path,
+    config: CtgprocConfig,
+    snow: SnowGridInfo | None = None,
+) -> AccumulationResult:
     """Read New Zealand points and apply the legacy NZCAT translation.
 
     Args:
@@ -1136,7 +1256,7 @@ def _read_nzgen(path,config,snow=None):
     Raises:
         ValueError: If a record, NZ category, latitude, or datum is invalid.
     """
-    records=[]
+    records: list[tuple[int, float, float]] = []
     for number,line in enumerate(path.read_text(encoding='ascii',errors='strict').splitlines(),start=1):
         if not line.strip(): continue
         fields=line.replace(',',' ').split()
@@ -1165,7 +1285,7 @@ def _read_nzgen(path,config,snow=None):
     return counts,len(records),int(good.sum())
 
 
-def _nlcd92_state(path):
+def _nlcd92_state(path: Path) -> str:
     """Infer the legacy NLCD92 state-grid key from a source filename.
 
     Args:
@@ -1184,7 +1304,12 @@ def _nlcd92_state(path):
     return match.group(1).lower()
 
 
-def _accumulate_nlcd92(path,config,spec: Nlcd92Spec | None=None,snow=None):
+def _accumulate_nlcd92(
+    path: Path,
+    config: CtgprocConfig,
+    spec: Nlcd92Spec | None = None,
+    snow: SnowGridInfo | None = None,
+) -> AccumulationResult:
     """Read and accumulate a headerless state NLCD92 byte grid.
 
     Args:
@@ -1238,7 +1363,12 @@ def _accumulate_nlcd92(path,config,spec: Nlcd92Spec | None=None,snow=None):
     return counts.reshape(USGS38.size,config.grid.ny,config.grid.nx),read,inside
 
 
-def _accumulate_nlcd_geotiff(path,config,translation,snow=None):
+def _accumulate_nlcd_geotiff(
+    path: Path,
+    config: CtgprocConfig,
+    translation: Int16Array,
+    snow: SnowGridInfo | None = None,
+) -> AccumulationResult:
     """Read and accumulate an NLCD GeoTIFF using its embedded geometry.
 
     Args:
@@ -1285,7 +1415,12 @@ def _accumulate_nlcd_geotiff(path,config,translation,snow=None):
     return counts.reshape(USGS38.size,config.grid.ny,config.grid.nx),read,inside
 
 
-def _corine_indices(data,photometric,path,valid=None):
+def _corine_indices(
+    data: ArrayLike,
+    photometric: int,
+    path: PathInput,
+    valid: ArrayLike | None = None,
+) -> Int16Array:
     """Decode index, class-code, or RGB CORINE pixels to class positions.
 
     Args:
@@ -1343,7 +1478,11 @@ def _corine_indices(data,photometric,path,valid=None):
     return indices
 
 
-def _accumulate_corine(path,config,snow=None):
+def _accumulate_corine(
+    path: Path,
+    config: CtgprocConfig,
+    snow: SnowGridInfo | None = None,
+) -> AccumulationResult:
     """Mesh-sample and accumulate any supported CORINE GeoTIFF encoding.
 
     Args:
@@ -1391,8 +1530,16 @@ def _accumulate_corine(path,config,snow=None):
     return counts.reshape(USGS38.size,config.grid.ny,config.grid.nx),read,inside
 
 
-def _accumulate_global_geotiff(path,config,translation,*,offset=0,missing=(),
-                               fallback_epsg=None,snow=None):
+def _accumulate_global_geotiff(
+    path: Path,
+    config: CtgprocConfig,
+    translation: Int16Array,
+    *,
+    offset: int = 0,
+    missing: Sequence[int] = (),
+    fallback_epsg: int | None = None,
+    snow: SnowGridInfo | None = None,
+) -> AccumulationResult:
     """Mesh-sample and accumulate a global categorical GeoTIFF.
 
     Args:
@@ -1456,7 +1603,12 @@ def _accumulate_global_geotiff(path,config,translation,*,offset=0,missing=(),
     return counts.reshape(USGS38.size,config.grid.ny,config.grid.nx),read,inside
 
 
-def _accumulate_modis(path,config,spec: ModisSpec | None=None,snow=None):
+def _accumulate_modis(
+    path: Path,
+    config: CtgprocConfig,
+    spec: ModisSpec | None = None,
+    snow: SnowGridInfo | None = None,
+) -> AccumulationResult:
     """Window, mesh-sample, and accumulate a raw BU MODIS byte grid.
 
     Args:
@@ -1508,9 +1660,12 @@ def _accumulate_modis(path,config,spec: ModisSpec | None=None,snow=None):
         sx=np.broadcast_to(mesh_x[:,:,None],(centers.size,mesh,mesh)).ravel()
         sy=np.broadcast_to(mesh_y[None,None,:],(centers.size,mesh,mesh)).ravel()
         gx,gy=project_geographic(sx,sy,config.grid,config.input_datum,units='km')
-        center_x,center_y=project_geographic(
-            centers,np.full(centers.size,center_y,dtype=np.float64),
-            config.grid,config.input_datum,units='km')
+        center_x,center_y=cast(
+            tuple[Float64Array, Float64Array],
+            project_geographic(
+                centers,np.full(centers.size,center_y,dtype=np.float64),
+                config.grid,config.input_datum,units='km'),
+        )
         _qa_write(config,'qamodis.dat',center_x,center_y)
         _qa_write(config,'qamesh.dat',gx,gy)
         ix,iy,in_grid=_inside_grid(gx,gy,config.grid)
@@ -1521,7 +1676,9 @@ def _accumulate_modis(path,config,spec: ModisSpec | None=None,snow=None):
         read+=raw.size; inside+=int(good.sum())
     return counts.reshape(USGS38.size,config.grid.ny,config.grid.nx),read,inside
 
-def _read_previous_landuse(path,grid):
+def _read_previous_landuse(
+    path: PathInput, grid: GridConfig
+) -> tuple[Int16Array, Int64Array, SnowGridInfo | None]:
     """Read CTGPROC continuation hits and optional sparse snow records.
 
     Args:
@@ -1540,6 +1697,7 @@ def _read_previous_landuse(path,grid):
         OSError: If the continuation file cannot be read.
     """
     source=Path(path)
+    snow: SnowGridInfo | None
     if source.suffix.lower() in {'.nc','.nc4','.cdf'}:
         with Dataset(source) as dataset:
             file_type=str(getattr(dataset,'landuse_file_type','')).upper()
@@ -1572,25 +1730,25 @@ def _read_previous_landuse(path,grid):
                 raise ValueError('previous land-use snow metadata is incomplete')
             snow=SnowGridInfo.create(grid) if present else None
             if snow is not None:
-                cell=np.asarray(dataset['snow_cell_index'][:],dtype=np.int64)-1
-                land=np.asarray(dataset['snow_landuse_index'][:],dtype=np.int64)-1
-                snow_grid=np.asarray(dataset['snow_grid_index'][:],dtype=np.int64)
-                fraction=np.asarray(dataset['snow_fraction'][:],dtype=np.float64)
-                if not (cell.shape==land.shape==snow_grid.shape==fraction.shape):
+                cell_values=np.asarray(dataset['snow_cell_index'][:],dtype=np.int64)-1
+                land_values=np.asarray(dataset['snow_landuse_index'][:],dtype=np.int64)-1
+                snow_grid_values=np.asarray(dataset['snow_grid_index'][:],dtype=np.int64)
+                fraction_values=np.asarray(dataset['snow_fraction'][:],dtype=np.float64)
+                if not (cell_values.shape==land_values.shape==snow_grid_values.shape==fraction_values.shape):
                     raise ValueError('previous land-use snow arrays do not match')
-                if (np.any((cell<0)|(cell>=grid.nx*grid.ny)) or
-                        np.any((land<0)|(land>=categories.size)) or
-                        np.any(~np.isfinite(fraction)|(fraction<0.))):
+                if (np.any((cell_values<0)|(cell_values>=grid.nx*grid.ny)) or
+                        np.any((land_values<0)|(land_values>=categories.size)) or
+                        np.any(~np.isfinite(fraction_values)|(fraction_values<0.))):
                     raise ValueError('previous land-use snow metadata is invalid')
                 if 'snow_sample_count' in dataset.variables:
                     snow_count=np.asarray(dataset['snow_sample_count'][:],dtype=np.int64)
-                    if snow_count.shape!=cell.shape or np.any(snow_count<0):
+                    if snow_count.shape!=cell_values.shape or np.any(snow_count<0):
                         raise ValueError('previous land-use snow counts are invalid')
                 else:
                     totals=counts.sum(axis=0,dtype=np.int64).ravel()
-                    snow_count=np.rint(fraction*totals[cell]).astype(np.int64)
+                    snow_count=np.rint(fraction_values*totals[cell_values]).astype(np.int64)
                 for cell_index,land_index,snow_index,hit_count in zip(
-                        cell,land,snow_grid,snow_count,strict=True):
+                        cell_values,land_values,snow_grid_values,snow_count,strict=True):
                     if hit_count:
                         snow.add_hits(cell_index,categories[land_index],snow_index,
                                       hit_count)
@@ -1639,7 +1797,7 @@ def _read_previous_landuse(path,grid):
     if not seen.all(): raise ValueError('previous land-use file does not contain every grid cell')
     if np.any(counts<0): raise ValueError('previous land-use counts must be non-negative')
     index+=record_count
-    snow=None
+    snow = None
     if index<len(lines) and lines[index].strip()=='SNOW Grid Information:':
         snow=SnowGridInfo.create(grid); index+=1
         snow_records=lines[index:index+record_count]
@@ -1670,7 +1828,9 @@ def _read_previous_landuse(path,grid):
     return categories,counts,snow
 
 
-def _snow_rows(snow,categories):
+def _snow_rows(
+    snow: SnowGridInfo | None, categories: Int16Array
+) -> tuple[Sequence[SnowRow], Int64Array]:
     """Flatten sparse snow hits into serializable fractional records.
 
     Args:
@@ -1690,7 +1850,7 @@ def _snow_rows(snow,categories):
     if snow is None:
         return (),np.empty(0,dtype=np.int64)
     grouped,totals=snow.records(categories)
-    rows=[]
+    rows: list[SnowRow] = []
     for (cell,land),items in sorted(grouped.items()):
         for snow_grid,count in items:
             fraction=COMPUTE_DTYPE(np.float64(count)/np.float64(totals[cell]))
@@ -1698,8 +1858,17 @@ def _snow_rows(snow,categories):
     return rows,totals
 
 
-def _write_netcdf(path,fractions,counts,g,categories=USGS38,*,final_output=True,
-                  snow=None,qa_statistics=None):
+def _write_netcdf(
+    path: PathInput,
+    fractions: Float32Array,
+    counts: Int64Array,
+    g: GridConfig,
+    categories: Int16Array = USGS38,
+    *,
+    final_output: bool = True,
+    snow: SnowGridInfo | None = None,
+    qa_statistics: tuple[int, int, int] | None = None,
+) -> None:
     """Write a modern NetCDF CTGPROC land-use product.
 
     Args:
@@ -1749,8 +1918,16 @@ def _write_netcdf(path,fractions,counts,g,categories=USGS38,*,final_output=True,
             ds.createVariable('snow_fraction','f4',('snow_record',))[:]=values[:,3]
             ds.createVariable('snow_sample_count','i4',('snow_record',))[:]=values[:,4].astype(np.int32)
 
-def _write_legacy(path,fractions,counts,g,categories=USGS38,*,final_output=True,
-                  snow=None):
+def _write_legacy(
+    path: Path,
+    fractions: Float32Array,
+    counts: Int64Array,
+    g: GridConfig,
+    categories: Int16Array = USGS38,
+    *,
+    final_output: bool = True,
+    snow: SnowGridInfo | None = None,
+) -> None:
     """Write a legacy ASCII ``LU.DAT`` CTGPROC product.
 
     Args:
@@ -1817,7 +1994,7 @@ def _write_legacy(path,fractions,counts,g,categories=USGS38,*,final_output=True,
                     s.write(fields+'\n')
 
 
-def _fractions_from_counts(counts):
+def _fractions_from_counts(counts: ArrayLike) -> tuple[Int64Array, Float32Array]:
     """Convert integer category hits to model-ready fractions.
 
     Args:
@@ -1837,7 +2014,7 @@ def _fractions_from_counts(counts):
     return totals,fractions.astype(COMPUTE_DTYPE)
 
 
-def _low_hit_threshold(average_hits,threshold_percent):
+def _low_hit_threshold(average_hits: int, threshold_percent: int) -> int:
     """Calculate the integer low-hit threshold used for QA reporting.
 
     Args:
@@ -1905,7 +2082,9 @@ def run(config: CtgprocConfig) -> LanduseResult:
         sources=tuple(source for source in sources
                       if source.input_type.upper() not in GLAZ_SPECS or
                       source.input_type.upper() in selected)
-    previous_snow=None
+    previous_snow: SnowGridInfo | None = None
+    categories: Int16Array | None
+    counts: Int64Array | None
     if config.previous_landuse is not None:
         categories,counts,previous_snow=_read_previous_landuse(
             config.previous_landuse,config.grid)
@@ -1983,11 +2162,14 @@ def run(config: CtgprocConfig) -> LanduseResult:
             categories=USGS38; partial,file_read,file_inside=_read_with_optional_snow(
                 _accumulate_glazas,item,active,snow=snow)
             if counts is None: counts=np.zeros(partial.shape,dtype=np.int64)
+        counts=cast(Int64Array,counts)
         if kind in GLOBAL_MERGE_TYPES:
             _merge_global_counts(counts,partial,categories)
         else:
             counts+=partial
         read+=file_read; inside+=file_inside
+    categories=cast(Int16Array,categories)
+    counts=cast(Int64Array,counts)
     raw_totals=counts.sum(axis=0,dtype=np.int64)
     average_hits=int(raw_totals.sum(dtype=np.int64)//(config.grid.nx*config.grid.ny))
     low_hit_threshold=_low_hit_threshold(

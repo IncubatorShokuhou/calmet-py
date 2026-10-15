@@ -5,10 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import BinaryIO, Iterable
+from typing import Any, BinaryIO, Generator, Literal, TypeAlias, cast
 
 import netCDF4 as nc
 import numpy as np
+import numpy.typing as npt
+
+
+CompressionLevel: TypeAlias = Literal[0,1,2,3,4,5,6,7,8,9]
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,11 +63,11 @@ class M3DHeader:
     nz: int
     nhours: int
     start: datetime
-    sigma: np.ndarray
-    latitude: np.ndarray
-    longitude: np.ndarray
-    terrain: np.ndarray
-    landuse: np.ndarray
+    sigma: npt.NDArray[np.float32]
+    latitude: npt.NDArray[np.float32]
+    longitude: npt.NDArray[np.float32]
+    terrain: npt.NDArray[np.float32]
+    landuse: npt.NDArray[np.int16]
     source_nx: int = 0
     source_ny: int = 0
     source_nz: int = 0
@@ -105,9 +109,9 @@ class M3DCell:
     timestamp: datetime
     i: int
     j: int
-    surface: np.ndarray
-    levels: np.ndarray
-    water: np.ndarray
+    surface: npt.NDArray[np.float32]
+    levels: npt.NDArray[np.float32]
+    water: npt.NDArray[np.float32]
 
     @property
     def date(self) -> datetime:
@@ -143,7 +147,7 @@ def _timestamp(field: bytes,description: str) -> datetime:
             a valid calendar hour.
     """
     try:
-        text=field.decode('ascii')
+        text: str=field.decode('ascii')
     except UnicodeDecodeError as error:
         raise ValueError(f'invalid M3D {description} timestamp') from error
     if len(text)!=10 or not text.isdecimal():
@@ -175,35 +179,46 @@ def _read_header(stream: BinaryIO) -> M3DHeader:
             truncated header record.
     """
     stream.readline()  # format/version
-    ncomment = int(stream.readline())
+    ncomment: int = int(stream.readline())
     for _ in range(ncomment):
         stream.readline()
     stream.readline()  # six output switches
-    grid = stream.readline().split()
-    projection = grid[0].decode("ascii")
+    grid: list[bytes] = stream.readline().split()
+    projection: str = grid[0].decode("ascii")
+    lat0: float; lon0: float; lat1: float; lat2: float
+    x0: float; y0: float; spacing: float
     lat0,lon0,lat1,lat2,x0,y0,spacing=map(float,grid[1:8])
+    source_nx: int; source_ny: int; source_nz: int
     source_nx, source_ny, source_nz = map(int, grid[8:11])
     stream.readline()  # physics flags
-    period = stream.readline().split()
+    period: list[bytes] = stream.readline().split()
     if len(period)<5:
         raise ValueError('M3D period record is incomplete')
-    start=_timestamp(period[0],'header')
+    start: datetime=_timestamp(period[0],'header')
     try:
+        nhours: int; nx: int; ny: int; nz: int
         nhours,nx,ny,nz=map(int,period[1:5])
     except ValueError as error:
         raise ValueError('invalid M3D period dimensions') from error
-    bounds=stream.readline().split()
+    bounds: list[bytes]=stream.readline().split()
     if len(bounds)<6:
         raise ValueError('M3D extraction-bounds record is incomplete')
+    i_start: int; j_start: int; i_end: int; j_end: int
+    k_start: int; k_end: int
     i_start,j_start,i_end,j_end,k_start,k_end=map(int,bounds[:6])
     if ((i_end-i_start+1,j_end-j_start+1,k_end-k_start+1)!=(nx,ny,nz)):
         raise ValueError('M3D extraction bounds do not match subset dimensions')
-    sigma = np.array([float(stream.readline()) for _ in range(nz)], dtype="f4")
-    latitude=np.empty((ny,nx),dtype='f4'); longitude=np.empty_like(latitude)
-    terrain=np.empty_like(latitude); landuse=np.empty((ny,nx),dtype='i2')
+    sigma: npt.NDArray[np.float32] = np.array(
+        [float(stream.readline()) for _ in range(nz)], dtype="f4"
+    )
+    latitude: npt.NDArray[np.float32]=np.empty((ny,nx),dtype='f4')
+    longitude: npt.NDArray[np.float32]=np.empty_like(latitude)
+    terrain: npt.NDArray[np.float32]=np.empty_like(latitude)
+    landuse: npt.NDArray[np.int16]=np.empty((ny,nx),dtype='i2')
     for _ in range(nx * ny):
-        fields=stream.readline().split()
+        fields: list[bytes]=stream.readline().split()
         if len(fields)<6: raise ValueError('invalid M3D static-cell record')
+        i: int; j: int
         i,j=int(fields[0])-i_start,int(fields[1])-j_start
         if not (0<=i<nx and 0<=j<ny): raise ValueError('M3D static-cell index is outside grid')
         latitude[j,i]=float(fields[2]); longitude[j,i]=float(fields[3])
@@ -213,7 +228,9 @@ def _read_header(stream: BinaryIO) -> M3DHeader:
                      source_nx,source_ny,source_nz,i_start,j_start,k_start)
 
 
-def _surface(line: bytes) -> tuple[datetime, int, int, np.ndarray]:
+def _surface(
+    line: bytes,
+) -> tuple[datetime, int, int, npt.NDArray[np.float32]]:
     """Decode one fixed-width M3D surface record.
 
     Args:
@@ -230,9 +247,9 @@ def _surface(line: bytes) -> tuple[datetime, int, int, np.ndarray]:
             invalid or the record is truncated.
     """
     # Fortran 221: i10,2i3,f7.1,f5.2,i2,3f8.1,f8.2,3f8.1
-    timestamp=_timestamp(line[0:10],'surface-record')
-    i = int(line[10:13]); j = int(line[13:16])
-    values = np.array([
+    timestamp: datetime=_timestamp(line[0:10],'surface-record')
+    i: int = int(line[10:13]); j: int = int(line[13:16])
+    values: npt.NDArray[np.float32] = np.array([
         float(line[16:23]), float(line[23:28]), float(line[28:30]),
         float(line[30:38]), float(line[38:46]), float(line[46:54]),
         float(line[54:62]), float(line[62:70]), float(line[70:78]),
@@ -241,7 +258,7 @@ def _surface(line: bytes) -> tuple[datetime, int, int, np.ndarray]:
     return timestamp, i, j, values
 
 
-def _level(line: bytes) -> np.ndarray:
+def _level(line: bytes) -> npt.NDArray[np.float32]:
     """Decode the eight basic fields from one fixed-width M3D level record.
 
     Args:
@@ -267,7 +284,7 @@ def _level(line: bytes) -> np.ndarray:
     ], dtype="f4")
 
 
-def _water(line: bytes) -> np.ndarray:
+def _water(line: bytes) -> npt.NDArray[np.float32]:
     """Decode WRTCMP's cloud-water fields, including negative run counts.
 
     Args:
@@ -282,9 +299,10 @@ def _water(line: bytes) -> np.ndarray:
     Raises:
         ValueError: If a nonblank six-column field is not a valid float.
     """
-    tail=line.rstrip(b'\r\n')[39:]
-    values=np.array([float(tail[index:index+6]) for index in range(0,len(tail),6)
-                     if tail[index:index+6].strip()],dtype='f4')
+    tail: bytes=line.rstrip(b'\r\n')[39:]
+    values: npt.NDArray[np.float32]=np.array(
+        [float(tail[index:index+6]) for index in range(0,len(tail),6)
+         if tail[index:index+6].strip()],dtype='f4')
     if values.size==1 and values[0]<0.:
         return np.zeros(int(round(-float(values[0]))),dtype='f4')
     return values
@@ -297,16 +315,16 @@ class M3DReader:
         path: Path to the formatted M3D input.
     """
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path) -> None:
         """Create a reader for one formatted M3D file.
 
         Args:
             path: Path-like input location. The file is opened by
                 :meth:`cells` or :meth:`to_netcdf`.
         """
-        self.path = Path(path)
+        self.path: Path = Path(path)
 
-    def cells(self) -> tuple[M3DHeader, Iterable[M3DCell]]:
+    def cells(self) -> tuple[M3DHeader, Generator[M3DCell,None,None]]:
         """Read the header and create a streaming cell iterator.
 
         Returns:
@@ -325,10 +343,10 @@ class M3DReader:
             Truncation and hourly-record validation errors are raised while
             consuming the returned iterator rather than by this method call.
         """
-        stream = self.path.open("rb", buffering=1024 * 1024)
-        header = _read_header(stream)
+        stream: BinaryIO = self.path.open("rb", buffering=1024 * 1024)
+        header: M3DHeader = _read_header(stream)
 
-        def generate():
+        def generate() -> Generator[M3DCell,None,None]:
             """Yield cells from the open M3D stream and close it afterward.
 
             Yields:
@@ -345,25 +363,34 @@ class M3DReader:
             """
             try:
                 for _time in range(header.nhours):
-                    hour_timestamp=None
+                    hour_timestamp: datetime | None=None
                     for _j in range(header.ny):
                         for _i in range(header.nx):
-                            line = stream.readline()
+                            line: bytes = stream.readline()
                             if not line:
                                 raise EOFError("m3d ended inside a surface record")
+                            timestamp: datetime
+                            i: int; j: int
+                            surface: npt.NDArray[np.float32]
                             timestamp, i, j, surface = _surface(line)
                             if hour_timestamp is None:
                                 hour_timestamp=timestamp
                             elif timestamp!=hour_timestamp:
                                 raise ValueError(
                                     'M3D cell timestamps are inconsistent within an hour')
-                            lines=[stream.readline() for _ in range(header.nz)]
+                            lines: list[bytes]=[
+                                stream.readline() for _ in range(header.nz)
+                            ]
                             if any(not line for line in lines):
                                 raise EOFError('m3d ended inside a level record')
-                            levels=np.stack([_level(line) for line in lines])
-                            water=np.zeros((header.nz,5),dtype='f4')
+                            levels: npt.NDArray[np.float32]=np.stack(
+                                [_level(line) for line in lines]
+                            )
+                            water: npt.NDArray[np.float32]=np.zeros(
+                                (header.nz,5),dtype='f4'
+                            )
                             for level,line in enumerate(lines):
-                                values=_water(line)
+                                values: npt.NDArray[np.float32]=_water(line)
                                 if values.size>5: raise ValueError('M3D water record has more than five fields')
                                 water[level,:values.size]=values
                             yield M3DCell(timestamp,i,j,surface,levels,water)
@@ -372,7 +399,9 @@ class M3DReader:
 
         return header, generate()
 
-    def to_netcdf(self,path: str | Path,*,compression=1) -> Path:
+    def to_netcdf(
+        self,path: str | Path,*,compression: CompressionLevel=1
+    ) -> Path:
         """Stream this formatted M3D file into canonical CALWRF NetCDF.
 
         Args:
@@ -399,48 +428,56 @@ class M3DReader:
                 or write operation, including an unsupported compression
                 setting.
         """
-        output=Path(path); output.parent.mkdir(parents=True,exist_ok=True)
+        output: Path=Path(path); output.parent.mkdir(parents=True,exist_ok=True)
+        header: M3DHeader
+        cells: Generator[M3DCell,None,None]
         header,cells=self.cells()
         with nc.Dataset(output,'w',format='NETCDF4') as dataset:
             for name,size in (('time',header.nhours),('level',header.nz),
                               ('y',header.ny),('x',header.nx),('date_strlen',19)):
                 dataset.createDimension(name,size)
-            time_text=dataset.createVariable('time_text','S1',('time','date_strlen'))
+            time_text: nc.Variable[Any]=dataset.createVariable(
+                'time_text','S1',('time','date_strlen')
+            )
             dataset.createVariable('sigma','f4',('level',))[:]=header.sigma
             for name,values in (('latitude',header.latitude),('longitude',header.longitude),
                                 ('terrain',header.terrain),('landuse',header.landuse)):
-                kind='i2' if name=='landuse' else 'f4'
+                kind: Literal['i2','f4']='i2' if name=='landuse' else 'f4'
                 dataset.createVariable(name,kind,('y','x'))[:]=values
-            level_names=('pressure','height','temperature','wind_direction','wind_speed',
+            level_names: tuple[str,...]=('pressure','height','temperature','wind_direction','wind_speed',
                          'vertical_velocity','relative_humidity','qvapor','qcloud','qrain',
                          'qice','qsnow','qgraupel')
-            level_vars={name:dataset.createVariable(name,'f4',('time','level','y','x'),
+            level_vars: dict[str,nc.Variable[np.float32]]={name:dataset.createVariable(name,'f4',('time','level','y','x'),
                 zlib=compression>0,complevel=compression) for name in level_names}
-            surface_names=('surface_pressure','precipitation','snow_cover','shortwave_down',
+            surface_names: tuple[str,...]=('surface_pressure','precipitation','snow_cover','shortwave_down',
                 'longwave_down','temperature_2m','qvapor_2m','wind_direction_10m',
                 'wind_speed_10m','sst')
-            surface_vars={name:dataset.createVariable(name,'f4',('time','y','x'),
+            surface_vars: dict[str,nc.Variable[np.float32]]={name:dataset.createVariable(name,'f4',('time','y','x'),
                 zlib=compression>0,complevel=compression) for name in surface_names}
             for name in ('pbl_height','sensible_heat_flux','friction_velocity'):
                 surface_vars[name]=dataset.createVariable(name,'f4',('time','y','x'),
                     zlib=compression>0,complevel=compression,fill_value=False)
                 surface_vars[name][:]=0.
             for time_index in range(header.nhours):
-                surface=np.empty((10,header.ny,header.nx),dtype='f4')
-                levels=np.empty((13,header.nz,header.ny,header.nx),dtype='f4')
-                timestamp=None
+                surface: npt.NDArray[np.float32]=np.empty(
+                    (10,header.ny,header.nx),dtype='f4'
+                )
+                levels: npt.NDArray[np.float32]=np.empty(
+                    (13,header.nz,header.ny,header.nx),dtype='f4'
+                )
+                timestamp: datetime | None=None
                 for _ in range(header.nx*header.ny):
-                    cell=next(cells); timestamp=cell.timestamp
-                    j=cell.j-header.j_start; i=cell.i-header.i_start
+                    cell: M3DCell=next(cells); timestamp=cell.timestamp
+                    j: int=cell.j-header.j_start; i: int=cell.i-header.i_start
                     surface[:,j,i]=cell.surface
                     levels[:8,:,j,i]=cell.levels.T
                     levels[8:,:,j,i]=cell.water.T
-                text=timestamp.strftime('%Y-%m-%d_%H:%M:%S')
+                text: str=cast(datetime,timestamp).strftime('%Y-%m-%d_%H:%M:%S')
                 time_text[time_index]=np.frombuffer(text.encode('ascii'),dtype='S1')
-                scales=(100.,10.,1.,1.,1.,1.,.001,1.,1.,1.)
+                scales: tuple[float,...]=(100.,10.,1.,1.,1.,1.,.001,1.,1.,1.)
                 for index,name in enumerate(surface_names): surface_vars[name][time_index]=surface[index]*scales[index]
                 for index,name in enumerate(level_names):
-                    scale=.001 if name in {'qvapor','qcloud','qrain','qice','qsnow','qgraupel'} else 1.
+                    scale: float=.001 if name in {'qvapor','qcloud','qrain','qice','qsnow','qgraupel'} else 1.
                     level_vars[name][time_index]=levels[index]*scale
             dataset.source_format='CALWRF M3D 2.1'
             dataset.pycalmet_stage='calwrf'
@@ -485,20 +522,24 @@ def selected_cells(path: str | Path, wanted: set[tuple[int, int, int]]) -> dict[
         EOFError: If the file ends inside a surface or level record.
         ValueError: If header or cell records are malformed or inconsistent.
     """
-    reader = M3DReader(path)
+    reader: M3DReader = M3DReader(path)
+    header: M3DHeader
+    cells: Generator[M3DCell,None,None]
     header, cells = reader.cells()
-    result = {}
-    per_time = header.nx * header.ny
+    result: dict[tuple[int,int,int],M3DCell] = {}
+    per_time: int = header.nx * header.ny
     for linear, cell in enumerate(cells):
+        time_index: int; within: int
         time_index, within = divmod(linear, per_time)
+        j: int; i: int
         j, i = divmod(within, header.nx)
-        key = (time_index, j, i)
+        key: tuple[int,int,int] = (time_index, j, i)
         if key in wanted:
             result[key] = cell
             if len(result) == len(wanted):
                 cells.close()
                 break
-    missing = wanted - result.keys()
+    missing: set[tuple[int,int,int]] = wanted - result.keys()
     if missing:
         raise KeyError(f"m3d cells not found: {sorted(missing)}")
     return result

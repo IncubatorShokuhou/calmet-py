@@ -2,12 +2,20 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from .datetime_utils import format_ordinal_code
+from os import PathLike
 from pathlib import Path
+from types import TracebackType
+from typing import Callable, Iterable, Sequence, TextIO, cast
 
 import numpy as np
+import numpy.typing as npt
 
 from .calmet_numerics import convective_velocity_scale, pgt_stability
+from .calmet_solver import HourFields, Step1Fields
+from .config import CalmetConfig
+from .datetime_utils import format_ordinal_code
+from .surface_data import SurfaceRecord, SurfaceStation
+from .upper_air import Sounding, UpperAirStation
 
 
 def _coded_time(value: datetime) -> int:
@@ -25,7 +33,10 @@ def _coded_time(value: datetime) -> int:
     return format_ordinal_code(value)
 
 
-def format_surface_input_debug(record,stations) -> str:
+def format_surface_input_debug(
+    record: SurfaceRecord,
+    stations: Iterable[SurfaceStation],
+) -> str:
     """Reproduce COMP formats 108/109 for one raw SURF.DAT record.
 
     Args:
@@ -41,14 +52,15 @@ def format_surface_input_debug(record,stations) -> str:
         ValueError: If any observation vector does not have shape
             ``(len(stations),)`` or a timestamp cannot be encoded.
     """
-    stations=tuple(stations)
-    count=len(stations)
-    fields=(record.wind_speed,record.wind_direction,record.ceiling_hundreds_ft,
-            record.cloud_tenths,record.temperature_k,record.relative_humidity,
-            record.pressure_mb,record.precipitation_code)
+    station_values: tuple[SurfaceStation, ...] = tuple(stations)
+    count: int = len(station_values)
+    fields: tuple[npt.NDArray[np.generic], ...] = (
+        record.wind_speed,record.wind_direction,record.ceiling_hundreds_ft,
+        record.cloud_tenths,record.temperature_k,record.relative_humidity,
+        record.pressure_mb,record.precipitation_code)
     if any(np.asarray(values).shape!=(count,) for values in fields):
         raise ValueError('surface debug record does not match station count')
-    lines=[
+    lines: list[str] = [
         (f"\n SURFACE MET. INPUT DATA -- YYYYJJJHH: {_coded_time(record.begin):10d}   "
          f"seconds: {record.begin.minute*60+record.begin.second:5d}  to -- YYYYJJJHH: "
          f"{_coded_time(record.end):10d}   seconds: "
@@ -58,7 +70,7 @@ def format_surface_input_debug(record,stations) -> str:
         ("                (m/s)   (deg)   (100s FT)    (tenths)    (deg K)"
          "    (%)      (mb)"),
     ]
-    for index,station in enumerate(stations):
+    for index,station in enumerate(station_values):
         lines.append(
             f" {int(station.identifier):9d}    {float(record.wind_speed[index]):7.2f}  "
             f"{float(record.wind_direction[index]):6.1f}     "
@@ -71,7 +83,7 @@ def format_surface_input_debug(record,stations) -> str:
     return "\n".join(lines)+"\n"
 
 
-def format_no_upper_prepdi_debug(step, ending: datetime) -> str:
+def format_no_upper_prepdi_debug(step: Step1Fields, ending: datetime) -> str:
     """Format ``NOOBS=1`` PREPDI diagnostics, including unavailable data.
 
     Args:
@@ -87,19 +99,19 @@ def format_no_upper_prepdi_debug(step, ending: datetime) -> str:
         ValueError: If retained U/V station arrays do not match the number of
             station names.
     """
-    names=tuple(step.debug_station_names)
-    u=np.asarray(step.debug_station_u)
-    v=np.asarray(step.debug_station_v)
+    names: tuple[str, ...] = tuple(step.debug_station_names)
+    u: npt.NDArray[np.floating] = np.asarray(step.debug_station_u)
+    v: npt.NDArray[np.floating] = np.asarray(step.debug_station_v)
     if u.shape!=(len(names),) or v.shape!=(len(names),):
         raise ValueError('PREPDI debug winds do not match station count')
     day=ending.timetuple().tm_yday
     second=ending.minute*60+ending.second
-    temperature=(
+    temperature: str = (
         "  Domain scale surf. temperature (TINF) = N/A (not available)"
         if step.debug_domain_temperature is None else
         (f"  Domain scale surf. temperature (TINF) = "
          f"{step.debug_domain_temperature:10.2f} (deg. K)"))
-    lines=[
+    lines: list[str] = [
         (f"\n  Diagnostic wind field data -- Year: {ending.year:4d}   "
          f"Julian day: {day:3d}   Hour: {ending.hour:2d}   Second: {second:4d}"),
         temperature,
@@ -117,8 +129,14 @@ def format_no_upper_prepdi_debug(step, ending: datetime) -> str:
     return "\n".join(lines)+"\n"
 
 
-def format_upper_air_input_debug(station_number,sounding,convergence_degrees,
-                                 layer_u,layer_v,temperature_faces=None) -> str:
+def format_upper_air_input_debug(
+    station_number: int,
+    sounding: Sounding,
+    convergence_degrees: npt.ArrayLike,
+    layer_u: npt.ArrayLike,
+    layer_v: npt.ArrayLike,
+    temperature_faces: npt.ArrayLike | None = None,
+) -> str:
     """Reproduce COMP formats 133--136 for one raw UP.DAT sounding.
 
     Args:
@@ -138,27 +156,32 @@ def format_upper_air_input_debug(station_number,sounding,convergence_degrees,
         ValueError: If raw sounding arrays have inconsistent shapes or sounding
             conversion fails.
     """
+    height: npt.NDArray[np.float32]
+    u: npt.NDArray[np.float32]
+    v: npt.NDArray[np.float32]
     height,u,v=sounding.converted(convergence_degrees)
-    count=len(height)
-    fields=(sounding.pressure_mb,sounding.temperature_c,u,v)
+    count: int = len(height)
+    fields: tuple[npt.NDArray[np.generic], ...] = (
+        sounding.pressure_mb,sounding.temperature_c,u,v)
     if any(np.asarray(values).shape!=(count,) for values in fields):
         raise ValueError('upper-air debug sounding fields do not match')
     timestamp=sounding.timestamp
-    lines=[
+    lines: list[str] = [
         (f"\n  UPPER AIR DATA  --  Year:{timestamp.year:4d}  Julian Day:"
          f"{timestamp.timetuple().tm_yday:3d}  Hour:{timestamp.hour:2d} (GMT)"),
         "",
         "  STA  PRES   HEIGHT    TEMP      U       V",
         "       (mb)   (m LGL)   (K)     (m/s)   (m/s)",
     ]
-    temperature=np.asarray(sounding.temperature_c,dtype=np.float32)
+    temperature: npt.NDArray[np.float32] = np.asarray(
+        sounding.temperature_c,dtype=np.float32)
     temperature=np.where(temperature<np.float32(999.89),
                          temperature+np.float32(273.15),temperature)
     for pressure,z,temp,u_value,v_value in zip(
             sounding.pressure_mb,height,temperature,u,v):
         lines.append(f" {int(station_number):3d}  {pressure:6.1f}  {z:7.1f}  "
                      f"{temp:6.2f}  {u_value:6.2f}  {v_value:6.2f}")
-    def profile(label,values):
+    def profile(label: str, values: npt.ArrayLike) -> list[str]:
         """Format a labeled profile in chunks of ten values.
 
         Args:
@@ -168,11 +191,12 @@ def format_upper_air_input_debug(station_number,sounding,convergence_degrees,
         Returns:
             List of listing lines without trailing newline characters.
         """
-        values=np.asarray(values)
-        chunks=[]
-        for begin in range(0,values.size,10):
+        value_array: npt.NDArray[np.number] = np.asarray(values)
+        chunks: list[str] = []
+        for begin in range(0,value_array.size,10):
             prefix=f" {label:<20} = " if begin==0 else " "*24
-            chunks.append(prefix+''.join(f"{value:10.3f}" for value in values[begin:begin+10]))
+            chunks.append(prefix+''.join(
+                f"{value:10.3f}" for value in value_array[begin:begin+10]))
         return chunks
     lines.extend(profile('U -- cell averaged',layer_u))
     lines.extend(profile('V -- cell averaged',layer_v))
@@ -181,7 +205,11 @@ def format_upper_air_input_debug(station_number,sounding,convergence_degrees,
     return "\n".join(lines)+"\n"
 
 
-def format_full_prepdi_debug(step,ending: datetime,lapse_rate) -> str:
+def format_full_prepdi_debug(
+    step: Step1Fields,
+    ending: datetime,
+    lapse_rate: npt.ArrayLike,
+) -> str:
     """Reproduce COMP formats 152 and 154--159 for ``NOOBS=0``.
 
     Args:
@@ -200,20 +228,23 @@ def format_full_prepdi_debug(step,ending: datetime,lapse_rate) -> str:
             station wind arrays do not match their names.
         IndexError: If ``lapse_rate`` has no ``[0, 0]`` element.
     """
-    if any(value is None for value in (step.debug_domain_u,step.debug_domain_v)):
+    if step.debug_domain_u is None or step.debug_domain_v is None:
         raise ValueError('complete PREPDI debug wind scalars are required')
-    names=tuple(step.debug_station_names)
-    u=np.asarray(step.debug_station_u); v=np.asarray(step.debug_station_v)
+    names: tuple[str, ...] = tuple(step.debug_station_names)
+    u: npt.NDArray[np.floating] = np.asarray(
+        cast(npt.ArrayLike,step.debug_station_u))
+    v: npt.NDArray[np.floating] = np.asarray(
+        cast(npt.ArrayLike,step.debug_station_v))
     if u.shape!=(len(names),) or v.shape!=(len(names),):
         raise ValueError('PREPDI debug winds do not match station count')
     day=ending.timetuple().tm_yday
     second=ending.minute*60+ending.second
-    temperature=(
+    temperature: str = (
         "  Domain scale surf. temperature (TINF) = N/A (not available)"
         if step.debug_domain_temperature is None else
         (f"  Domain scale surf. temperature (TINF) = "
          f"{step.debug_domain_temperature:10.2f} (deg. K)"))
-    lines=[
+    lines: list[str] = [
         (f"\n  Diagnostic wind field data -- Year: {ending.year:4d}   "
          f"Julian day: {day:3d}   Hour: {ending.hour:2d}   Second: {second:4d}"),
         ("  Domain-scale temp. lapse rate at point (1,1)(GAMMA) = "
@@ -231,7 +262,9 @@ def format_full_prepdi_debug(step,ending: datetime,lapse_rate) -> str:
     for index,(name,u_value,v_value) in enumerate(zip(names,u,v),1):
         lines.append(f"      {str(name):4.4s}     {index:4d}     {u_value:7.2f}   {v_value:7.2f}")
     for station_number,item in enumerate(step.debug_upper_data,1):
-        station,_,_,upper_u,upper_v=item
+        station,_,_,upper_u,upper_v=cast(
+            "tuple[UpperAirStation, tuple[Sounding, ...], float, "
+            "npt.NDArray[np.float32], npt.NDArray[np.float32]]",item)
         lines.extend((
             (f"\n  Upper air station: {str(station.name):4.4s}   Number: "
              f"{station_number:4d}   Year: {ending.year:4d}   Julian day: {day:3d}"
@@ -245,7 +278,7 @@ def format_full_prepdi_debug(step,ending: datetime,lapse_rate) -> str:
 
 
 def format_grid(
-    values,
+    values: npt.ArrayLike,
     message: str,
     *,
     significant_digits: int = 5,
@@ -274,13 +307,13 @@ def format_grid(
     """
     if significant_digits not in range(1, 6):
         raise ValueError("significant_digits must be from 1 through 5")
-    data=np.asarray(values)
+    data: npt.NDArray[np.number] = np.asarray(values)
     if data.ndim!=2:
         raise ValueError("line-printer fields must be two-dimensional")
     ny,nx=data.shape
     width=(3,3,3,4,5)[significant_digits-1]
     columns=(40,40,30,25,20)[significant_digits-1]
-    lines=["", "", f" {message:<70}"[:71]]
+    lines: list[str] = ["", "", f" {message:<70}"[:71]]
     if begin is not None:
         end=begin+timedelta(seconds=timestep_seconds)
         lines.extend(("", _period_line(begin,end), ""))
@@ -297,10 +330,12 @@ def format_grid(
     for first in range(0,nx,columns):
         last=min(first+columns,nx)
         for row in range(ny-1,-1,-1):
-            selected=np.asarray(data[row,first:last],dtype=np.float32)
-            signs=np.where(selected<0.,'-','+')
-            rounded=np.where(selected<0.,-(selected*scale-np.float32(.5)),
-                             selected*scale+np.float32(.5)).astype(np.int64)
+            selected: npt.NDArray[np.float32] = np.asarray(
+                data[row,first:last],dtype=np.float32)
+            signs: npt.NDArray[np.str_] = np.where(selected<0.,'-','+')
+            rounded: npt.NDArray[np.int64] = np.where(
+                selected<0.,-(selected*scale-np.float32(.5)),
+                selected*scale+np.float32(.5)).astype(np.int64)
             lines.append(f" {row+1:3d} I"+''.join(f"{value:{width}d} " for value in rounded))
             lines.append("     I"+''.join(f"{sign:>{width}} " for sign in signs))
         count=last-first
@@ -341,7 +376,19 @@ class CalmetListingWriter:
             hours, or ``None`` before the first append.
     """
 
-    def __init__(self, path, config, landuse, water_range):
+    stream: TextIO | None
+    config: CalmetConfig
+    landuse: npt.NDArray[np.integer]
+    water_range: tuple[int, int]
+    first_hour: datetime | None
+
+    def __init__(
+        self,
+        path: str | PathLike[str],
+        config: CalmetConfig,
+        landuse: npt.ArrayLike,
+        water_range: Sequence[int],
+    ) -> None:
         """Open a listing destination and retain its print configuration.
 
         Args:
@@ -361,10 +408,14 @@ class CalmetListingWriter:
         self.stream=target.open('w',encoding='ascii')
         self.config=config
         self.landuse=np.asarray(landuse)
-        self.water_range=tuple(water_range)
+        self.water_range=cast(tuple[int,int],tuple(water_range))
         self.first_hour=None
 
-    def append(self, hour, solar_elevation_sine):
+    def append(
+        self,
+        hour: HourFields,
+        solar_elevation_sine: npt.ArrayLike,
+    ) -> None:
         """Append enabled debug and line-printer fields for one timestep.
 
         Args:
@@ -397,7 +448,11 @@ class CalmetListingWriter:
         if (nh%config.print_interval_hours or timestamp.minute or timestamp.second):
             return
         duration=config.timestep_seconds
-        def write(values,message,digits=5):
+        def write(
+            values: npt.ArrayLike,
+            message: str,
+            digits: int = 5,
+        ) -> None:
             """Format and write one grid using the current interval.
 
             Args:
@@ -413,9 +468,10 @@ class CalmetListingWriter:
                 The current hour timestamp and configured timestep determine the
                 interval printed above the field.
             """
-            self.stream.write(format_grid(values,message,significant_digits=digits,
-                                           begin=timestamp,
-                                           timestep_seconds=duration))
+            stream=cast(TextIO,self.stream)
+            stream.write(format_grid(
+                values,message,significant_digits=digits,begin=timestamp,
+                timestep_seconds=duration))
         for level,enabled in enumerate(config.print_uv_levels):
             if enabled:
                 write(hour.wind.u[level],f'U-component (m/s) -- Level: {level+1:3d}')
@@ -426,12 +482,13 @@ class CalmetListingWriter:
         step=hour.step1; surface=hour.surface
         switches=config.print_surface_fields
         if switches[0]:
-            stability=pgt_stability(hour.wind.u[0],hour.wind.v[0],solar_elevation_sine,
+            stability: npt.NDArray[np.int8] = pgt_stability(
+                hour.wind.u[0],hour.wind.v[0],solar_elevation_sine,
                 step.cloud_fraction,step.ceiling_height,self.landuse,
                 surface.monin_obukhov_length,water_range=self.water_range)
             write(stability,'PGT stability class',2)
         averaging=('After averaging' if config.iavezi else 'No averaging')
-        fields=(
+        fields: tuple[tuple[Callable[[], npt.ArrayLike], str], ...] = (
             (lambda:surface.friction_velocity,'Friction velocity (m/s)'),
             (lambda:surface.monin_obukhov_length,'Monin-Obukhov length (m)'),
             (lambda:surface.mixing_height,f'Mixing height (m) -- {averaging}'),
@@ -448,9 +505,13 @@ class CalmetListingWriter:
             for level,enabled in enumerate(config.print_temperature_levels):
                 if enabled:
                     write(hour.temperature[level],f'Temperature (K) -- Level: {level+1:3d}')
-        self.stream.flush()
+        cast(TextIO,self.stream).flush()
 
-    def _append_noobs_debug(self,hour,solar_elevation_sine):
+    def _append_noobs_debug(
+        self,
+        hour: HourFields,
+        solar_elevation_sine: npt.ArrayLike,
+    ) -> None:
         """Write COMP LDB diagnostics for the configured observation mode.
 
         Args:
@@ -475,20 +536,21 @@ class CalmetListingWriter:
         timestamp=hour.timestamp
         surface=hour.surface
         sine=float(np.asarray(solar_elevation_sine)[0,0])
-        self.stream.write(
+        stream=cast(TextIO,self.stream)
+        stream.write(
             f"\n  Computed solar elevation angle data at point 1,1 -- Year: "
             f"{timestamp.year:4d}  Julian day: {timestamp.timetuple().tm_yday:3d}"
             f"   Hour: {timestamp.hour:2d}\n\n"
             f"   Sine (solar elev. angle)  {sine:7.5f}\n")
         if self.config.noobs==2:
-            self.stream.write(
+            stream.write(
                 " No observation mode\n"
                 " upper air data not yet defined...\n"
                 " surface   data not yet defined...\n")
         else:
             if hour.step1.debug_surface_record is None:
                 raise RuntimeError('missing retained SURF.DAT debug record')
-            self.stream.write(format_surface_input_debug(
+            stream.write(format_surface_input_debug(
                 hour.step1.debug_surface_record,
                 hour.step1.debug_surface_stations))
             ending=timestamp+timedelta(seconds=self.config.timestep_seconds)
@@ -496,19 +558,23 @@ class CalmetListingWriter:
                 from .upper_air import temperature_faces
                 for station_number,item in enumerate(
                         hour.step1.debug_upper_data,1):
-                    _,soundings,convergence,layer_u,layer_v=item
+                    _,soundings,convergence,layer_u,layer_v=cast(
+                        "tuple[UpperAirStation, tuple[Sounding, ...], float, "
+                        "npt.NDArray[np.float32], npt.NDArray[np.float32]]",
+                        item)
                     for sounding in soundings:
-                        face_temperature=(temperature_faces(
-                            sounding,self.config.z_faces_m)+np.float32(273.15)
+                        face_temperature: npt.NDArray[np.float32] | None = (
+                            temperature_faces(
+                                sounding,self.config.z_faces_m)+np.float32(273.15)
                             if self.config.include_w_temperature else None)
-                        self.stream.write(format_upper_air_input_debug(
+                        stream.write(format_upper_air_input_debug(
                             station_number,sounding,convergence,layer_u,layer_v,
                             face_temperature))
-                self.stream.write(format_full_prepdi_debug(
+                stream.write(format_full_prepdi_debug(
                     hour.step1,ending,hour.wind.lapse_rate))
             else:
-                self.stream.write(format_no_upper_prepdi_debug(hour.step1,ending))
-        self.stream.write(
+                stream.write(format_no_upper_prepdi_debug(hour.step1,ending))
+        stream.write(
             f"\n  Computed surface parameters -- Year: {timestamp.year:4d}   "
             f"Julian day: {timestamp.timetuple().tm_yday:3d}   "
             f"Hour: {timestamp.hour:2d}   Second: "
@@ -517,19 +583,22 @@ class CalmetListingWriter:
             f"       Short-Wave Radiation   {surface.shortwave_flux[0,0]:7.2f}    (W/m**2)\n")
         switches=self.config.print_surface_fields
         if switches[3] and surface.unaveraged_mixing_height is not None:
-            self.stream.write(format_grid(surface.unaveraged_mixing_height,
+            stream.write(format_grid(surface.unaveraged_mixing_height,
                 'Mixing height (m) -- Before averaging ',
                 begin=timestamp,timestep_seconds=self.config.timestep_seconds))
         if switches[7] and surface.unaveraged_convective_mixing_height is not None:
-            self.stream.write(format_grid(surface.unaveraged_convective_mixing_height,
+            stream.write(format_grid(surface.unaveraged_convective_mixing_height,
                 'Convective mixing height (m) -- Before averaging',
                 begin=timestamp,timestep_seconds=self.config.timestep_seconds))
-        self.stream.write(format_grid(surface.temperature_jump,
+        stream.write(format_grid(surface.temperature_jump,
             'Temperature jump at top of mixed layer (deg. K)',
             begin=timestamp,timestep_seconds=self.config.timestep_seconds))
-        self.stream.flush()
+        stream.flush()
 
-    def _convective_velocity(self,hour):
+    def _convective_velocity(
+        self,
+        hour: HourFields,
+    ) -> npt.NDArray[np.float32]:
         """Compute the listing's land/water convective velocity field.
 
         Args:
@@ -544,22 +613,24 @@ class CalmetListingWriter:
                 grid.
         """
         surface=hour.surface
-        value=convective_velocity_scale(surface.convective_mixing_height,
-            surface.sensible_heat_flux,hour.temperature[0],surface.density,
-            self.landuse,water_range=self.water_range)
+        value: npt.NDArray[np.float32] = convective_velocity_scale(
+            surface.convective_mixing_height,surface.sensible_heat_flux,
+            hour.temperature[0],surface.density,self.landuse,
+            water_range=self.water_range)
         if surface.water_convective_velocity_scale is not None:
-            water=((self.landuse>=self.water_range[0])&
-                   (self.landuse<=self.water_range[1]))
+            water: npt.NDArray[np.bool_] = (
+                (self.landuse>=self.water_range[0])&
+                (self.landuse<=self.water_range[1]))
             value=np.where(water,surface.water_convective_velocity_scale,value)
         return np.asarray(value,dtype=np.float32)
 
-    def close(self):
+    def close(self) -> None:
         """Flush and close the listing stream; repeated calls are harmless."""
         if self.stream is not None:
             self.stream.close()
             self.stream=None
 
-    def __enter__(self):
+    def __enter__(self) -> CalmetListingWriter:
         """Return this open writer for context-manager use.
 
         Returns:
@@ -567,12 +638,20 @@ class CalmetListingWriter:
         """
         return self
 
-    def __exit__(self,*exc):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         """Close the listing on context-manager exit.
 
         Args:
-            *exc: Exception type, value, and traceback supplied by the context
-                manager protocol.
+            exc_type: Exception class supplied by the context manager protocol.
+            exc_value: Exception instance supplied by the context manager
+                protocol.
+            traceback: Exception traceback supplied by the context manager
+                protocol.
 
         Returns:
             ``None``; exceptions are not suppressed.

@@ -399,6 +399,7 @@ def test_public_calmet_runs_native_mm4_to_netcdf(tmp_path,monkeypatch):
     with Dataset(geo,'w') as dataset:
         dataset.createDimension('y',1); dataset.createDimension('x',1)
         values={'terrain_height':0.,'dominant_landuse':20,'roughness_length':.1,
+                'leaf_area_index':1.,
                 'albedo':.2,'bowen_ratio':1.,'soil_heat_flux_parameter':.15,
                 'anthropogenic_heat_flux':0.}
         for name,value in values.items():
@@ -455,6 +456,16 @@ def test_public_calmet_runs_native_mm4_to_netcdf(tmp_path,monkeypatch):
         for _ in range(10): assert len(reader.read_record())==4
         assert len(reader.read_record())==4
         assert reader.read_record() is None
+
+    # Native adapters expose a mapping rather than a NetCDF ``variables``
+    # attribute.  Traditional CALMET output still needs to create its auxiliary
+    # file and must treat the absent qcloud field as unavailable.
+    calmet_dat=tmp_path/'calmet.dat'
+    config.output=calmet_dat; config.legacy_output_format=1
+    assert run_calmet(config)==calmet_dat
+    assert calmet_dat.is_file()
+    assert (tmp_path/'calmet.dat.aux').is_file()
+    config.legacy_output_format=2
 
     latitude,longitude=target_latitude_longitude(grid)
     surf=tmp_path/'surf.dat'

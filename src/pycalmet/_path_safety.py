@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from itertools import combinations
 from pathlib import Path
-from typing import Sequence
+from typing import Final, Sequence
 
 
 def _same_path(first: str | Path, second: str | Path) -> bool:
@@ -73,4 +73,4 @@ def validate_calwrf_paths(
                 )
 
 
-__all__ = ["validate_calwrf_paths"]
+__all__: Final[list[str]] = ["validate_calwrf_paths"]

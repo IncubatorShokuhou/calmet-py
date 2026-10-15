@@ -6,13 +6,17 @@ remain for historical terrain products that GDAL cannot reliably identify.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass,replace
+from os import PathLike
 from pathlib import Path
 import re
 import struct
 import tempfile
+from typing import IO, Final, TypeAlias, cast
 
 import numpy as np
+import numpy.typing as npt
 from netCDF4 import Dataset
 import rasterio
 from rasterio.errors import RasterioIOError
@@ -26,7 +30,7 @@ from pyproj import CRS, Transformer
 from scipy.spatial import cKDTree
 
 from .config import GridConfig, TerrelConfig, TerrelSource
-from ._ctgproc import _coastline_types, _read_coastline_bln
+from ._ctgproc import CoastPolygon, _coastline_types, _read_coastline_bln
 from .datums import NIMA_DATABASE_DATE
 from .gshhs import extract_gshhs
 from .legacy_text import gfortran_real_pair
@@ -34,13 +38,44 @@ from .projections import (grid_crs, project_from_crs, project_geographic,
                           project_glaz_to_lcc,
                           transform_grid, unproject_to_crs)
 
-_HGT_NAME = re.compile(r"^([NS])(\d{2})([EW])(\d{3})\.hgt$", re.IGNORECASE)
-_GTOPO_NAME = re.compile(r"^([EW])(\d{3})([NS])(\d{2})(?:\..*)?$", re.IGNORECASE)
-_3CD_NAME = re.compile(r"(?:^|.*?)(\d{2})(\d{3})\.3cd$", re.IGNORECASE)
+_HGT_NAME: Final[re.Pattern[str]] = re.compile(
+    r"^([NS])(\d{2})([EW])(\d{3})\.hgt$", re.IGNORECASE
+)
+_GTOPO_NAME: Final[re.Pattern[str]] = re.compile(
+    r"^([EW])(\d{3})([NS])(\d{2})(?:\..*)?$", re.IGNORECASE
+)
+_3CD_NAME: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|.*?)(\d{2})(\d{3})\.3cd$", re.IGNORECASE
+)
 
-COMPUTE_DTYPE = np.float32
-COORD_DTYPE = np.float64
-ACCUM_DTYPE = np.float64
+COMPUTE_DTYPE: Final[type[np.float32]] = np.float32
+COORD_DTYPE: Final[type[np.float64]] = np.float64
+ACCUM_DTYPE: Final[type[np.float64]] = np.float64
+
+_PathLike: TypeAlias = str | PathLike[str]
+_Float32Array: TypeAlias = npt.NDArray[np.float32]
+_Float64Array: TypeAlias = npt.NDArray[np.float64]
+_Int8Array: TypeAlias = npt.NDArray[np.int8]
+_Int32Array: TypeAlias = npt.NDArray[np.int32]
+_Int64Array: TypeAlias = npt.NDArray[np.int64]
+_IntpArray: TypeAlias = npt.NDArray[np.intp]
+_BoolArray: TypeAlias = npt.NDArray[np.bool_]
+_NumericArray: TypeAlias = npt.NDArray[np.generic]
+_PeakRadius: TypeAlias = float | tuple[float, float]
+_DemProfile: TypeAlias = tuple[int, tuple[float, float], float, _Int64Array]
+_PolarBaseIndices: TypeAlias = tuple[
+    _Float64Array, _Float64Array, _IntpArray, _IntpArray
+]
+_PolarPeakIndices: TypeAlias = tuple[
+    _Float64Array,
+    _Float64Array,
+    _IntpArray,
+    _IntpArray,
+    _IntpArray,
+    _IntpArray,
+    _Float64Array,
+    _Float64Array,
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +109,9 @@ class TerrainResult:
     high_hit_cells: int = 0
 
 
-def _hit_statistics(counts, threshold_percent):
+def _hit_statistics(
+    counts: npt.ArrayLike, threshold_percent: int
+) -> tuple[int, int, int, int, int]:
     """Calculate TERREL integer hit-count QA statistics.
 
     Args:
@@ -141,7 +178,7 @@ class DemHeader:
     codes: tuple[int, int, int, int]
     coordinate_unit: int
     elevation_unit: int
-    corners: np.ndarray
+    corners: _Float64Array
     resolution: tuple[float, float, float]
     profile_count: tuple[int, int]
     horizontal_datum: int
@@ -166,17 +203,22 @@ class _ReceptorState:
         vertices_z: Float32 ``(4, n)`` sample elevations in metres.
         distances: Float64 ``(4, n)`` receptor-to-sample distances in km.
     """
-    coordinates_km: np.ndarray
-    heights_m: np.ndarray
-    receptor_heights_m: np.ndarray
+    coordinates_km: _Float64Array
+    heights_m: _Float32Array
+    receptor_heights_m: _Float32Array
     interpolate: bool
     radius_km: float
-    vertices_x: np.ndarray
-    vertices_y: np.ndarray
-    vertices_z: np.ndarray
-    distances: np.ndarray
+    vertices_x: _Float64Array
+    vertices_y: _Float64Array
+    vertices_z: _Float32Array
+    distances: _Float64Array
 
-    def add(self, x_m, y_m, elevation_m) -> None:
+    def add(
+        self,
+        x_m: npt.ArrayLike,
+        y_m: npt.ArrayLike,
+        elevation_m: npt.ArrayLike,
+    ) -> None:
         """Accumulate terrain samples for every discrete receptor.
 
         Args:
@@ -231,7 +273,7 @@ class _ReceptorState:
                     self.vertices_z[corner, target] = z[source]
                     self.distances[corner, target] = nearest[replace]
 
-    def finish(self) -> np.ndarray:
+    def finish(self) -> _Float32Array:
         """Finalize and return the receptor terrain elevations.
 
         Returns:
@@ -258,7 +300,10 @@ class _RawEchoWriter:
         stream: Open ASCII text stream, or ``None`` after successful finish.
     """
 
-    def __init__(self,path,grid,datum):
+    path: Path
+    temporary: Path
+
+    def __init__(self, path: _PathLike, grid: GridConfig, datum: str) -> None:
         """Open a temporary raw-sample echo and write its legacy header.
 
         Args:
@@ -275,12 +320,19 @@ class _RawEchoWriter:
             dir=self.path.parent,prefix=self.path.name+".",delete=False,mode="w",
             encoding="ascii",newline="\n",
         )
-        self.temporary=Path(handle.name); self.stream=handle
+        self.temporary=Path(handle.name)
+        self.stream: IO[str] | None = cast(IO[str], handle)
         _write_legacy_header(
             self.stream,grid,datum,dataset="RAWECHO.DAT",version="1.0"
         )
 
-    def write(self,x_m,y_m,elevation_m,selected):
+    def write(
+        self,
+        x_m: npt.ArrayLike,
+        y_m: npt.ArrayLike,
+        elevation_m: npt.ArrayLike,
+        selected: _Int64Array | _BoolArray,
+    ) -> None:
         """Append selected projected terrain samples to the echo stream.
 
         Args:
@@ -300,9 +352,11 @@ class _RawEchoWriter:
         y=np.asarray(y_m).ravel()[selected]*.001
         z=np.asarray(elevation_m).ravel()[selected]
         for x_value,y_value,z_value in zip(x,y,z):
-            self.stream.write(f"{x_value:11.3f}{y_value:11.3f}{z_value:12.3f}\n")
+            cast(IO[str], self.stream).write(
+                f"{x_value:11.3f}{y_value:11.3f}{z_value:12.3f}\n"
+            )
 
-    def finish(self):
+    def finish(self) -> None:
         """Close and atomically publish the completed raw echo.
 
         Returns:
@@ -317,7 +371,7 @@ class _RawEchoWriter:
         self.stream.close(); self.stream=None
         self.temporary.replace(self.path)
 
-    def __del__(self):
+    def __del__(self) -> None:
         """Close and discard an unpublished temporary raw echo.
 
         Returns:
@@ -346,15 +400,17 @@ class _TerrainFilter:
         default_elevation_m: Float32 replacement elevations in metres by type.
         raw_echo: Optional writer receiving unfiltered in-domain samples.
     """
-    polygons: tuple
+    polygons: tuple[CoastPolygon, ...]
     coastal: bool
-    noise_replacement: np.ndarray
-    noise_minimum_m: np.ndarray
-    missing_replacement: np.ndarray
-    default_elevation_m: np.ndarray
+    noise_replacement: _Int8Array
+    noise_minimum_m: _Float32Array
+    missing_replacement: _Int8Array
+    default_elevation_m: _Float32Array
     raw_echo: _RawEchoWriter | None = None
 
-    def types(self, x_km, y_km):
+    def types(
+        self, x_km: npt.ArrayLike, y_km: npt.ArrayLike
+    ) -> _Int8Array:
         """Classify projected points into TERREL coastline types.
 
         Args:
@@ -370,7 +426,13 @@ class _TerrainFilter:
             return np.ones(np.asarray(x_km).shape, dtype=np.int8)
         return _coastline_types(x_km, y_km, self.polygons)
 
-    def extracted(self, x_m, y_m, elevation_m, domain):
+    def extracted(
+        self,
+        x_m: npt.ArrayLike,
+        y_m: npt.ArrayLike,
+        elevation_m: npt.ArrayLike,
+        domain: npt.ArrayLike,
+    ) -> _Float32Array:
         """Apply source-sample terrain replacement rules inside the domain.
 
         Args:
@@ -410,7 +472,9 @@ class _TerrainFilter:
         elevation.ravel()[selected]=values
         return elevation
 
-    def output(self, values, kinds):
+    def output(
+        self, values: npt.ArrayLike, kinds: npt.ArrayLike
+    ) -> _Float32Array:
         """Apply final cell-level replacement rules to gridded terrain.
 
         Args:
@@ -526,14 +590,17 @@ def _terrain_filter(config: TerrelConfig) -> _TerrainFilter:
         )
     polygons = (() if config.coastline_file is None else
                 _read_coastline_bln(config.coastline_file, coast_grid, allow_empty=True))
-    arrays = tuple(
-        np.asarray(values, dtype=dtype)
-        for values, dtype in (
-            (config.noise_replacement, np.int8),
-            (config.noise_minimum_m, COMPUTE_DTYPE),
-            (config.missing_replacement, np.int8),
-            (config.default_elevation_m, COMPUTE_DTYPE),
-        )
+    arrays = cast(
+        tuple[_Int8Array, _Float32Array, _Int8Array, _Float32Array],
+        tuple(
+            np.asarray(values, dtype=dtype)
+            for values, dtype in (
+                (config.noise_replacement, np.int8),
+                (config.noise_minimum_m, COMPUTE_DTYPE),
+                (config.missing_replacement, np.int8),
+                (config.default_elevation_m, COMPUTE_DTYPE),
+            )
+        ),
     )
     if any(values.shape != (5,) for values in arrays):
         raise ValueError("TERREL terrain replacement controls must contain five types")
@@ -544,7 +611,9 @@ def _terrain_filter(config: TerrelConfig) -> _TerrainFilter:
     )
 
 
-def _domain_mask(x, y, grid):
+def _domain_mask(
+    x: npt.ArrayLike, y: npt.ArrayLike, grid: GridConfig
+) -> _BoolArray:
     """Test projected metre coordinates against the closed target domain.
 
     Args:
@@ -561,7 +630,9 @@ def _domain_mask(x, y, grid):
     return ((x>=x_lower)&(x<=x_upper)&(y>=y_lower)&(y<=y_upper))
 
 
-def _grid_domain_metres(grid):
+def _grid_domain_metres(
+    grid: GridConfig,
+) -> tuple[np.float64, np.float64, np.float64, np.float64]:
     """Return projected target-domain bounds in metres.
 
     Args:
@@ -581,8 +652,11 @@ def _grid_domain_metres(grid):
         x_lower=x_origin; y_lower=y_origin
         x_upper=x_lower+grid.nx*float(grid.dx_km)
         y_upper=y_lower+grid.ny*float(grid.dy_km)
-    return tuple(COORD_DTYPE(value*1000.) for value in
-                 (x_lower,x_upper,y_lower,y_upper))
+    return cast(
+        tuple[np.float64, np.float64, np.float64, np.float64],
+        tuple(COORD_DTYPE(value * 1000.0) for value in
+              (x_lower, x_upper, y_lower, y_upper)),
+    )
 
 
 def _write_receptors(path: Path, receptors: _ReceptorState,
@@ -612,7 +686,7 @@ def _write_receptors(path: Path, receptors: _ReceptorState,
             stream.write(f" {x:12.5f}{y:12.5f}{terrain:10.2f}{height:10.2f}\n")
 
 
-def _save_header(grid: GridConfig, receptor_count: int) -> np.ndarray:
+def _save_header(grid: GridConfig, receptor_count: int) -> _Int32Array:
     """Build the seven-integer TERREL CELLOUT save-file header.
 
     Args:
@@ -658,7 +732,7 @@ def _fortran_records(path: Path) -> tuple[str, list[bytes]]:
     )
     if endian is None:
         raise ValueError(f"TERREL save file has an invalid first record: {path}")
-    records = []
+    records: list[bytes] = []
     offset = 0
     while offset < len(raw):
         if offset + 8 > len(raw):
@@ -674,7 +748,8 @@ def _fortran_records(path: Path) -> tuple[str, list[bytes]]:
     return endian, records
 
 
-def _load_save(path: Path, grid: GridConfig, sums, counts, maxima,
+def _load_save(path: Path, grid: GridConfig, sums: _Float64Array,
+               counts: _Int64Array, maxima: _Float32Array,
                receptors: _ReceptorState | None) -> None:
     """Restore CELLOUT terrain accumulators and receptor state.
 
@@ -704,7 +779,9 @@ def _load_save(path: Path, grid: GridConfig, sums, counts, maxima,
         raise ValueError("TERREL save-file header does not match the current grid/receptors")
     cell_count = grid.nx * grid.ny
 
-    def record(index, dtype, size, label):
+    def record(
+        index: int, dtype: str, size: int, label: str
+    ) -> _NumericArray:
         """Decode and size-check one save-file numeric record.
 
         Args:
@@ -748,7 +825,8 @@ def _load_save(path: Path, grid: GridConfig, sums, counts, maxima,
             ).T
 
 
-def _write_save(path: Path, grid: GridConfig, sums, counts, maxima,
+def _write_save(path: Path, grid: GridConfig, sums: _Float64Array,
+                counts: _Int64Array, maxima: _Float32Array,
                 receptors: _ReceptorState | None) -> None:
     """Write TERREL CELLOUT in little-endian sequential-unformatted layout.
 
@@ -767,7 +845,7 @@ def _write_save(path: Path, grid: GridConfig, sums, counts, maxima,
         OSError: If the destination cannot be created or written.
     """
     receptor_count = 0 if receptors is None else receptors.coordinates_km.shape[0]
-    arrays = [
+    arrays: list[_NumericArray] = [
         _save_header(grid, receptor_count).astype("<i4", copy=False),
         np.where(np.asarray(counts) == 0, np.float64(-999.0), sums).astype(
             "<f4", copy=False
@@ -792,7 +870,7 @@ def _write_save(path: Path, grid: GridConfig, sums, counts, maxima,
             stream.write(marker)
 
 
-_USGSLA_SPECS = {
+_USGSLA_SPECS: Final[dict[str, UsgslaSpec]] = {
     "NA": UsgslaSpec(9223, 8996, -4487.0, -4515.0, 50.0, -100.0),
     "SA": UsgslaSpec(6000, 8000, -3000.0, -4899.0, -15.0, -60.0),
     "AP": UsgslaSpec(9300, 8000, -5000.0, -3944.891, -15.0, 135.0),
@@ -821,7 +899,7 @@ def _tile_origin(path: Path) -> tuple[int, int]:
     return int(lat) * (1 if ns.upper() == "N" else -1), int(lon) * (1 if ew.upper() == "E" else -1)
 
 
-def _read_srtm_tile(path: Path) -> np.ndarray:
+def _read_srtm_tile(path: Path) -> _NumericArray:
     """Read a standard SRTM HGT tile through GDAL's SRTMHGT driver.
 
     Args:
@@ -843,13 +921,24 @@ def _read_srtm_tile(path: Path) -> np.ndarray:
                 raise ValueError(f"invalid square 16-bit HGT tile: {path}")
             if np.dtype(source.dtypes[0]).kind not in {"i", "u"}:
                 raise ValueError(f"SRTM HGT elevations must be integers: {path}")
-            return source.read(1)
+            return cast(_NumericArray,np.asarray(source.read(1)))
     except RasterioIOError as error:
         raise ValueError(f"invalid SRTM HGT tile: {path}") from error
 
 
-def _accumulate_tile(path, grid, sums, counts, input_datum='WGS-84', *, maxima=None,
-                     peak=False, receptors=None, direct=False, terrain_filter=None) -> int:
+def _accumulate_tile(
+    path: _PathLike,
+    grid: GridConfig,
+    sums: _Float64Array,
+    counts: _Int64Array,
+    input_datum: str = 'WGS-84',
+    *,
+    maxima: _Float32Array | None = None,
+    peak: bool = False,
+    receptors: _ReceptorState | None = None,
+    direct: bool = False,
+    terrain_filter: _TerrainFilter | None = None,
+) -> int:
     """Accumulate one SRTM HGT tile into a TERREL target grid.
 
     Args:
@@ -938,9 +1027,20 @@ def _gtopo_spec(path: Path) -> tuple[int, int, int, int, int]:
     return north, west, lat_degrees * 120, lon_degrees * 120, 120
 
 
-def _accumulate_gtopo30(path, grid, sums, counts, input_datum='WGS-84', *, spec=None,
-                        maxima=None, peak=False, receptors=None, direct=False,
-                        terrain_filter=None) -> int:
+def _accumulate_gtopo30(
+    path: Path,
+    grid: GridConfig,
+    sums: _Float64Array,
+    counts: _Int64Array,
+    input_datum: str = 'WGS-84',
+    *,
+    spec: tuple[int, int, int, int, int] | None = None,
+    maxima: _Float32Array | None = None,
+    peak: bool = False,
+    receptors: _ReceptorState | None = None,
+    direct: bool = False,
+    terrain_filter: _TerrainFilter | None = None,
+) -> int:
     """Accumulate a headerless, north-to-south GTOPO30 DEM.
 
     Args:
@@ -1007,7 +1107,7 @@ def _accumulate_gtopo30(path, grid, sums, counts, input_datum='WGS-84', *, spec=
     return inside_total
 
 
-def _read_generic(path: Path) -> tuple[int, int, int, np.ndarray]:
+def _read_generic(path: Path) -> tuple[int, int, int, _Float64Array]:
     """Read a TERREL Generic header and its scattered terrain records.
 
     Args:
@@ -1046,7 +1146,13 @@ def _read_generic(path: Path) -> tuple[int, int, int, np.ndarray]:
     return coordinate_type, elevation_unit, utm_zone, points
 
 
-def _add_cell_samples(flat, elevation, sums, counts, maxima):
+def _add_cell_samples(
+    flat: _Int64Array,
+    elevation: npt.ArrayLike,
+    sums: _Float64Array,
+    counts: _Int64Array,
+    maxima: _Float32Array | None,
+) -> None:
     """Add already indexed elevation samples to flat cell accumulators.
 
     Args:
@@ -1066,7 +1172,9 @@ def _add_cell_samples(flat, elevation, sums, counts, maxima):
         np.maximum.at(maxima, flat, elevation)
 
 
-def _peak_radius_from_points(x, y, grid) -> float | tuple[float, float]:
+def _peak_radius_from_points(
+    x: npt.ArrayLike, y: npt.ArrayLike, grid: GridConfig
+) -> _PeakRadius:
     """Infer a source footprint radius from the first two projected points.
 
     Args:
@@ -1090,7 +1198,9 @@ def _peak_radius_from_points(x, y, grid) -> float | tuple[float, float]:
     return _fixed_peak_radius(radius_m, grid)
 
 
-def _fixed_peak_radius(radius_m, grid) -> float | tuple[float, float]:
+def _fixed_peak_radius(
+    radius_m: float | np.float64, grid: GridConfig
+) -> _PeakRadius:
     """Convert a projected footprint radius into accumulation coordinates.
 
     Args:
@@ -1110,7 +1220,9 @@ def _fixed_peak_radius(radius_m, grid) -> float | tuple[float, float]:
     )
 
 
-def _polar_boundaries_km(grid):
+def _polar_boundaries_km(
+    grid: GridConfig,
+) -> tuple[_Float64Array, _Float64Array]:
     """Calculate polar ring and relative ray boundaries.
 
     Args:
@@ -1147,7 +1259,9 @@ def _polar_boundaries_km(grid):
     return radial,angular
 
 
-def _polar_boundaries(grid):
+def _polar_boundaries(
+    grid: GridConfig,
+) -> tuple[_Float64Array, _Float64Array]:
     """Calculate polar cell boundaries in accumulation units.
 
     Args:
@@ -1164,8 +1278,14 @@ def _polar_boundaries(grid):
     return np.asarray(radial*np.float64(1000.),dtype=np.float64),angular
 
 
-def _polar_cell_indices(dx,dy,radial_boundaries,angular_boundaries,
-                        first_angle,radius=None):
+def _polar_cell_indices(
+    dx: npt.ArrayLike,
+    dy: npt.ArrayLike,
+    radial_boundaries: npt.ArrayLike,
+    angular_boundaries: npt.ArrayLike,
+    first_angle: float,
+    radius: npt.ArrayLike | None = None,
+) -> _PolarBaseIndices | _PolarPeakIndices:
     """Assign projected offsets to polar cells and optional peak neighbours.
 
     Args:
@@ -1221,7 +1341,16 @@ def _polar_cell_indices(dx,dy,radial_boundaries,angular_boundaries,
             peak_angular,up_edge,angular_radius)
 
 
-def _accumulate_polar_points(x, y, elevation, grid, sums, counts, maxima, radius_m):
+def _accumulate_polar_points(
+    x: npt.ArrayLike,
+    y: npt.ArrayLike,
+    elevation: npt.ArrayLike,
+    grid: GridConfig,
+    sums: _Float64Array,
+    counts: _Int64Array,
+    maxima: _Float32Array | None,
+    radius_m: float | None,
+) -> int:
     """Accumulate projected samples into flat polar-grid cell arrays.
 
     Args:
@@ -1256,7 +1385,7 @@ def _accumulate_polar_points(x, y, elevation, grid, sums, counts, maxima, radius
     flat = angular_index[valid] * grid.nx + radial_index[valid]
     _add_cell_samples(flat, elevation[valid], sums, counts, maxima)
     if radius_m is not None:
-        peak_radial,peak_angular=indexed[4:6]
+        peak_radial,peak_angular=cast(_PolarPeakIndices, indexed)[4:6]
         perturbed_valid=(valid&(peak_radial>=0)&(peak_radial<grid.nx)&
                          (peak_angular>=0)&(peak_angular<grid.ny))
         for candidate_r, candidate_a, changed in (
@@ -1273,8 +1402,18 @@ def _accumulate_polar_points(x, y, elevation, grid, sums, counts, maxima, radius
     return int(valid.sum())
 
 
-def _accumulate_points(x, y, elevation, grid, sums, counts, maxima=None,
-                       peak_radius_grid=None, receptors=None, terrain_filter=None) -> int:
+def _accumulate_points(
+    x: npt.ArrayLike,
+    y: npt.ArrayLike,
+    elevation: npt.ArrayLike,
+    grid: GridConfig,
+    sums: _Float64Array,
+    counts: _Int64Array,
+    maxima: _Float32Array | None = None,
+    peak_radius_grid: _PeakRadius | None = None,
+    receptors: _ReceptorState | None = None,
+    terrain_filter: _TerrainFilter | None = None,
+) -> int:
     """Apply TERREL SAVEELEV accumulation to projected terrain samples.
 
     Args:
@@ -1309,7 +1448,8 @@ def _accumulate_points(x, y, elevation, grid, sums, counts, maxima=None,
         receptors.add(x[domain], y[domain], elevation[domain])
     if grid.grid_type == 3:
         return _accumulate_polar_points(
-            x, y, elevation, grid, sums, counts, maxima, peak_radius_grid
+            x, y, elevation, grid, sums, counts, maxima,
+            cast(float | None, peak_radius_grid),
         )
     xllm = np.float64(np.float64(grid.x_origin_km) * np.float64(1000.0))
     yllm = np.float64(np.float64(grid.y_origin_km) * np.float64(1000.0))
@@ -1339,7 +1479,7 @@ def _accumulate_points(x, y, elevation, grid, sums, counts, maxima=None,
     if peak_radius_grid is not None:
         radius_x, radius_y = (
             np.broadcast_to(np.asarray(value, dtype=np.float64), x.shape)
-            for value in peak_radius_grid
+            for value in cast(tuple[float, float], peak_radius_grid)
         )
         peak_x = np.trunc(cell_x + radius_x).astype(np.int64)
         peak_y = np.trunc(cell_y + radius_y).astype(np.int64)
@@ -1362,8 +1502,18 @@ def _accumulate_points(x, y, elevation, grid, sums, counts, maxima=None,
     return int(valid.sum())
 
 
-def _accumulate_generic(path, grid, sums, counts, input_datum="WGS-84", *, maxima=None,
-                        peak=False, receptors=None, terrain_filter=None) -> int:
+def _accumulate_generic(
+    path: _PathLike,
+    grid: GridConfig,
+    sums: _Float64Array,
+    counts: _Int64Array,
+    input_datum: str = "WGS-84",
+    *,
+    maxima: _Float32Array | None = None,
+    peak: bool = False,
+    receptors: _ReceptorState | None = None,
+    terrain_filter: _TerrainFilter | None = None,
+) -> int:
     """Accumulate TERREL Generic points using LOADGNR semantics.
 
     Args:
@@ -1415,8 +1565,18 @@ def _accumulate_generic(path, grid, sums, counts, input_datum="WGS-84", *, maxim
     )
 
 
-def _accumulate_nzgen(path, grid, sums, counts, input_datum="WGS-84", *, maxima=None,
-                      peak=False, receptors=None, terrain_filter=None) -> int:
+def _accumulate_nzgen(
+    path: _PathLike,
+    grid: GridConfig,
+    sums: _Float64Array,
+    counts: _Int64Array,
+    input_datum: str = "WGS-84",
+    *,
+    maxima: _Float32Array | None = None,
+    peak: bool = False,
+    receptors: _ReceptorState | None = None,
+    terrain_filter: _TerrainFilter | None = None,
+) -> int:
     """Accumulate New Zealand Generic terrain point records.
 
     Args:
@@ -1474,9 +1634,19 @@ def _usgsla_spec(path: Path) -> UsgslaSpec:
     raise ValueError(f"unrecognized USGSLA continent filename: {path.name}")
 
 
-def _accumulate_usgsla(path, grid, sums, counts, input_datum="ESR-S", *, spec=None,
-                       maxima=None, peak=False, receptors=None,
-                       terrain_filter=None) -> int:
+def _accumulate_usgsla(
+    path: _PathLike,
+    grid: GridConfig,
+    sums: _Float64Array,
+    counts: _Int64Array,
+    input_datum: str = "ESR-S",
+    *,
+    spec: UsgslaSpec | None = None,
+    maxima: _Float32Array | None = None,
+    peak: bool = False,
+    receptors: _ReceptorState | None = None,
+    terrain_filter: _TerrainFilter | None = None,
+) -> int:
     """Accumulate a USGS Global Lambert Azimuthal two-byte DEM image.
 
     Args:
@@ -1559,7 +1729,9 @@ def _accumulate_usgsla(path, grid, sums, counts, input_datum="ESR-S", *, spec=No
     return inside_total
 
 
-def _fixed_width_integers(lines, width: int, count: int, label: str) -> tuple[np.ndarray, int]:
+def _fixed_width_integers(
+    lines: Sequence[str], width: int, count: int, label: str
+) -> tuple[_Int64Array, int]:
     """Parse a requested number of fixed-width integers from text lines.
 
     Args:
@@ -1576,7 +1748,7 @@ def _fixed_width_integers(lines, width: int, count: int, label: str) -> tuple[np
         ValueError: If a non-blank field is not an integer or the lines end
             before ``count`` values are found.
     """
-    values = []
+    values: list[int] = []
     line_index = 0
     while len(values) < count and line_index < len(lines):
         line = lines[line_index].rstrip("\r\n")
@@ -1593,7 +1765,9 @@ def _fixed_width_integers(lines, width: int, count: int, label: str) -> tuple[np
     return np.asarray(values, dtype=np.int64), line_index
 
 
-def _read_arm3(path: Path):
+def _read_arm3(
+    path: Path,
+) -> tuple[int, int, int, int, _Int64Array, _Int64Array]:
     """Read an ARM3 panel index and packed 30-arc-second elevations.
 
     Args:
@@ -1624,9 +1798,19 @@ def _read_arm3(path: Path):
     return int(longitude_se), int(latitude_se), int(nx), int(ny), index, elevations
 
 
-def _accumulate_arm3(path, grid, sums, counts, input_datum="NAS-C", *, maxima=None,
-                     peak=False, receptors=None, direct=False,
-                     terrain_filter=None) -> int:
+def _accumulate_arm3(
+    path: _PathLike,
+    grid: GridConfig,
+    sums: _Float64Array,
+    counts: _Int64Array,
+    input_datum: str = "NAS-C",
+    *,
+    maxima: _Float32Array | None = None,
+    peak: bool = False,
+    receptors: _ReceptorState | None = None,
+    direct: bool = False,
+    terrain_filter: _TerrainFilter | None = None,
+) -> int:
     """Accumulate ARM3 30-arc-second terrain panels.
 
     Args:
@@ -1719,9 +1903,20 @@ def _3cd_origin(path: Path) -> tuple[int, int]:
     return int(latitude), int(west_longitude)
 
 
-def _accumulate_3cd(path, grid, sums, counts, input_datum="WGS-72", *, samples=1201,
-                    maxima=None, peak=False, receptors=None, direct=False,
-                    terrain_filter=None) -> int:
+def _accumulate_3cd(
+    path: _PathLike,
+    grid: GridConfig,
+    sums: _Float64Array,
+    counts: _Int64Array,
+    input_datum: str = "WGS-72",
+    *,
+    samples: int = 1201,
+    maxima: _Float32Array | None = None,
+    peak: bool = False,
+    receptors: _ReceptorState | None = None,
+    direct: bool = False,
+    terrain_filter: _TerrainFilter | None = None,
+) -> int:
     """Accumulate a transparent-access 3CD little-endian int16 raster.
 
     Args:
@@ -1826,7 +2021,7 @@ def _dmdf_point(record: str, second: bool = False) -> tuple[float, float, float]
     )
 
 
-def _read_dmdf(path: Path) -> np.ndarray:
+def _read_dmdf(path: Path) -> _Float64Array:
     """Read terrain points from a Canadian DMDF transfer file.
 
     Args:
@@ -1840,7 +2035,7 @@ def _read_dmdf(path: Path) -> np.ndarray:
         OSError: If the file cannot be read.
         ValueError: If a point record is malformed or no points are present.
     """
-    points = []
+    points: list[tuple[float, float, float]] = []
     previous_type = ""
     for line in path.read_text(encoding="ascii").splitlines():
         record = line.ljust(80)
@@ -1868,8 +2063,18 @@ def _read_dmdf(path: Path) -> np.ndarray:
     return np.asarray(points, dtype=np.float64)
 
 
-def _accumulate_dmdf(path, grid, sums, counts, input_datum="NAS-C", *, maxima=None,
-                     peak=False, receptors=None, terrain_filter=None) -> int:
+def _accumulate_dmdf(
+    path: _PathLike,
+    grid: GridConfig,
+    sums: _Float64Array,
+    counts: _Int64Array,
+    input_datum: str = "NAS-C",
+    *,
+    maxima: _Float32Array | None = None,
+    peak: bool = False,
+    receptors: _ReceptorState | None = None,
+    terrain_filter: _TerrainFilter | None = None,
+) -> int:
     """Accumulate Canadian DMDF fixed-column UTM point records.
 
     Args:
@@ -1982,7 +2187,7 @@ def _parse_dem_header(record: str) -> DemHeader:
     Raises:
         ValueError: If a fixed-width integer or floating-point field is invalid.
     """
-    def integers(start, count):
+    def integers(start: int, count: int) -> tuple[int, ...]:
         """Decode consecutive six-character integers from the header.
 
         Args:
@@ -2000,19 +2205,24 @@ def _parse_dem_header(record: str) -> DemHeader:
         except ValueError as error:
             raise ValueError("invalid USGS DEM integer header field") from error
 
-    codes = integers(144, 4)
+    codes = cast(tuple[int, int, int, int], integers(144, 4))
     coordinate_unit, elevation_unit, _ = integers(528, 3)
     corners = np.array([_dem_float(record[546 + 24 * i:570 + 24 * i])
                         for i in range(8)], dtype=np.float64).reshape(4, 2)
-    resolution = tuple(_dem_float(record[816 + 12 * i:828 + 12 * i]) for i in range(3))
-    profiles = integers(852, 2)
+    resolution = cast(
+        tuple[float, float, float],
+        tuple(_dem_float(record[816 + 12 * i:828 + 12 * i]) for i in range(3)),
+    )
+    profiles = cast(tuple[int, int], integers(852, 2))
     datum_field = record[890:892].strip()
     datum = int(datum_field) if datum_field else 0
     return DemHeader(codes, coordinate_unit, elevation_unit, corners,
                      resolution, profiles, datum)
 
 
-def _parse_dem_profiles(records: list[str], expected: int):
+def _parse_dem_profiles(
+    records: Sequence[str], expected: int
+) -> list[_DemProfile]:
     """Parse USGS DEM type-B elevation profiles.
 
     Args:
@@ -2028,7 +2238,7 @@ def _parse_dem_profiles(records: list[str], expected: int):
         ValueError: If profile headers, indices, elevations, record counts, or
             trailing logical records are invalid.
     """
-    profiles = []
+    profiles: list[_DemProfile] = []
     record_index = 1
     for wanted in range(1, expected + 1):
         if record_index >= len(records):
@@ -2061,9 +2271,19 @@ def _parse_dem_profiles(records: list[str], expected: int):
     return profiles
 
 
-def _accumulate_usgs_degree_dem(path, grid, sums, counts, input_datum="WGS-72", *,
-                                maxima=None, peak=False, receptors=None,
-                                direct=False, terrain_filter=None) -> int:
+def _accumulate_usgs_degree_dem(
+    path: _PathLike,
+    grid: GridConfig,
+    sums: _Float64Array,
+    counts: _Int64Array,
+    input_datum: str = "WGS-72",
+    *,
+    maxima: _Float32Array | None = None,
+    peak: bool = False,
+    receptors: _ReceptorState | None = None,
+    direct: bool = False,
+    terrain_filter: _TerrainFilter | None = None,
+) -> int:
     """Accumulate USGS90 or CDED geographic A/B-record DEM profiles.
 
     Args:
@@ -2116,7 +2336,10 @@ def _accumulate_usgs_degree_dem(path, grid, sums, counts, input_datum="WGS-72", 
         interpolated_y = ynear + (yfar - ynear) * along
         if direct:
             longitude = np.full(raw.shape, origin[0] / 3600.0)
-            latitude = (origin[1] + header.resolution[1] * np.arange(raw.size)) / 3600.0
+            latitude = cast(
+                _Float64Array,
+                (origin[1] + header.resolution[1] * np.arange(raw.size)) / 3600.0,
+            )
             x, y = project_geographic(longitude, latitude, grid, source_datum)
             x, y = np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64)
         else:
@@ -2138,8 +2361,18 @@ def _accumulate_usgs_degree_dem(path, grid, sums, counts, input_datum="WGS-72", 
     return inside_total
 
 
-def _accumulate_usgs30(path, grid, sums, counts, input_datum="NAS-C", *, maxima=None,
-                       peak=False, receptors=None, terrain_filter=None) -> int:
+def _accumulate_usgs30(
+    path: _PathLike,
+    grid: GridConfig,
+    sums: _Float64Array,
+    counts: _Int64Array,
+    input_datum: str = "NAS-C",
+    *,
+    maxima: _Float32Array | None = None,
+    peak: bool = False,
+    receptors: _ReceptorState | None = None,
+    terrain_filter: _TerrainFilter | None = None,
+) -> int:
     """Accumulate USGS 7.5-minute UTM A/B-record DEM profiles.
 
     Args:
@@ -2205,7 +2438,18 @@ def _accumulate_usgs30(path, grid, sums, counts, input_datum="NAS-C", *, maxima=
     return inside_total
 
 
-def _geotiff_geometry(path: Path):
+def _geotiff_geometry(
+    path: Path,
+) -> tuple[
+    CRS,
+    float,
+    float,
+    float,
+    float,
+    float,
+    _NumericArray,
+    _BoolArray,
+]:
     """Read one terrain GeoTIFF band, mask, CRS, and centre geometry.
 
     Args:
@@ -2251,7 +2495,7 @@ def _geotiff_geometry(path: Path):
     # Keep this narrow metadata fallback for uncommon bottom-up TIFFs; all CRS,
     # affine, band, unit, and pixel reads above still go through Rasterio.
     with tifffile.TiffFile(path) as tiff:
-        page = tiff.pages[0]
+        page = cast(tifffile.TiffPage, tiff.pages[0])
         orientation = int(page.tags[274].value) if 274 in page.tags else 1
         if orientation not in {1, 4}:
             raise ValueError(f"unsupported terrain GeoTIFF orientation {orientation}")
@@ -2274,8 +2518,18 @@ def _geotiff_geometry(path: Path):
     return source_crs, float(x0), float(y0), dx, dy, elevation_scale, data, valid
 
 
-def _accumulate_geotiff(path, grid, sums, counts, input_datum="WGS-84", *, maxima=None,
-                        peak=False, receptors=None, terrain_filter=None) -> int:
+def _accumulate_geotiff(
+    path: _PathLike,
+    grid: GridConfig,
+    sums: _Float64Array,
+    counts: _Int64Array,
+    input_datum: str = "WGS-84",
+    *,
+    maxima: _Float32Array | None = None,
+    peak: bool = False,
+    receptors: _ReceptorState | None = None,
+    terrain_filter: _TerrainFilter | None = None,
+) -> int:
     """Accumulate terrain GeoTIFF pixels following LOADTIFF/SAVEELEV.
 
     Args:
@@ -2300,13 +2554,15 @@ def _accumulate_geotiff(path, grid, sums, counts, input_datum="WGS-84", *, maxim
     )
     to_geographic = Transformer.from_crs(source_crs, source_crs.geodetic_crs, always_xy=True)
     source_x = x0 + dx * np.arange(data.shape[1], dtype=np.float64)
-    radius = None
+    radius: _PeakRadius | None = None
     if peak:
         corner_source_x = np.array([source_x[0], source_x[-1], source_x[-1], source_x[0]])
         last_y = y0 + dy * (data.shape[0] - 1)
         corner_source_y = np.array([y0, y0, last_y, last_y])
         corner_lon, corner_lat = to_geographic.transform(corner_source_x, corner_source_y)
         corner_x, corner_y = project_geographic(corner_lon, corner_lat, grid, input_datum)
+        corner_x = cast(_Float64Array, corner_x)
+        corner_y = cast(_Float64Array, corner_y)
         dx_m = min(abs(corner_x[1] - corner_x[0]),
                    abs(corner_x[2] - corner_x[3])) / data.shape[1]
         dy_m = min(abs(corner_y[3] - corner_y[0]),
@@ -2333,7 +2589,15 @@ def _accumulate_geotiff(path, grid, sums, counts, input_datum="WGS-84", *, maxim
     return inside_total
 
 
-def _write_netcdf(path, terrain, counts, grid, datum, *, peak=False) -> None:
+def _write_netcdf(
+    path: _PathLike,
+    terrain: _Float32Array,
+    counts: _Int64Array,
+    grid: GridConfig,
+    datum: str,
+    *,
+    peak: bool = False,
+) -> None:
     """Write the canonical CF-style TERREL NetCDF product.
 
     Args:
@@ -2388,7 +2652,9 @@ def _write_netcdf(path, terrain, counts, grid, datum, *, peak=False) -> None:
                           zlib=True)[:] = counts.reshape(grid.ny, grid.nx)
 
 
-def _cell_type_coordinates(grid):
+def _cell_type_coordinates(
+    grid: GridConfig,
+) -> tuple[_Float64Array, _Float64Array]:
     """Calculate projected cell-centre coordinates for classification.
 
     Args:
@@ -2410,7 +2676,9 @@ def _cell_type_coordinates(grid):
     return np.meshgrid(x,y,indexing="xy")
 
 
-def _cell_types(grid, terrain_filter):
+def _cell_types(
+    grid: GridConfig, terrain_filter: _TerrainFilter
+) -> _Int8Array:
     """Classify every target cell using the configured coastline polygons.
 
     Args:
@@ -2424,7 +2692,9 @@ def _cell_types(grid, terrain_filter):
     return terrain_filter.types(x,y)
 
 
-def _cell_averages(sums, counts):
+def _cell_averages(
+    sums: npt.ArrayLike, counts: npt.ArrayLike
+) -> _Float32Array:
     """Finish high-precision terrain sums as a model float32 field.
 
     Args:
@@ -2443,8 +2713,11 @@ def _cell_averages(sums, counts):
     return average.astype(COMPUTE_DTYPE)
 
 
-def _fill_polar_angular_gaps(terrain, missing_threshold=-9999.0,
-                             ray_angles_deg=None):
+def _fill_polar_angular_gaps(
+    terrain: npt.ArrayLike,
+    missing_threshold: float = -9999.0,
+    ray_angles_deg: npt.ArrayLike | None = None,
+) -> _Float32Array:
     """Fill each missing polar cell from the nearest populated ray.
 
     Args:
@@ -2500,7 +2773,14 @@ def _fill_polar_angular_gaps(terrain, missing_threshold=-9999.0,
     return values
 
 
-def _finalize_terrain(sums,counts,maxima,grid,peak,terrain_filter):
+def _finalize_terrain(
+    sums: _Float64Array,
+    counts: _Int64Array,
+    maxima: _Float32Array,
+    grid: GridConfig,
+    peak: bool,
+    terrain_filter: _TerrainFilter,
+) -> _Float32Array:
     """Convert accumulators into the filtered final terrain grid.
 
     Args:
@@ -2533,7 +2813,9 @@ def _finalize_terrain(sums,counts,maxima,grid,peak,terrain_filter):
     return final
 
 
-def _write_surfer_grid(path,terrain,grid):
+def _write_surfer_grid(
+    path: _PathLike, terrain: _Float32Array, grid: GridConfig
+) -> None:
     """Write PLTOUT's Surfer ASCII DSAA grid for a Cartesian domain.
 
     Args:
@@ -2569,7 +2851,9 @@ def _write_surfer_grid(path,terrain,grid):
                 stream.write("".join(f"{value:8.1f}" for value in row[start:start+10])+"\n")
 
 
-def _write_plot_output(path,terrain,grid):
+def _write_plot_output(
+    path: _PathLike, terrain: _Float32Array, grid: GridConfig
+) -> None:
     """Write TERREL plot output for the target grid type.
 
     Args:
@@ -2591,7 +2875,15 @@ def _write_plot_output(path,terrain,grid):
     path.write_text("",encoding="ascii")
 
 
-def _interp2d(x_vertices, y_vertices, values, distances, x, y, distance_max):
+def _interp2d(
+    x_vertices: npt.ArrayLike,
+    y_vertices: npt.ArrayLike,
+    values: npt.ArrayLike,
+    distances: npt.ArrayLike,
+    x: float,
+    y: float,
+    distance_max: float,
+) -> np.float32:
     """Interpolate a receptor elevation from one point in each quadrant.
 
     Args:
@@ -2623,16 +2915,16 @@ def _interp2d(x_vertices, y_vertices, values, distances, x, y, distance_max):
     minimum_y = np.min(yo)
     candidates = np.flatnonzero(yo == minimum_y)
     first = int(candidates[np.argmin(xo[candidates])])
-    other = [index for index in range(4) if index != first]
-    angles=[]
+    other: list[int] = [index for index in range(4) if index != first]
+    angle_values: list[np.float64] = []
     for index in other:
         dy=yo[index]-yo[first]
         dx=xo[index]-xo[first]+1.e-30
         angle=np.arctan2(dy,dx)
         if angle< -np.pi/2.:
             angle+=2.*np.pi
-        angles.append(angle)
-    angles=np.asarray(angles,dtype=COORD_DTYPE)
+        angle_values.append(angle)
+    angles=np.asarray(angle_values,dtype=COORD_DTYPE)
     second = other[int(np.argmin(angles))]
     fourth = other[int(np.argmax(angles))]
     third = 6 - first - second - fourth
@@ -2650,7 +2942,7 @@ def _interp2d(x_vertices, y_vertices, values, distances, x, y, distance_max):
         edge_values[edge]=(along*zo[end]+(side-along)*zo[start])/side
         if perpendicular[edge]<1.e-3:
             return COMPUTE_DTYPE(edge_values[edge])
-    def opposite(first,third):
+    def opposite(first: int, third: int) -> np.float64:
         """Blend values from one pair of opposite polygon edges.
 
         Args:
@@ -2662,7 +2954,9 @@ def _interp2d(x_vertices, y_vertices, values, distances, x, y, distance_max):
         """
         numerator=(edge_values[first]*perpendicular[third]+
                    edge_values[third]*perpendicular[first])
-        return numerator/(perpendicular[first]+perpendicular[third])
+        return np.float64(
+            numerator/(perpendicular[first]+perpendicular[third])
+        )
     first_estimate=opposite(0,2); second_estimate=opposite(1,3)
     p24=perpendicular[1]+perpendicular[3]
     p13=perpendicular[0]+perpendicular[2]
@@ -2670,7 +2964,13 @@ def _interp2d(x_vertices, y_vertices, values, distances, x, y, distance_max):
     return COMPUTE_DTYPE(numerator/np.sum(perpendicular))
 
 
-def _fill_void_cells(sums, counts, grid, radius_km, maxima=None) -> int:
+def _fill_void_cells(
+    sums: _Float64Array,
+    counts: _Int64Array,
+    grid: GridConfig,
+    radius_km: float,
+    maxima: _Float32Array | None = None,
+) -> int:
     """Fill void cells from nearest original cells within a physical radius.
 
     Args:
@@ -2747,7 +3047,9 @@ def _fill_void_cells(sums, counts, grid, radius_km, maxima=None) -> int:
             tied = np.asarray([nearest_index], dtype=np.int64)
         filled_values[output_index] = np.mean(source_values[tied], dtype=ACCUM_DTYPE)
         if filled_maxima is not None:
-            filled_maxima[output_index] = np.max(source_maxima[tied])
+            filled_maxima[output_index] = np.max(
+                cast(_Float32Array, source_maxima)[tied]
+            )
 
     sums_grid.ravel()[target_flat_indices] = filled_values
     counts_grid.ravel()[target_flat_indices] = 1
@@ -2756,7 +3058,14 @@ def _fill_void_cells(sums, counts, grid, radius_km, maxima=None) -> int:
     return int(target_flat_indices.size)
 
 
-def _write_legacy_header(stream, grid, datum, *, dataset="TERREL.DAT", version="2.0") -> None:
+def _write_legacy_header(
+    stream: IO[str],
+    grid: GridConfig,
+    datum: str,
+    *,
+    dataset: str = "TERREL.DAT",
+    version: str = "2.0",
+) -> None:
     """Write the common legacy TERREL header emitted by ``WRTHEAD``.
 
     Args:
@@ -2783,6 +3092,7 @@ def _write_legacy_header(stream, grid, datum, *, dataset="TERREL.DAT", version="
     stream.write(f"{projection:<8}\n")
     latitude=lambda value: f'{abs(value):g}{"N" if value>=0 else "S"}'
     longitude=lambda value: f'{abs(value):g}{"E" if value>=0 else "W"}'
+    fields: tuple[str, ...]
     if projection == "UTM":
         stream.write(f"{grid.utm_zone:4d}{grid.hemisphere:<4}\n")
     elif projection == "LCC":
@@ -2808,7 +3118,13 @@ def _write_legacy_header(stream, grid, datum, *, dataset="TERREL.DAT", version="
     stream.write("KM  M   \nW_E N_S \n")
 
 
-def _write_legacy(path, terrain, grid, datum, model=1) -> None:
+def _write_legacy(
+    path: Path,
+    terrain: _Float32Array,
+    grid: GridConfig,
+    datum: str,
+    model: int = 1,
+) -> None:
     """Write a legacy TERREL product for the selected CALPUFF model layout.
 
     Args:
@@ -2917,7 +3233,9 @@ def run(config: TerrelConfig) -> TerrainResult:
         raise ValueError("TERREL polar IPROC must be 1 or 2")
     if config.terrain_sources:
         sources=list(config.terrain_sources)
-        missing=[str(item.path) for item in sources if not Path(item.path).is_file()]
+        missing: list[str] = [
+            str(item.path) for item in sources if not Path(item.path).is_file()
+        ]
         if missing: raise FileNotFoundError('TERREL control lists missing terrain files: '+', '.join(missing))
         if len({Path(item.path).resolve() for item in sources})!=len(sources):
             raise ValueError('TERREL control lists duplicate terrain files')
@@ -2925,7 +3243,8 @@ def run(config: TerrelConfig) -> TerrainResult:
     root = Path(config.srtm_dir)
     available={path.name.casefold():path for path in root.iterdir() if _HGT_NAME.match(path.name)}
     if config.terrain_files:
-        missing=[]; tiles=[]
+        missing = []
+        tiles: list[Path] = []
         for item in config.terrain_files:
             name=Path(item).name.casefold(); tile=available.get(name)
             if tile is None: missing.append(Path(item).name)
@@ -2977,7 +3296,7 @@ def run(config: TerrelConfig) -> TerrainResult:
     if config.plot_output is not None:
         _write_plot_output(config.plot_output,terrain,grid)
     if receptors is not None:
-        receptor_output = Path(config.receptor_output)
+        receptor_output = Path(cast(str | Path, config.receptor_output))
         receptor_output.parent.mkdir(parents=True, exist_ok=True)
         _write_receptors(receptor_output, receptors, terrain_filter)
     valid = terrain > -998.0
@@ -3098,7 +3417,7 @@ def _run_sources(config: TerrelConfig, sources: list[TerrelSource]) -> TerrainRe
     if config.plot_output is not None:
         _write_plot_output(config.plot_output,terrain,grid)
     if receptors is not None:
-        receptor_output=Path(config.receptor_output)
+        receptor_output=Path(cast(str | Path, config.receptor_output))
         receptor_output.parent.mkdir(parents=True,exist_ok=True)
         _write_receptors(receptor_output,receptors,terrain_filter)
     valid=terrain>-998.

@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import BinaryIO, Iterator
 
 import numpy as np
+import numpy.typing as npt
 
 
 @dataclass(frozen=True,slots=True)
@@ -63,7 +64,7 @@ class M2DRecord:
     """
     timestamp: datetime
     name: str
-    values: np.ndarray
+    values: npt.NDArray[np.float32]
 
     @property
     def date(self) -> datetime:
@@ -99,7 +100,7 @@ def _timestamp(field: bytes,description: str) -> datetime:
             not form a valid calendar timestamp.
     """
     try:
-        text=field.decode('ascii')
+        text: str=field.decode('ascii')
     except UnicodeDecodeError as error:
         raise ValueError(f'invalid M2D {description} timestamp') from error
     if len(text)!=10 or not text.isdecimal():
@@ -116,15 +117,15 @@ class M2DReader:
     Attributes:
         path: Source M2D file path.
     """
-    def __init__(self,path):
+    def __init__(self,path: str | Path) -> None:
         """Store the M2D source path without opening it.
 
         Args:
             path: Existing formatted M2D path.
         """
-        self.path=Path(path)
+        self.path: Path=Path(path)
 
-    def records(self) -> tuple[M2DHeader,Iterable[M2DRecord]]:
+    def records(self) -> tuple[M2DHeader,Iterator[M2DRecord]]:
         """Read the header and return a lazy variable-record iterator.
 
         Returns:
@@ -138,38 +139,44 @@ class M2DReader:
                 malformed.
             EOFError: If iteration reaches a truncated variable record.
         """
-        stream=self.path.open('rb',buffering=1024*1024)
+        stream: BinaryIO=self.path.open('rb',buffering=1024*1024)
         stream.readline()
-        comment_count=int(stream.readline())
-        comments=[stream.readline().decode('ascii') for _ in range(comment_count)]
+        comment_count: int=int(stream.readline())
+        comments: list[str]=[stream.readline().decode('ascii') for _ in range(comment_count)]
         try:
-            variable_count=int(comments[1].split()[0])
-            variables=tuple(line.split()[1] for line in comments[2:2+variable_count])
+            variable_count: int=int(comments[1].split()[0])
+            variables: tuple[str,...]=tuple(line.split()[1] for line in comments[2:2+variable_count])
         except (IndexError,ValueError) as error:
             stream.close(); raise ValueError('invalid M2D variable comment block') from error
         stream.readline()
-        grid=stream.readline().split(); source_nx,source_ny,source_nz=map(int,grid[8:11])
+        grid: list[bytes]=stream.readline().split()
+        source_nx: int; source_ny: int; source_nz: int
+        source_nx,source_ny,source_nz=map(int,grid[8:11])
         stream.readline()
-        period=stream.readline().split()
+        period: list[bytes]=stream.readline().split()
         if len(period)<5:
             stream.close(); raise ValueError('M2D period record is incomplete')
         try:
-            start=_timestamp(period[0],'header')
+            start: datetime=_timestamp(period[0],'header')
+            nhours: int; nx: int; ny: int; nz: int
             nhours,nx,ny,nz=map(int,period[1:5])
         except ValueError:
             stream.close(); raise
-        bounds=stream.readline().split()
+        bounds: list[bytes]=stream.readline().split()
         if len(bounds)<6:
             stream.close(); raise ValueError('M2D extraction-bounds record is incomplete')
+        i_start: int; j_start: int; i_end: int; j_end: int
+        k_start: int; k_end: int
         i_start,j_start,i_end,j_end,k_start,k_end=map(int,bounds[:6])
         if ((i_end-i_start+1,j_end-j_start+1,k_end-k_start+1)!=(nx,ny,nz)):
             stream.close(); raise ValueError(
                 'M2D extraction bounds do not match subset dimensions')
         for _ in range(nz+nx*ny): stream.readline()
-        header=M2DHeader(nx,ny,nz,nhours,start,variables,
-                         source_nx,source_ny,source_nz,i_start,j_start,k_start)
+        header: M2DHeader=M2DHeader(nx,ny,nz,nhours,start,variables,
+                                   source_nx,source_ny,source_nz,
+                                   i_start,j_start,k_start)
 
-        def generate():
+        def generate() -> Iterator[M2DRecord]:
             """Yield decoded variable records and close the owned stream.
 
             Yields:
@@ -181,15 +188,15 @@ class M2DReader:
             """
             try:
                 for _ in range(nhours*variable_count):
-                    line=stream.readline()
+                    line: bytes=stream.readline()
                     if not line: raise EOFError('M2D ended before a variable record')
-                    timestamp=_timestamp(line[:10],'variable-record')
-                    name=line[12:20].decode('ascii').strip()
-                    rows=[]
+                    timestamp: datetime=_timestamp(line[:10],'variable-record')
+                    name: str=line[12:20].decode('ascii').strip()
+                    rows: list[list[float]]=[]
                     for _row in range(ny):
-                        values=[]
+                        values: list[float]=[]
                         while len(values)<nx:
-                            data=stream.readline().rstrip(b'\r\n')
+                            data: bytes=stream.readline().rstrip(b'\r\n')
                             if not data: raise EOFError('M2D ended inside a gridded row')
                             values.extend(float(data[index:index+10])
                                           for index in range(0,len(data),10)

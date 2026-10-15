@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, TypeAlias
+from typing import Any, Callable, Final, TypeAlias, TypeVar
 
 from .api import _GRID_PARAMETER_NAMES, _config
 from .calmet import run as _run_calmet
@@ -27,7 +27,16 @@ CtgprocSpec: TypeAlias = CtgprocConfig | StageSpec
 MakegeoSpec: TypeAlias = MakegeoConfig | StageSpec
 CalmetSpec: TypeAlias = CalmetConfig | StageSpec
 
-_CONTROL_FILES = {
+StageConfigT = TypeVar(
+    "StageConfigT",
+    CalwrfConfig,
+    TerrelConfig,
+    CtgprocConfig,
+    MakegeoConfig,
+    CalmetConfig,
+)
+
+_CONTROL_FILES: Final[dict[str, str]] = {
     "calwrf": "calwrf.inp",
     "terrel": "terrel.inp",
     "ctgproc": "ctgproc.inp",
@@ -90,7 +99,11 @@ def _mapping_specs(value: Mapping[str, Any]) -> dict[str, Any]:
     return {name: value[name] for name in _CONTROL_FILES}
 
 
-def _mapping_defaults(cls: Any, value: Any, **defaults: Any) -> Any:
+def _mapping_defaults(
+    cls: type[StageConfigT],
+    value: StageConfigT | StageSpec | None,
+    **defaults: Any,
+) -> StageConfigT | StageSpec | None:
     """Supply pipeline-managed paths that a mapping does not define.
 
     Legacy field names are normalized before the defaults are added, so an
@@ -141,11 +154,11 @@ def _annotate_error(error: Exception, stage: str) -> None:
 
 def _resolve_stage(
     name: str,
-    cls: Any,
-    value: Any,
-    loader: Any,
+    cls: type[StageConfigT],
+    value: StageConfigT | StageSpec | None,
+    loader: Callable[..., StageConfigT],
     parameters: Mapping[str, Any] | None = None,
-) -> Any:
+) -> StageConfigT:
     """Build one stage configuration and label configuration failures.
 
     Args:
@@ -222,8 +235,9 @@ def _resolve_config(
             "configurations, not both"
         )
     parameter_only = inp is None and not supplied
+    specs: Mapping[str, Any]
     if isinstance(inp, PipelineConfig):
-        specs: Mapping[str, Any] = {
+        specs = {
             "calwrf": inp.calwrf,
             "terrel": inp.terrel,
             "ctgproc": inp.ctgproc,
@@ -231,7 +245,7 @@ def _resolve_config(
             "calmet": inp.calmet,
         }
     elif isinstance(inp, (str, Path)):
-        specs: Mapping[str, Any] = _directory_specs(inp)
+        specs = _directory_specs(inp)
     elif isinstance(inp, Mapping):
         specs = _mapping_specs(inp)
     elif inp is None:
@@ -352,7 +366,11 @@ def _select_stage_parameters(
     return result
 
 
-def _run_stage(name: str, runner: Any, config: Any) -> Path:
+def _run_stage(
+    name: str,
+    runner: Callable[[StageConfigT], str | Path],
+    config: StageConfigT,
+) -> Path:
     """Run one configured stage and label failures with its name.
 
     Args:
@@ -541,4 +559,4 @@ from ._pipeline_api import run_pipeline
 # Present the generated wrapper as the public function of this module.
 run_pipeline.__module__ = __name__
 
-__all__ = ["PipelineConfig", "run_pipeline"]
+__all__: Final[list[str]] = ["PipelineConfig", "run_pipeline"]

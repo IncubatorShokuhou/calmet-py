@@ -1,11 +1,15 @@
 """Reader for CALMET.DAT winds used by the IGFMET nested-grid option."""
 from __future__ import annotations
 
+from typing import Literal, TypeAlias, cast, overload
+
 from datetime import datetime, timedelta
 from pathlib import Path
 import struct
+from collections.abc import Iterable, Mapping
 
 import numpy as np
+from numpy.typing import ArrayLike, NDArray
 from scipy.spatial import cKDTree
 
 from .config import GridConfig
@@ -16,7 +20,14 @@ from .projections import (grid_convergence,grid_crs,transform_grid,
                           unproject_geographic)
 
 
-MODEL_DTYPE=np.float32
+MODEL_DTYPE: type[np.float32]=np.float32
+Float32Array: TypeAlias = NDArray[np.float32]
+Int32Array: TypeAlias = NDArray[np.int32]
+
+
+FieldArray: TypeAlias = Float32Array | Int32Array
+WindRecord: TypeAlias = tuple[datetime,Float32Array,Float32Array]
+FieldRecord: TypeAlias = tuple[datetime,dict[str,FieldArray]]
 
 
 def _coded_time(code: int, seconds: int) -> datetime:
@@ -36,7 +47,13 @@ def _coded_time(code: int, seconds: int) -> datetime:
     except ValueError as error: raise ValueError(f'invalid CALMET.DAT timestamp {code}/{seconds}') from error
 
 
-def _field(payload: bytes, size: int, *, mtver=1, integer=False):
+def _field(
+    payload: bytes,
+    size: int,
+    *,
+    mtver: int=1,
+    integer: bool=False,
+) -> tuple[str,int,int,int,int,FieldArray]:
     """Decode one CALMET.DAT labeled field record.
 
     Args:
@@ -67,7 +84,13 @@ def _field(payload: bytes, size: int, *, mtver=1, integer=False):
     return label,begin_code,begin_seconds,end_code,end_seconds,values
 
 
-def _run_control_time(year,month,day,hour,seconds=0):
+def _run_control_time(
+    year: int,
+    month: int,
+    day: int,
+    hour: int,
+    seconds: int=0,
+) -> datetime:
     """Decode a calendar timestamp from a CALMET run-control record.
 
     Args:
@@ -88,7 +111,7 @@ def _run_control_time(year,month,day,hour,seconds=0):
         raise ValueError('invalid CALMET.DAT run-control timestamp') from error
 
 
-def _run_control_timezone(value):
+def _run_control_timezone(value: str) -> str:
     """Normalize a CALMET run-control timezone to hours west of UTC.
 
     Args:
@@ -105,7 +128,11 @@ def _run_control_timezone(value):
         raise ValueError('invalid CALMET.DAT run-control timezone') from error
 
 
-def _covering_record(records,when,label):
+def _covering_record(
+    records: Mapping[datetime,WindRecord],
+    when: datetime,
+    label: str,
+) -> WindRecord:
     """Find the wind interval satisfying ``begin < when <= end``.
 
     Args:
@@ -161,8 +188,30 @@ class InitialGuessCalmetData:
         fields: Optionally retained complete periods keyed by ending timestamp.
     """
 
-    def __init__(self,path,*,retain_fields=False,field_endings=None,
-                 record_endings=None):
+    version: str
+    start: datetime
+    end: datetime
+    timezone: str
+    duration_hours: int
+    run_type: int
+    iwfcod: int
+    surface_station_count: int
+    upper_station_count: int
+    precipitation_station_count: int
+    sea_station_count: int
+    landuse_category_count: int
+    water_category_min: int
+    water_category_max: int
+    includes_w_temperature: bool
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        retain_fields: bool=False,
+        field_endings: Iterable[datetime] | None=None,
+        record_endings: Iterable[datetime] | None=None,
+    ) -> None:
         """Read and validate one CALMET.DAT initial-guess file.
 
         Args:
@@ -180,7 +229,9 @@ class InitialGuessCalmetData:
             ValueError: If metadata, record sizes/order, timestamps, or wind
                 level coverage are invalid.
         """
-        self.path=Path(path)
+        self.path: Path=Path(path)
+        selected_field_endings: frozenset[datetime] | None
+        selected_record_endings: frozenset[datetime] | None
         selected_field_endings=(None if field_endings is None else
                                 frozenset(field_endings))
         selected_record_endings=(None if record_endings is None else
@@ -203,8 +254,8 @@ class InitialGuessCalmetData:
                     if comment is None or len(comment)!=132:
                         raise ValueError('invalid CALMET.DAT comment record')
                 control=reader.read_record()
-                expected=176 if mtver else 148
-                if control is None or len(control)!=expected:
+                control_size=176 if mtver else 148
+                if control is None or len(control)!=control_size:
                     raise ValueError(f'invalid CALMET.DAT {self.version} run-control record')
                 if mtver:
                     first=struct.unpack_from('<10i',control,0)
@@ -240,7 +291,7 @@ class InitialGuessCalmetData:
                 if control is None or len(control)!=108:
                     raise ValueError('invalid legacy CALMET.DAT run-control record')
                 self.version=control[:8].decode('ascii').strip()
-                level=control[8:16].decode('ascii').strip()
+                release_level=control[8:16].decode('ascii').strip()
                 year,month,day,hour,hours_west,hours,self.run_type,nx,ny,nz=struct.unpack_from('<10i',control,16)
                 self.start=_run_control_time(year,month,day,hour)-timedelta(hours=1)
                 self.end=self.start+timedelta(hours=hours)
@@ -252,7 +303,8 @@ class InitialGuessCalmetData:
                  self.landuse_category_count,self.water_category_min,
                  self.water_category_max,lcalgrd)=struct.unpack_from('<9i',control,72)
                 try:
-                    has_projection=int(level[:6])>=980304 or float(self.version[:6])>5.1
+                    has_projection=(int(release_level[:6])>=980304 or
+                                    float(self.version[:6])>5.1)
                 except ValueError as error:
                     raise ValueError('invalid legacy CALMET version or level') from error
                 if has_projection:
@@ -273,7 +325,7 @@ class InitialGuessCalmetData:
                 datum='NWS-84'; false_easting=false_northing=0.
                 hemisphere='S' if utm_zone<0 else 'N'
                 utm_zone=abs(utm_zone); mtver=0
-            self.grid=GridConfig(nx,ny,dx_m/1000.,dx_m/1000.,projection=projection,
+            self.grid: GridConfig=GridConfig(nx,ny,dx_m/1000.,dx_m/1000.,projection=projection,
                 datum=datum,x_origin_km=x_origin_m/1000.,y_origin_km=y_origin_m/1000.,
                 false_easting_km=false_easting,false_northing_km=false_northing,
                 hemisphere=hemisphere,utm_zone=utm_zone,lat0=lat0,lon0=lon0,
@@ -282,7 +334,39 @@ class InitialGuessCalmetData:
             self.includes_w_temperature=bool(lcalgrd)
             count=nx*ny
 
-            def take(label,size,integer=False):
+            @overload
+            def take(
+                label: str,size: int,integer: Literal[False]=False,
+            ) -> Float32Array:
+                """Type a floating-point static-field read.
+
+                Args:
+                    label: Expected eight-character field label.
+                    size: Required scalar value count.
+                    integer: Literal selecting floating-point decoding.
+
+                Returns:
+                    Decoded float32 field values.
+                """
+                ...
+
+            @overload
+            def take(
+                label: str,size: int,integer: Literal[True],
+            ) -> Int32Array:
+                """Type an integer static-field read.
+
+                Args:
+                    label: Expected eight-character field label.
+                    size: Required scalar value count.
+                    integer: Literal selecting integer decoding.
+
+                Returns:
+                    Decoded int32 field values.
+                """
+                ...
+
+            def take(label: str,size: int,integer: bool=False) -> FieldArray:
                 """Read and validate the next labeled static field.
 
                 Args:
@@ -303,22 +387,24 @@ class InitialGuessCalmetData:
                 if actual!=label: raise ValueError(f'expected CALMET.DAT {label}, found {actual}')
                 return values
 
-            self.z_faces_m=take('ZFACE',nz+1)
+            self.z_faces_m: Float32Array=take('ZFACE',nz+1)
             if self.surface_station_count:
                 take('XSSTA',self.surface_station_count); take('YSSTA',self.surface_station_count)
             if self.upper_station_count:
                 take('XUSTA',self.upper_station_count); take('YUSTA',self.upper_station_count)
             if self.precipitation_station_count>0:
                 take('XPSTA',self.precipitation_station_count); take('YPSTA',self.precipitation_station_count)
-            self.roughness_m=take('Z0',count).reshape(ny,nx)
-            self.landuse=take('ILANDU',count,True).reshape(ny,nx)
-            self.terrain_m=take('ELEV',count).reshape(ny,nx)
-            self.leaf_area_index=take('XLAI',count).reshape(ny,nx)
-            self.nearest_surface_station=(
+            self.roughness_m: Float32Array=take('Z0',count).reshape(ny,nx)
+            self.landuse: Int32Array=take('ILANDU',count,True).reshape(ny,nx)
+            self.terrain_m: Float32Array=take('ELEV',count).reshape(ny,nx)
+            self.leaf_area_index: Float32Array=take('XLAI',count).reshape(ny,nx)
+            self.nearest_surface_station: Int32Array | None=(
                 take('NEARS',count,True).reshape(ny,nx)
                 if self.surface_station_count else None)
 
-            partial={}; labels_by_period={}; fields_by_period={}
+            partial: dict[tuple[datetime,datetime],list[Float32Array]]={}
+            labels_by_period: dict[tuple[datetime,datetime],list[str]]={}
+            fields_by_period: dict[tuple[datetime,datetime],dict[str,FieldArray]]={}
             while (payload:=reader.read_record()) is not None:
                 if len(payload)<8: raise ValueError('CALMET.DAT field record is truncated')
                 raw_label=payload[:8].decode('ascii').rstrip()
@@ -345,38 +431,40 @@ class InitialGuessCalmetData:
                 if (selected_record_endings is not None and
                         end not in selected_record_endings):
                     continue
-                try: level=int(label[5:])-1
+                try: wind_level=int(label[5:])-1
                 except ValueError as error: raise ValueError(f'invalid CALMET wind label {label!r}') from error
-                if not 0<=level<nz: raise ValueError(f'CALMET wind level is out of range: {label!r}')
+                if not 0<=wind_level<nz: raise ValueError(f'CALMET wind level is out of range: {label!r}')
                 item=partial.setdefault((begin,end),[
                     np.full((nz,ny,nx),np.nan,dtype=MODEL_DTYPE),
                     np.full((nz,ny,nx),np.nan,dtype=MODEL_DTYPE)])
                 component=0 if label.startswith('U-') else 1
-                if np.isfinite(item[component][level]).any():
+                if np.isfinite(item[component][wind_level]).any():
                     raise ValueError(f'duplicate CALMET wind record {label} at {end}')
-                item[component][level]=values.reshape(ny,nx)
-        self.records={}; self.fields={}
+                item[component][wind_level]=cast(Float32Array,values).reshape(ny,nx)
+        self.records: dict[datetime,WindRecord]={}
+        self.fields: dict[datetime,FieldRecord]={}
         for (begin,end),(u,v) in partial.items():
             if not np.isfinite(u).all() or not np.isfinite(v).all():
                 raise ValueError(f'incomplete CALMET wind records for {begin}--{end}')
-            expected=[]
+            expected_labels: list[str]=[]
             for level in range(1,nz+1):
-                expected.extend((f'U-LEV{level:3d}',f'V-LEV{level:3d}'))
-                if self.includes_w_temperature: expected.append(f'WFACE{level:3d}')
+                expected_labels.extend((f'U-LEV{level:3d}',f'V-LEV{level:3d}'))
+                if self.includes_w_temperature: expected_labels.append(f'WFACE{level:3d}')
             if self.run_type==1:
                 if self.includes_w_temperature:
-                    expected.extend(f'T-LEV{level:3d}' for level in range(1,nz+1))
-                expected.extend(('IPGT','USTAR','ZI','EL','WSTAR'))
-                if self.precipitation_station_count!=0: expected.append('RMM')
-                expected.extend(('TEMPK','RHO','QSW','IRH'))
-                if self.precipitation_station_count!=0: expected.append('IPCODE')
+                    expected_labels.extend(f'T-LEV{level:3d}' for level in range(1,nz+1))
+                expected_labels.extend(('IPGT','USTAR','ZI','EL','WSTAR'))
+                if self.precipitation_station_count!=0: expected_labels.append('RMM')
+                expected_labels.extend(('TEMPK','RHO','QSW','IRH'))
+                if self.precipitation_station_count!=0: expected_labels.append('IPCODE')
             actual=labels_by_period[(begin,end)]
-            if actual!=expected:
+            if actual!=expected_labels:
                 mismatch=next((index for index,(left,right) in
-                    enumerate(zip(actual,expected)) if left!=right),
-                    min(len(actual),len(expected)))
+                    enumerate(zip(actual,expected_labels)) if left!=right),
+                    min(len(actual),len(expected_labels)))
                 found=actual[mismatch] if mismatch<len(actual) else '<EOF>'
-                wanted=expected[mismatch] if mismatch<len(expected) else '<end of period>'
+                wanted=(expected_labels[mismatch]
+                        if mismatch<len(expected_labels) else '<end of period>')
                 raise ValueError(f'invalid CALMET record order for {begin}--{end}: '
                                  f'expected {wanted}, found {found}')
             if end in self.records: raise ValueError(f'duplicate CALMET ending time {end}')
@@ -387,7 +475,7 @@ class InitialGuessCalmetData:
         if not self.records: raise ValueError('CALMET.DAT contains no wind records')
 
     @property
-    def z_centers_m(self):
+    def z_centers_m(self) -> Float32Array:
         """Return vertical cell-centre heights.
 
         Returns:
@@ -396,7 +484,7 @@ class InitialGuessCalmetData:
         return np.asarray(.5*(self.z_faces_m[:-1]+self.z_faces_m[1:]),
                           dtype=MODEL_DTYPE)
 
-    def at_end(self,when):
+    def at_end(self,when: datetime) -> WindRecord:
         """Return the wind record with an exact ending timestamp.
 
         Args:
@@ -411,7 +499,7 @@ class InitialGuessCalmetData:
         try: return self.records[when]
         except KeyError as error: raise ValueError(f'CALMET.DAT has no wind record ending at {when}') from error
 
-    def fields_at_end(self,when):
+    def fields_at_end(self,when: datetime) -> FieldRecord:
         """Return all retained fields for one complete output period.
 
         Args:
@@ -427,7 +515,7 @@ class InitialGuessCalmetData:
         except KeyError as error: raise ValueError(
             f'CALMET.DAT has no field record ending at {when}') from error
 
-    def at_covering(self,when):
+    def at_covering(self,when: datetime) -> WindRecord:
         """Return the RDMET2 period satisfying ``begin < when <= end``.
 
         Args:
@@ -456,8 +544,14 @@ class InitialGuessCalmetSeries:
         fields: Combined retained complete periods by ending time.
     """
 
-    def __init__(self,paths,*,retain_fields=False,field_endings=None,
-                 record_endings=None):
+    def __init__(
+        self,
+        paths: Iterable[str | Path],
+        *,
+        retain_fields: bool=False,
+        field_endings: Iterable[datetime] | None=None,
+        record_endings: Iterable[datetime] | None=None,
+    ) -> None:
         """Load a compatible, non-overlapping sequence of CALMET.DAT files.
 
         Args:
@@ -487,11 +581,11 @@ class InitialGuessCalmetSeries:
                 raise ValueError('IGFDAT files use different time zones')
             if not np.array_equal(item.roughness_m,first.roughness_m):
                 raise ValueError('IGFDAT files use different roughness fields')
-        self.files=files
-        self.grid=first.grid; self.z_faces_m=first.z_faces_m
-        self.roughness_m=first.roughness_m; self.timezone=first.timezone
-        self.includes_w_temperature=all(item.includes_w_temperature for item in files)
-        self.records={}; self.fields={}
+        self.files: tuple[InitialGuessCalmetData,...]=files
+        self.grid: GridConfig=first.grid; self.z_faces_m: Float32Array=first.z_faces_m
+        self.roughness_m: Float32Array=first.roughness_m; self.timezone: str=first.timezone
+        self.includes_w_temperature: bool=all(item.includes_w_temperature for item in files)
+        self.records: dict[datetime,WindRecord]={}; self.fields: dict[datetime,FieldRecord]={}
         for item in files:
             overlap=self.records.keys()&item.records.keys()
             if overlap: raise ValueError(f'IGFDAT files overlap at {min(overlap)}')
@@ -499,7 +593,7 @@ class InitialGuessCalmetSeries:
             self.fields.update(item.fields)
 
     @property
-    def z_centers_m(self):
+    def z_centers_m(self) -> Float32Array:
         """Return common vertical cell-centre heights.
 
         Returns:
@@ -508,7 +602,7 @@ class InitialGuessCalmetSeries:
         return np.asarray(.5*(self.z_faces_m[:-1]+self.z_faces_m[1:]),
                           dtype=MODEL_DTYPE)
 
-    def at_end(self,when):
+    def at_end(self,when: datetime) -> WindRecord:
         """Return the series wind record with an exact ending timestamp.
 
         Args:
@@ -523,7 +617,7 @@ class InitialGuessCalmetSeries:
         try: return self.records[when]
         except KeyError as error: raise ValueError(f'IGFDAT series has no wind record ending at {when}') from error
 
-    def fields_at_end(self,when):
+    def fields_at_end(self,when: datetime) -> FieldRecord:
         """Return retained complete fields for an exact ending timestamp.
 
         Args:
@@ -539,7 +633,7 @@ class InitialGuessCalmetSeries:
         except KeyError as error: raise ValueError(
             f'IGFDAT series has no field record ending at {when}') from error
 
-    def at_covering(self,when):
+    def at_covering(self,when: datetime) -> WindRecord:
         """Return the RDMET2 period satisfying ``begin < when <= end``.
 
         Args:
@@ -554,7 +648,13 @@ class InitialGuessCalmetSeries:
         return _covering_record(self.records,when,'IGFDAT series')
 
 
-def _r2interpi_four(source_points,target_points,values,*,block_size=32768):
+def _r2interpi_four(
+    source_points: ArrayLike,
+    target_points: ArrayLike,
+    values: ArrayLike,
+    *,
+    block_size: int=32768,
+) -> Float32Array:
     """Interpolate from the four nearest cells with inverse-square weights.
 
     Args:
@@ -578,7 +678,7 @@ def _r2interpi_four(source_points,target_points,values,*,block_size=32768):
     if fields.ndim!=2 or fields.shape[1]!=source.shape[0]:
         raise ValueError('R2INTERPI values must be (field,source point)')
     if source.shape[0]<4: raise ValueError('R2INTERPI requires at least four source cells')
-    output=np.empty((fields.shape[0],targets.shape[0]),dtype=MODEL_DTYPE)
+    output: Float32Array=np.empty((fields.shape[0],targets.shape[0]),dtype=MODEL_DTYPE)
     tree=cKDTree(source)
     for start in range(0,targets.shape[0],block_size):
         stop=min(start+block_size,targets.shape[0])
@@ -592,7 +692,12 @@ def _r2interpi_four(source_points,target_points,values,*,block_size=32768):
     return output
 
 
-def _rdcalmet_vertical(values,source_centers_m,target_centers_m,roughness_m):
+def _rdcalmet_vertical(
+    values: ArrayLike,
+    source_centers_m: ArrayLike,
+    target_centers_m: ArrayLike,
+    roughness_m: ArrayLike,
+) -> Float32Array:
     """Apply RDCALMET vertical persistence and interpolation.
 
     Below the first source level the routine applies logarithmic wind-profile
@@ -626,7 +731,7 @@ def _rdcalmet_vertical(values,source_centers_m,target_centers_m,roughness_m):
         raise ValueError('IGFMET source levels are not increasing')
     if np.any(roughness<=MODEL_DTYPE(0.)) or np.any(roughness==source[0]):
         raise ValueError('IGFMET roughness is invalid for logarithmic extrapolation')
-    result=np.empty((target.size,*field.shape[1:]),dtype=MODEL_DTYPE)
+    result: Float32Array=np.empty((target.size,*field.shape[1:]),dtype=MODEL_DTYPE)
     below=target<source[0]
     if np.any(below):
         log_z0=np.log(roughness)
@@ -646,7 +751,11 @@ def _rdcalmet_vertical(values,source_centers_m,target_centers_m,roughness_m):
     return result
 
 
-def _rdcalmet_rotate(u,v,direction_adjustment_degrees):
+def _rdcalmet_rotate(
+    u: ArrayLike,
+    v: ArrayLike,
+    direction_adjustment_degrees: ArrayLike,
+) -> tuple[Float32Array,Float32Array]:
     """Rotate horizontal winds by a grid-direction adjustment.
 
     Args:
@@ -672,8 +781,12 @@ def _rdcalmet_rotate(u,v,direction_adjustment_degrees):
     return rotated_u,rotated_v
 
 
-def interpolate_initial_guess(data, when: datetime,
-                              target_grid: GridConfig, target_centers_m):
+def interpolate_initial_guess(
+    data: InitialGuessCalmetData | InitialGuessCalmetSeries,
+    when: datetime,
+    target_grid: GridConfig,
+    target_centers_m: ArrayLike,
+) -> tuple[Float32Array,Float32Array]:
     """Apply RDCALMET rotation, vertical interpolation, and R2INTERPI.
 
     Args:

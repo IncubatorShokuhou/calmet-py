@@ -5,11 +5,16 @@ rounding in CALMET's legacy sequential-unformatted interchange file.  A
 separate legacy writer can therefore be regression-tested against this source.
 """
 from __future__ import annotations
+from collections.abc import Iterable,Mapping,Sequence
 from pathlib import Path
-from datetime import timedelta
+from datetime import datetime,timedelta
+from os import PathLike
 import struct
+from types import TracebackType
+from typing import TYPE_CHECKING,Any,Literal,TypeAlias,cast
 import numpy as np
-from netCDF4 import Dataset,date2num
+import numpy.typing as npt
+from netCDF4 import Dataset,Variable,date2num
 from .datetime_utils import format_ordinal_code
 from .calmet_numerics import convective_velocity_scale,mesopac_layer_average,pgt_stability
 from .calmet_solver import HourFields,target_latitude_longitude
@@ -17,7 +22,23 @@ from .config import GridConfig
 from .legacy_io import FortranSequentialWriter,fixed_string
 
 
-def _array_data(value,dtype=None):
+FilePath: TypeAlias=str | PathLike[str]
+NumericArray: TypeAlias=npt.NDArray[np.generic]
+if TYPE_CHECKING:
+    ArraySource: TypeAlias=npt.ArrayLike | Variable[Any]
+else:
+    ArraySource: TypeAlias=npt.ArrayLike | Variable
+GeophysicalSource: TypeAlias=Mapping[str,ArraySource] | Dataset
+IntegerScalar: TypeAlias=int | np.integer
+RealScalar: TypeAlias=int | float | np.integer | np.floating
+CompressionLevel: TypeAlias=Literal[0,1,2,3,4,5,6,7,8,9]
+NetCDFDType: TypeAlias=Literal['f8','f4','i2','i1']
+
+
+def _array_data(
+    value: ArraySource,
+    dtype: npt.DTypeLike | None=None,
+) -> NumericArray:
     """Read a netCDF variable or array and apply one dtype conversion.
 
     Args:
@@ -28,11 +49,12 @@ def _array_data(value,dtype=None):
     Returns:
         NumPy array with the source shape and requested dtype.
     """
-    data=value[:] if hasattr(value,'dimensions') else value
-    return np.asarray(data,dtype=dtype)
+    if isinstance(value,Variable):
+        return np.asarray(value[:],dtype=dtype)
+    return np.asarray(value,dtype=dtype)
 
 
-def _whole_run_hours(start, end, output_name):
+def _whole_run_hours(start: datetime,end: datetime,output_name: str) -> int:
     """Return an exact whole-hour duration for an integer output header.
 
     Args:
@@ -52,7 +74,11 @@ def _whole_run_hours(start, end, output_name):
         raise ValueError(f'{output_name} output requires a whole-hour run period')
     return int(seconds/3600)
 
-def _convective_velocity(hour: HourFields,landuse,water_range):
+def _convective_velocity(
+    hour: HourFields,
+    landuse: npt.ArrayLike,
+    water_range: tuple[int,int],
+) -> npt.NDArray[np.float32]:
     """Reproduce WATER-before-AVEMIX and land-only WSTARR sequencing.
 
     Args:
@@ -70,12 +96,12 @@ def _convective_velocity(hour: HourFields,landuse,water_range):
             model grid.
     """
     surface=hour.surface
-    value=convective_velocity_scale(surface.convective_mixing_height,
+    value: npt.NDArray[np.float32]=convective_velocity_scale(surface.convective_mixing_height,
         surface.sensible_heat_flux,hour.temperature[0],surface.density,landuse,
         water_range=water_range)
     if surface.water_convective_velocity_scale is not None:
-        categories=np.asarray(landuse)
-        water=(categories>=water_range[0])&(categories<=water_range[1])
+        categories=cast(npt.NDArray[np.integer],np.asarray(landuse))
+        water: npt.NDArray[np.bool_]=(categories>=water_range[0])&(categories<=water_range[1])
         value=np.where(water,surface.water_convective_velocity_scale,value)
     return np.asarray(value,dtype=np.float32)
 
@@ -89,7 +115,23 @@ class CalmetNetCDFWriter:
         run_type: CALMET run type; zero writes only horizontal winds.
     """
 
-    def __init__(self,path,grid: GridConfig,z_faces_m,geophysical,*,compression=1,water_range=(50,55),run_type=1):
+    path: Path
+    dataset: Dataset | None
+    water_range: tuple[int,int]
+    run_type: int
+    _index: int
+
+    def __init__(
+        self,
+        path: FilePath,
+        grid: GridConfig,
+        z_faces_m: npt.ArrayLike,
+        geophysical: GeophysicalSource,
+        *,
+        compression: int=1,
+        water_range: Sequence[int]=(50,55),
+        run_type: int=1,
+    ) -> None:
         """Create the NetCDF dimensions, coordinates, and output variables.
 
         Args:
@@ -114,24 +156,40 @@ class CalmetNetCDFWriter:
             static coordinate and geophysical variables.
         """
         self.path=Path(path); self.path.parent.mkdir(parents=True,exist_ok=True); self._index=0
-        self.dataset=Dataset(self.path,'w',format='NETCDF4'); self.water_range=tuple(water_range); self.run_type=int(run_type)
+        self.dataset=Dataset(self.path,'w',format='NETCDF4')
+        self.water_range=cast(tuple[int,int],tuple(water_range))
+        self.run_type=int(run_type)
         ds=self.dataset
-        faces=np.asarray(z_faces_m,dtype=np.float32)
-        centers=np.float32(.5)*(faces[:-1]+faces[1:])
+        faces: npt.NDArray[np.float32]=np.asarray(z_faces_m,dtype=np.float32)
+        centers: npt.NDArray[np.float32]=np.float32(.5)*(faces[:-1]+faces[1:])
         ds.createDimension('time',None); ds.createDimension('level',centers.size); ds.createDimension('face',faces.size); ds.createDimension('y',grid.ny); ds.createDimension('x',grid.nx)
         ds.Conventions='CF-1.8'; ds.source='PyCALMET NumPy solver'; ds.pycalmet_stage='calmet'; ds.projection=grid.projection
         ds.water_category_min=int(self.water_range[0]); ds.water_category_max=int(self.water_range[1])
-        time=ds.createVariable('time','f8',('time',)); time.units='seconds since 1970-01-01 00:00:00'; time.calendar='standard'
-        for name,data,units in (('level_height',centers,'m'),('face_height',faces,'m')):
-            variable=ds.createVariable(name,'f4',('level' if name=='level_height' else 'face',)); variable.units=units; variable[:]=np.asarray(data,dtype=np.float32)
+        time: Variable[np.float64]=ds.createVariable('time','f8',('time',)); time.units='seconds since 1970-01-01 00:00:00'; time.calendar='standard'
+        for coordinate_name,coordinate_data,coordinate_units in (
+                ('level_height',centers,'m'),('face_height',faces,'m')):
+            variable=ds.createVariable(
+                coordinate_name,'f4',
+                ('level' if coordinate_name=='level_height' else 'face',))
+            variable.units=coordinate_units
+            variable[:]=np.asarray(coordinate_data,dtype=np.float32)
+        latitude: npt.NDArray[np.float64]
+        longitude: npt.NDArray[np.float64]
         latitude,longitude=target_latitude_longitude(grid)
-        static=(('latitude',np.asarray(latitude,dtype=np.float64),'degrees_north','f8'),
+        static: tuple[tuple[str,NumericArray,str,NetCDFDType],...]=(
+                ('latitude',np.asarray(latitude,dtype=np.float64),'degrees_north','f8'),
                 ('longitude',np.asarray(longitude,dtype=np.float64),'degrees_east','f8'),
                 ('terrain_height',_array_data(geophysical['terrain_height'],np.float32),'m','f4'),
                 ('landuse',_array_data(geophysical['dominant_landuse'],np.int16),'1','i2'))
-        for name,data,units,dtype in static:
-            variable=ds.createVariable(name,dtype,('y','x'),zlib=True,complevel=compression); variable.units=units; variable[:]=data
-        variables=(
+        compression_level=cast(CompressionLevel,compression)
+        for static_name,static_data,static_units,static_dtype in static:
+            variable=ds.createVariable(
+                static_name,static_dtype,('y','x'),zlib=True,
+                complevel=compression_level)
+            variable.units=static_units; variable[:]=static_data
+        variables: tuple[
+            tuple[str,NetCDFDType,tuple[str,...],str],...
+        ]=(
             ('wind_u','f4',('time','level','y','x'),'m s-1'),('wind_v','f4',('time','level','y','x'),'m s-1'),
             *(() if self.run_type==0 else (
             ('vertical_velocity','f4',('time','face','y','x'),'m s-1'),('temperature','f4',('time','level','y','x'),'K'),
@@ -145,9 +203,16 @@ class CalmetNetCDFWriter:
             ('convective_mixing_height','f4',('time','y','x'),'m'),('convective_velocity_scale','f4',('time','y','x'),'m s-1'),
             ('pgt_stability_class','i1',('time','y','x'),'1'))))
         for name,dtype,dims,units in variables:
-            variable=ds.createVariable(name,dtype,dims,zlib=True,complevel=compression); variable.units=units
+            variable=ds.createVariable(
+                name,dtype,dims,zlib=True,complevel=compression_level)
+            variable.units=units
 
-    def append(self,hour: HourFields,solar_elevation_sine,landuse):
+    def append(
+        self,
+        hour: HourFields,
+        solar_elevation_sine: npt.ArrayLike,
+        landuse: npt.ArrayLike,
+    ) -> None:
         """Write and synchronize one time record.
 
         Args:
@@ -168,13 +233,14 @@ class CalmetNetCDFWriter:
             Fields are converted to float32 except time, latitude, longitude,
             and integer codes. The dataset is flushed after every append.
         """
-        ds=self.dataset; i=self._index; step=hour.step1; surface=hour.surface
+        ds=cast(Dataset,self.dataset)
+        i=self._index; step=hour.step1; surface=hour.surface
         ds['time'][i]=date2num(hour.timestamp,ds['time'].units,ds['time'].calendar)
         if self.run_type==0:
             ds['wind_u'][i]=np.asarray(hour.wind.u,dtype=np.float32)
             ds['wind_v'][i]=np.asarray(hour.wind.v,dtype=np.float32)
             ds.sync(); self._index+=1; return
-        values={'wind_u':hour.wind.u,'wind_v':hour.wind.v,'vertical_velocity':hour.wind.w,
+        values: dict[str,npt.ArrayLike]={'wind_u':hour.wind.u,'wind_v':hour.wind.v,'vertical_velocity':hour.wind.w,
             'temperature':hour.temperature,'relative_humidity':step.relative_humidity,
             'cloud_fraction':step.cloud_fraction,'ceiling_height':step.ceiling_height,
             'surface_relative_humidity':step.surface_relative_humidity,
@@ -183,7 +249,7 @@ class CalmetNetCDFWriter:
             'shortwave_flux':surface.shortwave_flux,'sensible_heat_flux':surface.sensible_heat_flux,
             'friction_velocity':surface.friction_velocity,'monin_obukhov_length':surface.monin_obukhov_length,
             'mixing_height':surface.mixing_height,'convective_mixing_height':surface.convective_mixing_height}
-        integer_fields={'precipitation_code'}
+        integer_fields: set[str]={'precipitation_code'}
         for name,value in values.items():
             dtype=np.int8 if name in integer_fields else np.float32
             ds[name][i]=np.asarray(value,dtype=dtype)
@@ -196,11 +262,11 @@ class CalmetNetCDFWriter:
         )
         ds.sync(); self._index+=1
 
-    def close(self):
+    def close(self) -> None:
         """Flush and close the NetCDF dataset; repeated calls are harmless."""
         if self.dataset is not None: self.dataset.close(); self.dataset=None
 
-    def __enter__(self):
+    def __enter__(self) -> CalmetNetCDFWriter:
         """Return this open writer for context-manager use.
 
         Returns:
@@ -208,12 +274,20 @@ class CalmetNetCDFWriter:
         """
         return self
 
-    def __exit__(self,*exc):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         """Close the dataset on context-manager exit.
 
         Args:
-            *exc: Exception type, value, and traceback supplied by the context
-                manager protocol.
+            exc_type: Exception class supplied by the context manager protocol.
+            exc_value: Exception instance supplied by the context manager
+                protocol.
+            traceback: Exception traceback supplied by the context manager
+                protocol.
 
         Returns:
             ``None``; exceptions are not suppressed.
@@ -236,9 +310,29 @@ class MesopacWriter:
         water_range: Inclusive land-use category range treated as water.
     """
 
-    def __init__(self,path,grid: GridConfig,z_faces_m,geophysical,start,end,*,
-                 timezone_offset=0,surface_coordinates_m=(),upper_coordinates_m=(),
-                 nearest_surface_station=None,water_range=(50,55)):
+    writer: FortranSequentialWriter
+    grid: GridConfig
+    faces: npt.NDArray[np.float32]
+    landuse: NumericArray
+    surface_coordinates: npt.NDArray[np.float32]
+    upper_coordinates: npt.NDArray[np.float32]
+    water_range: tuple[int,int]
+
+    def __init__(
+        self,
+        path: FilePath,
+        grid: GridConfig,
+        z_faces_m: npt.ArrayLike,
+        geophysical: GeophysicalSource,
+        start: datetime,
+        end: datetime,
+        *,
+        timezone_offset: int=0,
+        surface_coordinates_m: npt.ArrayLike=(),
+        upper_coordinates_m: npt.ArrayLike=(),
+        nearest_surface_station: npt.ArrayLike | None=None,
+        water_range: Sequence[int]=(50,55),
+    ) -> None:
         """Open a MESOPAC file and write its static header records.
 
         Args:
@@ -268,16 +362,17 @@ class MesopacWriter:
             roughness, nearest-station, and land-use records immediately.
         """
         hours=_whole_run_hours(start,end,'MESOPAC')
-        self.writer=FortranSequentialWriter(path); self.grid=grid
+        self.writer=FortranSequentialWriter(Path(path)); self.grid=grid
         self.faces=np.asarray(z_faces_m,dtype=np.float32)
         self.landuse=self._array(geophysical['dominant_landuse'])
         self.surface_coordinates=np.asarray(surface_coordinates_m,dtype=np.float32).reshape(-1,2)
         self.upper_coordinates=np.asarray(upper_coordinates_m,dtype=np.float32).reshape(-1,2)
-        self.water_range=tuple(water_range)
+        self.water_range=cast(tuple[int,int],tuple(water_range))
         shape=(grid.ny,grid.nx)
         if self.landuse.shape!=shape:
             raise ValueError('MESOPAC landuse does not match the CALMET grid')
-        nearest=np.zeros(shape,dtype=np.int32) if nearest_surface_station is None else np.asarray(nearest_surface_station)
+        nearest: NumericArray=(np.zeros(shape,dtype=np.int32) if nearest_surface_station is None
+                              else np.asarray(nearest_surface_station))
         if nearest.shape!=shape:
             raise ValueError('MESOPAC nearest-station grid does not match the CALMET grid')
         spacing=np.float32(grid.dx_km*1000.)
@@ -295,7 +390,7 @@ class MesopacWriter:
         self.writer.write_record(self.landuse.astype('<i4',copy=False).ravel(order='C'))
 
     @staticmethod
-    def _array(value):
+    def _array(value: ArraySource) -> NumericArray:
         """Materialize a netCDF variable or array-like value.
 
         Args:
@@ -304,10 +399,10 @@ class MesopacWriter:
         Returns:
             NumPy array preserving the source shape and dtype.
         """
-        return np.asarray(value[:] if hasattr(value,'dimensions') else value)
+        return _array_data(value)
 
     @staticmethod
-    def _i(*values):
+    def _i(*values: IntegerScalar) -> bytes:
         """Pack values as little-endian signed 32-bit integers.
 
         Args:
@@ -322,7 +417,7 @@ class MesopacWriter:
         return struct.pack('<'+'i'*len(values),*values)
 
     @staticmethod
-    def _f(*values):
+    def _f(*values: RealScalar) -> bytes:
         """Pack values as little-endian IEEE float32 scalars.
 
         Args:
@@ -336,7 +431,10 @@ class MesopacWriter:
         """
         return struct.pack('<'+'f'*len(values),*values)
 
-    def _station_grid_coordinates(self,coordinates):
+    def _station_grid_coordinates(
+        self,
+        coordinates: npt.NDArray[np.float32],
+    ) -> npt.NDArray[np.float32]:
         """Convert projected station metres to MESOPAC grid coordinates.
 
         Args:
@@ -349,7 +447,7 @@ class MesopacWriter:
         shift=np.float32(self.grid.dx_km*500.)
         return np.asarray((coordinates-shift)/np.float32(self.grid.dx_km*1000.)+np.float32(1.),dtype='<f4')
 
-    def _grid_record(self,value,integer=False):
+    def _grid_record(self,value: npt.ArrayLike,integer: bool=False) -> None:
         """Write one two-dimensional MESOPAC grid record.
 
         Args:
@@ -363,13 +461,21 @@ class MesopacWriter:
         Notes:
             Values are flattened in C order before the record is written.
         """
-        array=np.asarray(value)
+        array: NumericArray=np.asarray(value)
         if array.shape!=(self.grid.ny,self.grid.nx):
             raise ValueError('MESOPAC hourly field does not match the CALMET grid')
         self.writer.write_record(array.astype('<i4' if integer else '<f4',copy=False).ravel(order='C'))
 
-    def append(self,hour: HourFields,solar_elevation_sine,*,station_temperature_k,
-               station_shortwave_flux,station_relative_humidity,station_precipitation_code):
+    def append(
+        self,
+        hour: HourFields,
+        solar_elevation_sine: npt.ArrayLike,
+        *,
+        station_temperature_k: npt.ArrayLike,
+        station_shortwave_flux: npt.ArrayLike,
+        station_relative_humidity: npt.ArrayLike,
+        station_precipitation_code: npt.ArrayLike,
+    ) -> None:
         """Append one MESOPAC hourly record group.
 
         Args:
@@ -394,8 +500,9 @@ class MesopacWriter:
             then one record containing mean density and station data.
         """
         ns=len(self.surface_coordinates)
-        station=(np.asarray(station_temperature_k),np.asarray(station_shortwave_flux),
-                 np.asarray(station_relative_humidity),np.asarray(station_precipitation_code))
+        station: tuple[NumericArray,NumericArray,NumericArray,NumericArray]=(
+            np.asarray(station_temperature_k),np.asarray(station_shortwave_flux),
+            np.asarray(station_relative_humidity),np.asarray(station_precipitation_code))
         if any(value.shape!=(ns,) for value in station):
             raise ValueError('MESOPAC station arrays must match the surface-station count')
         wind=hour.wind; surface=hour.surface; step=hour.step1
@@ -411,17 +518,19 @@ class MesopacWriter:
                               (wstar,False),(surface.monin_obukhov_length,False),(pgt,True),
                               (step.precipitation_rate,False)):
             self._grid_record(value,integer)
-        density=np.asarray(surface.density,dtype=np.float32).ravel(order='C')
-        average_density=np.cumsum(density,dtype=np.float32)[-1]/np.float32(density.size)
+        density: npt.NDArray[np.float32]=np.asarray(
+            surface.density,dtype=np.float32).ravel(order='C')
+        average_density: np.float32=(
+            np.cumsum(density,dtype=np.float32)[-1]/np.float32(density.size))
         self.writer.write_record(self._f(average_density),
             station[0].astype('<f4',copy=False),station[1].astype('<f4',copy=False),
             station[2].astype('<i4',copy=False),station[3].astype('<i4',copy=False))
 
-    def close(self):
+    def close(self) -> None:
         """Close the sequential-unformatted output stream."""
         self.writer.close()
 
-    def __enter__(self):
+    def __enter__(self) -> MesopacWriter:
         """Return this open writer for context-manager use.
 
         Returns:
@@ -429,12 +538,20 @@ class MesopacWriter:
         """
         return self
 
-    def __exit__(self,*exc):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         """Close the writer on context-manager exit.
 
         Args:
-            *exc: Exception type, value, and traceback supplied by the context
-                manager protocol.
+            exc_type: Exception class supplied by the context manager protocol.
+            exc_value: Exception instance supplied by the context manager
+                protocol.
+            traceback: Exception traceback supplied by the context manager
+                protocol.
 
         Returns:
             ``None``; exceptions are not suppressed.
@@ -453,13 +570,29 @@ class AuxiliaryCalmetWriter:
             written.
         timestep_seconds: Duration represented by each appended field group.
     """
-    _fields_2d=(('CLDMRUP','G/KG','RC4'),('ZCLDBOT','MAGL','RC4'),
-                ('ZCLDTOP','MAGL','RC4'))
-    _fields_3d=(('CLDMR3D','G/KG','RC4'),)
+    _fields_2d: tuple[tuple[str,str,str],...]=(
+        ('CLDMRUP','G/KG','RC4'),('ZCLDBOT','MAGL','RC4'),
+        ('ZCLDTOP','MAGL','RC4'))
+    _fields_3d: tuple[tuple[str,str,str],...]=(('CLDMR3D','G/KG','RC4'),)
+    writer: FortranSequentialWriter
+    grid: GridConfig
+    faces: npt.NDArray[np.float32]
+    available: bool
+    timestep_seconds: int
 
-    def __init__(self,path,grid: GridConfig,z_faces_m,start,end,*,
-                 control_lines=(),base_timezone='UTC-0000',available=True,
-                 timestep_seconds=3600):
+    def __init__(
+        self,
+        path: FilePath,
+        grid: GridConfig,
+        z_faces_m: npt.ArrayLike,
+        start: datetime,
+        end: datetime,
+        *,
+        control_lines: Iterable[str]=(),
+        base_timezone: str='UTC-0000',
+        available: bool=True,
+        timestep_seconds: int=3600,
+    ) -> None:
         """Open CALMET.AUX and optionally write its version 1.1 header.
 
         Args:
@@ -489,17 +622,18 @@ class AuxiliaryCalmetWriter:
         """
         run_hours=(_whole_run_hours(start,end,'CALMET.AUX')
                    if available else None)
-        self.writer=FortranSequentialWriter(path)
+        self.writer=FortranSequentialWriter(Path(path))
         self.grid=grid
         self.faces=np.asarray(z_faces_m,dtype=np.float32)
         self.available=bool(available)
         self.timestep_seconds=int(timestep_seconds)
         if self.available:
-            self._write_header(start,end,list(control_lines),base_timezone,
-                               run_hours)
+            self._write_header(
+                start,end,list(control_lines),base_timezone,
+                cast(int,run_hours))
 
     @staticmethod
-    def _i(*values):
+    def _i(*values: IntegerScalar) -> bytes:
         """Pack values as little-endian signed 32-bit integers.
 
         Args:
@@ -514,7 +648,7 @@ class AuxiliaryCalmetWriter:
         return struct.pack('<'+'i'*len(values),*values)
 
     @staticmethod
-    def _f(*values):
+    def _f(*values: RealScalar) -> bytes:
         """Pack values as little-endian IEEE float32 scalars.
 
         Args:
@@ -529,7 +663,7 @@ class AuxiliaryCalmetWriter:
         return struct.pack('<'+'f'*len(values),*values)
 
     @staticmethod
-    def _stamp(value):
+    def _stamp(value: datetime) -> int:
         """Encode a datetime as CALMET ``YYYYJJJHH``.
 
         Args:
@@ -544,7 +678,7 @@ class AuxiliaryCalmetWriter:
         return format_ordinal_code(value)
 
     @staticmethod
-    def _date_parts(value):
+    def _date_parts(value: datetime) -> tuple[int,int,int,int,int]:
         """Split a datetime into CALMET calendar header fields.
 
         Args:
@@ -556,7 +690,7 @@ class AuxiliaryCalmetWriter:
         return value.year,value.month,value.day,value.hour,value.minute*60+value.second
 
     @classmethod
-    def _time_bounds(cls,begin,end):
+    def _time_bounds(cls,begin: datetime,end: datetime) -> bytes:
         """Pack one CALMET.AUX interval timestamp record.
 
         Args:
@@ -574,7 +708,14 @@ class AuxiliaryCalmetWriter:
         return cls._i(cls._stamp(begin),begin.minute*60+begin.second,
                       cls._stamp(end),end.minute*60+end.second)
 
-    def _write_header(self,start,end,control_lines,base_timezone,hours):
+    def _write_header(
+        self,
+        start: datetime,
+        end: datetime,
+        control_lines: Sequence[str],
+        base_timezone: str,
+        hours: int,
+    ) -> None:
         """Write the complete CALMET.AUX declaration and static header.
 
         Args:
@@ -621,7 +762,7 @@ class AuxiliaryCalmetWriter:
             *(fixed_string(item[1],8) for item in self._fields_3d),
             *(fixed_string(item[2],4) for item in self._fields_3d))
 
-    def _compressed(self,label,data):
+    def _compressed(self,label: str,data: npt.ArrayLike) -> None:
         """Zero-run encode and write one two-dimensional auxiliary field.
 
         Args:
@@ -637,20 +778,21 @@ class AuxiliaryCalmetWriter:
             encoded words represent zero-run lengths; physical negative values
             therefore cannot be represented.
         """
-        values=np.asarray(data,dtype=np.float32)
+        values: npt.NDArray[np.float32]=np.asarray(data,dtype=np.float32)
         if values.shape!=(self.grid.ny,self.grid.nx):
             raise ValueError('CALMET.AUX field does not match the CALMET grid')
-        flat=values.ravel(order='C')
+        flat: npt.NDArray[np.float32]=values.ravel(order='C')
         if np.any(flat<0.):
             raise ValueError('CALMET.AUX compression cannot encode negative values')
-        nonzero=np.flatnonzero(flat!=np.float32(0.))
+        nonzero: npt.NDArray[np.intp]=np.flatnonzero(flat!=np.float32(0.))
         if nonzero.size:
-            previous=np.r_[-1,nonzero[:-1]]
-            gaps=nonzero-previous-1
-            has_gap=gaps>0
-            value_positions=np.arange(nonzero.size)+np.cumsum(has_gap)
+            previous: npt.NDArray[np.intp]=np.r_[-1,nonzero[:-1]]
+            gaps: npt.NDArray[np.intp]=nonzero-previous-1
+            has_gap: npt.NDArray[np.bool_]=gaps>0
+            value_positions: npt.NDArray[np.intp]=np.arange(nonzero.size)+np.cumsum(has_gap)
             trailing=int(flat.size-nonzero[-1]-1)
-            encoded=np.empty(nonzero.size+int(has_gap.sum())+int(trailing>0),dtype='<f4')
+            encoded: npt.NDArray[np.float32]=np.empty(
+                nonzero.size+int(has_gap.sum())+int(trailing>0),dtype='<f4')
             encoded[value_positions]=flat[nonzero]
             encoded[value_positions[has_gap]-1]=-(
                 gaps[has_gap].astype(np.float32)+np.float32(.0001))
@@ -661,7 +803,7 @@ class AuxiliaryCalmetWriter:
         self.writer.write_record(self._i(encoded.size))
         self.writer.write_record(fixed_string(label,12),encoded)
 
-    def append(self,hour: HourFields):
+    def append(self,hour: HourFields) -> None:
         """Append one timestamped CALMET.AUX cloud-water field group.
 
         Args:
@@ -687,24 +829,26 @@ class AuxiliaryCalmetWriter:
                 step.cloud_liquid_water_above_top)
         if any(field is None for field in fields) or step.cloud_liquid_water_3d is None:
             raise ValueError('CALMET.AUX output requires prognostic cloud-water fields')
+        available_fields=cast(
+            tuple[npt.ArrayLike,npt.ArrayLike,npt.ArrayLike],fields)
         begin=hour.timestamp
         end=begin+timedelta(seconds=self.timestep_seconds)
         timestamp=self._time_bounds(begin,end)
-        for (name,_,_),field in zip(self._fields_2d,fields):
+        for (name,_,_),field in zip(self._fields_2d,available_fields):
             self.writer.write_record(timestamp)
             self._compressed(name,field)
-        cloud=np.asarray(step.cloud_liquid_water_3d)
+        cloud: NumericArray=np.asarray(step.cloud_liquid_water_3d)
         if cloud.shape!=(self.faces.size-1,self.grid.ny,self.grid.nx):
             raise ValueError('CALMET.AUX 3-D cloud water does not match the CALMET grid')
         self.writer.write_record(timestamp)
         for index,field in enumerate(cloud,1):
             self._compressed(f'CLDMR3D {index:04d}',field)
 
-    def close(self):
+    def close(self) -> None:
         """Close the sequential-unformatted output stream."""
         self.writer.close()
 
-    def __enter__(self):
+    def __enter__(self) -> AuxiliaryCalmetWriter:
         """Return this open writer for context-manager use.
 
         Returns:
@@ -712,12 +856,20 @@ class AuxiliaryCalmetWriter:
         """
         return self
 
-    def __exit__(self,*exc):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         """Close the writer on context-manager exit.
 
         Args:
-            *exc: Exception type, value, and traceback supplied by the context
-                manager protocol.
+            exc_type: Exception class supplied by the context manager protocol.
+            exc_value: Exception instance supplied by the context manager
+                protocol.
+            traceback: Exception traceback supplied by the context manager
+                protocol.
 
         Returns:
             ``None``; exceptions are not suppressed.
@@ -751,12 +903,47 @@ class LegacyCalmetWriter:
         landuse: Dominant land-use field used for water physics.
     """
 
-    def __init__(self,path,grid: GridConfig,z_faces_m,geophysical,start,end,*,
-                 control_lines=(),base_timezone='UTC-0000',include_w_temperature=False,
-                 water_range=(50,55),landuse_category_count=14,run_type=1,timestep_seconds=3600,
-                 precipitation_station_count=-1,surface_coordinates_km=(),upper_coordinates_km=(),
-                 precipitation_coordinates_km=(),nearest_surface_station=None,
-                 iwfcod=1,sea_station_count=0):
+    writer: FortranSequentialWriter
+    grid: GridConfig
+    faces: npt.NDArray[np.float32]
+    include_w_temperature: bool
+    water_range: tuple[int,int]
+    landuse_category_count: int
+    run_type: int
+    timestep_seconds: int
+    precipitation_station_count: int
+    iwfcod: int
+    sea_station_count: int
+    surface_coordinates: npt.NDArray[np.float64]
+    upper_coordinates: npt.NDArray[np.float64]
+    precipitation_coordinates: npt.NDArray[np.float64]
+    nearest_surface_station: npt.NDArray[np.int32] | None
+    landuse: NumericArray
+
+    def __init__(
+        self,
+        path: FilePath,
+        grid: GridConfig,
+        z_faces_m: npt.ArrayLike,
+        geophysical: GeophysicalSource,
+        start: datetime,
+        end: datetime,
+        *,
+        control_lines: Iterable[str]=(),
+        base_timezone: str='UTC-0000',
+        include_w_temperature: bool=False,
+        water_range: Sequence[int]=(50,55),
+        landuse_category_count: int=14,
+        run_type: int=1,
+        timestep_seconds: int=3600,
+        precipitation_station_count: int=-1,
+        surface_coordinates_km: npt.ArrayLike=(),
+        upper_coordinates_km: npt.ArrayLike=(),
+        precipitation_coordinates_km: npt.ArrayLike=(),
+        nearest_surface_station: npt.ArrayLike | None=None,
+        iwfcod: int=1,
+        sea_station_count: int=0,
+    ) -> None:
         """Open CALMET.DAT and write all static version 2.1 records.
 
         Args:
@@ -804,8 +991,8 @@ class LegacyCalmetWriter:
             geophysical records immediately.
         """
         run_hours=_whole_run_hours(start,end,'CALMET')
-        self.writer=FortranSequentialWriter(path); self.grid=grid; self.faces=np.asarray(z_faces_m,dtype='<f4'); self.include_w_temperature=include_w_temperature
-        self.water_range=tuple(water_range); self.landuse_category_count=int(landuse_category_count)
+        self.writer=FortranSequentialWriter(Path(path)); self.grid=grid; self.faces=np.asarray(z_faces_m,dtype='<f4'); self.include_w_temperature=include_w_temperature
+        self.water_range=cast(tuple[int,int],tuple(water_range)); self.landuse_category_count=int(landuse_category_count)
         self.run_type=int(run_type)
         self.timestep_seconds=int(timestep_seconds)
         self.precipitation_station_count=int(precipitation_station_count)
@@ -817,11 +1004,18 @@ class LegacyCalmetWriter:
         self.precipitation_coordinates=np.asarray(precipitation_coordinates_km,dtype=float).reshape(-1,2)
         shape=(grid.ny,grid.nx)
         if nearest_surface_station is None and len(self.surface_coordinates):
-            x=grid.x_origin_km+(np.arange(grid.nx)+.5)*grid.dx_km
-            y=grid.y_origin_km+(np.arange(grid.ny)+.5)*grid.dy_km
+            x: npt.NDArray[np.float64]=np.asarray(
+                grid.x_origin_km+(np.arange(grid.nx)+.5)*grid.dx_km,
+                dtype=np.float64)
+            y: npt.NDArray[np.float64]=np.asarray(
+                grid.y_origin_km+(np.arange(grid.ny)+.5)*grid.dy_km,
+                dtype=np.float64)
+            gx: npt.NDArray[np.float64]
+            gy: npt.NDArray[np.float64]
             gx,gy=np.meshgrid(x,y)
-            distance=((gx[...,None]-self.surface_coordinates[:,0])**2+
-                      (gy[...,None]-self.surface_coordinates[:,1])**2)
+            distance: npt.NDArray[np.float64]=(
+                (gx[...,None]-self.surface_coordinates[:,0])**2+
+                (gy[...,None]-self.surface_coordinates[:,1])**2)
             nearest_surface_station=np.argmin(distance,axis=2)+1
         self.nearest_surface_station=(None if nearest_surface_station is None else
             np.asarray(nearest_surface_station,dtype=np.int32))
@@ -837,7 +1031,7 @@ class LegacyCalmetWriter:
             geophysical,start,end,list(control_lines),base_timezone,run_hours)
 
     @staticmethod
-    def _array(value):
+    def _array(value: ArraySource) -> NumericArray:
         """Materialize a netCDF variable or array-like value.
 
         Args:
@@ -846,10 +1040,10 @@ class LegacyCalmetWriter:
         Returns:
             NumPy array preserving the source shape and dtype.
         """
-        return np.asarray(value[:] if hasattr(value,'dimensions') else value)
+        return _array_data(value)
 
     @staticmethod
-    def _date_parts(value):
+    def _date_parts(value: datetime) -> tuple[int,int,int,int,int]:
         """Split a datetime into CALMET calendar header fields.
 
         Args:
@@ -861,7 +1055,7 @@ class LegacyCalmetWriter:
         return (value.year,value.month,value.day,value.hour,value.minute*60+value.second)
 
     @staticmethod
-    def _stamp(value):
+    def _stamp(value: datetime) -> int:
         """Encode a datetime as CALMET ``YYYYJJJHH``.
 
         Args:
@@ -876,7 +1070,7 @@ class LegacyCalmetWriter:
         return format_ordinal_code(value)
 
     @staticmethod
-    def _i(*values):
+    def _i(*values: IntegerScalar) -> bytes:
         """Pack values as little-endian signed 32-bit integers.
 
         Args:
@@ -891,7 +1085,7 @@ class LegacyCalmetWriter:
         return struct.pack('<'+'i'*len(values),*values)
 
     @staticmethod
-    def _f(*values):
+    def _f(*values: RealScalar) -> bytes:
         """Pack values as little-endian IEEE float32 scalars.
 
         Args:
@@ -905,7 +1099,14 @@ class LegacyCalmetWriter:
         """
         return struct.pack('<'+'f'*len(values),*values)
 
-    def _field_record(self,label,data,begin=None,end=None,integer=False):
+    def _field_record(
+        self,
+        label: str,
+        data: ArraySource,
+        begin: datetime | None=None,
+        end: datetime | None=None,
+        integer: bool=False,
+    ) -> None:
         """Write one labeled static or time-bounded CALMET field record.
 
         Args:
@@ -928,16 +1129,24 @@ class LegacyCalmetWriter:
         if begin is None:
             if end is not None:
                 raise ValueError('CALMET field end time requires a begin time')
-            times=self._i(0,0,0,0)
+            times: bytes=self._i(0,0,0,0)
         else:
             if end is None:
                 raise ValueError('CALMET field begin time requires an end time')
             times=self._i(self._stamp(begin),begin.minute*60+begin.second,
                           self._stamp(end),end.minute*60+end.second)
-        dtype='<i4' if integer else '<f4'; array=self._array(data).astype(dtype,copy=False)
+        dtype: str='<i4' if integer else '<f4'; array: NumericArray=self._array(data).astype(dtype,copy=False)
         self.writer.write_record(fixed_string(label,8),times,array.ravel(order='C'))
 
-    def _write_header(self,geo,start,end,control_lines,base_timezone,run_hours):
+    def _write_header(
+        self,
+        geo: GeophysicalSource,
+        start: datetime,
+        end: datetime,
+        control_lines: Sequence[str],
+        base_timezone: str,
+        run_hours: int,
+    ) -> None:
         """Write declaration, run control, coordinates, and static fields.
 
         Args:
@@ -955,7 +1164,10 @@ class LegacyCalmetWriter:
         """
         w=self.writer; g=self.grid
         w.write_record(fixed_string('CALMET.DAT',16),fixed_string('2.1',16),fixed_string('No-Obs file structure with embedded control file',64))
-        comments=['Produced by PyCALMET NumPy implementation','Internal Coordinate Transformations: pyproj/PROJ']+control_lines
+        comments: list[str]=[
+            'Produced by PyCALMET NumPy implementation',
+            'Internal Coordinate Transformations: pyproj/PROJ',
+        ]+list(control_lines)
         w.write_record(self._i(len(comments)))
         for line in comments: w.write_record(fixed_string(line.rstrip('\n'),132))
         run=self._i(*self._date_parts(start),*self._date_parts(end))+fixed_string(base_timezone,8)
@@ -983,10 +1195,19 @@ class LegacyCalmetWriter:
         self._field_record('ELEV',self._array(geo['terrain_height']))
         self._field_record('XLAI',self._array(geo['leaf_area_index']))
         if len(self.surface_coordinates):
-            self._field_record('NEARS',self.nearest_surface_station,integer=True)
+            self._field_record(
+                'NEARS',cast(npt.NDArray[np.int32],
+                             self.nearest_surface_station),integer=True)
 
-    def append(self,hour: HourFields,solar_elevation_sine,*,surface_relative_humidity=None,
-               precipitation_rate=None,precipitation_code=None):
+    def append(
+        self,
+        hour: HourFields,
+        solar_elevation_sine: npt.ArrayLike,
+        *,
+        surface_relative_humidity: npt.ArrayLike | None=None,
+        precipitation_rate: npt.ArrayLike | None=None,
+        precipitation_code: npt.ArrayLike | None=None,
+    ) -> None:
         """Append one OUTHR time-bounded field group.
 
         Args:
@@ -1022,19 +1243,23 @@ class LegacyCalmetWriter:
             for k in range(hour.temperature.shape[0]): self._field_record(f'T-LEV{k+1:3d}',hour.temperature[k],begin,end)
         pgt=pgt_stability(wind.u[0],wind.v[0],solar_elevation_sine,hour.step1.cloud_fraction,hour.step1.ceiling_height,self.landuse,surface.monin_obukhov_length,water_range=self.water_range)
         wstar=_convective_velocity(hour,self.landuse,self.water_range)
-        fields=[('IPGT',pgt,True),('USTAR',surface.friction_velocity,False),('ZI',surface.mixing_height,False),
-                ('EL',surface.monin_obukhov_length,False),('WSTAR',wstar,False)]
-        if self.precipitation_station_count!=0: fields.append(('RMM',precipitation_rate,False))
+        fields: list[tuple[str,ArraySource,bool]]=[
+            ('IPGT',pgt,True),('USTAR',surface.friction_velocity,False),
+            ('ZI',surface.mixing_height,False),
+            ('EL',surface.monin_obukhov_length,False),('WSTAR',wstar,False)]
+        if self.precipitation_station_count!=0:
+            fields.append(('RMM',precipitation_rate,False))
         fields.extend((('TEMPK',hour.temperature[0],False),('RHO',surface.density,False),
                        ('QSW',surface.shortwave_flux,False),('IRH',surface_relative_humidity,True)))
-        if self.precipitation_station_count!=0: fields.append(('IPCODE',precipitation_code,True))
+        if self.precipitation_station_count!=0:
+            fields.append(('IPCODE',precipitation_code,True))
         for label,data,integer in fields: self._field_record(label,data,begin,end,integer)
 
-    def close(self):
+    def close(self) -> None:
         """Close the sequential-unformatted output stream."""
         self.writer.close()
 
-    def __enter__(self):
+    def __enter__(self) -> LegacyCalmetWriter:
         """Return this open writer for context-manager use.
 
         Returns:
@@ -1042,12 +1267,20 @@ class LegacyCalmetWriter:
         """
         return self
 
-    def __exit__(self,*exc):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         """Close the writer on context-manager exit.
 
         Args:
-            *exc: Exception type, value, and traceback supplied by the context
-                manager protocol.
+            exc_type: Exception class supplied by the context manager protocol.
+            exc_value: Exception instance supplied by the context manager
+                protocol.
+            traceback: Exception traceback supplied by the context manager
+                protocol.
 
         Returns:
             ``None``; exceptions are not suppressed.

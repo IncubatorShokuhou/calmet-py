@@ -4,19 +4,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from collections.abc import Iterable
+from typing import Literal, SupportsFloat, TypeAlias, cast, overload
 
 import numpy as np
+from numpy.typing import ArrayLike, NDArray
 
 from .config import GridConfig
 from .legacy_io import FortranSequentialReader
 
 
-MODEL_DTYPE=np.float32
-_DAY=timedelta(days=1)
-_NOON=timedelta(hours=12)
+MODEL_DTYPE: type[np.float32]=np.float32
+Float32Array: TypeAlias = NDArray[np.float32]
+Int32Array: TypeAlias = NDArray[np.int32]
+ProgDType: TypeAlias = Literal['<f4', '<i4']
+
+_DAY: timedelta=timedelta(days=1)
+_NOON: timedelta=timedelta(hours=12)
 
 
-def _parse_hour(value):
+def _parse_hour(value: SupportsFloat) -> tuple[timedelta,bool]:
     """Parse a PROG.DAT decimal ``HH.MM`` value at the file boundary.
 
     Args:
@@ -48,7 +55,7 @@ def _parse_hour(value):
     return timedelta(hours=clock.hour,minutes=clock.minute),False
 
 
-def _hour_label(value):
+def _hour_label(value: SupportsFloat) -> timedelta:
     """Return normalized time-of-day for a decimal ``HH.MM`` label.
 
     Args:
@@ -63,7 +70,45 @@ def _hour_label(value):
     return _parse_hour(value)[0]
 
 
-def _array(payload, dtype, count, label):
+@overload
+def _array(
+    payload: bytes, dtype: Literal['<f4'], count: int, label: str
+) -> Float32Array:
+    """Type a float32 PROG.DAT record decode.
+
+    Args:
+        payload: Raw Fortran sequential-record payload.
+        dtype: Literal selecting float32 decoding.
+        count: Required number of scalar values.
+        label: Record name included in validation errors.
+
+    Returns:
+        Writable one-dimensional float32 array.
+    """
+    ...
+
+
+@overload
+def _array(
+    payload: bytes, dtype: Literal['<i4'], count: int, label: str
+) -> Int32Array:
+    """Type an int32 PROG.DAT record decode.
+
+    Args:
+        payload: Raw Fortran sequential-record payload.
+        dtype: Literal selecting int32 decoding.
+        count: Required number of scalar values.
+        label: Record name included in validation errors.
+
+    Returns:
+        Writable one-dimensional int32 array.
+    """
+    ...
+
+
+def _array(
+    payload: bytes, dtype: ProgDType, count: int, label: str
+) -> Float32Array | Int32Array:
     """Decode one fixed-size binary PROG.DAT record.
 
     Args:
@@ -104,9 +149,9 @@ class ProgRecord:
     x_origin_km: float
     y_origin_km: float
     spacing_km: float
-    height_m: np.ndarray
-    u_cm_s: np.ndarray
-    v_cm_s: np.ndarray
+    height_m: Float32Array
+    u_cm_s: Float32Array
+    v_cm_s: Float32Array
 
 
 class ProgData:
@@ -117,7 +162,7 @@ class ProgData:
         records: Ordered prognostic wind records from the file.
     """
 
-    def __init__(self,path):
+    def __init__(self,path: str | Path) -> None:
         """Read and validate all wind fields in a PROG.DAT file.
 
         Args:
@@ -128,8 +173,8 @@ class ProgData:
             ValueError: If a record is truncated, has invalid dimensions or
                 heights, or the file contains no usable field.
         """
-        self.path=Path(path)
-        records=[]
+        self.path: Path=Path(path)
+        records: list[ProgRecord]=[]
         with FortranSequentialReader(self.path) as reader:
             while (time_payload:=reader.read_record()) is not None:
                 hour=float(_array(time_payload,'<f4',1,'time')[0])
@@ -149,10 +194,10 @@ class ProgData:
             raise ValueError('PROG.DAT contains no prognostic records')
         if any(record.spacing_km<=0. for record in records):
             raise ValueError('PROG.DAT grid spacing must be positive')
-        self.records=tuple(records)
+        self.records: tuple[ProgRecord,...]=tuple(records)
 
     @staticmethod
-    def _required(reader,label):
+    def _required(reader: FortranSequentialReader,label: str) -> bytes:
         """Read a required sequential record.
 
         Args:
@@ -171,7 +216,14 @@ class ProgData:
         return payload
 
     @classmethod
-    def _read_component(cls,reader,nx,ny,nz,label):
+    def _read_component(
+        cls,
+        reader: FortranSequentialReader,
+        nx: int,
+        ny: int,
+        nz: int,
+        label: str,
+    ) -> Float32Array:
         """Read one row-recorded three-dimensional wind component.
 
         Args:
@@ -188,7 +240,7 @@ class ProgData:
         Raises:
             ValueError: If any component row is missing or has the wrong size.
         """
-        result=np.empty((nz,ny,nx),dtype=MODEL_DTYPE)
+        result: Float32Array=np.empty((nz,ny,nx),dtype=MODEL_DTYPE)
         for level in range(nz):
             for row in range(ny):
                 result[level,row]=_array(
@@ -196,7 +248,7 @@ class ProgData:
                     '<f4',nx,label)
         return result
 
-    def at_hour(self,hour):
+    def at_hour(self,hour: SupportsFloat) -> ProgRecord:
         """Return the first record matching a normalized ending-hour label.
 
         Args:
@@ -216,7 +268,12 @@ class ProgData:
             if label==wanted: return record
         raise ValueError(f'PROG.DAT has no record for ending hour {float(hour):g}')
 
-    def interpolate(self,hour,grid: GridConfig,target_height_m):
+    def interpolate(
+        self,
+        hour: SupportsFloat,
+        grid: GridConfig,
+        target_height_m: ArrayLike,
+    ) -> tuple[Float32Array,Float32Array]:
         """Interpolate a selected ending-hour wind field to a CALMET grid.
 
         Args:
@@ -235,7 +292,11 @@ class ProgData:
         return self.interpolate_record(self.at_hour(hour),grid,target_height_m)
 
     @staticmethod
-    def interpolate_record(record,grid: GridConfig,target_height_m):
+    def interpolate_record(
+        record: ProgRecord,
+        grid: GridConfig,
+        target_height_m: ArrayLike,
+    ) -> tuple[Float32Array,Float32Array]:
         """Interpolate an explicitly selected record without hour ambiguity.
 
         Args:
@@ -251,8 +312,8 @@ class ProgData:
             ValueError: If target heights are invalid or a target horizontal
                 point has no source-grid neighbours.
         """
-        target_height=np.asarray(target_height_m,dtype=MODEL_DTYPE)
-        source_height=np.asarray(record.height_m,dtype=MODEL_DTYPE)
+        target_height: Float32Array=np.asarray(target_height_m,dtype=MODEL_DTYPE)
+        source_height: Float32Array=np.asarray(record.height_m,dtype=MODEL_DTYPE)
         if target_height.ndim!=1 or target_height.size<1:
             raise ValueError('target PROG.DAT heights must be a non-empty vector')
         if source_height.size==1:
@@ -306,7 +367,7 @@ class ProgData:
         return (np.asarray(output_u,dtype=MODEL_DTYPE),
                 np.asarray(output_v,dtype=MODEL_DTYPE))
 
-    def _record_offsets(self):
+    def _record_offsets(self) -> tuple[timedelta,...]:
         """Unwrap record clocks into an ordered, date-independent timeline.
 
         Returns:
@@ -317,10 +378,10 @@ class ProgData:
             ValueError: If a clock label is invalid or records move backwards
                 without a plausible midnight rollover.
         """
-        offsets=[]
-        day=timedelta(0)
-        previous_offset=None
-        previous_clock=None
+        offsets: list[timedelta]=[]
+        day: timedelta=timedelta(0)
+        previous_offset: timedelta | None=None
+        previous_clock: timedelta | None=None
         for index,record in enumerate(self.records):
             clock,is_24=_parse_hour(record.hour)
             if is_24:
@@ -332,7 +393,7 @@ class ProgData:
                     # A large backwards clock jump is an implicit midnight
                     # (``00.00`` is the conventional alias for ``24.00``).
                     # A small jump is an out-of-order record, not a new day.
-                    if previous_clock-clock>=_NOON:
+                    if cast(timedelta, previous_clock)-clock>=_NOON:
                         day+=_DAY
                         offset=day+clock
                     else:
@@ -348,7 +409,7 @@ class ProgData:
             previous_clock=clock
         return tuple(offsets)
 
-    def records_for_times(self,times):
+    def records_for_times(self,times: Iterable[datetime]) -> tuple[ProgRecord,...]:
         """Select records for ordered ending datetimes across one or more days.
 
         Dates are supplied by the caller because ``PROG.DAT`` stores only a
@@ -389,7 +450,7 @@ class ProgData:
         missing=targets[0]
         for first_index in candidates:
             origin=targets[0]-offsets[first_index]
-            selected=[]
+            selected: list[ProgRecord]=[]
             cursor=first_index
             for target in targets:
                 requested=target-origin

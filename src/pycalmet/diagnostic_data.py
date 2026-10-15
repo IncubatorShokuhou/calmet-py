@@ -1,11 +1,18 @@
 """Sequential scalar records from legacy CALMET DIAG.DAT files."""
 from __future__ import annotations
 
+from typing import TypeAlias
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from collections.abc import Sequence
 
 import numpy as np
+from numpy.typing import NDArray
+
+
+Float64Array: TypeAlias = NDArray[np.float64]
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,10 +43,10 @@ class DiagnosticRecord:
     lapse_rate_k_m: float | None = None
     initial_u_m_s: float | None = None
     initial_v_m_s: float | None = None
-    surface_u_m_s: np.ndarray | None = None
-    surface_v_m_s: np.ndarray | None = None
-    upper_u_m_s: np.ndarray | None = None
-    upper_v_m_s: np.ndarray | None = None
+    surface_u_m_s: Float64Array | None = None
+    surface_v_m_s: Float64Array | None = None
+    upper_u_m_s: Float64Array | None = None
+    upper_v_m_s: Float64Array | None = None
 
 
 def _fixed_value(line: str, label: str, width: int) -> float:
@@ -73,10 +80,23 @@ class DiagnosticData:
             :class:`DiagnosticRecord` objects.
     """
 
-    def __init__(self, path, start: datetime, count: int, timestep_seconds: int,
-                 *, surface_temperature=False, lapse_rate=False, initial_wind=False,
-                 surface_wind=False,upper_wind=False,surface_wind_names=(),
-                 upper_wind_names=(),levels=0,iextrp=-1):
+    def __init__(
+        self,
+        path: str | Path,
+        start: datetime,
+        count: int,
+        timestep_seconds: int,
+        *,
+        surface_temperature: bool=False,
+        lapse_rate: bool=False,
+        initial_wind: bool=False,
+        surface_wind: bool=False,
+        upper_wind: bool=False,
+        surface_wind_names: Sequence[object]=(),
+        upper_wind_names: Sequence[object]=(),
+        levels: int=0,
+        iextrp: int=-1,
+    ) -> None:
         """Read the requested sequence of diagnostic records.
 
         Args:
@@ -107,10 +127,10 @@ class DiagnosticData:
             ValueError: If a requested record is missing or malformed, station
                 identifiers are ambiguous, or ``levels`` is negative.
         """
-        self.path=Path(path)
+        self.path: Path=Path(path)
         lines=iter(self.path.read_text(encoding='ascii',errors='strict').splitlines())
 
-        def take(label,width):
+        def take(label: str,width: int) -> float:
             """Read one fixed-width scalar from the next input line.
 
             Args:
@@ -127,7 +147,7 @@ class DiagnosticData:
             except StopIteration as error:
                 raise ValueError(f'DIAG.DAT ends before {label} record') from error
 
-        def line(label):
+        def line(label: str) -> str:
             """Return the next raw line from DIAG.DAT.
 
             Args:
@@ -143,7 +163,7 @@ class DiagnosticData:
             except StopIteration as error:
                 raise ValueError(f'DIAG.DAT ends before {label} record') from error
 
-        def names(values,label):
+        def names(values: Sequence[object],label: str) -> tuple[str,...]:
             """Normalize and validate a station-name sequence.
 
             Args:
@@ -168,7 +188,7 @@ class DiagnosticData:
         nz=int(levels)
         if nz<0: raise ValueError('DIAG.DAT level count must be non-negative')
 
-        def fields(text,start,number,label):
+        def fields(text: str,start: int,number: int,label: str) -> list[float]:
             """Decode consecutive five-character numeric fields.
 
             Args:
@@ -189,7 +209,7 @@ class DiagnosticData:
             try: return [float(text[start+5*i:start+5*(i+1)]) for i in range(number)]
             except ValueError as error: raise ValueError(f'invalid DIAG.DAT {label} record') from error
 
-        def surface_block():
+        def surface_block() -> tuple[Float64Array,Float64Array]:
             """Read one LAST-terminated surface-wind station block.
 
             Returns:
@@ -216,7 +236,7 @@ class DiagnosticData:
                 v[index]=9999. if v_value==999. else v_value
             return u,v
 
-        def upper_block():
+        def upper_block() -> tuple[Float64Array,Float64Array]:
             """Read one LAST-terminated upper-air wind station block.
 
             Returns:
@@ -249,8 +269,16 @@ class DiagnosticData:
                         u[level,index]=u_value; v[level,index]=v_value
             return u,v
 
-        records={}
+        records: dict[datetime,DiagnosticRecord]={}
         for index in range(int(count)):
+            temperature: float | None
+            gamma: float | None
+            u: float | None
+            v: float | None
+            surface_u: Float64Array | None
+            surface_v: Float64Array | None
+            upper_u: Float64Array | None
+            upper_v: Float64Array | None
             temperature=take('surface temperature',6) if surface_temperature else None
             # GAMDIA is read in K/km and converted to K/m by PREPDI.
             gamma=take('lapse rate',5)/1000. if lapse_rate else None
@@ -261,7 +289,7 @@ class DiagnosticData:
             when=start+timedelta(seconds=index*timestep_seconds)
             records[when]=DiagnosticRecord(temperature,gamma,u,v,
                 surface_u,surface_v,upper_u,upper_v)
-        self.records=records
+        self.records: dict[datetime,DiagnosticRecord]=records
 
     def at_begin(self, when: datetime) -> DiagnosticRecord:
         """Return the diagnostic record at an exact interval beginning.

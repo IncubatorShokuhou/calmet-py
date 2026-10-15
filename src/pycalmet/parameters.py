@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import re
 import shlex
-from typing import Any, Callable
+from typing import Any, Callable, Final, TypeAlias
 
 from .config import (
     CalmetConfig, CalwrfConfig, CtgprocConfig, CtgprocSource, GridConfig,
@@ -339,7 +339,7 @@ def _sampling(value: Any) -> str:
     return "direct" if method else "legacy"
 
 
-Alias = tuple[tuple[str, ...], Callable[[Any], Any]]
+Alias: TypeAlias = tuple[tuple[str, ...], Callable[[Any], Any]]
 
 
 def _alias(target: str | tuple[str, ...], converter: Callable[[Any], Any] = _identity) -> Alias:
@@ -395,17 +395,17 @@ _add(CALWRF, _integer, NFILES="$nfiles", IB="$ib", IE="$ie", JB="$jb",
      JE="$je", KB="$kb", KE="$ke")
 
 
-TERREL_KINDS = ("USGS90", "USGS30", "ARM3", "3CD", "DMDF", "CDED", "SRTM1",
+TERREL_KINDS: Final[tuple[str, ...]] = ("USGS90", "USGS30", "ARM3", "3CD", "DMDF", "CDED", "SRTM1",
                  "SRTM3", "GTOPO30", "USGSLA", "NZGEN", "GEN", "GEOTIFF")
-TERREL_DATUM_KEYS = {"USGS90":"DUSGS90", "USGS30":"DUSGS30", "ARM3":"DARM3",
+TERREL_DATUM_KEYS: Final[dict[str, str]] = {"USGS90":"DUSGS90", "USGS30":"DUSGS30", "ARM3":"DARM3",
     "3CD":"D3CD", "DMDF":"DDMDF", "CDED":"DCDED", "SRTM1":"DSRTM1",
     "SRTM3":"DSRTM3", "GTOPO30":"DGTOPO30", "USGSLA":"DUSGSLA",
     "NZGEN":"DNZGEN", "GEN":"DGEN", "GEOTIFF":"DGEOTIFF"}
-TERREL_DATUM_DEFAULTS = {"USGS90":"WGS-72", "USGS30":"NAS-C", "ARM3":"NAS-C",
+TERREL_DATUM_DEFAULTS: Final[dict[str, str]] = {"USGS90":"WGS-72", "USGS30":"NAS-C", "ARM3":"NAS-C",
     "3CD":"WGS-72", "DMDF":"NAS-C", "CDED":"NAR-C", "SRTM1":"WGS-96",
     "SRTM3":"WGS-96", "GTOPO30":"WGS-84", "USGSLA":"ESR-S",
     "NZGEN":"WGS-84", "GEN":"WGS-84", "GEOTIFF":"WGS-84"}
-TERREL = dict(GRID)
+TERREL: dict[str, Alias] = dict(GRID)
 _add(TERREL, _identity, OUTFIL="output", XYINP="receptor_input", XYOUT="receptor_output",
      PREVFIL="previous_save", SAVEFIL="save_output", COASTBLN="coastline_file",
      GSHHSIN="gshhs_file", PLTFIL="plot_output", RAWECHO="raw_echo_output",
@@ -429,10 +429,10 @@ for kind in TERREL_KINDS:
     TERREL[TERREL_DATUM_KEYS[kind]] = _alias(f"$source_datum.{kind}", _text)
 
 
-CTG_KINDS = ("GLC2K", "UMDGLC", "CTG", "NZGEN", "GLAZNA", "GLAZSA", "GLAZEU",
+CTG_KINDS: Final[tuple[str, ...]] = ("GLC2K", "UMDGLC", "CTG", "NZGEN", "GLAZNA", "GLAZSA", "GLAZEU",
              "GLAZAS", "GLAZAF", "GLAZAP", "NLCD92", "NLCDTF", "NLCD01",
              "CORINE", "MODIS", "GEN")
-CTG = dict(GRID)
+CTG: dict[str, Alias] = dict(GRID)
 _add(CTG, _identity, LUDAT="output", LUINDAT="$luindat", COASTBLN="coastline_file",
      GSHHSIN="gshhs_file", PREVDAT="previous_landuse")
 _add(CTG, _text, DATUM="grid.datum", DWVS="coastline_source_datum",
@@ -473,7 +473,7 @@ def _records(value: Any, count: int) -> list[list[Any]]:
         value = [[key, *record] for key, record in value.items()]
     elif isinstance(value, (str, Path)) or not isinstance(value, Sequence):
         value = [value]
-    result = []
+    result: list[list[Any]] = []
     for record in value:
         parts = ([part for part in re.split(r"[\s,]+", record.strip()) if part]
                  if isinstance(record, str) else list(record))
@@ -497,8 +497,14 @@ def _properties(value: Any) -> dict[int, tuple[float, float, float, float, float
     Raises:
         ValueError: If a record has the wrong width or a field is not numeric.
     """
-    return {_integer(row[0]): (*(_real(item) for item in row[1:7]), _integer(row[7]))
-            for row in _records(value, 8)}
+    return {
+        _integer(row[0]): (
+            _real(row[1]), _real(row[2]), _real(row[3]),
+            _real(row[4]), _real(row[5]), _real(row[6]),
+            _integer(row[7]),
+        )
+        for row in _records(value, 8)
+    }
 
 
 def _snow_age(value: Any) -> dict[int, tuple[int, float]]:
@@ -534,7 +540,7 @@ def _splits(value: Any) -> tuple[tuple[int, int, float], ...]:
                  for row in _records(value, 3))
 
 
-MAKEGEO = dict(GRID)
+MAKEGEO: dict[str, Alias] = dict(GRID)
 _add(MAKEGEO, _identity, TERRDAT="terrain", LUDAT="landuse", GEODAT="output",
      LU2DAT="secondary_landuse", SNOWDAT="snow_data", LUGRD="landuse_plot_output",
      TEGRD="terrain_plot_output")
@@ -559,7 +565,7 @@ MAKEGEO.update(X=_alias("input_properties", _properties),
 MAKEGEO["RUNLST"] = _alias("$listing")
 
 
-CALMET = dict(GRID)
+CALMET: dict[str, Alias] = dict(GRID)
 _add(CALMET, _identity, PRGDAT="meteorology", GEODAT="geophysical", METDAT="output",
      PACDAT="mesopac_output", DCSTGD="distance_to_coast_output", METLST="listing_output",
      CLDDAT="cloud_data", SRFDAT="surface_data", DIADAT="diagnostic_data",
@@ -592,7 +598,7 @@ _add(CALMET, _reals, XBBAR="$barrier.xb", YBBAR="$barrier.yb",
      XBCST="$lake.xbcst", YBCST="$lake.ybcst", XECST="$lake.xecst",
      YECST="$lake.yecst")
 
-CALMET_INT = {
+CALMET_INT: Final[dict[str, str]] = {
  "NM3D":"$nm3d", "NZ":"$nz", "MREG":"regulatory_mode", "IRTYPE":"run_type",
  "IFORMO":"legacy_output_format", "IPRINF":"print_interval_hours", "NN1":"debug_first_step",
  "NN2":"debug_last_step", "IOUTD":"wind_debug_output", "NZPRN2":"wind_debug_levels",
@@ -621,7 +627,7 @@ CALMET_INT = {
 _add(CALMET, _integer, **CALMET_INT)
 for name in ("NSECDT","ISTEPPG","ISTEPPGS"):
     CALMET[name]=_alias(CALMET_INT[name],_named_integer(name))
-CALMET_REAL = {
+CALMET_REAL: Final[dict[str, str]] = {
  "HAFANG":"half_average_angle", "CONSTB":"constb", "CONSTE":"conste", "CONSTN":"constn",
  "CONSTW":"constw", "FCORIOL":"coriolis", "DPTMIN":"minimum_lapse_rate",
  "DZZI":"mixing_lapse_depth_m", "ZIMIN":"minimum_mixing_height_m",
@@ -877,16 +883,19 @@ def normalize_public_parameters(cls: type[Any], parameters: Mapping[str, Any]) -
             raise ValueError("CALWRF NFILES does not match FLNAMES")
 
     elif cls is TerrelConfig:
-        sources = [TerrelSource(path, kind, str(special.get("source_datum." + kind,
-                    TERREL_DATUM_DEFAULTS[kind]))) for kind in TERREL_KINDS
-                   for path in special.get("source." + kind, ())]
-        if sources:
-            spelling = claimed["$source." + sources[0].input_type]
-            assign("terrain_sources", tuple(sources), spelling)
-            assign("terrain_files", tuple(source.path for source in sources), spelling)
+        terrain_sources: list[TerrelSource] = [TerrelSource(path, kind, str(special.get("source_datum." + kind,
+                            TERREL_DATUM_DEFAULTS[kind]))) for kind in TERREL_KINDS
+                           for path in special.get("source." + kind, ())]
+        if terrain_sources:
+            spelling = claimed["$source." + terrain_sources[0].input_type]
+            assign("terrain_sources", tuple(terrain_sources), spelling)
+            assign("terrain_files", tuple(source.path for source in terrain_sources), spelling)
             values.setdefault("srtm_dir", Path("."))
-        if "source_count" in special and special["source_count"] != len(sources):
-            raise ValueError(f"TERREL NTDF declares {special['source_count']} files but {len(sources)} are active")
+        if "source_count" in special and special["source_count"] != len(terrain_sources):
+            raise ValueError(
+                f"TERREL NTDF declares {special['source_count']} files but "
+                f"{len(terrain_sources)} are active"
+            )
         if "polar_processing" in grid and "processing_method" not in values:
             values["processing_method"] = grid["polar_processing"]
         for target, defaults in (
@@ -948,12 +957,12 @@ def normalize_public_parameters(cls: type[Any], parameters: Mapping[str, Any]) -
             else: raise ValueError(f"CTGPROC legacy LULC must be from 1 through 11, got {lulc}")
             items.append((kind, special["luindat"]))
         if items:
-            sources = tuple(CtgprocSource(path, kind, _ctg_datum(kind, special),
+            landuse_sources: tuple[CtgprocSource, ...] = tuple(CtgprocSource(path, kind, _ctg_datum(kind, special),
                 special.get("mesh." + kind, special.get("mesh.default", 1))) for kind, path in items)
             spelling = claimed.get("$source." + items[0][0], claimed.get("$luindat", "LUINDAT"))
-            for target, value in (("landuse_sources", sources),
-                ("landuse_files", tuple(item.path for item in sources)), ("input_type", sources[0].input_type),
-                ("mesh_density", sources[0].mesh_density), ("input_datum", sources[0].input_datum)):
+            for target, value in (("landuse_sources", landuse_sources),
+                ("landuse_files", tuple(item.path for item in landuse_sources)), ("input_type", landuse_sources[0].input_type),
+                ("mesh_density", landuse_sources[0].mesh_density), ("input_datum", landuse_sources[0].input_datum)):
                 assign(target, value, spelling)
         if ("source_count" in special and
                 not (special["source_count"] == 0 and "luindat" in special) and
@@ -1085,7 +1094,13 @@ def normalize_public_parameters(cls: type[Any], parameters: Mapping[str, Any]) -
             supplied_grid = values.get("grid")
             x_origin = grid.get("x_origin_km", getattr(supplied_grid, "x_origin_km", 0.))
             y_origin = grid.get("y_origin_km", getattr(supplied_grid, "y_origin_km", 0.))
-            regions = []
+            regions: list[
+                tuple[
+                    float, float, float, float,
+                    float, float, float, float,
+                    tuple[int, ...],
+                ]
+            ] = []
             offset = 0
             for index, station_count in enumerate(station_counts):
                 coordinates = [column[index] for column in columns]
@@ -1100,4 +1115,4 @@ def normalize_public_parameters(cls: type[Any], parameters: Mapping[str, Any]) -
     return NormalizedParameters(values, grid, special)
 
 
-__all__ = ["NormalizedParameters", "normalize_public_parameters"]
+__all__: Final[list[str]] = ["NormalizedParameters", "normalize_public_parameters"]

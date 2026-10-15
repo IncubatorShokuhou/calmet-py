@@ -9,6 +9,7 @@ the package-level API and by applications that want to construct a
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Final
 
 from .config import CalwrfConfig
 
@@ -39,4 +40,4 @@ def run(config: CalwrfConfig) -> Path:
     return _run(config)
 
 
-__all__ = ["run"]
+__all__: Final[list[str]] = ["run"]

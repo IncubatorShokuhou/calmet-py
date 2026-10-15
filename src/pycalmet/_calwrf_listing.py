@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Sequence
+from typing import Final, Sequence
 
 
 def _format_time(value: datetime) -> str:
@@ -61,8 +61,8 @@ def write_calwrf_listing(
         IndexError: If ``written_times`` is empty.
         OSError: If the destination directory or listing cannot be written.
     """
-    target = Path(path)
-    lines = [
+    target: Path = Path(path)
+    lines: list[str] = [
         "PYCALMET CALWRF RUN LISTING",
         f"Title: {title}",
         "Status: completed",
@@ -88,4 +88,4 @@ def write_calwrf_listing(
     return target
 
 
-__all__ = ["write_calwrf_listing"]
+__all__: Final[list[str]] = ["write_calwrf_listing"]

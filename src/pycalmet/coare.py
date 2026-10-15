@@ -2,13 +2,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TypeAlias
 
 import numpy as np
+from numpy.typing import ArrayLike, NDArray
 from scipy.ndimage import distance_transform_edt
 
 
-MODEL_DTYPE=np.float32
-ACCUM_DTYPE=np.float64
+Float32Array: TypeAlias = NDArray[np.float32]
+Float64Array: TypeAlias = NDArray[np.float64]
+BoolArray: TypeAlias = NDArray[np.bool_]
+IntegerArray: TypeAlias = NDArray[np.integer]
+Shape: TypeAlias = int | tuple[int, ...]
+
+MODEL_DTYPE: type[np.float32] = np.float32
+ACCUM_DTYPE: type[np.float64] = np.float64
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,18 +46,18 @@ class CoareFlux:
         :func:`surface_flux` and uses the model's ``float32`` dtype.
     """
 
-    roughness_m: np.ndarray
-    monin_obukhov_m: np.ndarray
-    friction_velocity_m_s: np.ndarray
-    temperature_scale_k: np.ndarray
-    humidity_scale_kg_kg: np.ndarray
-    sensible_heat_flux_w_m2: np.ndarray
-    latent_heat_flux_w_m2: np.ndarray
-    buoyancy_flux_k_m_s: np.ndarray
-    cool_skin_delta_k: np.ndarray
-    gustiness_m_s: np.ndarray
-    stress_n_m2: np.ndarray
-    rain_heat_flux_w_m2: np.ndarray
+    roughness_m: Float32Array
+    monin_obukhov_m: Float32Array
+    friction_velocity_m_s: Float32Array
+    temperature_scale_k: Float32Array
+    humidity_scale_kg_kg: Float32Array
+    sensible_heat_flux_w_m2: Float32Array
+    latent_heat_flux_w_m2: Float32Array
+    buoyancy_flux_k_m_s: Float32Array
+    cool_skin_delta_k: Float32Array
+    gustiness_m_s: Float32Array
+    stress_n_m2: Float32Array
+    rain_heat_flux_w_m2: Float32Array
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,20 +85,20 @@ class WarmLayerState:
         ordinary CALMET fields remain ``float32``.
     """
 
-    time_old_s: np.ndarray
-    heat_column_j_m2: np.ndarray
-    stress_integral_n_s_m2: np.ndarray
-    stress_old_n_m2: np.ndarray
-    rain_heat_old_w_m2: np.ndarray
-    sensible_old_w_m2: np.ndarray
-    latent_old_w_m2: np.ndarray
-    morning_started: np.ndarray
-    absorption_fraction: np.ndarray
-    layer_thickness_m: np.ndarray
-    initialized: np.ndarray
+    time_old_s: Float64Array
+    heat_column_j_m2: Float64Array
+    stress_integral_n_s_m2: Float64Array
+    stress_old_n_m2: Float64Array
+    rain_heat_old_w_m2: Float64Array
+    sensible_old_w_m2: Float64Array
+    latent_old_w_m2: Float64Array
+    morning_started: BoolArray
+    absorption_fraction: Float64Array
+    layer_thickness_m: Float64Array
+    initialized: BoolArray
 
 
-def initial_warm_layer_state(shape):
+def initial_warm_layer_state(shape: Shape) -> WarmLayerState:
     """Create COARE first-call state for an output-grid shape.
 
     Args:
@@ -101,15 +109,21 @@ def initial_warm_layer_state(shape):
     """
     # Warm-layer heat and stress integrals persist across many timesteps, so
     # keep this small state in FP64 while ordinary model fields use FP32.
-    zeros=np.zeros(shape,dtype=ACCUM_DTYPE)
+    zeros: Float64Array = np.zeros(shape,dtype=ACCUM_DTYPE)
     return WarmLayerState(
         zeros.copy(),zeros.copy(),zeros.copy(),zeros.copy(),zeros.copy(),
         zeros.copy(),zeros.copy(),np.zeros(shape,dtype=bool),
         np.full(shape,.5),np.full(shape,19.),np.zeros(shape,dtype=bool))
 
 
-def advance_warm_layer(state,solar_time_s,sea_temperature_k,sensor_depth_m,
-                       shortwave_down_w_m2,longwave_down_w_m2):
+def advance_warm_layer(
+    state: WarmLayerState,
+    solar_time_s: ArrayLike,
+    sea_temperature_k: ArrayLike,
+    sensor_depth_m: ArrayLike,
+    shortwave_down_w_m2: ArrayLike,
+    longwave_down_w_m2: ArrayLike,
+) -> tuple[Float32Array, WarmLayerState, Float32Array]:
     """Advance the vectorized COARE PWP warm layer before the ASL solve.
 
     Args:
@@ -128,17 +142,24 @@ def advance_warm_layer(state,solar_time_s,sea_temperature_k,sensor_depth_m,
         Numeric arrays have the broadcast input shape; temperatures use
         ``float32``.
     """
+    time: Float64Array
+    temperature: Float64Array
+    depth: Float64Array
+    shortwave: Float64Array
+    longwave: Float64Array
     time,temperature,depth,shortwave,longwave=np.broadcast_arrays(
         np.asarray(solar_time_s,dtype=ACCUM_DTYPE),
         np.asarray(sea_temperature_k,dtype=ACCUM_DTYPE),
         np.asarray(sensor_depth_m,dtype=ACCUM_DTYPE),
         np.asarray(shortwave_down_w_m2,dtype=ACCUM_DTYPE),
         np.asarray(longwave_down_w_m2,dtype=ACCUM_DTYPE))
-    initialized=np.asarray(state.initialized,dtype=bool)
+    initialized: BoolArray = np.asarray(state.initialized,dtype=bool)
     midnight=initialized&(time<state.time_old_s)
     normal=initialized&~midnight
-    heat=np.where(midnight,0.,state.heat_column_j_m2).copy()
-    stress_integral=np.where(midnight,0.,state.stress_integral_n_s_m2).copy()
+    heat: Float64Array = np.where(midnight,0.,state.heat_column_j_m2).copy()
+    stress_integral: Float64Array = np.where(
+        midnight,0.,state.stress_integral_n_s_m2
+    ).copy()
     started=np.where(midnight,False,state.morning_started).copy()
     fraction=np.where(midnight,.5,state.absorption_fraction).copy()
     thickness=np.where(midnight,19.,state.layer_thickness_m).copy()
@@ -176,7 +197,7 @@ def advance_warm_layer(state,solar_time_s,sea_temperature_k,sensor_depth_m,
                      np.maximum(stress_integral,np.finfo(ACCUM_DTYPE).tiny),0.)
     sensor_increment=np.where(thickness<depth,warming,warming*depth/thickness)
     adjusted=np.where(normal,temperature+sensor_increment,temperature)
-    next_state=WarmLayerState(
+    next_state: WarmLayerState = WarmLayerState(
         time,heat,stress_integral,state.stress_old_n_m2,state.rain_heat_old_w_m2,
         state.sensible_old_w_m2,state.latent_old_w_m2,started,fraction,thickness,
         np.ones(time.shape,dtype=bool))
@@ -184,7 +205,10 @@ def advance_warm_layer(state,solar_time_s,sea_temperature_k,sensor_depth_m,
             np.asarray(warming,dtype=MODEL_DTYPE))
 
 
-def update_warm_layer_fluxes(state,flux):
+def update_warm_layer_fluxes(
+    state: WarmLayerState,
+    flux: CoareFlux,
+) -> WarmLayerState:
     """Store surface fluxes consumed by the next warm-layer timestep.
 
     Args:
@@ -205,7 +229,12 @@ def update_warm_layer_fluxes(state,flux):
         state.initialized)
 
 
-def distance_to_coast(landuse,water_range,dx_km,dy_km):
+def distance_to_coast(
+    landuse: ArrayLike,
+    water_range: tuple[int, int],
+    dx_km: float,
+    dy_km: float,
+) -> Float32Array:
     """Calculate CALMET SETCOAST distance to the nearest land-cell centre.
 
     Args:
@@ -218,7 +247,7 @@ def distance_to_coast(landuse,water_range,dx_km,dy_km):
         ``float32`` array in kilometres with the land-use shape. Land cells
         are zero; an all-water domain receives the CALMET sentinel ``1e6``.
     """
-    categories=np.asarray(landuse)
+    categories: IntegerArray = np.asarray(landuse)
     water=(categories>=water_range[0])&(categories<=water_range[1])
     if water.all():
         return np.where(water,MODEL_DTYPE(1.e6),MODEL_DTYPE(0.)).astype(MODEL_DTYPE)
@@ -226,7 +255,10 @@ def distance_to_coast(landuse,water_range,dx_km,dy_km):
     return np.where(water,distance,0.).astype(MODEL_DTYPE)
 
 
-def _humidity_vapor_pressure(temperature_c, pressure_mb):
+def _humidity_vapor_pressure(
+    temperature_c: ArrayLike,
+    pressure_mb: ArrayLike,
+) -> Float32Array:
     """Evaluate CALMET's Buck/Tetens saturation vapor pressure.
 
     Args:
@@ -236,13 +268,13 @@ def _humidity_vapor_pressure(temperature_c, pressure_mb):
     Returns:
         Saturation vapor pressure in millibars with ``float32`` arithmetic.
     """
-    temperature=np.asarray(temperature_c,dtype=MODEL_DTYPE)
-    pressure=np.asarray(pressure_mb,dtype=MODEL_DTYPE)
+    temperature: Float32Array = np.asarray(temperature_c,dtype=MODEL_DTYPE)
+    pressure: Float32Array = np.asarray(pressure_mb,dtype=MODEL_DTYPE)
     return ((1.0007+3.46e-6*pressure)*6.1121*
             np.exp(17.502*temperature/(240.97+temperature)))
 
 
-def _psiu(z_over_l):
+def _psiu(z_over_l: ArrayLike) -> Float32Array:
     """Evaluate the COARE momentum stability correction.
 
     Args:
@@ -251,9 +283,9 @@ def _psiu(z_over_l):
     Returns:
         ``float32`` correction array with the input shape.
     """
-    value=np.asarray(z_over_l,dtype=MODEL_DTYPE)
+    value: Float32Array = np.asarray(z_over_l,dtype=MODEL_DTYPE)
     unstable=value<0.
-    result=np.empty_like(value)
+    result: Float32Array = np.empty_like(value)
     if unstable.any():
         selected=value[unstable]
         x=np.power(np.maximum(1.-15.*selected,0.),.25)
@@ -273,7 +305,7 @@ def _psiu(z_over_l):
     return result
 
 
-def _psit(z_over_l):
+def _psit(z_over_l: ArrayLike) -> Float32Array:
     """Evaluate the COARE scalar-temperature stability correction.
 
     Args:
@@ -282,9 +314,9 @@ def _psit(z_over_l):
     Returns:
         ``float32`` correction array with the input shape.
     """
-    value=np.asarray(z_over_l,dtype=MODEL_DTYPE)
+    value: Float32Array = np.asarray(z_over_l,dtype=MODEL_DTYPE)
     unstable=value<0.
-    result=np.empty_like(value)
+    result: Float32Array = np.empty_like(value)
     if unstable.any():
         selected=value[unstable]
         x=np.sqrt(np.maximum(1.-15.*selected,0.))
@@ -304,8 +336,12 @@ def _psit(z_over_l):
     return result
 
 
-def downward_longwave(temperature_k,relative_humidity_percent,cloud_fraction,
-                      ceiling_height_m):
+def downward_longwave(
+    temperature_k: ArrayLike,
+    relative_humidity_percent: ArrayLike,
+    cloud_fraction: ArrayLike,
+    ceiling_height_m: ArrayLike,
+) -> Float32Array:
     """Calculate downward longwave radiation with CALMET ``RADFLX``.
 
     Args:
@@ -318,6 +354,10 @@ def downward_longwave(temperature_k,relative_humidity_percent,cloud_fraction,
         Broadcast ``float32`` array of downward longwave radiation in watts
         per square metre.
     """
+    temperature: Float32Array
+    humidity: Float32Array
+    cloud: Float32Array
+    ceiling: Float32Array
     temperature,humidity,cloud,ceiling=np.broadcast_arrays(
         np.asarray(temperature_k,dtype=MODEL_DTYPE),
         np.asarray(relative_humidity_percent,dtype=MODEL_DTYPE),
@@ -332,25 +372,25 @@ def downward_longwave(temperature_k,relative_humidity_percent,cloud_fraction,
 
 
 def surface_flux(
-    wind_speed_m_s,
-    air_temperature_k,
-    sea_temperature_k,
-    humidity,
+    wind_speed_m_s: ArrayLike,
+    air_temperature_k: ArrayLike,
+    sea_temperature_k: ArrayLike,
+    humidity: ArrayLike,
     *,
-    wind_height_m=10.,
-    temperature_height_m=10.,
-    pressure_mb=1008.,
-    boundary_layer_height_m=600.,
-    shortwave_down_w_m2=0.,
-    longwave_down_w_m2=0.,
-    rainfall_mm_h=0.,
-    wave_method=0,
-    wave_period_s=-999.,
-    wave_height_m=-999.,
-    coastal_shelf_length_km=0.,
-    distance_to_coast_km=0.,
-    cool_skin=False,
-):
+    wind_height_m: ArrayLike = 10.,
+    temperature_height_m: ArrayLike = 10.,
+    pressure_mb: ArrayLike = 1008.,
+    boundary_layer_height_m: ArrayLike = 600.,
+    shortwave_down_w_m2: ArrayLike = 0.,
+    longwave_down_w_m2: ArrayLike = 0.,
+    rainfall_mm_h: ArrayLike = 0.,
+    wave_method: int = 0,
+    wave_period_s: ArrayLike = -999.,
+    wave_height_m: ArrayLike = -999.,
+    coastal_shelf_length_km: ArrayLike = 0.,
+    distance_to_coast_km: ArrayLike = 0.,
+    cool_skin: bool = False,
+) -> CoareFlux:
     """Evaluate the stateless part of CALMET's COARE 2.6 implementation.
 
     ``humidity`` follows the legacy interface: values below 2 are relative
@@ -396,11 +436,22 @@ def surface_flux(
     """
     if wave_method not in {0,1,2}:
         raise ValueError('COARE wave_method must be 0, 1, or 2')
+    u: Float32Array
+    t_k: Float32Array
+    ts_k: Float32Array
+    q_input: Float32Array
     u,t_k,ts_k,q_input=np.broadcast_arrays(
         np.asarray(wind_speed_m_s,dtype=MODEL_DTYPE),
         np.asarray(air_temperature_k,dtype=MODEL_DTYPE),
         np.asarray(sea_temperature_k,dtype=MODEL_DTYPE),
         np.asarray(humidity,dtype=MODEL_DTYPE))
+    zu: Float32Array
+    zt: Float32Array
+    p: Float32Array
+    zi: Float32Array
+    rs: Float32Array
+    rl: Float32Array
+    rain: Float32Array
     zu,zt,p,zi,rs,rl,rain=np.broadcast_arrays(
         np.asarray(wind_height_m,dtype=MODEL_DTYPE),
         np.asarray(temperature_height_m,dtype=MODEL_DTYPE),
@@ -458,8 +509,8 @@ def surface_flux(
     ustar=speed*von/(np.log(zu/zo10)-_psiu(zetu))
     charn=np.where(speed>18.,.018,
                    np.where(speed>10.,.011+(.018-.011)*(speed-10.)/8.,.011))
-    shelf=np.asarray(coastal_shelf_length_km,dtype=MODEL_DTYPE)
-    coast=np.asarray(distance_to_coast_km,dtype=MODEL_DTYPE)
+    shelf: Float32Array = np.asarray(coastal_shelf_length_km,dtype=MODEL_DTYPE)
+    coast: Float32Array = np.asarray(distance_to_coast_km,dtype=MODEL_DTYPE)
     shelf_safe=np.where(shelf<.1,1.,shelf)
     factor=np.where(shelf<.1,1.,1.-(1.-.032/charn)*np.exp(-(coast/shelf_safe)**4))
     charn=charn*factor

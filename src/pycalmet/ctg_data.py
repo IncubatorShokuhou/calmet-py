@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Final
 
 
 @dataclass(frozen=True,slots=True)
@@ -40,10 +41,10 @@ class ModisSpec:
     spacing: float=1./120.
 
 
-MODIS_SPEC=ModisSpec()
+MODIS_SPEC: Final[ModisSpec] = ModisSpec()
 
 
-NLCD92_SPECS={
+NLCD92_SPECS: Final[dict[str, Nlcd92Spec]] = {
     'alabama':Nlcd92Spec(11864,19175,696.27,1386.3),
     'arizona':Nlcd92Spec(20036,23328,-1747.23,1701.78),
     'arkansas':Nlcd92Spec(14869,13461,122.34,1510.8),
