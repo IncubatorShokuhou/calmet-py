@@ -1,4 +1,5 @@
 from dataclasses import replace
+import inspect
 from pathlib import Path
 
 import pytest
@@ -432,3 +433,269 @@ def test_run_pipeline_requires_every_explicit_stage(monkeypatch, tmp_path):
         )
 
     assert calls == []
+
+
+PIPELINE_STAGE_APIS = {
+    "calwrf": pycalmet.calwrf,
+    "terrel": pycalmet.terrel,
+    "ctgproc": pycalmet.ctrproc,
+    "makegeo": pycalmet.makegeo,
+    "calmet": pycalmet.calmet,
+}
+
+
+def _canonical_api_parameters(function):
+    """Return the typed parameters, excluding each stage's input wrapper."""
+    return [
+        parameter
+        for parameter in inspect.signature(function).parameters.values()
+        if parameter.name not in {"inp", "legacy_parameters"}
+    ]
+
+
+def test_run_pipeline_signature_exposes_every_typed_stage_parameter():
+    signature = inspect.signature(pycalmet.run_pipeline)
+    parameters = signature.parameters
+    grouped = [
+        "inp",
+        "calwrf",
+        "terrel",
+        "ctgproc",
+        "makegeo",
+        "calmet",
+        "output",
+    ]
+    expected_prefixed = [
+        f"{stage}_{parameter.name}"
+        for stage, function in PIPELINE_STAGE_APIS.items()
+        for parameter in _canonical_api_parameters(function)
+    ]
+
+    # Keep the compact directory/grouped-config forms while making all 323
+    # canonical stage parameters discoverable to IDEs and inspect.signature.
+    assert list(parameters) == grouped + expected_prefixed
+    assert len(expected_prefixed) == 323
+    assert signature.return_annotation is not inspect.Signature.empty
+
+    for name in grouped:
+        assert parameters[name].annotation is not inspect.Parameter.empty
+    for stage, function in PIPELINE_STAGE_APIS.items():
+        for source in _canonical_api_parameters(function):
+            exposed = parameters[f"{stage}_{source.name}"]
+            assert exposed.kind is inspect.Parameter.KEYWORD_ONLY
+            assert exposed.default == source.default
+            assert exposed.annotation == source.annotation
+
+    assert not any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    assert not any(name.endswith("legacy_parameters") for name in parameters)
+
+
+def test_run_pipeline_builds_every_stage_from_only_prefixed_parameters(
+    monkeypatch, tmp_path
+):
+    calls = _install_recording_runners(monkeypatch, write_outputs=True)
+    grid = pycalmet.GridConfig(2, 2, 1.0, 1.0)
+    final_output = tmp_path / "final.nc"
+
+    result = pycalmet.run_pipeline(
+        inp=None,
+        output=final_output,
+        calwrf_wrf_files=(tmp_path / "wrf.nc",),
+        calwrf_start="2018010100",
+        calwrf_end="2018010101",
+        calwrf_output=tmp_path / "requested-calwrf.nc",
+        calwrf_legacy_output=tmp_path / "requested.m3d",
+        calwrf_surface_output=tmp_path / "requested.m2d",
+        calwrf_listing_output=tmp_path / "calwrf.lst",
+        calwrf_compression=2,
+        calwrf_title="CALWRF title",
+        terrel_srtm_dir=tmp_path / "srtm",
+        terrel_output=tmp_path / "requested-terrain.nc",
+        terrel_grid=grid,
+        terrel_save_output=tmp_path / "terrain.sav",
+        terrel_plot_output=tmp_path / "terrain.grd",
+        terrel_raw_echo_output=tmp_path / "terrain-raw.dat",
+        terrel_qa_hit_threshold_percent=61,
+        ctgproc_landuse_files=(tmp_path / "landuse.dat",),
+        ctgproc_output=tmp_path / "requested-landuse.nc",
+        ctgproc_grid=grid,
+        ctgproc_output_format="legacy",
+        ctgproc_final_output=False,
+        ctgproc_qa_cell_output=True,
+        ctgproc_qa_output_directory=tmp_path / "ctgproc-qa",
+        ctgproc_qa_hit_threshold_percent=62,
+        makegeo_terrain=tmp_path / "requested-terrain.nc",
+        makegeo_landuse=tmp_path / "requested-landuse.nc",
+        makegeo_output=tmp_path / "requested-geo.nc",
+        makegeo_grid=grid,
+        makegeo_landuse_plot_output=tmp_path / "landuse.grd",
+        makegeo_terrain_plot_output=tmp_path / "terrain.grd",
+        makegeo_color_map_output=tmp_path / "colors.txt",
+        makegeo_title="MAKEGEO title",
+        calmet_meteorology=tmp_path / "requested-met.nc",
+        calmet_geophysical=tmp_path / "requested-geo.nc",
+        calmet_output=tmp_path / "requested-calmet.nc",
+        calmet_start="2018010100",
+        calmet_end="2018010101",
+        calmet_grid=grid,
+        calmet_compression=7,
+        calmet_listing_output=tmp_path / "calmet.lst",
+        calmet_cloud_output=1,
+        calmet_print_fields=True,
+        calmet_micrometeorology_debug=True,
+        calmet_wind_debug_output=1,
+        calmet_wind_debug_fields=(1,) * 9,
+    )
+
+    assert result == final_output
+    assert [stage for stage, _ in calls] == list(STAGES)
+    assert [type(config) for _, config in calls] == [
+        CalwrfConfig,
+        TerrelConfig,
+        CtgprocConfig,
+        MakegeoConfig,
+        CalmetConfig,
+    ]
+
+    configured = {stage: config for stage, config in calls}
+    calwrf = configured["CALWRF"]
+    terrel = configured["TERREL"]
+    ctgproc = configured["CTGPROC"]
+    makegeo = configured["MAKEGEO"]
+    calmet = configured["CALMET"]
+
+    # Colliding field names belong only to their stage.
+    assert calwrf.compression == 2
+    assert calmet.compression == 7
+    assert calwrf.title == "CALWRF title"
+    assert makegeo.title == "MAKEGEO title"
+    assert terrel.qa_hit_threshold_percent == 61
+    assert ctgproc.qa_hit_threshold_percent == 62
+
+    # User-facing intermediate paths remain valid API parameters, but the
+    # pipeline always replaces or disables them for its private workspace.
+    workspace = Path(calwrf.output).parent
+    assert calwrf.output == workspace / "calwrf.nc"
+    assert calwrf.legacy_output is None
+    assert calwrf.surface_output is None
+    assert calwrf.listing_output is None
+    assert terrel.output == workspace / "terrain.nc"
+    assert terrel.save_output is None
+    assert terrel.plot_output is None
+    assert terrel.raw_echo_output is None
+    assert ctgproc.output == workspace / "landuse.nc"
+    assert ctgproc.output_format == "netcdf"
+    assert ctgproc.final_output is True
+    assert ctgproc.qa_cell_output is False
+    assert ctgproc.qa_output_directory is None
+    assert makegeo.terrain == terrel.output
+    assert makegeo.landuse == ctgproc.output
+    assert makegeo.output == workspace / "geo.nc"
+    assert makegeo.landuse_plot_output is None
+    assert makegeo.terrain_plot_output is None
+    assert makegeo.color_map_output is None
+    assert calmet.meteorology == calwrf.output
+    assert calmet.geophysical == makegeo.output
+    assert calmet.output == final_output
+    assert calmet.listing_output is None
+    assert calmet.cloud_output == 0
+    assert calmet.print_fields is False
+    assert calmet.micrometeorology_debug is False
+    assert calmet.wind_debug_output == 0
+    assert tuple(calmet.wind_debug_fields) == (0,) * 9
+
+    assert not workspace.exists()
+    assert [path.name for path in tmp_path.iterdir()] == ["final.nc"]
+
+
+def test_run_pipeline_uses_prefixed_calmet_output_when_top_level_is_omitted(
+    monkeypatch, tmp_path
+):
+    _install_recording_runners(monkeypatch, write_outputs=True)
+    grid = pycalmet.GridConfig(2, 2, 1.0, 1.0)
+    final_output = tmp_path / "from-calmet-output.nc"
+
+    result = pycalmet.run_pipeline(
+        calwrf_wrf_files=(tmp_path / "wrf.nc",),
+        calwrf_start="2018010100",
+        calwrf_end="2018010101",
+        terrel_srtm_dir=tmp_path / "srtm",
+        terrel_grid=grid,
+        ctgproc_landuse_files=(tmp_path / "landuse.dat",),
+        ctgproc_grid=grid,
+        makegeo_grid=grid,
+        calmet_output=final_output,
+        calmet_start="2018010100",
+        calmet_end="2018010101",
+        calmet_grid=grid,
+    )
+
+    assert result == final_output
+    assert final_output.read_text(encoding="utf-8") == "CALMET"
+
+
+def test_run_pipeline_explicit_default_values_override_control_file(
+    monkeypatch, tmp_path
+):
+    control_directory = tmp_path / "config"
+    control_directory.mkdir()
+    for filename in (
+        "calwrf.inp",
+        "terrel.inp",
+        "ctgproc.inp",
+        "makegeo.inp",
+        "calmet.inp",
+    ):
+        (control_directory / filename).touch()
+
+    configured = _pipeline_config(tmp_path)
+    configured = replace(
+        configured,
+        calmet=replace(
+            configured.calmet,
+            noobs=7,
+            coriolis=42.0,
+            timestep_seconds=1800,
+        ),
+    )
+    loaded = {
+        "calwrf_config": configured.calwrf,
+        "terrel_config": configured.terrel,
+        "ctgproc_config": configured.ctgproc,
+        "makegeo_config": configured.makegeo,
+        "calmet_config": configured.calmet,
+    }
+    loader_arguments = {}
+
+    def loader(name, base):
+        def load(path, **overrides):
+            loader_arguments[name] = (Path(path), overrides)
+            return replace(base, **overrides)
+
+        return load
+
+    for name, base in loaded.items():
+        monkeypatch.setattr(pipeline, name, loader(name, base))
+    calls = _install_recording_runners(monkeypatch)
+
+    pycalmet.run_pipeline(
+        control_directory,
+        output=tmp_path / "final.nc",
+        # These equal the Python API defaults.  Their explicit presence must
+        # still override different values read from the control file.
+        calmet_noobs=0,
+        calmet_coriolis=999.0,
+    )
+
+    calmet_path, calmet_overrides = loader_arguments["calmet_config"]
+    assert calmet_path == control_directory / "calmet.inp"
+    assert calmet_overrides == {"noobs": 0, "coriolis": 999.0}
+
+    calmet = calls[-1][1]
+    assert calmet.noobs == 0
+    assert calmet.coriolis == 999.0
+    # An omitted argument continues to use the value loaded from the control.
+    assert calmet.timestep_seconds == 1800

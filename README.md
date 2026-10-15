@@ -39,43 +39,99 @@ python -m pytest -q
 
 ## Quick start
 
-For a complete run, point `run_pipeline` at the directory containing the five
-control files and choose the final CALMET output path:
+`run_pipeline` exposes the complete five-stage workflow as one typed keyword
+API. Stage prefixes keep same-named controls unambiguous. Among output paths,
+only the final CALMET destination is needed because the pipeline manages every
+interstage dataset:
 
 ```python
+from datetime import datetime
+from pathlib import Path
+
 import pycalmet
 
+example = Path("examples/zhejiang")
+grid = pycalmet.GridConfig(
+    nx=610,
+    ny=499,
+    dx_km=1.0,
+    dy_km=1.0,
+    projection="LCC",
+    lat0=27.0,
+    lon0=117.5,
+    lat1=30.0,
+    lat2=60.0,
+    datum="WGS-84",
+)
+
 result = pycalmet.run_pipeline(
-    "examples/zhejiang/config",
-    output="output/zhejiang/calmet.nc",
+    inp=None,
+    calwrf_wrf_files=[
+        example / "wrfout_d01_2018-03-18_00_00_00.nc",
+        example / "wrfout_d01_2018-03-18_01_00_00.nc",
+        example / "wrfout_d01_2018-03-18_02_00_00.nc",
+    ],
+    calwrf_start=datetime(2018, 3, 18, 0),
+    calwrf_end=datetime(2018, 3, 18, 2),
+    terrel_srtm_dir=Path("terrain/srtm3"),
+    terrel_grid=grid,
+    terrel_sampling="bilinear",
+    ctgproc_landuse_files=[example / "landuse/zhejiang_generic.landuse"],
+    ctgproc_grid=grid,
+    ctgproc_input_type="GEN",
+    ctgproc_input_datum="WGS-84",
+    ctgproc_mesh_density=12,
+    makegeo_grid=grid,
+    calmet_start=datetime(2018, 3, 18, 0),
+    calmet_end=datetime(2018, 3, 18, 1),
+    calmet_grid=grid,
+    calmet_noobs=2,
+    calmet_iprog=14,
+    calmet_irhprog=1,
+    calmet_itprog=2,
+    calmet_wind_extrapolation=-1,
+    calmet_precipitation_station_count=-1,
+    output=Path("output/zhejiang/calmet.nc"),
 )
 ```
 
-The directory form discovers `calwrf.inp`, `terrel.inp`, `ctgproc.inp`,
-`makegeo.inp`, and `calmet.inp`. The stages exchange NetCDF datasets inside an
-automatically cleaned temporary directory. The pipeline disables traditional
-M3D/M2D, listing, QA, plot, save, and debug products, so the selected CALMET
-file is the only persistent output when using NetCDF as shown above. The
-legacy CALMET final format also writes its required `.aux` companion. If
-`output` is omitted, the effective output path in `calmet.inp` is used.
+Every field in the stage parameter reference below is available under its
+`calwrf_`, `terrel_`, `ctgproc_`, `makegeo_`, or `calmet_` prefix. For example,
+CALMET `z_faces_m` becomes `calmet_z_faces_m`. A stage grid can be a
+`GridConfig`, as above, or prefixed flat controls such as `terrel_nx`,
+`terrel_ny`, and `terrel_dx_km`. Python defaults match the individual stage
+APIs. The pipeline rewires interstage paths and disables intermediate and
+diagnostic outputs to honor its single-final-product contract, so those paths
+do not need to be supplied in parameter-only mode.
 
-The five stage inputs can also be supplied explicitly:
+That contract requires `makegeo_snow_processing=False`,
+`calmet_save_output=True`, and `calmet_test_mode=2`: snow processing creates
+multiple dated GEO files, while the other two values are required to perform
+and save the final CALMET calculation.
+
+The stages exchange NetCDF datasets inside an automatically cleaned temporary
+directory. The pipeline disables traditional M3D/M2D, listing, QA, plot, save,
+and debug products, so the selected CALMET file is the only persistent output
+when using NetCDF as shown above. The legacy CALMET final format also writes
+its required `.aux` companion.
+
+As a convenience for an existing control-file workflow, the first argument
+may instead be a **directory** containing all five control files:
 
 ```python
-base = "examples/zhejiang/config"
 result = pycalmet.run_pipeline(
-    calwrf=f"{base}/calwrf.inp",
-    terrel=f"{base}/terrel.inp",
-    ctgproc=f"{base}/ctgproc.inp",
-    makegeo=f"{base}/makegeo.inp",
-    calmet=f"{base}/calmet.inp",
-    output="output/zhejiang/calmet.nc",
+    Path("examples/zhejiang/config"),  # folder, not a single .inp file
+    output=Path("output/zhejiang/calmet.nc"),
 )
 ```
 
-Each stage input accepts its control-file path, matching typed configuration
-object, or a parameter mapping. `PipelineConfig` groups the five typed stage
-configurations and can be passed as the first argument to `run_pipeline`.
+This directory form discovers `calwrf.inp`, `terrel.inp`, `ctgproc.inp`,
+`makegeo.inp`, and `calmet.inp`. If `output` is omitted, it uses the effective
+output path from `calmet.inp`. The grouped `calwrf=`, `terrel=`, `ctgproc=`,
+`makegeo=`, and `calmet=` inputs also accept one control-file path, parameter
+mapping, or typed configuration object per stage. `PipelineConfig` groups the
+five typed stage configurations and can be passed as the first argument to
+`run_pipeline`.
 
 Each stage accepts either explicit keyword arguments or its legacy
 CALMET-family control file. These `.inp` files are program-specific control

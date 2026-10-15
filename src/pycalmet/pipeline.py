@@ -8,7 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, TypeAlias
 
-from .api import _config
+from .api import _GRID_PARAMETER_NAMES, _config
 from .calmet import run as _run_calmet
 from .calwrf import run as _run_calwrf
 from .config import (CalmetConfig, CalwrfConfig, CtgprocConfig, MakegeoConfig,
@@ -92,9 +92,15 @@ def _annotate_error(error: Exception, stage: str) -> None:
         error.args = (message,)
 
 
-def _resolve_stage(name: str, cls: Any, value: Any, loader: Any) -> Any:
+def _resolve_stage(
+    name: str,
+    cls: Any,
+    value: Any,
+    loader: Any,
+    parameters: Mapping[str, Any] | None = None,
+) -> Any:
     try:
-        return _config(cls, value, {}, loader)
+        return _config(cls, value, dict(parameters or {}), loader)
     except Exception as error:
         _annotate_error(error, name)
         raise
@@ -109,7 +115,12 @@ def _resolve_config(
     makegeo: MakegeoSpec | None,
     calmet: CalmetSpec | None,
     output: str | Path | None,
+    stage_parameters: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> PipelineConfig:
+    parameters = {
+        name: dict((stage_parameters or {}).get(name, {}))
+        for name in _CONTROL_FILES
+    }
     explicit = {
         "calwrf": calwrf,
         "terrel": terrel,
@@ -124,20 +135,34 @@ def _resolve_config(
             "pass either a pipeline config/control directory or the five stage "
             "configurations, not both"
         )
+    parameter_only = inp is None and not supplied
     if isinstance(inp, PipelineConfig):
-        return inp
-    if isinstance(inp, (str, Path)):
+        specs: Mapping[str, Any] = {
+            "calwrf": inp.calwrf,
+            "terrel": inp.terrel,
+            "ctgproc": inp.ctgproc,
+            "makegeo": inp.makegeo,
+            "calmet": inp.calmet,
+        }
+    elif isinstance(inp, (str, Path)):
         specs: Mapping[str, Any] = _directory_specs(inp)
     elif isinstance(inp, Mapping):
         specs = _mapping_specs(inp)
     elif inp is None:
-        if len(supplied) != len(_CONTROL_FILES):
+        if parameter_only:
+            specs = parameters
+            # These mappings already contain the flattened stage arguments.
+            # Passing the same values as overrides would make ``_config`` see
+            # both a mapping and keyword parameters.
+            parameters = {name: {} for name in _CONTROL_FILES}
+        elif len(supplied) != len(_CONTROL_FILES):
             missing = [name for name in _CONTROL_FILES if name not in supplied]
             raise TypeError(
                 "run_pipeline requires all five stage configurations; missing: "
                 + ", ".join(missing)
             )
-        specs = explicit
+        else:
+            specs = explicit
     else:
         raise TypeError(
             "inp must be a PipelineConfig, mapping, or control-file directory"
@@ -172,16 +197,59 @@ def _resolve_config(
     # late-stage control therefore cannot leave work products behind.
     return PipelineConfig(
         calwrf=_resolve_stage(
-            "CALWRF", CalwrfConfig, specs["calwrf"], calwrf_config),
+            "CALWRF", CalwrfConfig, specs["calwrf"], calwrf_config,
+            parameters["calwrf"]),
         terrel=_resolve_stage(
-            "TERREL", TerrelConfig, specs["terrel"], terrel_config),
+            "TERREL", TerrelConfig, specs["terrel"], terrel_config,
+            parameters["terrel"]),
         ctgproc=_resolve_stage(
-            "CTGPROC", CtgprocConfig, specs["ctgproc"], ctgproc_config),
+            "CTGPROC", CtgprocConfig, specs["ctgproc"], ctgproc_config,
+            parameters["ctgproc"]),
         makegeo=_resolve_stage(
-            "MAKEGEO", MakegeoConfig, specs["makegeo"], makegeo_config),
+            "MAKEGEO", MakegeoConfig, specs["makegeo"], makegeo_config,
+            parameters["makegeo"]),
         calmet=_resolve_stage(
-            "CALMET", CalmetConfig, specs["calmet"], calmet_config),
+            "CALMET", CalmetConfig, specs["calmet"], calmet_config,
+            parameters["calmet"]),
     )
+
+
+def _select_stage_parameters(
+    stage: str,
+    values: Mapping[str, Any],
+    supplied: frozenset[str],
+    names: tuple[str, ...],
+    omitted: tuple[str, ...],
+    *,
+    parameter_only: bool,
+) -> dict[str, Any]:
+    """Select one stage's arguments from the generated flattened wrapper."""
+    prefix = f"{stage}_"
+    if not parameter_only:
+        return {
+            name: values[f"{prefix}{name}"]
+            for name in names
+            if f"{prefix}{name}" in supplied
+        }
+
+    omitted_names = set(omitted)
+    supplied_grid = values.get(f"{prefix}grid") is not None
+    result: dict[str, Any] = {}
+    for name in names:
+        public_name = f"{prefix}{name}"
+        value = values[public_name]
+        if name in omitted_names and value is None:
+            continue
+        if name == "grid" and value is None:
+            continue
+        if (
+            supplied_grid
+            and name in _GRID_PARAMETER_NAMES
+            and public_name not in supplied
+        ):
+            continue
+        result[name] = value
+    return result
 
 
 def _run_stage(name: str, runner: Any, config: Any) -> Path:
@@ -200,7 +268,7 @@ def _effective_output(config: CalmetConfig, output: str | Path | None) -> Path:
     return Path(config.output)
 
 
-def run_pipeline(
+def _run_pipeline(
     inp: PipelineConfig | Mapping[str, Any] | str | Path | None = None,
     *,
     calwrf: CalwrfSpec | None = None,
@@ -209,6 +277,7 @@ def run_pipeline(
     makegeo: MakegeoSpec | None = None,
     calmet: CalmetSpec | None = None,
     output: str | Path | None = None,
+    stage_parameters: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> Path:
     """Run CALWRF, TERREL, CTGPROC, MAKEGEO, and CALMET in sequence.
 
@@ -231,6 +300,7 @@ def run_pipeline(
         makegeo=makegeo,
         calmet=calmet,
         output=output,
+        stage_parameters=stage_parameters,
     )
     if config.makegeo.snow_processing:
         raise ValueError(
@@ -319,5 +389,10 @@ def run_pipeline(
         _run_stage("MAKEGEO", _run_makegeo, makegeo_configured)
         return _run_stage("CALMET", _run_calmet, calmet_configured)
 
+
+from ._pipeline_api import run_pipeline
+
+# Present the generated wrapper as the public function of this module.
+run_pipeline.__module__ = __name__
 
 __all__ = ["PipelineConfig", "run_pipeline"]

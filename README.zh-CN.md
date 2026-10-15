@@ -37,42 +37,90 @@ python -m pytest -q
 
 ## 快速开始
 
-完整运行时，只需把五份控制文件所在目录交给 `run_pipeline`，并指定最终的 CALMET
-输出路径：
+`run_pipeline` 把五个阶段作为一个完整的类型化关键字 API 暴露出来。参数名前的阶段
+前缀用于区分同名控制项；阶段间数据由流水线管理，在各类输出路径中只需指定最终的
+CALMET 输出位置：
 
 ```python
+from datetime import datetime
+from pathlib import Path
+
 import pycalmet
 
+example = Path("examples/zhejiang")
+grid = pycalmet.GridConfig(
+    nx=610,
+    ny=499,
+    dx_km=1.0,
+    dy_km=1.0,
+    projection="LCC",
+    lat0=27.0,
+    lon0=117.5,
+    lat1=30.0,
+    lat2=60.0,
+    datum="WGS-84",
+)
+
 result = pycalmet.run_pipeline(
-    "examples/zhejiang/config",
-    output="output/zhejiang/calmet.nc",
+    inp=None,
+    calwrf_wrf_files=[
+        example / "wrfout_d01_2018-03-18_00_00_00.nc",
+        example / "wrfout_d01_2018-03-18_01_00_00.nc",
+        example / "wrfout_d01_2018-03-18_02_00_00.nc",
+    ],
+    calwrf_start=datetime(2018, 3, 18, 0),
+    calwrf_end=datetime(2018, 3, 18, 2),
+    terrel_srtm_dir=Path("terrain/srtm3"),
+    terrel_grid=grid,
+    terrel_sampling="bilinear",
+    ctgproc_landuse_files=[example / "landuse/zhejiang_generic.landuse"],
+    ctgproc_grid=grid,
+    ctgproc_input_type="GEN",
+    ctgproc_input_datum="WGS-84",
+    ctgproc_mesh_density=12,
+    makegeo_grid=grid,
+    calmet_start=datetime(2018, 3, 18, 0),
+    calmet_end=datetime(2018, 3, 18, 1),
+    calmet_grid=grid,
+    calmet_noobs=2,
+    calmet_iprog=14,
+    calmet_irhprog=1,
+    calmet_itprog=2,
+    calmet_wind_extrapolation=-1,
+    calmet_precipitation_station_count=-1,
+    output=Path("output/zhejiang/calmet.nc"),
+)
+```
+
+下方各阶段参数表中的每个字段，都可分别加上 `calwrf_`、`terrel_`、`ctgproc_`、
+`makegeo_` 或 `calmet_` 前缀后直接传入。例如 CALMET 的 `z_faces_m` 对应
+`calmet_z_faces_m`。网格既可以像上例一样传入 `GridConfig`，也可以写成
+`terrel_nx`、`terrel_ny`、`terrel_dx_km` 等带阶段前缀的独立参数。未传项沿用对应
+单阶段 API 的 Python 默认值。为了保证只保留最终产品，流水线会重新连接阶段间路径，
+并关闭中间输出和诊断输出；纯参数模式不需要填写这些路径。
+
+这一单一最终产品约定要求 `makegeo_snow_processing=False`、
+`calmet_save_output=True` 和 `calmet_test_mode=2`：积雪流程会生成多份按日期区分的 GEO
+文件，后两项则分别用于执行计算和保存最终 CALMET 结果。
+
+各阶段通过自动清理的临时目录交换 NetCDF 数据；流水线会关闭传统 M3D/M2D、列表、
+质检、绘图、保存和调试产物，因此持久写入的只有指定的最终 CALMET 文件（使用上例
+的 NetCDF 格式时）。传统 CALMET 最终格式还会按格式要求写出 `.aux` 配套文件。
+
+已有控制文件时，也可以把包含全部五份控制文件的**文件夹**作为第一个参数：
+
+```python
+result = pycalmet.run_pipeline(
+    Path("examples/zhejiang/config"),  # 文件夹，不是单个 .inp 文件
+    output=Path("output/zhejiang/calmet.nc"),
 )
 ```
 
 目录模式会自动查找 `calwrf.inp`、`terrel.inp`、`ctgproc.inp`、
-`makegeo.inp` 和 `calmet.inp`。各阶段通过自动清理的临时目录交换 NetCDF 数据；
-流水线会关闭传统 M3D/M2D、列表、质检、绘图、保存和调试产物，因此持久写入的
-只有指定的最终 CALMET 文件（使用上例的 NetCDF 格式时）。传统 CALMET 最终格式
-还会按格式要求写出 `.aux` 配套文件。省略 `output` 时，使用 `calmet.inp` 中实际
-生效的输出路径。
-
-也可以逐项指定五个阶段的输入：
-
-```python
-base = "examples/zhejiang/config"
-result = pycalmet.run_pipeline(
-    calwrf=f"{base}/calwrf.inp",
-    terrel=f"{base}/terrel.inp",
-    ctgproc=f"{base}/ctgproc.inp",
-    makegeo=f"{base}/makegeo.inp",
-    calmet=f"{base}/calmet.inp",
-    output="output/zhejiang/calmet.nc",
-)
-```
-
-每个阶段输入都可以是对应的控制文件路径、类型化配置对象或参数映射。
-`PipelineConfig` 可将五个阶段的类型化配置集中为一个对象，并作为
-`run_pipeline` 的第一个参数传入。
+`makegeo.inp` 和 `calmet.inp`。省略 `output` 时，使用 `calmet.inp` 中实际生效的
+输出路径。分组形式的 `calwrf=`、`terrel=`、`ctgproc=`、`makegeo=` 和 `calmet=`
+也可以分别接收一份控制文件路径、参数映射或对应的类型化配置对象。`PipelineConfig`
+可将五个阶段的类型化配置集中为一个对象，并作为 `run_pipeline` 的第一个参数传入。
 
 每个阶段既可以直接传入关键字参数，也可以读取对应的 CALMET 系列传统控制文件。
 这里的 `.inp` 是各程序自己的控制文件，并不是标准 Fortran `NAMELIST`。浙江示例
