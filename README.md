@@ -92,8 +92,14 @@ result = pycalmet.run_pipeline(
     calmet_iprog=14,
     calmet_irhprog=1,
     calmet_itprog=2,
+    calmet_coriolis=1.0e-4,
+    calmet_maximum_mixing_height_m=2500.0,
+    calmet_maximum_water_mixing_height_m=2500.0,
+    calmet_precipitation_radius_km=50.0,
+    calmet_mnmdav=10,
     calmet_wind_extrapolation=-1,
     calmet_precipitation_station_count=-1,
+    calmet_include_w_temperature=False,
     output=Path("output/zhejiang/calmet.nc"),
 )
 ```
@@ -141,7 +147,8 @@ mapping, or typed configuration object per stage. `PipelineConfig` groups the
 five typed stage configurations and can be passed as the first argument to
 `run_pipeline`. This is the form used by `examples/zhejiang/run.py`; execute it
 with `./examples/zhejiang/run.sh`. For debugging individual stages and keeping
-their outputs, use `examples/zhejiang/run_stages.py`.
+their outputs, use `examples/zhejiang/run_stages.py`, which demonstrates the
+pure keyword-parameter API without reading control files.
 
 Each stage accepts either explicit keyword arguments or its legacy
 CALMET-family control file. These `.inp` files are program-specific control

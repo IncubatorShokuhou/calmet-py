@@ -69,7 +69,10 @@ To inspect the output from every stage, run the separate debugging example:
 PYTHONPATH=src python examples/zhejiang/run_stages.py
 ```
 
-It calls the five public stage APIs individually and retains `calwrf.nc`,
-`terrain.nc`, `landuse.nc`, `geo.nc`, and `calmet.nc` under
-`output/zhejiang/`, along with any diagnostic products enabled by the control
-files.
+This script does not read any `.inp` file. It supplies typed Python keyword
+parameters to the five public stage APIs and lets omitted controls use their
+documented Python defaults. The parameters that affect the Zhejiang run are
+written explicitly, including the source datum for every SRTM tile and the
+prognostic meteorology, humidity, temperature, precipitation, and mixing-height
+settings. It retains `calwrf.nc`, `terrain.nc`, `landuse.nc`, `geo.nc`, and
+`calmet.nc` under `output/zhejiang/`.

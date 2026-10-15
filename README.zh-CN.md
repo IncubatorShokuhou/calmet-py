@@ -88,8 +88,14 @@ result = pycalmet.run_pipeline(
     calmet_iprog=14,
     calmet_irhprog=1,
     calmet_itprog=2,
+    calmet_coriolis=1.0e-4,
+    calmet_maximum_mixing_height_m=2500.0,
+    calmet_maximum_water_mixing_height_m=2500.0,
+    calmet_precipitation_radius_km=50.0,
+    calmet_mnmdav=10,
     calmet_wind_extrapolation=-1,
     calmet_precipitation_station_count=-1,
+    calmet_include_w_temperature=False,
     output=Path("output/zhejiang/calmet.nc"),
 )
 ```
@@ -130,7 +136,7 @@ result = pycalmet.run_pipeline(
 可将五个阶段的类型化配置集中为一个对象，并作为 `run_pipeline` 的第一个参数传入。
 `examples/zhejiang/run.py` 使用的就是这种目录形式，可通过
 `./examples/zhejiang/run.sh` 运行。若要逐阶段调试并保留各阶段输出，请运行
-`examples/zhejiang/run_stages.py`。
+`examples/zhejiang/run_stages.py`；该脚本演示纯关键字参数 API，不读取控制文件。
 
 每个阶段既可以直接传入关键字参数，也可以读取对应的 CALMET 系列传统控制文件。
 这里的 `.inp` 是各程序自己的控制文件，并不是标准 Fortran `NAMELIST`。浙江示例
