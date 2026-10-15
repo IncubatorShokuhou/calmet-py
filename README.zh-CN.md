@@ -13,7 +13,7 @@ Python 主流程无需编译 Fortran。
 ## 主要特性
 
 - 使用 Python、NumPy 和 SciPy 执行，无需 Fortran 编译器。
-- 一个软件包覆盖五个公开处理阶段。
+- 一个软件包覆盖五个公开处理阶段和完整流水线。
 - 支持 WRF NetCDF 输入和 CF 兼容的 NetCDF 输出。
 - 兼容传统 CALWRF、TERREL、CTGPROC、MAKEGEO 和 CALMET 文件。
 - WRF 数据按时次流式处理，可处理超过内存容量的数据集。
@@ -36,6 +36,43 @@ python -m pytest -q
 ```
 
 ## 快速开始
+
+完整运行时，只需把五份控制文件所在目录交给 `run_pipeline`，并指定最终的 CALMET
+输出路径：
+
+```python
+import pycalmet
+
+result = pycalmet.run_pipeline(
+    "examples/zhejiang/config",
+    output="output/zhejiang/calmet.nc",
+)
+```
+
+目录模式会自动查找 `calwrf.inp`、`terrel.inp`、`ctgproc.inp`、
+`makegeo.inp` 和 `calmet.inp`。各阶段通过自动清理的临时目录交换 NetCDF 数据；
+流水线会关闭传统 M3D/M2D、列表、质检、绘图、保存和调试产物，因此持久写入的
+只有指定的最终 CALMET 文件（使用上例的 NetCDF 格式时）。传统 CALMET 最终格式
+还会按格式要求写出 `.aux` 配套文件。省略 `output` 时，使用 `calmet.inp` 中实际
+生效的输出路径。
+
+也可以逐项指定五个阶段的输入：
+
+```python
+base = "examples/zhejiang/config"
+result = pycalmet.run_pipeline(
+    calwrf=f"{base}/calwrf.inp",
+    terrel=f"{base}/terrel.inp",
+    ctgproc=f"{base}/ctgproc.inp",
+    makegeo=f"{base}/makegeo.inp",
+    calmet=f"{base}/calmet.inp",
+    output="output/zhejiang/calmet.nc",
+)
+```
+
+每个阶段输入都可以是对应的控制文件路径、类型化配置对象或参数映射。
+`PipelineConfig` 可将五个阶段的类型化配置集中为一个对象，并作为
+`run_pipeline` 的第一个参数传入。
 
 每个阶段既可以直接传入关键字参数，也可以读取对应的 CALMET 系列传统控制文件。
 这里的 `.inp` 是各程序自己的控制文件，并不是标准 Fortran `NAMELIST`。浙江示例
@@ -485,6 +522,8 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 公开 API：
 
 ```python
+pycalmet.run_pipeline(...)
+pycalmet.PipelineConfig(...)
 pycalmet.calwrf(...)
 pycalmet.terrel(...)
 pycalmet.ctrproc(...)   # pycalmet.ctgproc 是兼容别名

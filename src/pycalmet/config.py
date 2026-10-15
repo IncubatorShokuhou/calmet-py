@@ -334,3 +334,14 @@ class CalmetConfig:
             self.smoothing_passes=(2,)+(4,)*(layers-1)
         if self.barrier_top_level is None:
             self.barrier_top_level=layers
+
+
+@dataclass(slots=True)
+class PipelineConfig:
+    """Resolved configuration for a complete CALMET preprocessing run."""
+
+    calwrf: CalwrfConfig
+    terrel: TerrelConfig
+    ctgproc: CtgprocConfig
+    makegeo: MakegeoConfig
+    calmet: CalmetConfig

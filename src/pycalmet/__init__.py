@@ -15,21 +15,25 @@ from . import calwrf as _calwrf_component
 from . import ctgproc as _ctgproc_component
 from . import ctrproc as _ctrproc_component
 from . import makegeo as _makegeo_component
+from . import pipeline as _pipeline_component
 from . import readlst as _readlst_component
 from . import terrel as _terrel_component
 from .api import calmet, calwrf, ctgproc, ctrproc, makegeo, terrel
 from .aux_data import AuxiliaryCloudHour,AuxiliaryData,AuxiliaryHeader
 from .config import (CalmetConfig,CalwrfConfig,CtgprocConfig,CtgprocSource,
-                     GridConfig,MakegeoConfig,TerrelConfig,TerrelSource)
+                     GridConfig,MakegeoConfig,PipelineConfig,TerrelConfig,
+                     TerrelSource)
+from .pipeline import run_pipeline
 from .readlst import readlst
 from .datums import DATUMS,DatumDefinition,datum_definition,datum_shift
 from .prog_data import ProgData,ProgRecord
 from . import legacy
 
 __all__ = [
-    "calwrf", "terrel", "ctrproc", "ctgproc", "makegeo", "calmet", "readlst",
+    "calwrf", "terrel", "ctrproc", "ctgproc", "makegeo", "calmet",
+    "run_pipeline", "readlst",
     "GridConfig", "CalwrfConfig", "TerrelConfig", "TerrelSource", "CtgprocConfig", "CtgprocSource",
-    "MakegeoConfig", "CalmetConfig",
+    "MakegeoConfig", "CalmetConfig", "PipelineConfig",
     "DATUMS", "DatumDefinition", "datum_definition", "datum_shift",
     "ProgData", "ProgRecord",
     "AuxiliaryData", "AuxiliaryHeader", "AuxiliaryCloudHour", "legacy",

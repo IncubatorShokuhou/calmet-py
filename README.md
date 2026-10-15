@@ -15,7 +15,7 @@ numerical references are kept in separate, clearly scoped directories.
 ## Highlights
 
 - Pure Python and NumPy/SciPy execution; no Fortran compiler is required.
-- Five public processing stages exposed through one package.
+- Five public processing stages plus an end-to-end pipeline exposed through one package.
 - WRF NetCDF input and CF-compatible NetCDF output.
 - Compatibility with legacy CALWRF, TERREL, CTGPROC, MAKEGEO, and CALMET files.
 - Streaming WRF processing for datasets larger than memory.
@@ -38,6 +38,44 @@ python -m pytest -q
 ```
 
 ## Quick start
+
+For a complete run, point `run_pipeline` at the directory containing the five
+control files and choose the final CALMET output path:
+
+```python
+import pycalmet
+
+result = pycalmet.run_pipeline(
+    "examples/zhejiang/config",
+    output="output/zhejiang/calmet.nc",
+)
+```
+
+The directory form discovers `calwrf.inp`, `terrel.inp`, `ctgproc.inp`,
+`makegeo.inp`, and `calmet.inp`. The stages exchange NetCDF datasets inside an
+automatically cleaned temporary directory. The pipeline disables traditional
+M3D/M2D, listing, QA, plot, save, and debug products, so the selected CALMET
+file is the only persistent output when using NetCDF as shown above. The
+legacy CALMET final format also writes its required `.aux` companion. If
+`output` is omitted, the effective output path in `calmet.inp` is used.
+
+The five stage inputs can also be supplied explicitly:
+
+```python
+base = "examples/zhejiang/config"
+result = pycalmet.run_pipeline(
+    calwrf=f"{base}/calwrf.inp",
+    terrel=f"{base}/terrel.inp",
+    ctgproc=f"{base}/ctgproc.inp",
+    makegeo=f"{base}/makegeo.inp",
+    calmet=f"{base}/calmet.inp",
+    output="output/zhejiang/calmet.nc",
+)
+```
+
+Each stage input accepts its control-file path, matching typed configuration
+object, or a parameter mapping. `PipelineConfig` groups the five typed stage
+configurations and can be passed as the first argument to `run_pipeline`.
 
 Each stage accepts either explicit keyword arguments or its legacy
 CALMET-family control file. These `.inp` files are program-specific control
@@ -497,6 +535,8 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 The public processing API is:
 
 ```python
+pycalmet.run_pipeline(...)
+pycalmet.PipelineConfig(...)
 pycalmet.calwrf(...)
 pycalmet.terrel(...)
 pycalmet.ctrproc(...)   # pycalmet.ctgproc is a compatibility alias
