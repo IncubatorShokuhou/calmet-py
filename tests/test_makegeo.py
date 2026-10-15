@@ -1,5 +1,6 @@
 from io import StringIO
 from pathlib import Path
+from datetime import date,datetime,timezone
 
 import numpy as np
 import pytest
@@ -8,7 +9,7 @@ from pyproj import Transformer
 from pycalmet._ctgproc import (SnowGridInfo,_write_legacy as write_landuse_legacy,
                                _write_netcdf as write_landuse_netcdf,
                                run as run_ctgproc)
-from pycalmet._makegeo import (SnowReference,_category_sum,_fields,_fortran_exp,_fortran_log,_merge_landuse,_snow_albedo_values,_split_categories,_water_sum,
+from pycalmet._makegeo import (SnowReference,SnowVariable,_category_sum,_fields,_merge_landuse,_snow_albedo_values,_split_categories,_water_sum,
                                _expand_packed_snow,_read_formatted_snow_header,
                                _fill_snow_spatial,_fill_snow_temporal,
                                _iter_formatted_snow_days,
@@ -226,16 +227,15 @@ def test_snow_weighted_fields_select_properties_per_reference_sample():
         config,snow_full_nx=2)
     assert fields[0].tolist()==[[10,20]]
     np.testing.assert_allclose(fields[1],[[.5**.75,np.sqrt(.02)]])
-    # MSAL=2 retains the legacy ABI bug: positive snow age selects the snow
-    # table even where the depth field is zero.
-    np.testing.assert_allclose(fields[2],[[.775,.75]])
+    # MSAL=2 selects snow albedo only where the sampled snow depth is positive.
+    np.testing.assert_allclose(fields[2],[[.175,.75]])
     np.testing.assert_allclose(fields[3],[[1.75,15.]])
     np.testing.assert_allclose(fields[4],[[.275,.85]])
     np.testing.assert_allclose(fields[5],[[3.75,35.]])
     np.testing.assert_allclose(fields[6],[[4.75,45.]])
 
 
-def test_computed_snow_roughness_and_aged_albedo_match_fortran_formulas():
+def test_computed_snow_roughness_and_aged_albedo_follow_configured_formulas():
     grid=GridConfig(1,1,1.,1.)
     reference=SnowReference(np.array([0]),np.array([0]),np.array([1]),np.array([1.]))
     normal={1:(1.,.2,1.,.2,0.,1.,10),2:(.05,.7,.5,.1,0.,0.,90)}
@@ -273,6 +273,53 @@ def test_formatted_snow_header_and_run_length_data_are_streamed():
     assert _read_formatted_snow_variable(stream,header) is None
 
 
+def test_formatted_snow_variable_requires_matching_valid_timestamps():
+    text=(f'{"SNODAS":<16}{"1.0":<16}{"synthetic":<64}\n'
+          '0\nLL      \nWGS-84  GREGORIAN \nM   \n'
+          '-124.7 52.8 1 1 0.008333 -0.008333\nUTC+0000\nGREGORIAN_YMDHS\n'
+          '-124.729584 52.8704185 6935 3351 0.00833333377 -0.00833333377\n'
+          '1 1 1 1 1\n')
+    block=lambda month,day,hour=0,seconds=0: (
+        f'{2020:4d}{month:3d}{day:3d}{hour:3d} {seconds:04d} ')
+    tail=f'{"SNOWDEP":<8} {0:7d}{100:7d}{-32768:7d}{10.:8.1f}{1:10d}\n{1:7d}\n'
+    header=_read_formatted_snow_header(StringIO(text))
+
+    with pytest.raises(ValueError,match='timestamps do not match'):
+        _read_formatted_snow_variable(
+            StringIO(block(1,2)+block(1,3)+tail),header)
+    with pytest.raises(ValueError,match='second timestamp is invalid'):
+        _read_formatted_snow_variable(
+            StringIO(block(1,2)+block(13,2)+tail),header)
+    with pytest.raises(ValueError,match='must be midnight'):
+        _read_formatted_snow_variable(
+            StringIO(block(1,2,23,3600)+block(1,2,23,3600)+tail),header)
+
+
+@pytest.mark.parametrize(('timestamp','message'),(
+    (datetime(2020,1,1,1),'midnight'),
+    (datetime(2020,1,1,0,1),'midnight'),
+    (datetime(2020,1,1,0,0,1),'midnight'),
+    (datetime(2020,1,1,0,0,0,1),'midnight'),
+    (datetime(2020,1,1,tzinfo=timezone.utc),'timezone-naive'),
+))
+def test_formatted_snow_daily_iterator_rejects_non_midnight_timestamps(
+        tmp_path,monkeypatch,timestamp,message):
+    header=(f'{"SNODAS":<16}{"1.0":<16}{"synthetic":<64}\n0\nLL      \n'
+            'WGS-84  GREGORIAN \nM   \n-124.7 52.8 1 1 0.008333 -0.008333\n'
+            'UTC+0000\nGREGORIAN_YMDHS\n'
+            '-124.729584 52.8704185 6935 3351 0.00833333377 -0.00833333377\n'
+            '1 1 1 1 2\n')
+    source=tmp_path/'snow.dat'; source.write_text(header,encoding='ascii')
+    values=np.ones((1,1),dtype=np.float32)
+    records=iter((SnowVariable(timestamp,'SNOWDEP',values),
+                  SnowVariable(timestamp,'PRECIPS',values)))
+    monkeypatch.setattr('pycalmet._makegeo._read_formatted_snow_variable',
+                        lambda stream,metadata: next(records))
+    with pytest.raises(ValueError,match=message):
+        list(_iter_formatted_snow_days(
+            source,date(2020,1,1),date(2020,1,1)))
+
+
 def test_packed_snow_decoder_rejects_truncated_runs():
     with np.testing.assert_raises_regex(ValueError,'truncated'):
         _expand_packed_snow([-4],0,-32768,1.,4)
@@ -291,7 +338,7 @@ def test_snow_temporal_fill_preserves_all_day_missing_value():
     assert np.isnan(result.item())
 
 
-def test_formatted_snow_daily_iterator_keeps_three_day_window_and_age(tmp_path):
+def test_formatted_snow_daily_iterator_aligns_depth_and_age_to_middle_day(tmp_path):
     header=(f'{"SNODAS":<16}{"1.0":<16}{"synthetic":<64}\n0\nLL      \n'
             'WGS-84  GREGORIAN \nM   \n-124.7 52.8 1 1 0.008333 -0.008333\n'
             'UTC+0000\nGREGORIAN_YMDHS\n'
@@ -306,13 +353,14 @@ def test_formatted_snow_daily_iterator_keeps_three_day_window_and_age(tmp_path):
     for day,depth,precipitation in ((1,10,2),(2,-32768,0),(3,30,0),(4,40,2)):
         body+=variable(day,'SNOWDEP',depth)+variable(day,'PRECIPS',precipitation)
     source=tmp_path/'snow.dat'; source.write_text(header+body,encoding='ascii')
-    days=list(_iter_formatted_snow_days(source,20200102,20200103))
+    days=list(_iter_formatted_snow_days(
+        source,date(2020,1,2),date(2020,1,3)))
     assert [item[0].day for item in days]==[2,3]
     assert days[0][1].item()==2.
     assert days[1][1].item()==3.
-    # RDSN returns the next day's already-updated NDSNOW array.
-    assert days[0][2].item()==2
-    assert days[1][2].item()==0
+    assert days[0][2].item()==1
+    # Day 4 snowfall may fill day 3 depth, but must not reset day 3 snow age.
+    assert days[1][2].item()==2
     assert days[0][3].i_begin==1
 
 
@@ -345,7 +393,8 @@ def test_makegeo_public_run_writes_one_dated_file_per_snow_day(
     snowy={11:(.1,.8,2.,.3,0.,.5,10)}
     result=run(MakegeoConfig('unused',land,tmp_path/output_name,grid,use_terrain=False,
         input_properties=normal,snow_processing=True,snow_data=snow_data,
-        snow_start_date=20200102,snow_end_date=20200102,snow_properties=snowy,
+        snow_start_date=date(2020,1,2),snow_end_date=date(2020,1,2),
+        snow_properties=snowy,
         snow_age_parameters={11:(10,.1)},snow_roughness_method=2,
         snow_albedo_method=2,water_categories=(),output_categories=(10,),
         missing_category=11))

@@ -97,7 +97,7 @@ def format_wind_number_map(values):
 
 
 class WindPrintWriter:
-    """Write ``IPR5..IPR8`` stage maps to legacy ``TEST.PRT``."""
+    """Write the requested wind-module diagnostic maps to ``TEST.PRT``."""
 
     def __init__(self,path,fields,levels=None):
         target=Path(path); target.parent.mkdir(parents=True,exist_ok=True)
@@ -119,6 +119,25 @@ class WindPrintWriter:
                 f'\n     Y-COMPONENT OF WIND (V) AT LEVEL = {level+1:4d}     (M/SEC)\n'
                 '     '+'-'*49+'\n')
             self.stream.write(format_wind_number_map(v[level]))
+
+    def _speed_direction(self,u,v):
+        """Print final horizontal-wind speed and meteorological direction."""
+        u=np.asarray(u); v=np.asarray(v)
+        levels=u.shape[0] if self.levels is None else min(int(self.levels),u.shape[0])
+        for level in range(levels):
+            speed=np.hypot(u[level],v[level])
+            direction=np.mod(
+                270.-np.rad2deg(np.arctan2(v[level],u[level])),360.)
+            direction=np.where(
+                speed<1.e-5,0.,np.where(direction==0.,360.,direction))
+            self.stream.write(
+                f'\n\n     WIND SPEED (M/S) AT LEVEL = {level+1:4d}\n'
+                '     '+'-'*26+'\n')
+            self.stream.write(format_wind_number_map(speed))
+            self.stream.write(
+                f'\n\n     WIND DIRECTION (DEGREES) AT LEVEL = {level+1:4d}\n'
+                '     '+'-'*34+'\n')
+            self.stream.write(format_wind_number_map(direction))
 
     def append(self,hour):
         current=hour.timestamp.replace(minute=0,second=0,microsecond=0)
@@ -173,6 +192,12 @@ class WindPrintWriter:
                     f'\n\n     DIVERGENCE AT LEVEL = {level+1:4d}\n'
                     '     '+'-'*24+'\n')
                 self.stream.write(format_wind_number_map(hour.wind.divergence[level]))
+        if self.fields[3]:
+            time=float((nh-1)*100)
+            self.stream.write(
+                f'\n          FINAL WIND SPEED AND DIRECTION AT TIME = {time:7.0f}.'
+                f'     (SIMULATION HOUR NO.{nh:3d} )\n          '+72*'-'+'\n')
+            self._speed_direction(hour.wind.u,hour.wind.v)
         self.stream.flush()
 
     def close(self):

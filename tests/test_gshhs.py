@@ -4,11 +4,13 @@ import numpy as np
 from netCDF4 import Dataset
 import pytest
 from pyproj import Transformer
+from shapely import box
+from shapely.geometry import Polygon
 
 from pycalmet._ctgproc import _read_coastline_bln,run
 from pycalmet.config import CtgprocConfig,GridConfig
-from pycalmet.gshhs import (boundary_side,clip_coast_polygon,extract_gshhs,
-                            iter_gshhs)
+from pycalmet.gshhs import (GshhsHeader,GshhsPolygon,boundary_side,
+                            clip_coast_polygon,extract_gshhs,iter_gshhs)
 from pycalmet.projections import geographic_crs,grid_crs
 
 
@@ -72,26 +74,82 @@ def test_boundary_side_matches_iside_ties_and_inside_rules():
                                   [1,2,3,4,1,3,2,2])
 
 
-def test_clip_coast_polygon_retains_outside_endpoints_and_closes_land():
+def test_clip_coast_polygon_matches_shapely_box_intersection():
     longitude=np.array([-.5,.2,.8,1.5,1.5,-.5])
     latitude=np.array([.2,.2,.8,.8,-.5,-.5])
-    result=clip_coast_polygon(longitude,latitude,longitude,latitude,1,
-                              (0.,1.,0.,1.),(0.,1.,0.,1.))
-    np.testing.assert_array_equal(result,np.array([
-        [-.5,.2],[.2,.2],[.8,.8],[1.5,.8],[1.,1.],[0.,1.],[0.,0.],[-.5,.2]
-    ]))
+    result,=clip_coast_polygon(longitude,latitude,longitude,latitude,1,
+                               (0.,1.,0.,1.),(0.,1.,0.,1.))
+    expected=Polygon(np.column_stack((longitude,latitude))).intersection(box(0.,0.,1.,1.))
+    assert Polygon(result).equals(expected)
+    assert result.dtype==np.float64
+    assert np.all(result>=0.) and np.all(result<=1.)
 
 
 def test_clip_surrounding_polygon_uses_level_direction():
     longitude=np.array([-2.,-2.,.5,2.,2.,2.,.5,-2.,-2.])
     latitude=np.array([.5,-2.,-2.,-2.,.5,2.,2.,2.,.5])
-    # The old surround test also requires observations on all four nearest sides.
-    land=clip_coast_polygon(longitude,latitude,longitude,latitude,1,
-                            (0.,1.,0.,1.),(0.,1.,0.,1.),(-2.,2.,-2.,2.))
-    water=clip_coast_polygon(longitude[::-1],latitude[::-1],longitude[::-1],latitude[::-1],2,
+    land,=clip_coast_polygon(longitude,latitude,longitude,latitude,1,
                              (0.,1.,0.,1.),(0.,1.,0.,1.),(-2.,2.,-2.,2.))
-    np.testing.assert_array_equal(land,[[0.,0.],[1.,0.],[1.,1.],[0.,1.],[0.,0.]])
-    np.testing.assert_array_equal(water,[[0.,1.],[1.,1.],[1.,0.],[0.,0.],[0.,1.]])
+    water,=clip_coast_polygon(longitude[::-1],latitude[::-1],longitude[::-1],latitude[::-1],2,
+                              (0.,1.,0.,1.),(0.,1.,0.,1.),(-2.,2.,-2.,2.))
+    assert Polygon(land).equals(box(0.,0.,1.,1.))
+    assert Polygon(water).equals(box(0.,0.,1.,1.))
+    signed_area=lambda points: .5*np.sum(
+        points[:-1,0]*points[1:,1]-points[1:,0]*points[:-1,1])
+    assert signed_area(land)>0.
+    assert signed_area(water)<0.
+
+
+def test_clip_boundary_only_contact_does_not_create_polygon():
+    longitude=np.array([1.,2.,2.,1.])
+    latitude=np.array([0.,0.,1.,1.])
+    result=clip_coast_polygon(longitude,latitude,longitude,latitude,1,
+                              (0.,1.,0.,1.),(0.,1.,0.,1.))
+    assert result==()
+
+
+def test_clip_coast_polygon_preserves_all_disconnected_components():
+    source=(box(0.,-1.,1.2,-.2).union(box(0.,.2,1.2,1.)).union(
+        box(1.,-1.,2.,1.)))
+    coordinates=np.asarray(source.exterior.coords)
+    parts=clip_coast_polygon(
+        coordinates[:,0],coordinates[:,1],coordinates[:,0],coordinates[:,1],1,
+        (0.,.9,-2.,2.),(0.,.9,-2.,2.),
+    )
+    expected=source.intersection(box(0.,-2.,.9,2.))
+    assert len(parts)==2
+    assert sum(Polygon(part).area for part in parts)==pytest.approx(expected.area)
+
+
+def test_extract_gshhs_writes_each_clipped_component_as_a_bln_record(
+        tmp_path,monkeypatch):
+    geometry=(box(0.,-1.,1.2,-.2).union(box(0.,.2,1.2,1.)).union(
+        box(1.,-1.,2.,1.)))
+    coordinates=np.asarray(geometry.exterior.coords)
+    header=GshhsHeader(
+        9,len(coordinates),1,0,2_000_000,-1_000_000,1_000_000,100,10,
+        False,1,
+    )
+    polygon=GshhsPolygon(header,coordinates[:,0],coordinates[:,1])
+    monkeypatch.setattr('pycalmet.gshhs.iter_gshhs',lambda source: iter((polygon,)))
+    monkeypatch.setattr(
+        'pycalmet.gshhs.unproject_geographic',
+        lambda x,y,*args,**kwargs: (np.asarray(x),np.asarray(y)),
+    )
+    monkeypatch.setattr(
+        'pycalmet.gshhs.datum_shift',
+        lambda lon,lat,**kwargs: (np.asarray(lon),np.asarray(lat),np.zeros(np.shape(lon))),
+    )
+    monkeypatch.setattr(
+        'pycalmet.gshhs.project_geographic',
+        lambda lon,lat,*args,**kwargs: (np.asarray(lon),np.asarray(lat)),
+    )
+    grid=GridConfig(1,1,.9,4.,x_origin_km=0.,y_origin_km=-2.)
+    output=tmp_path/'components.bln'
+    assert extract_gshhs(tmp_path/'unused.b',output,grid)==2
+    polygons=_read_coastline_bln(output,grid)
+    assert len(polygons)==2
+    assert all(polygon.kind==1 for polygon in polygons)
 
 
 def test_extract_gshhs_projects_closes_and_writes_readable_bln(tmp_path):

@@ -2,17 +2,20 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import rasterio
 import tifffile
 from netCDF4 import Dataset
 from pyproj import CRS,Transformer
+from rasterio.transform import from_origin
 
 from pycalmet._ctgproc import (CORINE_TO_USGS,GLAZ_SPECS,GLAZ_TO_USGS,NZ_TO_USGS,USGS38,
                                QA_FILENAMES,SnowGridInfo,
                                CoastPolygon,_coastline_types,_corine_indices,_geotiff_geometry,_polygon_membership,_read_coastline_bln,
-                               _fractions_from_counts,_grid_centers_1d,_grid_indices,_low_hit_threshold,_merge_global_counts,_mesh_coordinates,_mesh_offsets,_select_glaz_markers,_snow_grid_indices,_source_centers,
+                               _fractions_from_counts,_grid_centers_1d,_grid_indices,_low_hit_threshold,_merge_global_counts,_mesh_coordinates,_mesh_offsets,_read_categorical_raster,_select_glaz_markers,_snow_grid_indices,_source_centers,
                                _swap_coastline_categories,_window,_write_legacy,run)
 from pycalmet.config import CtgprocConfig,CtgprocSource,GridConfig
 from pycalmet.ctg_data import NLCD92_SPECS,ModisSpec,Nlcd92Spec
+from pycalmet.legacy._compat import _ctgproc as legacy_ctgproc
 from pycalmet.projections import geographic_crs,grid_crs
 
 
@@ -27,6 +30,23 @@ def test_glaz_translation_is_the_legacy_table():
     assert np.all(np.diff(USGS38) > 0)
 
 
+def test_landuse_fractions_use_fp32_model_dtype():
+    totals,fractions=_fractions_from_counts(
+        np.array([[[1,0]],[[3,0]]],dtype=np.int64))
+    assert fractions.dtype==np.float32
+    np.testing.assert_array_equal(totals,[[4,0]])
+    np.testing.assert_array_equal(fractions[:,0,0],[.25,.75])
+
+
+def test_grid_indices_use_floor_at_and_below_negative_boundaries():
+    grid=GridConfig(2,2,1.,1.)
+    coordinate=np.array([-1.,-1.+1.e-12,-1.e-12,0.,1.e-12,.999999999,1.])
+    ix,iy=_grid_indices(coordinate,coordinate,grid)
+    expected=np.array([-1,-1,-1,0,0,0,1])
+    np.testing.assert_array_equal(ix,expected)
+    np.testing.assert_array_equal(iy,expected)
+
+
 def test_geotiff_orientation_four_uses_bottom_to_top_rows():
     x0,y0,dx,dy,_=_geotiff_geometry(
         (30.,30.,0.),(0.,0.,0.,500000.,4000000.,0.),1,
@@ -34,13 +54,21 @@ def test_geotiff_orientation_four_uses_bottom_to_top_rows():
     np.testing.assert_allclose([x0,y0,dx,dy],[500.015,4000.015,.03,.03])
 
 
-def test_pnpoly_preserves_legacy_vertex_edge_and_inside_states():
+def test_shapely_polygon_membership_uses_standard_boundary_states():
     polygon=CoastPolygon(1,np.array([0.,2.,2.,0.],dtype=np.float32),
                           np.array([0.,0.,2.,2.],dtype=np.float32))
     actual=_polygon_membership(
         np.array([1.,3.,0.,1.,2.],dtype=np.float32),
         np.array([1.,1.,0.,0.,1.],dtype=np.float32),polygon)
     np.testing.assert_array_equal(actual,[1,-1,0,0,0])
+
+
+def test_shapely_polygon_membership_does_not_inherit_legacy_fp32_edge_rounding():
+    polygon=CoastPolygon(
+        1,np.array([10000.,10002.,10002.,10000.]),np.array([0.,0.,2.,2.]))
+    x=np.array([9999.9999]); y=np.array([1.])
+    np.testing.assert_array_equal(_polygon_membership(x,y,polygon),[-1])
+    np.testing.assert_array_equal(legacy_ctgproc._polygon_membership(x,y,polygon),[0])
 
 
 def test_six_continental_glaz_specs_match_fortran_tables():
@@ -76,28 +104,56 @@ def test_snow_grid_information_uses_sparse_sample_hits(tmp_path,monkeypatch):
     assert fields[9:]==['8','1','2','0.333']
 
 
-def test_snow_grid_hits_preserve_fortran_jp_index_bug_and_insertion_order(monkeypatch):
+def test_snow_grid_hits_use_matching_grid_while_legacy_preserves_jp_index_bug(monkeypatch):
     grid=GridConfig(1,1,1.,1.)
     snow=SnowGridInfo.create(grid)
+    legacy_snow=legacy_ctgproc.SnowGridInfo.create(grid)
     longitude=-124.729584+np.array([0.,1.,0.,0.])*8.33333377e-3
     monkeypatch.setattr('pycalmet._ctgproc.unproject_geographic',
         lambda x,y,grid,target_datum,units:(longitude,np.full(4,52.8704185)))
-    snow.add(np.full(4,.1),np.full(4,.1),np.full(4,11),np.ones(4,dtype=bool))
+    monkeypatch.setattr('pycalmet.legacy._compat._ctgproc.unproject_geographic',
+        lambda x,y,grid,target_datum,units:(longitude,np.full(4,52.8704185)))
+    args=(np.full(4,.1),np.full(4,.1),np.full(4,11),np.ones(4,dtype=bool))
+    snow.add(*args)
+    legacy_snow.add(*args)
     grouped,totals=snow.records(USGS38)
-    assert grouped[0,1]==[(1,1),(2,3)]
+    legacy_grouped,legacy_totals=legacy_snow.records(USGS38)
+    assert grouped[0,1]==[(1,3),(2,1)]
+    assert legacy_grouped[0,1]==[(1,1),(2,3)]
     assert totals.item()==4
+    np.testing.assert_array_equal(legacy_totals,totals)
 
 
-def test_snow_processing_requires_final_non_generic_run(tmp_path):
-    source=tmp_path/'generic.dat'
-    source.write_text('GENERIC.LANDUSE\n0\nLL\nWGS-84\nDEG\n1\n11\n',encoding='ascii')
+def test_snow_grid_information_has_no_fixed_ten_grid_limit(monkeypatch):
     grid=GridConfig(1,1,1.,1.)
-    with pytest.raises(ValueError,match='final run'):
-        run(CtgprocConfig([source],tmp_path/'out',grid,input_type='GEN',
-                          snow_processing=True,final_output=False))
-    with pytest.raises(ValueError,match='GENERIC'):
-        run(CtgprocConfig([source],tmp_path/'out',grid,input_type='GEN',
-                          snow_processing=True))
+    snow=SnowGridInfo.create(grid)
+    longitude=-124.729584+np.arange(11)*8.33333377e-3
+    monkeypatch.setattr('pycalmet._ctgproc.unproject_geographic',
+        lambda x,y,grid,target_datum,units:(longitude,np.full(11,52.8704185)))
+    snow.add(np.full(11,.1),np.full(11,.1),np.full(11,11),
+             np.ones(11,dtype=bool))
+    grouped,totals=snow.records(USGS38)
+    assert len(grouped[0,1])==11
+    assert totals.item()==11
+
+
+def test_generic_snow_processing_supports_intermediate_output_and_category_map(tmp_path):
+    source=tmp_path/'generic.dat'
+    source.write_text('GENERIC.LANDUSE\n0\nLL\nWGS-84\nDEG\n2\n7 42\n'
+                      '7 0 0\n42 0 0\n',encoding='ascii')
+    grid=GridConfig(1,1,2.,2.,projection='LAZA',lat0=0.,lon0=0.,
+                    x_origin_km=-1.,y_origin_km=-1.)
+    output=tmp_path/'out.nc'
+    run(CtgprocConfig([source],output,grid,input_type='GEN',snow_processing=True,
+                      final_output=False,category_map={7:10,42:10}))
+    with Dataset(output) as dataset:
+        assert dataset.landuse_file_type=='HITS'
+        np.testing.assert_array_equal(dataset['landuse_category'][:],[10])
+        assert dataset['sample_count'][0,0,0]==2
+        assert len(dataset.dimensions['snow_record'])==1
+        assert dataset['snow_landuse_index'][0]==1
+        assert dataset['snow_sample_count'][0]==2
+        assert dataset['snow_fraction'][0]==1.
 
 
 def test_multiple_glaz_files_accumulate_before_fraction_output(tmp_path,monkeypatch):
@@ -115,7 +171,7 @@ def test_multiple_glaz_files_accumulate_before_fraction_output(tmp_path,monkeypa
     assert calls==['a.img','b.img'] and result.source_cells_read==2
 
 
-def test_mixed_sources_follow_fortran_type_order_and_own_settings(tmp_path,monkeypatch):
+def test_mixed_sources_follow_declared_order_and_own_settings(tmp_path,monkeypatch):
     calls=[]
     def fake_global(path,config,*args,**kwargs):
         calls.append((config.input_type,config.input_datum,config.mesh_density))
@@ -133,7 +189,7 @@ def test_mixed_sources_follow_fortran_type_order_and_own_settings(tmp_path,monke
              CtgprocSource(tmp_path/'glc','GLC2K','WGS-84',5))
     result=run(CtgprocConfig([],tmp_path/'mixed.nc',GridConfig(1,1,1.,1.),
                              landuse_sources=sources))
-    assert calls==[('GLC2K','WGS-84',5),('CTG','NAS-C',3)]
+    assert calls==[('CTG','NAS-C',3),('GLC2K','WGS-84',5)]
     with Dataset(result.output) as dataset:
         categories=dataset['landuse_category'][:]
         indices=[np.where(categories==value)[0].item() for value in (11,21)]
@@ -174,11 +230,27 @@ def test_global_merge_drops_water_over_land_and_replaces_water_with_land():
                                   [[2,5,0],[0,0,13]])
 
 
-def test_global_input_is_rejected_after_a_continuation_grid(tmp_path):
-    source=tmp_path/'global.img'; source.write_bytes(b'x')
-    with pytest.raises(ValueError,match='first continuation run'):
-        run(CtgprocConfig([source],tmp_path/'out.nc',GridConfig(1,1,1.,1.),
-                          input_type='GLAZAS',previous_landuse=tmp_path/'previous.nc'))
+def test_global_input_can_merge_after_a_continuation_grid(tmp_path,monkeypatch):
+    grid=GridConfig(1,1,2.,2.,projection='LAZA',lat0=0.,lon0=0.,
+                    x_origin_km=-1.,y_origin_km=-1.)
+    points=tmp_path/'water.dat'; points.write_text('1 1 0 0\n',encoding='ascii')
+    previous=tmp_path/'previous.nc'
+    run(CtgprocConfig([points],previous,grid,input_type='NZGEN',
+                      input_datum='WGS-84',final_output=False))
+    source=tmp_path/'global.tif'; source.write_bytes(b'x')
+    def fake_global(path,config,*args,**kwargs):
+        counts=np.zeros((len(USGS38),1,1),dtype=np.int64)
+        counts[np.where(USGS38==11)[0].item(),0,0]=3
+        return counts,1,1
+    monkeypatch.setattr('pycalmet._ctgproc._accumulate_global_geotiff',fake_global)
+    output=tmp_path/'out.nc'
+    run(CtgprocConfig([source],output,grid,input_type='UMDGLC',
+                      previous_landuse=previous))
+    with Dataset(output) as dataset:
+        land=np.where(dataset['landuse_category'][:]==11)[0].item()
+        water=np.where(dataset['landuse_category'][:]==55)[0].item()
+        assert dataset['sample_count'][land,0,0]==3
+        assert dataset['sample_count'][water,0,0]==1
 
 
 def test_coastline_fill_only_sets_empty_cells_whose_centers_are_ocean(tmp_path,monkeypatch):
@@ -403,11 +475,15 @@ def test_global_geotiff_meshes_pixels_and_translates_classes(
     keys=(1,1,0,3,1024,0,1,2,1025,0,1,raster_type,2048,0,1,4326)
     tags=[
         (33550,'d',3,(.01,.01,0.),False),
-        (33922,'d',6,(0.,0.,0.,-.02,.02,0.),False)]
-    if kind!='GLC2K': tags.append((34735,'H',len(keys),keys,False))
+        (33922,'d',6,(0.,0.,0.,-.02,.02,0.),False),
+        (34735,'H',len(keys),keys,False)]
     tifffile.imwrite(source,np.asarray(values,dtype='u1'),extratags=tags)
-    grid=GridConfig(1,1,2.,2.,projection='LAZA',lat0=0.,lon0=0.,
-                    x_origin_km=-2.,y_origin_km=0.)
+    if kind=='GLC2K':
+        _,x0,y0,dx,dy,_,_,valid=_read_categorical_raster(source)
+        np.testing.assert_allclose([x0,y0,dx,dy],[-.02,.02,.01,-.01])
+        assert valid.all()
+    grid=GridConfig(1,1,3.,3.,projection='LAZA',lat0=0.,lon0=0.,
+                    x_origin_km=-3.,y_origin_km=0.)
     result=run(CtgprocConfig([source],tmp_path/f'{kind}.nc',grid,input_type=kind,
                              mesh_density=2))
     with Dataset(result.output) as dataset:
@@ -415,6 +491,66 @@ def test_global_geotiff_meshes_pixels_and_translates_classes(
         indices=[np.where(categories==value)[0].item() for value in expected]
         np.testing.assert_allclose(dataset['landuse_fraction'][indices,0,0],fractions)
     assert (result.source_cells_read,result.samples_inside_grid,result.populated_cells)==(4,inside,1)
+
+
+def test_nlcd_geotiff_declared_nodata_is_ignored(tmp_path):
+    source=tmp_path/'nlcd-nodata.tif'
+    with rasterio.open(
+        source,'w',driver='GTiff',width=2,height=2,count=1,dtype='uint8',
+        crs='EPSG:5070',transform=from_origin(0.,60.,30.,30.),nodata=255,
+    ) as dataset:
+        dataset.write(np.array([[22,255],[72,0]],dtype=np.uint8),1)
+    grid=GridConfig(1,1,.06,.06,projection='ACEA',lat0=23.,lon0=-96.,
+                    lat1=29.5,lat2=45.5,datum='NAR-C')
+    result=run(CtgprocConfig([source],tmp_path/'nlcd-nodata.nc',grid,input_type='NLCD01'))
+    with Dataset(result.output) as dataset:
+        categories=dataset['landuse_category'][:]
+        indices=[np.where(categories==value)[0].item() for value in (11,82)]
+        np.testing.assert_allclose(dataset['landuse_fraction'][indices,0,0],[.5,.5])
+    assert (result.source_cells_read,result.samples_inside_grid,result.populated_cells)==(4,2,1)
+
+
+def test_corine_geotiff_declared_nodata_is_ignored(tmp_path):
+    source=tmp_path/'corine-nodata.tif'
+    with rasterio.open(
+        source,'w',driver='GTiff',width=2,height=2,count=1,dtype='uint16',
+        crs='EPSG:4326',transform=from_origin(-.03,.03,.01,.01),nodata=65535,
+    ) as dataset:
+        dataset.write(np.array([[111,65535],[333,0]],dtype=np.uint16),1)
+    grid=GridConfig(1,1,4.,4.,projection='LAZA',lat0=0.,lon0=0.,
+                    x_origin_km=-4.,y_origin_km=0.)
+    result=run(CtgprocConfig([source],tmp_path/'corine-nodata.nc',grid,
+                             input_type='CORINE',mesh_density=1))
+    with Dataset(result.output) as dataset:
+        categories=dataset['landuse_category'][:]
+        indices=[np.where(categories==value)[0].item() for value in (16,83)]
+        np.testing.assert_allclose(dataset['landuse_fraction'][indices,0,0],[.5,.5])
+    assert (result.source_cells_read,result.samples_inside_grid,result.populated_cells)==(4,2,1)
+
+
+@pytest.mark.parametrize(('kind','values','expected','inside'),[
+    ('GLC2K',[[1,255],[24,3]],[42,41],8),
+    ('UMDGLC',[[0,1],[255,14]],[55,42,77],12),
+])
+def test_global_geotiff_declared_nodata_is_ignored(
+        tmp_path,kind,values,expected,inside):
+    source=tmp_path/f'{kind.lower()}-nodata.tif'
+    with rasterio.open(
+        source,'w',driver='GTiff',width=2,height=2,count=1,dtype='uint8',
+        crs='EPSG:4326',transform=from_origin(-.03,.03,.01,.01),nodata=255,
+    ) as dataset:
+        dataset.write(np.asarray(values,dtype=np.uint8),1)
+    grid=GridConfig(1,1,4.,4.,projection='LAZA',lat0=0.,lon0=0.,
+                    x_origin_km=-4.,y_origin_km=0.)
+    result=run(CtgprocConfig([source],tmp_path/f'{kind}-nodata.nc',grid,
+                             input_type=kind,mesh_density=2))
+    with Dataset(result.output) as dataset:
+        categories=dataset['landuse_category'][:]
+        indices=[np.where(categories==value)[0].item() for value in expected]
+        np.testing.assert_allclose(
+            dataset['landuse_fraction'][indices,0,0],np.full(len(expected),1/len(expected)))
+    assert (result.source_cells_read,result.samples_inside_grid,result.populated_cells)==(
+        4,inside,1)
 
 
 def test_corine_supports_index_class_and_rgb_encodings(tmp_path):
@@ -446,19 +582,22 @@ def test_corine_geotiff_runs_through_public_accumulator(tmp_path):
     assert (result.source_cells_read,result.samples_inside_grid,result.populated_cells)==(4,3,1)
 
 
-def test_raw_modis_windows_meshes_and_preserves_itab_overwrite(tmp_path,monkeypatch):
+def test_raw_modis_uses_its_documented_translation_and_qa_file(tmp_path,monkeypatch):
     spec=ModisSpec(2,2,-.015,.015,.01)
     monkeypatch.setattr('pycalmet._ctgproc.MODIS_SPEC',spec)
     source=tmp_path/'modis.bin'; np.array([[1,2],[0,18]],dtype='u1').tofile(source)
     grid=GridConfig(1,1,2.,2.,projection='LAZA',lat0=0.,lon0=0.,datum='ESR-R',
                     x_origin_km=-2.,y_origin_km=0.)
     result=run(CtgprocConfig([source],tmp_path/'modis.nc',grid,input_type='MODIS',
-                             input_datum='ESR-R',mesh_density=2))
+                             input_datum='ESR-R',mesh_density=2,
+                             qa_cell_output=True))
     with Dataset(result.output) as dataset:
         categories=dataset['landuse_category'][:]
-        indices=[np.where(categories==value)[0].item() for value in (16,21,61)]
-        np.testing.assert_allclose(dataset['landuse_fraction'][indices,0,0],[1/3]*3)
+        indices=[np.where(categories==value)[0].item() for value in (42,52)]
+        np.testing.assert_allclose(dataset['landuse_fraction'][indices,0,0],[1/3,2/3])
     assert (result.source_cells_read,result.samples_inside_grid,result.populated_cells)==(4,12,1)
+    assert (tmp_path/'qamodis.dat').stat().st_size>0
+    assert (tmp_path/'qaglaz.dat').stat().st_size==0
 
 
 def test_generic_files_require_matching_category_tables(tmp_path):
@@ -467,9 +606,30 @@ def test_generic_files_require_matching_category_tables(tmp_path):
     first.write_text(header.format(1),encoding='ascii'); second.write_text(header.format(2),encoding='ascii')
     with pytest.raises(ValueError,match='identical category'):
         run(CtgprocConfig([first,second],tmp_path/'out.nc',GridConfig(1,1,1.,1.),input_type='GEN'))
-    with pytest.raises(ValueError,match='GENERIC'):
-        run(CtgprocConfig([first],tmp_path/'coast.nc',GridConfig(1,1,1.,1.),
-                          input_type='GEN',coastline_swap=True))
+
+
+def test_generic_points_support_coastline_reclassification(tmp_path):
+    grid=GridConfig(2,1,2.,2.,projection='LAZA',lat0=0.,lon0=0.,
+                    x_origin_km=-2.,y_origin_km=-1.)
+    inverse=Transformer.from_crs(grid_crs(grid,units='km'),
+                                 geographic_crs('WGS-84'),always_xy=True)
+    left=inverse.transform(-1.,0.); right=inverse.transform(1.,0.)
+    source=tmp_path/'generic.lu'
+    source.write_text('GENERIC.LANDUSE 1.0\n0\nLL\nWGS-84\nDEG\n2\n11 55\n'
+                      f'11 {left[0]} {left[1]}\n11 {right[0]} {right[1]}\n',
+                      encoding='ascii')
+    coastline=tmp_path/'coast.bln'
+    coastline.write_text('5, 1, "1,1,1"\n0,-1\n2,-1\n2,1\n0,1\n0,-1\n',
+                         encoding='ascii')
+    output=tmp_path/'coast.nc'
+    run(CtgprocConfig([source],output,grid,input_type='GEN',
+                      coastline_file=coastline,coastline_swap=True,
+                      fill_empty_ocean=False))
+    with Dataset(output) as dataset:
+        categories=dataset['landuse_category'][:]
+        land=np.where(categories==11)[0].item(); ocean=np.where(categories==55)[0].item()
+        np.testing.assert_array_equal(dataset['sample_count'][land,0,:],[0,1])
+        np.testing.assert_array_equal(dataset['sample_count'][ocean,0,:],[1,0])
 
 
 def test_category_map_merges_source_classes_in_declared_order(tmp_path):
@@ -518,3 +678,22 @@ def test_continuation_hits_round_trip_and_accumulate(tmp_path,extension):
         assert dataset['sample_count'][water,0,0]==2
         assert dataset['landuse_fraction'][water,0,0]==1.
     assert result.populated_cells==1
+
+
+def test_snow_metadata_round_trips_through_modern_continuation(tmp_path):
+    grid=GridConfig(1,1,2.,2.,projection='LAZA',lat0=0.,lon0=0.,
+                    x_origin_km=-1.,y_origin_km=-1.)
+    source=tmp_path/'generic.lu'
+    source.write_text('GENERIC.LANDUSE 1.0\n0\nLL\nWGS-84\nDEG\n1\n11\n'
+                      '11 0 0\n',encoding='ascii')
+    first=tmp_path/'first.nc'
+    run(CtgprocConfig([source],first,grid,input_type='GEN',snow_processing=True,
+                      final_output=False))
+    final=tmp_path/'final.nc'
+    run(CtgprocConfig([source],final,grid,input_type='GEN',snow_processing=True,
+                      previous_landuse=first))
+    with Dataset(final) as dataset:
+        assert dataset['sample_count'][0,0,0]==2
+        assert len(dataset.dimensions['snow_record'])==1
+        assert dataset['snow_sample_count'][0]==2
+        assert dataset['snow_fraction'][0]==1.

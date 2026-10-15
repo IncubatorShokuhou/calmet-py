@@ -15,7 +15,20 @@ from .calmet_numerics import convective_velocity_scale,mesopac_layer_average,pgt
 from .calmet_solver import HourFields,target_latitude_longitude
 from .config import GridConfig
 from .legacy_io import FortranSequentialWriter,fixed_string
-from ._makegeo import _legacy_round
+
+
+def _array_data(value,dtype=None):
+    """Read a netCDF variable or array and apply one dtype conversion."""
+    data=value[:] if hasattr(value,'dimensions') else value
+    return np.asarray(data,dtype=dtype)
+
+
+def _whole_run_hours(start, end, output_name):
+    """Return an exact whole-hour duration for integer legacy headers."""
+    seconds=(end-start).total_seconds()
+    if seconds<0 or seconds%3600:
+        raise ValueError(f'{output_name} output requires a whole-hour run period')
+    return int(seconds/3600)
 
 def _convective_velocity(hour: HourFields,landuse,water_range):
     """Reproduce WATER-before-AVEMIX and land-only WSTARR sequencing."""
@@ -34,16 +47,20 @@ class CalmetNetCDFWriter:
     def __init__(self,path,grid: GridConfig,z_faces_m,geophysical,*,compression=1,water_range=(50,55),run_type=1):
         self.path=Path(path); self.path.parent.mkdir(parents=True,exist_ok=True); self._index=0
         self.dataset=Dataset(self.path,'w',format='NETCDF4'); self.water_range=tuple(water_range); self.run_type=int(run_type)
-        ds=self.dataset; faces=np.asarray(z_faces_m,dtype=float); centers=.5*(faces[:-1]+faces[1:])
+        ds=self.dataset
+        faces=np.asarray(z_faces_m,dtype=np.float32)
+        centers=np.float32(.5)*(faces[:-1]+faces[1:])
         ds.createDimension('time',None); ds.createDimension('level',centers.size); ds.createDimension('face',faces.size); ds.createDimension('y',grid.ny); ds.createDimension('x',grid.nx)
         ds.Conventions='CF-1.8'; ds.source='PyCALMET NumPy solver'; ds.pycalmet_stage='calmet'; ds.projection=grid.projection
         ds.water_category_min=int(self.water_range[0]); ds.water_category_max=int(self.water_range[1])
         time=ds.createVariable('time','f8',('time',)); time.units='seconds since 1970-01-01 00:00:00'; time.calendar='standard'
         for name,data,units in (('level_height',centers,'m'),('face_height',faces,'m')):
-            variable=ds.createVariable(name,'f4',('level' if name=='level_height' else 'face',)); variable.units=units; variable[:]=data
+            variable=ds.createVariable(name,'f4',('level' if name=='level_height' else 'face',)); variable.units=units; variable[:]=np.asarray(data,dtype=np.float32)
         latitude,longitude=target_latitude_longitude(grid)
-        static=(('latitude',latitude,'degrees_north','f4'),('longitude',longitude,'degrees_east','f4'),
-                ('terrain_height',np.asarray(geophysical['terrain_height']),'m','f4'),('landuse',np.asarray(geophysical['dominant_landuse']),'1','i2'))
+        static=(('latitude',np.asarray(latitude,dtype=np.float64),'degrees_north','f8'),
+                ('longitude',np.asarray(longitude,dtype=np.float64),'degrees_east','f8'),
+                ('terrain_height',_array_data(geophysical['terrain_height'],np.float32),'m','f4'),
+                ('landuse',_array_data(geophysical['dominant_landuse'],np.int16),'1','i2'))
         for name,data,units,dtype in static:
             variable=ds.createVariable(name,dtype,('y','x'),zlib=True,complevel=compression); variable.units=units; variable[:]=data
         variables=(
@@ -51,7 +68,7 @@ class CalmetNetCDFWriter:
             *(() if self.run_type==0 else (
             ('vertical_velocity','f4',('time','face','y','x'),'m s-1'),('temperature','f4',('time','level','y','x'),'K'),
             ('relative_humidity','f4',('time','level','y','x'),'%'),('cloud_fraction','f4',('time','y','x'),'1'),
-            ('surface_relative_humidity','i1',('time','y','x'),'%'),
+            ('surface_relative_humidity','f4',('time','y','x'),'%'),
             ('precipitation_rate','f4',('time','y','x'),'mm h-1'),('precipitation_code','i1',('time','y','x'),'1'),
             ('ceiling_height','f4',('time','y','x'),'m'),('surface_temperature','f4',('time','y','x'),'K'),
             ('surface_density','f4',('time','y','x'),'kg m-3'),('shortwave_flux','f4',('time','y','x'),'W m-2'),
@@ -65,8 +82,10 @@ class CalmetNetCDFWriter:
     def append(self,hour: HourFields,solar_elevation_sine,landuse):
         ds=self.dataset; i=self._index; step=hour.step1; surface=hour.surface
         ds['time'][i]=date2num(hour.timestamp,ds['time'].units,ds['time'].calendar)
-        ds['wind_u'][i]=hour.wind.u; ds['wind_v'][i]=hour.wind.v
-        if self.run_type==0: ds.sync(); self._index+=1; return
+        if self.run_type==0:
+            ds['wind_u'][i]=np.asarray(hour.wind.u,dtype=np.float32)
+            ds['wind_v'][i]=np.asarray(hour.wind.v,dtype=np.float32)
+            ds.sync(); self._index+=1; return
         values={'wind_u':hour.wind.u,'wind_v':hour.wind.v,'vertical_velocity':hour.wind.w,
             'temperature':hour.temperature,'relative_humidity':step.relative_humidity,
             'cloud_fraction':step.cloud_fraction,'ceiling_height':step.ceiling_height,
@@ -76,9 +95,17 @@ class CalmetNetCDFWriter:
             'shortwave_flux':surface.shortwave_flux,'sensible_heat_flux':surface.sensible_heat_flux,
             'friction_velocity':surface.friction_velocity,'monin_obukhov_length':surface.monin_obukhov_length,
             'mixing_height':surface.mixing_height,'convective_mixing_height':surface.convective_mixing_height}
-        for name,value in values.items(): ds[name][i]=np.asarray(value)
+        integer_fields={'precipitation_code'}
+        for name,value in values.items():
+            dtype=np.int8 if name in integer_fields else np.float32
+            ds[name][i]=np.asarray(value,dtype=dtype)
         ds['convective_velocity_scale'][i]=_convective_velocity(hour,landuse,self.water_range)
-        ds['pgt_stability_class'][i]=pgt_stability(hour.wind.u[0],hour.wind.v[0],solar_elevation_sine,step.cloud_fraction,step.ceiling_height,landuse,surface.monin_obukhov_length,water_range=self.water_range)
+        ds['pgt_stability_class'][i]=np.asarray(
+            pgt_stability(hour.wind.u[0],hour.wind.v[0],solar_elevation_sine,
+                          step.cloud_fraction,step.ceiling_height,landuse,
+                          surface.monin_obukhov_length,water_range=self.water_range),
+            dtype=np.int8,
+        )
         ds.sync(); self._index+=1
 
     def close(self):
@@ -93,6 +120,7 @@ class MesopacWriter:
     def __init__(self,path,grid: GridConfig,z_faces_m,geophysical,start,end,*,
                  timezone_offset=0,surface_coordinates_m=(),upper_coordinates_m=(),
                  nearest_surface_station=None,water_range=(50,55)):
+        hours=_whole_run_hours(start,end,'MESOPAC')
         self.writer=FortranSequentialWriter(path); self.grid=grid
         self.faces=np.asarray(z_faces_m,dtype=np.float32)
         self.landuse=self._array(geophysical['dominant_landuse'])
@@ -105,9 +133,6 @@ class MesopacWriter:
         nearest=np.zeros(shape,dtype=np.int32) if nearest_surface_station is None else np.asarray(nearest_surface_station)
         if nearest.shape!=shape:
             raise ValueError('MESOPAC nearest-station grid does not match the CALMET grid')
-        hours=int((end-start).total_seconds()//3600)
-        if end<start or end-start!=timedelta(hours=hours):
-            raise ValueError('MESOPAC output requires a whole-hour run period')
         spacing=np.float32(grid.dx_km*1000.)
         if grid.dx_km!=grid.dy_km:
             raise ValueError('MESOPAC output requires square horizontal cells')
@@ -179,13 +204,16 @@ class AuxiliaryCalmetWriter:
     def __init__(self,path,grid: GridConfig,z_faces_m,start,end,*,
                  control_lines=(),base_timezone='UTC-0000',available=True,
                  timestep_seconds=3600):
+        run_hours=(_whole_run_hours(start,end,'CALMET.AUX')
+                   if available else None)
         self.writer=FortranSequentialWriter(path)
         self.grid=grid
         self.faces=np.asarray(z_faces_m,dtype=np.float32)
         self.available=bool(available)
         self.timestep_seconds=int(timestep_seconds)
         if self.available:
-            self._write_header(start,end,list(control_lines),base_timezone)
+            self._write_header(start,end,list(control_lines),base_timezone,
+                               run_hours)
 
     @staticmethod
     def _i(*values): return struct.pack('<'+'i'*len(values),*values)
@@ -201,7 +229,12 @@ class AuxiliaryCalmetWriter:
     def _date_parts(value):
         return value.year,value.month,value.day,value.hour,value.minute*60+value.second
 
-    def _write_header(self,start,end,control_lines,base_timezone):
+    @classmethod
+    def _time_bounds(cls,begin,end):
+        return cls._i(cls._stamp(begin),begin.minute*60+begin.second,
+                      cls._stamp(end),end.minute*60+end.second)
+
+    def _write_header(self,start,end,control_lines,base_timezone,hours):
         writer=self.writer; grid=self.grid
         writer.write_record(fixed_string('CALMET.AUX',16),fixed_string('1.1',16),
             fixed_string('Generic file structure with compression',64))
@@ -209,7 +242,6 @@ class AuxiliaryCalmetWriter:
         writer.write_record(self._i(len(comments)))
         for line in comments:
             writer.write_record(fixed_string(line.rstrip('\n'),132))
-        hours=int((end-start).total_seconds()//3600)
         run=(self._i(*self._date_parts(start),*self._date_parts(end))+
              fixed_string(base_timezone,8)+self._i(hours,grid.nx,grid.ny,self.faces.size-1)+
              self._f(grid.dx_km*1000.,grid.x_origin_km*1000.,grid.y_origin_km*1000.)+
@@ -266,9 +298,8 @@ class AuxiliaryCalmetWriter:
         if any(field is None for field in fields) or step.cloud_liquid_water_3d is None:
             raise ValueError('CALMET.AUX output requires prognostic cloud-water fields')
         begin=hour.timestamp
-        begin_seconds=begin.minute*60+begin.second
-        timestamp=self._i(self._stamp(begin),begin_seconds,
-                          self._stamp(begin),begin_seconds+self.timestep_seconds)
+        end=begin+timedelta(seconds=self.timestep_seconds)
+        timestamp=self._time_bounds(begin,end)
         for (name,_,_),field in zip(self._fields_2d,fields):
             self.writer.write_record(timestamp)
             self._compressed(name,field)
@@ -291,6 +322,7 @@ class LegacyCalmetWriter:
                  precipitation_station_count=-1,surface_coordinates_km=(),upper_coordinates_km=(),
                  precipitation_coordinates_km=(),nearest_surface_station=None,
                  iwfcod=1,sea_station_count=0):
+        run_hours=_whole_run_hours(start,end,'CALMET')
         self.writer=FortranSequentialWriter(path); self.grid=grid; self.faces=np.asarray(z_faces_m,dtype='<f4'); self.include_w_temperature=include_w_temperature
         self.water_range=tuple(water_range); self.landuse_category_count=int(landuse_category_count)
         self.run_type=int(run_type)
@@ -320,7 +352,8 @@ class LegacyCalmetWriter:
                 raise ValueError('nearest surface-station index is out of range')
         if self.precipitation_station_count>0 and len(self.precipitation_coordinates)!=self.precipitation_station_count:
             raise ValueError('precipitation coordinates must match positive NPSTA')
-        self.landuse=self._array(geophysical['dominant_landuse']); self._write_header(geophysical,start,end,list(control_lines),base_timezone)
+        self.landuse=self._array(geophysical['dominant_landuse']); self._write_header(
+            geophysical,start,end,list(control_lines),base_timezone,run_hours)
 
     @staticmethod
     def _array(value): return np.asarray(value[:] if hasattr(value,'dimensions') else value)
@@ -336,22 +369,25 @@ class LegacyCalmetWriter:
 
     def _field_record(self,label,data,begin=None,end=None,integer=False):
         if begin is None:
+            if end is not None:
+                raise ValueError('CALMET field end time requires a begin time')
             times=self._i(0,0,0,0)
         else:
-            begin_seconds=begin.minute*60+begin.second
-            times=self._i(self._stamp(begin),begin_seconds,
-                          self._stamp(begin),begin_seconds+self.timestep_seconds)
+            if end is None:
+                raise ValueError('CALMET field begin time requires an end time')
+            times=self._i(self._stamp(begin),begin.minute*60+begin.second,
+                          self._stamp(end),end.minute*60+end.second)
         dtype='<i4' if integer else '<f4'; array=self._array(data).astype(dtype,copy=False)
         self.writer.write_record(fixed_string(label,8),times,array.ravel(order='C'))
 
-    def _write_header(self,geo,start,end,control_lines,base_timezone):
+    def _write_header(self,geo,start,end,control_lines,base_timezone,run_hours):
         w=self.writer; g=self.grid
         w.write_record(fixed_string('CALMET.DAT',16),fixed_string('2.1',16),fixed_string('No-Obs file structure with embedded control file',64))
         comments=['Produced by PyCALMET NumPy implementation','Internal Coordinate Transformations: pyproj/PROJ']+control_lines
         w.write_record(self._i(len(comments)))
         for line in comments: w.write_record(fixed_string(line.rstrip('\n'),132))
         run=self._i(*self._date_parts(start),*self._date_parts(end))+fixed_string(base_timezone,8)
-        run+=self._i(int((end-start).total_seconds()//3600),self.run_type,g.nx,g.ny,self.faces.size-1)
+        run+=self._i(run_hours,self.run_type,g.nx,g.ny,self.faces.size-1)
         run+=self._f(g.dx_km*1000.,g.x_origin_km*1000.,g.y_origin_km*1000.)
         run+=self._i(self.iwfcod,len(self.surface_coordinates),len(self.upper_coordinates),
                      self.precipitation_station_count,self.sea_station_count,self.landuse_category_count,
@@ -370,10 +406,10 @@ class LegacyCalmetWriter:
         if len(self.precipitation_coordinates):
             self._field_record('XPSTA',self.precipitation_coordinates[:,0]*1000.)
             self._field_record('YPSTA',self.precipitation_coordinates[:,1]*1000.)
-        self._field_record('Z0',_legacy_round(self._array(geo['roughness_length']),4))
+        self._field_record('Z0',self._array(geo['roughness_length']))
         self._field_record('ILANDU',geo['dominant_landuse'],integer=True)
-        self._field_record('ELEV',_legacy_round(self._array(geo['terrain_height']),2))
-        self._field_record('XLAI',_legacy_round(self._array(geo['leaf_area_index']),2))
+        self._field_record('ELEV',self._array(geo['terrain_height']))
+        self._field_record('XLAI',self._array(geo['leaf_area_index']))
         if len(self.surface_coordinates):
             self._field_record('NEARS',self.nearest_surface_station,integer=True)
 

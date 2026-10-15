@@ -4,8 +4,10 @@ from pathlib import Path
 import pytest
 
 import numpy as np
+import rasterio
 import tifffile
 from netCDF4 import Dataset
+from rasterio.transform import Affine,from_origin
 
 from pycalmet._terrel import (_3cd_origin,_accumulate_3cd,_accumulate_arm3,
                               _accumulate_dmdf,_accumulate_generic,_accumulate_geotiff,
@@ -13,7 +15,7 @@ from pycalmet._terrel import (_3cd_origin,_accumulate_3cd,_accumulate_arm3,
                               _accumulate_points,
                               _accumulate_usgs30,_accumulate_usgs_degree_dem,
                               _accumulate_usgsla,
-                              _cell_average,_cell_averages,_cell_search_count,_cell_type_coordinates,_dem_records,_geotiff_geometry,_gtopo_spec,
+                              _cell_averages,_cell_type_coordinates,_dem_records,_geotiff_geometry,_gtopo_spec,
                               _fill_polar_angular_gaps,
                               _finalize_terrain,
                               _fixed_peak_radius,_grid_domain_metres,
@@ -25,12 +27,13 @@ from pycalmet._terrel import (_3cd_origin,_accumulate_3cd,_accumulate_arm3,
                               _hit_statistics,
                               _polar_boundaries,
                               _parse_dem_profiles,_read_arm3,
-                              _read_dmdf,_read_generic,_tile_origin,
+                              _read_dmdf,_read_generic,_read_srtm_tile,_tile_origin,
                               _usgsla_spec,_write_legacy,_write_legacy_header,_write_netcdf,
                               _write_plot_output,_write_save,run,
                               _write_surfer_grid,
                               UsgslaSpec)
 from pycalmet.config import GridConfig,TerrelConfig,TerrelSource
+from pycalmet.legacy._compat import _terrel as legacy_terrel
 
 
 def test_terrel_netcdf_carries_makegeo_grid_contract(tmp_path):
@@ -69,6 +72,17 @@ def test_terrel_legacy_header_formats_hemispheres_for_all_projections(projection
 )
 def test_srtm_name_origin(name, origin):
     assert _tile_origin(Path(name)) == origin
+
+
+def test_standard_srtm_tile_is_read_through_rasterio(tmp_path):
+    source=tmp_path/'N00E000.hgt'
+    values=np.full((1201,1201),-32768,dtype='>i2')
+    values[0,0]=123; values[-1,-1]=456
+    values.tofile(source)
+    actual=_read_srtm_tile(source)
+    assert actual.shape==(1201,1201)
+    assert actual.dtype.kind=='i'
+    assert (actual[0,0],actual[-1,-1])==(123,456)
 
 
 def test_hit_statistics_match_terrel_nonempty_average_and_nint_thresholds():
@@ -168,6 +182,13 @@ def test_common_accumulator_tracks_peak_independently_of_mean():
     np.testing.assert_allclose(maxima, [20.0])
 
 
+def test_terrain_average_finishes_high_precision_sum_as_fp32():
+    result=_cell_averages(np.array([1.,2.],dtype=np.float64),
+                          np.array([2,0],dtype=np.int64))
+    assert result.dtype==np.float32
+    np.testing.assert_array_equal(result,np.array([.5,-999.],dtype=np.float32))
+
+
 def test_cartesian_peak_radius_duplicates_boundary_sample_into_neighbor():
     grid = GridConfig(2, 1, 1.0, 1.0)
     sums = np.zeros(2)
@@ -181,7 +202,7 @@ def test_cartesian_peak_radius_duplicates_boundary_sample_into_neighbor():
         sums,
         counts,
         maxima,
-        peak_radius_grid=0.1,
+        peak_radius_grid=(0.1, 0.1),
     )
     assert inside == 2
     np.testing.assert_allclose(sums, [15.0, 5.0])
@@ -189,14 +210,27 @@ def test_cartesian_peak_radius_duplicates_boundary_sample_into_neighbor():
     np.testing.assert_allclose(maxima, [10.0, 5.0])
 
 
-def test_cartesian_peak_does_not_add_cross_cell_when_other_perturbation_is_outside():
+def test_cartesian_peak_handles_axes_independently_at_domain_edge():
     grid=GridConfig(2,2,1.,1.)
     sums=np.zeros(4,dtype=np.float32)
     counts=np.zeros(4,dtype=np.int64)
     maxima=np.full(4,-999.,dtype=np.float32)
     _accumulate_points(
-        [1950.],[950.],[17.],grid,sums,counts,maxima,peak_radius_grid=.1)
-    np.testing.assert_array_equal(counts,[0,1,0,0])
+        [1950.],[950.],[17.],grid,sums,counts,maxima,
+        peak_radius_grid=(.1,.1))
+    np.testing.assert_array_equal(counts,[0,1,0,1])
+
+
+def test_cartesian_peak_radius_scales_each_axis_on_rectangular_grid():
+    grid=GridConfig(2,2,2.,1.)
+    assert _fixed_peak_radius(200.,grid)==pytest.approx((.1,.2))
+    sums=np.zeros(4,dtype=np.float64)
+    counts=np.zeros(4,dtype=np.int64)
+    maxima=np.full(4,-999.,dtype=np.float32)
+    _accumulate_points(
+        [1900.],[850.],[17.],grid,sums,counts,maxima,
+        peak_radius_grid=_fixed_peak_radius(200.,grid))
+    np.testing.assert_array_equal(counts,[1,1,1,1])
 
 
 def test_polar_peak_does_not_add_angular_cell_when_radial_perturbation_is_outside():
@@ -544,6 +578,42 @@ def test_cellfill_uses_nearest_valid_cell_for_outer_boundary():
     np.testing.assert_array_equal(counts, 1)
 
 
+def test_cellfill_uses_physical_distance_on_rectangular_grid():
+    grid=GridConfig(3,3,2.,1.)
+    sums=np.zeros(9,dtype=np.float64)
+    counts=np.zeros(9,dtype=np.int64)
+    maxima=np.full(9,-999.,dtype=np.float32)
+    sums[4]=12.; counts[4]=1; maxima[4]=19.
+    assert _fill_void_cells(sums,counts,grid,1.1,maxima)==2
+    expected_counts=np.array([[0,1,0],[0,1,0],[0,1,0]])
+    np.testing.assert_array_equal(counts.reshape(3,3),expected_counts)
+    np.testing.assert_array_equal(sums.reshape(3,3)[:,1],[12.,12.,12.])
+    np.testing.assert_array_equal(maxima.reshape(3,3)[:,1],[19.,19.,19.])
+
+
+def test_cellfill_ties_are_averaged_without_source_order_dependence():
+    grid=GridConfig(3,1,1.,1.)
+
+    def filled(sample_order):
+        sums=np.zeros(3,dtype=np.float64)
+        counts=np.zeros(3,dtype=np.int64)
+        maxima=np.full(3,-999.,dtype=np.float32)
+        x=np.array([.5,2.5])*1000.
+        elevation=np.array([10.,30.],dtype=np.float32)
+        _accumulate_points(
+            x[sample_order],[500.,500.],elevation[sample_order],grid,
+            sums,counts,maxima)
+        assert _fill_void_cells(sums,counts,grid,1.1,maxima)==1
+        return sums,counts,maxima
+
+    forward=filled(np.array([0,1]))
+    reverse=filled(np.array([1,0]))
+    for actual,expected in zip(forward,reverse):
+        np.testing.assert_array_equal(actual,expected)
+    np.testing.assert_array_equal(forward[0],[10.,20.,30.])
+    np.testing.assert_array_equal(forward[2],[10.,30.,30.])
+
+
 
 
 def test_run_dispatches_generic_source_from_public_configuration(tmp_path, monkeypatch):
@@ -599,6 +669,45 @@ def test_polar_boundaries_and_cellind_radial_perturbation():
 def test_fillang_rejects_an_entirely_empty_ring_instead_of_looping_forever():
     with pytest.raises(ValueError,match="entirely empty polar ring"):
         _fill_polar_angular_gaps(np.full((4,1),-32000.,dtype=np.float32))
+
+
+def test_polar_cell_types_use_actual_ring_and_ray_coordinates():
+    grid=GridConfig(
+        2,2,1.,1.,x_origin_km=10.,y_origin_km=20.,grid_type=3,
+        ring_distances_km=(1.,2.),ray_angles_deg=(90.,180.),polar_processing=1,
+    )
+    x,y=_cell_type_coordinates(grid)
+    np.testing.assert_allclose(x,[[11.,12.],[10.,10.]],atol=1e-12)
+    np.testing.assert_allclose(y,[[20.,20.],[19.,18.]],atol=1e-12)
+    legacy_x,legacy_y=legacy_terrel._cell_type_coordinates(grid)
+    assert not np.allclose(x,legacy_x)
+    assert not np.allclose(y,legacy_y)
+
+
+def test_cartesian_cell_types_use_rectangular_grid_spacing():
+    grid=GridConfig(
+        2,2,2.,1.,x_origin_km=10.,y_origin_km=20.,grid_type=1,
+    )
+    x,y=_cell_type_coordinates(grid)
+    np.testing.assert_array_equal(x,[[11.,13.],[11.,13.]])
+    np.testing.assert_array_equal(y,[[20.5,20.5],[21.5,21.5]])
+
+
+def test_polar_gap_fill_is_nearest_neighbor_with_stable_ties():
+    source=np.array([[10.],[-999.],[30.],[-999.]],dtype=np.float32)
+    actual=_fill_polar_angular_gaps(
+        source,missing_threshold=-998.,ray_angles_deg=(0.,90.,180.,270.))
+    np.testing.assert_array_equal(actual[:,0],[10.,10.,30.,10.])
+    np.testing.assert_array_equal(
+        legacy_terrel._fill_polar_angular_gaps(source,missing_threshold=-998.)[:,0],
+        [10.,20.,30.,20.])
+
+
+def test_polar_gap_fill_uses_physical_ray_angles():
+    source=np.array([[10.],[-999.],[30.]],dtype=np.float32)
+    actual=_fill_polar_angular_gaps(
+        source,missing_threshold=-998.,ray_angles_deg=(10.,20.,200.))
+    np.testing.assert_array_equal(actual[:,0],[10.,10.,30.])
 
 
 def test_polar_finalize_runs_fillang_after_height_replacement(tmp_path):
@@ -1082,9 +1191,10 @@ def test_geotiff_uses_pixel_centres_and_loadtiff_elevation_limits(tmp_path, monk
             (34735, "H", len(keys), keys, False),
         ],
     )
-    crs, x0, y0, dx, dy, elevation_scale, data = _geotiff_geometry(source)
+    crs, x0, y0, dx, dy, elevation_scale, data, valid = _geotiff_geometry(source)
     assert crs.to_epsg() == 4326
-    assert (x0, y0, dx, dy, data.shape) == (0.25, 0.75, 0.5, 0.5, (2, 2))
+    assert (x0, y0, dx, dy, data.shape) == (0.25, 0.75, 0.5, -0.5, (2, 2))
+    assert valid.all()
     assert elevation_scale == 0.3048
     monkeypatch.setattr(
         "pycalmet._terrel.project_geographic",
@@ -1110,6 +1220,49 @@ def test_geotiff_orientation_four_is_normalized_to_top_down_rows(tmp_path):
             (34735,'H',len(keys),keys,False),
         ],
     )
-    _,x0,y0,dx,dy,_,data=_geotiff_geometry(source)
-    assert (x0,y0,dx,dy)==(.25,.75,.5,.5)
+    _,x0,y0,dx,dy,_,data,valid=_geotiff_geometry(source)
+    assert (x0,y0,dx,dy)==(.25,.75,.5,-.5)
     np.testing.assert_array_equal(data,[[3,4],[1,2]])
+    assert valid.all()
+
+
+def test_geotiff_declared_nodata_is_not_accumulated(tmp_path,monkeypatch):
+    source=tmp_path/'nodata.tif'
+    with rasterio.open(
+        source,'w',driver='GTiff',width=2,height=2,count=1,dtype='float32',
+        crs='EPSG:4326',transform=from_origin(0.,1.,.5,.5),nodata=-9999.,
+    ) as dataset:
+        dataset.write(np.array([[10.,-9999.],[30.,40.]],dtype=np.float32),1)
+    monkeypatch.setattr(
+        'pycalmet._terrel.project_geographic',
+        lambda longitude,latitude,grid,datum: (longitude*1000.,latitude*1000.),
+    )
+    grid=GridConfig(2,2,.5,.5)
+    sums=np.zeros(4); counts=np.zeros(4,dtype=np.int64)
+    assert _accumulate_geotiff(source,grid,sums,counts)==3
+    np.testing.assert_array_equal(counts,[1,1,1,0])
+    np.testing.assert_array_equal(sums,[30.,40.,10.,0.])
+
+
+def test_geotiff_south_up_affine_uses_increasing_row_coordinates(tmp_path,monkeypatch):
+    source=tmp_path/'south-up.tif'
+    with rasterio.open(
+        source,'w',driver='GTiff',width=1,height=2,count=1,dtype='int16',
+        crs='EPSG:4326',transform=Affine(.5,0.,10.,0.,.5,20.),
+    ) as dataset:
+        dataset.write(np.array([[10],[20]],dtype=np.int16),1)
+    _,x0,y0,dx,dy,_,_,valid=_geotiff_geometry(source)
+    assert (x0,y0,dx,dy)==(10.25,20.25,.5,.5)
+    assert valid.all()
+    monkeypatch.setattr(
+        'pycalmet._terrel.project_geographic',
+        lambda longitude,latitude,grid,datum: (
+            (np.asarray(longitude)-10.)*1000.,
+            (np.asarray(latitude)-20.)*1000.,
+        ),
+    )
+    grid=GridConfig(1,2,.5,.5)
+    sums=np.zeros(2); counts=np.zeros(2,dtype=np.int64)
+    assert _accumulate_geotiff(source,grid,sums,counts)==2
+    np.testing.assert_array_equal(counts,[1,1])
+    np.testing.assert_array_equal(sums,[10.,20.])

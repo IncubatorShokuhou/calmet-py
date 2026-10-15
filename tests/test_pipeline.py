@@ -374,7 +374,13 @@ def test_run_pipeline_cleans_temporary_files_after_stage_failure(
 
     assert calls == ["CALWRF", "TERREL"]
     assert not temporary_directories[0].exists()
-    assert any("stage: TERREL" in note for note in caught.value.__notes__)
+    notes = getattr(caught.value, "__notes__", ())
+    if notes:
+        assert any("stage: TERREL" in note for note in notes)
+    else:
+        # BaseException.add_note and __notes__ were added in Python 3.11;
+        # Python 3.10 carries the stage annotation in the exception message.
+        assert "stage: TERREL" in str(caught.value)
 
 
 def test_run_pipeline_reports_missing_control_file_before_running(
@@ -471,10 +477,10 @@ def test_run_pipeline_signature_exposes_every_typed_stage_parameter():
         for parameter in _canonical_api_parameters(function)
     ]
 
-    # Keep the compact directory/grouped-config forms while making all 323
+    # Keep the compact directory/grouped-config forms while making all 322
     # canonical stage parameters discoverable to IDEs and inspect.signature.
     assert list(parameters) == grouped + expected_prefixed
-    assert len(expected_prefixed) == 323
+    assert len(expected_prefixed) == 322
     assert signature.return_annotation is not inspect.Signature.empty
 
     for name in grouped:

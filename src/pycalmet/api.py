@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import fields, replace
-from datetime import datetime
+from datetime import date, datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, ParamSpec, TypeVar
@@ -135,8 +135,8 @@ def calwrf(
     inp: CalwrfConfig | Mapping[str, Any] | str | Path | None = None,
     *,
     wrf_files: Sequence[str | Path] | None = None,
-    start: str | int | datetime | None = None,
-    end: str | int | datetime | None = None,
+    start: datetime | str | None = None,
+    end: datetime | str | None = None,
     output: str | Path | None = None,
     create_surface: bool = True,
     compression: int = 1,
@@ -147,13 +147,12 @@ def calwrf(
     surface_output: str | Path | None = None,
     title: str = 'Create 3D.DAT file for WRF output',
     listing_output: str | Path | None = None,
-    legacy_file_rain_reset: bool = False,
     **legacy_parameters: Any,
 ) -> Path:
     """Run CALWRF from ``inp`` or fully typed keyword parameters."""
     from .calwrf import run
     from .control import calwrf_config
-    source,parameters=_arguments(inp,locals(),{'wrf_files': None, 'start': None, 'end': None, 'output': None, 'create_surface': True, 'compression': 1, 'i_range': None, 'j_range': None, 'k_range': None, 'legacy_output': None, 'surface_output': None, 'title': 'Create 3D.DAT file for WRF output', 'listing_output': None, 'legacy_file_rain_reset': False},{'wrf_files', 'start', 'end', 'output'},legacy_parameters)
+    source,parameters=_arguments(inp,locals(),{'wrf_files': None, 'start': None, 'end': None, 'output': None, 'create_surface': True, 'compression': 1, 'i_range': None, 'j_range': None, 'k_range': None, 'legacy_output': None, 'surface_output': None, 'title': 'Create 3D.DAT file for WRF output', 'listing_output': None},{'wrf_files', 'start', 'end', 'output'},legacy_parameters)
     return run(_config(CalwrfConfig,source,parameters,calwrf_config))
 
 
@@ -352,8 +351,8 @@ def makegeo(
     qa_cell: tuple[int, int] | None = None,
     snow_processing: bool = False,
     snow_data: str | Path | None = None,
-    snow_start_date: int | None = None,
-    snow_end_date: int | None = None,
+    snow_start_date: date | datetime | str | None = None,
+    snow_end_date: date | datetime | str | None = None,
     snow_properties: dict[int, tuple[float, float, float, float, float, float, int]] | None = None,
     snow_age_parameters: dict[int, tuple[int, float]] | None = None,
     snow_roughness_method: int = 1,
@@ -403,8 +402,8 @@ def calmet(
     meteorology: str | Path | Sequence[str | Path] | None = None,
     geophysical: str | Path | None = None,
     output: str | Path | None = None,
-    start: str | datetime | None = None,
-    end: str | datetime | None = None,
+    start: datetime | str | None = None,
+    end: datetime | str | None = None,
     noobs: int = 0,
     run_type: int = 1,
     save_output: bool = True,

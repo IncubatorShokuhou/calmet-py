@@ -1,9 +1,7 @@
-"""Vectorised TERREL implementation for legacy terrain databases.
+"""Terrain preprocessing for standard rasters and CALMET source formats.
 
-The legacy ``MSHEET=0`` algorithm is intentionally retained: only the four
-corners of each one-degree sheet are projected and coordinates inside the
-sheet are linearly interpolated. Projecting every sample is more accurate, but
-it is not numerically equivalent to TERREL 7.0.
+Rasterio handles standard SRTM and GeoTIFF inputs.  Format-specific readers
+remain for historical terrain products that GDAL cannot reliably identify.
 """
 
 from __future__ import annotations
@@ -16,13 +14,16 @@ import tempfile
 
 import numpy as np
 from netCDF4 import Dataset
+import rasterio
+from rasterio.errors import RasterioIOError
+import tifffile
 
 from ._proj_data import configure_proj_data
 
 configure_proj_data()
 
 from pyproj import CRS, Transformer
-import tifffile
+from scipy.spatial import cKDTree
 
 from .config import GridConfig, TerrelConfig, TerrelSource
 from ._ctgproc import _coastline_types, _read_coastline_bln
@@ -36,6 +37,10 @@ from .projections import (grid_crs, project_from_crs, project_geographic,
 _HGT_NAME = re.compile(r"^([NS])(\d{2})([EW])(\d{3})\.hgt$", re.IGNORECASE)
 _GTOPO_NAME = re.compile(r"^([EW])(\d{3})([NS])(\d{2})(?:\..*)?$", re.IGNORECASE)
 _3CD_NAME = re.compile(r"(?:^|.*?)(\d{2})(\d{3})\.3cd$", re.IGNORECASE)
+
+COMPUTE_DTYPE = np.float32
+COORD_DTYPE = np.float64
+ACCUM_DTYPE = np.float64
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,30 +109,28 @@ class _ReceptorState:
 
     def add(self, x_m, y_m, elevation_m) -> None:
         """Vectorised port of XYELEV, batched to bound temporary memory."""
-        f32=np.float64
-        x=np.asarray(np.asarray(x_m,dtype=f32).ravel()*f32(.001),dtype=f32)
-        y=np.asarray(np.asarray(y_m,dtype=f32).ravel()*f32(.001),dtype=f32)
-        z=np.asarray(elevation_m,dtype=f32).ravel()
-        valid = z >= f32(-32000.)
+        x=np.asarray(x_m,dtype=COORD_DTYPE).ravel()*.001
+        y=np.asarray(y_m,dtype=COORD_DTYPE).ravel()*.001
+        z=np.asarray(elevation_m,dtype=COMPUTE_DTYPE).ravel()
+        valid = z >= COMPUTE_DTYPE(-32000.)
         x, y, z = x[valid], y[valid], z[valid]
         if not x.size:
+            return
+        if not self.interpolate:
+            tree=cKDTree(np.column_stack((x,y)))
+            groups=tree.query_ball_point(self.coordinates_km,self.radius_km)
+            for receptor,indices in enumerate(groups):
+                if indices:
+                    self.heights_m[receptor]=max(
+                        self.heights_m[receptor],np.max(z[indices]))
             return
         for start in range(0, self.coordinates_km.shape[0], 256):
             stop = min(start + 256, self.coordinates_km.shape[0])
             receptor_x = self.coordinates_km[start:stop, 0, None]
             receptor_y = self.coordinates_km[start:stop, 1, None]
-            dx=np.asarray(x[None,:]-receptor_x,dtype=f32)
-            dy=np.asarray(y[None,:]-receptor_y,dtype=f32)
-            square=np.asarray(np.asarray(dx*dx,dtype=f32)+
-                              np.asarray(dy*dy,dtype=f32),dtype=f32)
-            distance=np.asarray(np.sqrt(square.astype(np.float64)),dtype=f32)
-            if not self.interpolate:
-                nearby = distance <= f32(self.radius_km)
-                candidates=np.where(nearby,z[None,:],f32(-np.inf)).astype(f32)
-                self.heights_m[start:stop] = np.asarray(np.maximum(
-                    self.heights_m[start:stop], np.max(candidates, axis=1)
-                ),dtype=f32)
-                continue
+            dx=np.asarray(x[None,:]-receptor_x,dtype=COORD_DTYPE)
+            dy=np.asarray(y[None,:]-receptor_y,dtype=COORD_DTYPE)
+            distance=np.hypot(dx,dy)
             quadrant = np.where(
                 dx <= 0.0,
                 np.where(dy <= 0.0, 0, 3),
@@ -209,16 +212,15 @@ class _TerrainFilter:
         return _coastline_types(x_km, y_km, self.polygons)
 
     def extracted(self, x_m, y_m, elevation_m, domain):
-        f32=np.float64
-        elevation=np.asarray(elevation_m,dtype=f32).copy()
+        elevation=np.asarray(elevation_m,dtype=COMPUTE_DTYPE).copy()
         selected=np.flatnonzero(domain)
         if not selected.size:
             return elevation
         if self.raw_echo is not None:
             self.raw_echo.write(x_m,y_m,elevation_m,selected)
         kinds=self.types(
-            np.asarray(np.asarray(x_m,dtype=f32).ravel()[selected]*f32(.001),dtype=f32),
-            np.asarray(np.asarray(y_m,dtype=f32).ravel()[selected]*f32(.001),dtype=f32))
+            np.asarray(x_m,dtype=COORD_DTYPE).ravel()[selected]*.001,
+            np.asarray(y_m,dtype=COORD_DTYPE).ravel()[selected]*.001)
         values=elevation.ravel()[selected]
         defaults=self.default_elevation_m[kinds]
         missing_rule=self.missing_replacement[kinds]
@@ -227,29 +229,29 @@ class _TerrainFilter:
         remaining=~always
         noise_rule=self.noise_replacement[kinds]
         noisy=(remaining&(noise_rule>0)&(values<self.noise_minimum_m[kinds])&
-               (values>f32(-32000.)))
-        values[noisy&(noise_rule==1)]=f32(-32001.)
+               (values>COMPUTE_DTYPE(-32000.)))
+        values[noisy&(noise_rule==1)]=COMPUTE_DTYPE(-32001.)
         values[noisy&(noise_rule==2)]=self.noise_minimum_m[kinds][noisy&(noise_rule==2)]
         values[noisy&(noise_rule==3)]=defaults[noisy&(noise_rule==3)]
-        missing=remaining&(values<f32(-32000.))
+        missing=remaining&(values<COMPUTE_DTYPE(-32000.))
         values[missing&(missing_rule==2)]=defaults[missing&(missing_rule==2)]
         elevation.ravel()[selected]=values
         return elevation
 
     def output(self, values, kinds):
-        f32=np.float64
-        result=np.asarray(values,dtype=f32).copy()
+        result=np.asarray(values,dtype=COMPUTE_DTYPE).copy()
         kinds=np.asarray(kinds,dtype=np.int8)
         defaults=self.default_elevation_m[kinds]
         missing_rule=self.missing_replacement[kinds]
         result[missing_rule==3]=defaults[missing_rule==3]
         noise_rule=self.noise_replacement[kinds]
         noisy=((missing_rule!=3)&(noise_rule>0)&
-               (result<self.noise_minimum_m[kinds])&(result>f32(-999.)))
-        result[noisy&(noise_rule==1)]=f32(-999.)
+               (result<self.noise_minimum_m[kinds])&
+               (result>COMPUTE_DTYPE(-999.)))
+        result[noisy&(noise_rule==1)]=COMPUTE_DTYPE(-999.)
         result[noisy&(noise_rule==2)]=self.noise_minimum_m[kinds][noisy&(noise_rule==2)]
         result[noisy&(noise_rule==3)]=defaults[noisy&(noise_rule==3)]
-        missing=result<f32(-998.)
+        missing=result<COMPUTE_DTYPE(-998.)
         replace=missing&(missing_rule!=0)
         result[replace]=defaults[replace]
         return result
@@ -269,10 +271,11 @@ def _read_receptors(config: TerrelConfig) -> _ReceptorState | None:
             f"NXYCOL={config.receptor_columns}"
         )
     count = records.shape[0]
-    height=(records[:,2].copy() if config.receptor_columns==4 else
-            np.full(count,-999.,dtype=np.float64))
-    receptor_height=(records[:,3].copy() if config.receptor_columns==4 else
-                     np.zeros(count,dtype=np.float64))
+    height=(records[:,2].astype(COMPUTE_DTYPE) if config.receptor_columns==4 else
+            np.full(count,-999.,dtype=COMPUTE_DTYPE))
+    receptor_height=(records[:,3].astype(COMPUTE_DTYPE)
+                     if config.receptor_columns==4 else
+                     np.zeros(count,dtype=COMPUTE_DTYPE))
     return _ReceptorState(
         records[:, :2].copy(), height, receptor_height,
         config.interpolate_receptors, config.receptor_radius_km,
@@ -284,7 +287,7 @@ def _read_receptors(config: TerrelConfig) -> _ReceptorState | None:
                    np.full(count,-1.e15,dtype=np.float64),
                    np.full(count,1.e15,dtype=np.float64),
                    np.full(count,1.e15,dtype=np.float64))),
-        np.full((4,count),-999.,dtype=np.float64),
+        np.full((4,count),-999.,dtype=COMPUTE_DTYPE),
         np.full((4,count),1.e15,dtype=np.float64),
     )
 
@@ -315,9 +318,9 @@ def _terrain_filter(config: TerrelConfig) -> _TerrainFilter:
         np.asarray(values, dtype=dtype)
         for values, dtype in (
             (config.noise_replacement, np.int8),
-            (config.noise_minimum_m, np.float64),
+            (config.noise_minimum_m, COMPUTE_DTYPE),
             (config.missing_replacement, np.int8),
-            (config.default_elevation_m, np.float64),
+            (config.default_elevation_m, COMPUTE_DTYPE),
         )
     )
     if any(values.shape != (5,) for values in arrays):
@@ -336,24 +339,18 @@ def _domain_mask(x, y, grid):
 
 
 def _grid_domain_metres(grid):
-    """Build TERREL's XLLM/XURM/YLLM/YURM in assignment order."""
-    f32=np.float64
-    x_origin=f32(grid.x_origin_km); y_origin=f32(grid.y_origin_km)
+    """Return the projected domain bounds in metres."""
+    x_origin=float(grid.x_origin_km); y_origin=float(grid.y_origin_km)
     if grid.grid_type==3:
         radial,_=_polar_boundaries_km(grid)
-        extent=radial[-1]
-        x_lower=np.asarray(x_origin-extent,dtype=f32)
-        x_upper=np.asarray(x_origin+extent,dtype=f32)
-        y_lower=np.asarray(y_origin-extent,dtype=f32)
-        y_upper=np.asarray(y_origin+extent,dtype=f32)
+        extent=float(radial[-1])
+        x_lower,x_upper=x_origin-extent,x_origin+extent
+        y_lower,y_upper=y_origin-extent,y_origin+extent
     else:
         x_lower=x_origin; y_lower=y_origin
-        x_width=np.asarray(f32(grid.nx)*f32(grid.dx_km),dtype=f32)
-        y_width=np.asarray(f32(grid.ny)*f32(grid.dy_km),dtype=f32)
-        x_upper=np.asarray(x_lower+x_width,dtype=f32)
-        y_upper=np.asarray(y_lower+y_width,dtype=f32)
-    scale=f32(1000.)
-    return tuple(np.asarray(value*scale,dtype=f32) for value in
+        x_upper=x_lower+grid.nx*float(grid.dx_km)
+        y_upper=y_lower+grid.ny*float(grid.dy_km)
+    return tuple(COORD_DTYPE(value*1000.) for value in
                  (x_lower,x_upper,y_lower,y_upper))
 
 
@@ -495,48 +492,56 @@ def _tile_origin(path: Path) -> tuple[int, int]:
     return int(lat) * (1 if ns.upper() == "N" else -1), int(lon) * (1 if ew.upper() == "E" else -1)
 
 
+def _read_srtm_tile(path: Path) -> np.ndarray:
+    """Read a standard SRTM HGT tile through GDAL's SRTMHGT driver."""
+    try:
+        with rasterio.open(path) as source:
+            if source.driver != "SRTMHGT" or source.count != 1:
+                raise ValueError(f"not a standard single-band SRTM HGT tile: {path}")
+            if source.width != source.height or source.width < 2:
+                raise ValueError(f"invalid square 16-bit HGT tile: {path}")
+            if np.dtype(source.dtypes[0]).kind not in {"i", "u"}:
+                raise ValueError(f"SRTM HGT elevations must be integers: {path}")
+            return source.read(1)
+    except RasterioIOError as error:
+        raise ValueError(f"invalid SRTM HGT tile: {path}") from error
+
+
 def _accumulate_tile(path, grid, sums, counts, input_datum='WGS-84', *, maxima=None,
                      peak=False, receptors=None, direct=False, terrain_filter=None) -> int:
+    path = Path(path)
     lat_s, lon_w = _tile_origin(path)
-    side = int(round((path.stat().st_size // 2) ** 0.5))
-    if side * side * 2 != path.stat().st_size or side < 2:
-        raise ValueError(f"invalid square 16-bit HGT tile: {path}")
-    corner_lon = np.array([lon_w, lon_w + 1, lon_w, lon_w + 1], dtype=np.float64)
-    corner_lat = np.array([lat_s + 1, lat_s + 1, lat_s, lat_s], dtype=np.float64)
-    # Legacy TERREL stores all projected coordinates and interpolation
-    # increments in default REAL (IEEE float32).  Preserve that rounding,
-    # since samples lying within millimetres of a cell edge can otherwise
-    # move to an adjacent output cell.
-    cx, cy = (np.asarray(a, dtype=np.float64) for a in
+    raw = _read_srtm_tile(path)
+    side = raw.shape[0]
+    corner_lon = np.array([lon_w, lon_w + 1, lon_w, lon_w + 1], dtype=COORD_DTYPE)
+    corner_lat = np.array([lat_s + 1, lat_s + 1, lat_s, lat_s], dtype=COORD_DTYPE)
+    cx, cy = (np.asarray(a, dtype=COORD_DTYPE) for a in
               project_geographic(corner_lon,corner_lat,grid,input_datum))
     xnw, xne, xsw, xse = cx
     ynw, yne, ysw, yse = cy
-    raw = np.memmap(path, dtype=">i2", mode="r", shape=(side, side))
-    denominator = np.float64(side - 1)
-    step = np.float64(1.0) / denominator
-    along = np.arange(side - 1, dtype=np.float64)
+    denominator = float(side - 1)
+    step = 1.0 / denominator
+    along = np.arange(side - 1, dtype=COORD_DTYPE)
     inside_total = 0
     # TERREL skips the northern overlap row and eastern overlap column.
     for j in range(1, side):
-        south = np.float64(np.float64(j - 1) * step + step)
+        south = j * step
         xnear = xnw + (xsw - xnw) * south
         ynear = ynw + (ysw - ynw) * south
         xfar = xne + (xse - xne) * south
         yfar = yne + (yse - yne) * south
-        delx = np.float64((xfar - xnear) * step)
-        dely = np.float64((yfar - ynear) * step)
+        delx = (xfar - xnear) * step
+        dely = (yfar - ynear) * step
         interpolated_x = xnear + delx * along
         interpolated_y = ynear + dely * along
         if direct:
-            longitude = lon_w + along.astype(np.float64) / float(denominator)
+            longitude = lon_w + along / denominator
             latitude = np.full(longitude.shape, lat_s + 1.0 - float(south))
             x, y = project_geographic(longitude, latitude, grid, input_datum)
-            x, y = np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64)
+            x, y = np.asarray(x, dtype=COORD_DTYPE), np.asarray(y, dtype=COORD_DTYPE)
         else:
-            # LOADOTHER computes DELX/DELY once as the full edge difference
-            # times STEP, then advances by the integer column index.
             x, y = interpolated_x, interpolated_y
-        z = np.asarray(raw[j, : side - 1], dtype=np.float64)
+        z = np.asarray(raw[j, : side - 1], dtype=COMPUTE_DTYPE)
         radius = (_peak_radius_from_points(interpolated_x, interpolated_y, grid)
                   if peak else None)
         inside_total += _accumulate_points(
@@ -580,7 +585,8 @@ def _accumulate_gtopo30(path, grid, sums, counts, input_datum='WGS-84', *, spec=
             cx,cy=(np.asarray(a,dtype=np.float64) for a in
                    project_geographic(corner_lon,corner_lat,grid,input_datum))
             xnw,xne,xsw,xse=cx; ynw,yne,ysw,yse=cy
-            block=np.asarray(raw[row0:row0+samples,col0:col0+samples],dtype=np.float64)
+            block=np.asarray(
+                raw[row0:row0+samples,col0:col0+samples],dtype=COMPUTE_DTYPE)
             for j in range(block.shape[0]):
                 south=np.float64(j)/np.float64(samples)
                 fraction=along[:block.shape[1]]
@@ -637,26 +643,30 @@ def _add_cell_samples(flat, elevation, sums, counts, maxima):
         np.maximum.at(maxima, flat, elevation)
 
 
-def _peak_radius_from_points(x, y, grid) -> float:
-    if grid.grid_type != 3 and not np.isclose(grid.dx_km, grid.dy_km):
-        raise ValueError("legacy TERREL Cartesian peak processing requires square cells")
+def _peak_radius_from_points(x, y, grid) -> float | tuple[float, float]:
+    """Return a source footprint radius in the grid's native index units.
+
+    Polar accumulation works in projected metres.  Cartesian accumulation
+    works in cell coordinates, so its x and y radii must be scaled by the
+    corresponding cell spacing.
+    """
     x = np.asarray(x, dtype=np.float64).ravel()
     y = np.asarray(y, dtype=np.float64).ravel()
     if x.size < 2:
         raise ValueError("TERREL peak processing needs at least two source points")
     radius_m = np.float64(0.5) * np.hypot(x[1] - x[0], y[1] - y[0])
-    if grid.grid_type == 3:
-        return float(radius_m)
-    cell_m=np.asarray(np.float64(grid.dx_km)*np.float64(1000.),dtype=np.float64)
-    return float(np.asarray(radius_m/cell_m,dtype=np.float64))
+    return _fixed_peak_radius(radius_m, grid)
 
 
-def _fixed_peak_radius(radius_m, grid) -> float:
-    radius_m = np.float64(radius_m)
+def _fixed_peak_radius(radius_m, grid) -> float | tuple[float, float]:
+    """Convert a projected-metre radius for polar or Cartesian accumulation."""
+    radius_m = float(radius_m)
     if grid.grid_type == 3:
-        return float(radius_m)
-    cell_m=np.asarray(np.float64(grid.dx_km)*np.float64(1000.),dtype=np.float64)
-    return float(np.asarray(radius_m/cell_m,dtype=np.float64))
+        return radius_m
+    return (
+        radius_m / (float(grid.dx_km) * 1000.0),
+        radius_m / (float(grid.dy_km) * 1000.0),
+    )
 
 
 def _polar_boundaries_km(grid):
@@ -688,46 +698,35 @@ def _polar_boundaries(grid):
 
 def _polar_cell_indices(dx,dy,radial_boundaries,angular_boundaries,
                         first_angle,radius=None):
-    """Vectorised CELLIND polar branch with floating-point boundaries."""
-    f32=np.float64
-    dx=np.asarray(dx,dtype=f32); dy=np.asarray(dy,dtype=f32)
-    radial=np.asarray(radial_boundaries,dtype=f32)
-    angular=np.asarray(angular_boundaries,dtype=f32)
-    square=np.asarray(np.asarray(dx*dx,dtype=f32)+
-                      np.asarray(dy*dy,dtype=f32),dtype=f32)
-    distance=np.asarray(np.sqrt(square.astype(np.float64)),dtype=f32)
+    """Return polar ring and ray indices for projected offsets."""
+    dx=np.asarray(dx,dtype=COORD_DTYPE); dy=np.asarray(dy,dtype=COORD_DTYPE)
+    radial=np.asarray(radial_boundaries,dtype=COORD_DTYPE)
+    angular=np.asarray(angular_boundaries,dtype=COORD_DTYPE)
+    distance=np.hypot(dx,dy)
     radial_index=np.searchsorted(radial,distance,side="right")
-    angle=np.asarray(np.arctan2(dx.astype(np.float64),dy.astype(np.float64)),dtype=f32)
-    direction=np.asarray(angle*f32(57.29578),dtype=f32)
-    shifted=np.asarray(direction-f32(first_angle),dtype=f32)
-    shifted=np.where(shifted<f32(0.),
-                     np.asarray(shifted+f32(360.),dtype=f32),shifted).astype(f32)
+    direction=np.degrees(np.arctan2(dx,dy))
+    shifted=np.mod(direction-float(first_angle),360.)
     angular_index=np.searchsorted(angular,shifted,side="right")
     angular_index=np.where(angular_index>=angular.size,0,angular_index)
     if radius is None:
         return distance,shifted,radial_index,angular_index
 
-    radius=np.broadcast_to(np.asarray(radius,dtype=f32),distance.shape)
+    radius=np.broadcast_to(np.asarray(radius,dtype=COORD_DTYPE),distance.shape)
     peak_radial=radial_index.copy()
     in_grid=radial_index<radial.size
     boundary=radial[np.minimum(radial_index,radial.size-1)]
-    outward=np.asarray(distance+radius,dtype=f32)>boundary
+    outward=distance+radius>boundary
     peak_radial[in_grid&outward]=radial_index[in_grid&outward]+1
     previous_boundary=radial[np.maximum(radial_index-1,0)]
     inward=(in_grid&(radial_index>=1)&
-            (np.asarray(distance-radius,dtype=f32)<previous_boundary))
+            (distance-radius<previous_boundary))
     peak_radial[inward]=radial_index[inward]-1
     previous=np.where(angular_index==0,angular.size-1,angular_index-1)
     following=np.where(angular_index==angular.size-1,0,angular_index+1)
-    up_edge=np.asarray(angular[angular_index]-shifted,dtype=f32)
-    up_edge=np.where(up_edge<f32(0.),
-                     np.asarray(up_edge+f32(360.),dtype=f32),up_edge).astype(f32)
-    down_edge=np.asarray(shifted-angular[previous],dtype=f32)
-    down_edge=np.where(down_edge<f32(0.),
-                       np.asarray(down_edge+f32(360.),dtype=f32),down_edge).astype(f32)
-    divisor=np.where(distance==f32(0.),f32(.001),distance).astype(f32)
-    angular_radius=np.asarray(
-        np.asarray(radius*f32(57.29578),dtype=f32)/divisor,dtype=f32)
+    up_edge=np.mod(angular[angular_index]-shifted,360.)
+    down_edge=np.mod(shifted-angular[previous],360.)
+    divisor=np.where(distance==0.,.001,distance)
+    angular_radius=np.degrees(radius/divisor)
     peak_angular=angular_index.copy()
     peak_angular=np.where(up_edge<angular_radius,following,peak_angular)
     peak_angular=np.where((up_edge>=angular_radius)&(down_edge<angular_radius),
@@ -740,7 +739,7 @@ def _accumulate_polar_points(x, y, elevation, grid, sums, counts, maxima, radius
     radial_boundaries, angular_boundaries = _polar_boundaries(grid)
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
-    elevation = np.asarray(elevation, dtype=np.float64)
+    elevation = np.asarray(elevation, dtype=COMPUTE_DTYPE)
     x_origin=np.asarray(np.float64(grid.x_origin_km)*np.float64(1000.),dtype=np.float64)
     y_origin=np.asarray(np.float64(grid.y_origin_km)*np.float64(1000.),dtype=np.float64)
     dx = np.asarray(x-x_origin,dtype=np.float64)
@@ -774,7 +773,7 @@ def _accumulate_points(x, y, elevation, grid, sums, counts, maxima=None,
     """Apply SAVEELEV's standard mean-grid path to projected metre points."""
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
-    elevation = np.asarray(elevation, dtype=np.float64)
+    elevation = np.asarray(elevation, dtype=COMPUTE_DTYPE)
     domain=_domain_mask(x,y,grid)
     if terrain_filter is not None:
         elevation=terrain_filter.extracted(x,y,elevation,domain)
@@ -810,19 +809,24 @@ def _accumulate_points(x, y, elevation, grid, sums, counts, maxima=None,
     flat = iy[valid] * grid.nx + ix[valid]
     _add_cell_samples(flat, elevation[valid], sums, counts, maxima)
     if peak_radius_grid is not None:
-        radius = np.broadcast_to(np.asarray(peak_radius_grid, dtype=np.float64), x.shape)
-        peak_x = np.trunc(cell_x + radius).astype(np.int64)
-        peak_y = np.trunc(cell_y + radius).astype(np.int64)
-        peak_x = np.where(peak_x == ix, np.trunc(cell_x - radius).astype(np.int64), peak_x)
-        peak_y = np.where(peak_y == iy, np.trunc(cell_y - radius).astype(np.int64), peak_y)
-        perturbed_valid=(valid&(peak_x>=0)&(peak_x<grid.nx)&
-                         (peak_y>=0)&(peak_y<grid.ny))
+        radius_x, radius_y = (
+            np.broadcast_to(np.asarray(value, dtype=np.float64), x.shape)
+            for value in peak_radius_grid
+        )
+        peak_x = np.trunc(cell_x + radius_x).astype(np.int64)
+        peak_y = np.trunc(cell_y + radius_y).astype(np.int64)
+        peak_x = np.where(
+            peak_x == ix, np.trunc(cell_x - radius_x).astype(np.int64), peak_x
+        )
+        peak_y = np.where(
+            peak_y == iy, np.trunc(cell_y - radius_y).astype(np.int64), peak_y
+        )
         for candidate_x, candidate_y, changed in (
             (peak_x, iy, peak_x != ix),
             (ix, peak_y, peak_y != iy),
             (peak_x, peak_y, (peak_x != ix) & (peak_y != iy)),
         ):
-            selected = (perturbed_valid & changed & (candidate_x >= 0) & (candidate_x < grid.nx) &
+            selected = (valid & changed & (candidate_x >= 0) & (candidate_x < grid.nx) &
                         (candidate_y >= 0) & (candidate_y < grid.ny))
             if selected.any():
                 candidate_flat = candidate_y[selected] * grid.nx + candidate_x[selected]
@@ -936,8 +940,9 @@ def _accumulate_usgsla(path, grid, sums, counts, input_datum="ESR-S", *, spec=No
     source_x = spec.x_origin_km + np.arange(i0, i1 + 1, dtype=np.float64)
     inside_total = 0
     for j in range(j0, j1 + 1):
-        encoded = np.asarray(raw[spec.ny - j, i0 - 1:i1], dtype=np.float64)
-        elevation = encoded[:, 1] + 255.0 * encoded[:, 0]
+        encoded = np.asarray(
+            raw[spec.ny - j, i0 - 1:i1], dtype=COMPUTE_DTYPE)
+        elevation = encoded[:, 1] + COMPUTE_DTYPE(255.0) * encoded[:, 0]
         source_y = np.full(source_x.shape, spec.y_origin_km + j)
         if grid.projection.upper() == 'LCC':
             x, y = project_glaz_to_lcc(
@@ -1302,7 +1307,11 @@ def _accumulate_usgs_degree_dem(path, grid, sums, counts, input_datum="WGS-72", 
         valid = raw > -32000
         rounded = np.where(base + raw >= 0.0, np.floor(base + raw + 0.5),
                            np.ceil(base + raw - 0.5))
-        elevation = np.where(valid, rounded.astype(np.int16).astype(np.float64) * scale, raw)
+        elevation = np.where(
+            valid,
+            rounded.astype(np.int16).astype(COMPUTE_DTYPE) * COMPUTE_DTYPE(scale),
+            raw,
+        ).astype(COMPUTE_DTYPE, copy=False)
         radius = (_peak_radius_from_points(interpolated_x,interpolated_y,grid)
                   if peak else None)
         inside_total += _accumulate_points(
@@ -1345,9 +1354,10 @@ def _accumulate_usgs30(path, grid, sums, counts, input_datum="NAS-C", *, maxima=
                            np.ceil(base + raw - 0.5))
         elevation = np.where(
             valid,
-            rounded.astype(np.int16).astype(np.float64) * elevation_scale,
+            rounded.astype(np.int16).astype(COMPUTE_DTYPE)
+            * COMPUTE_DTYPE(elevation_scale),
             raw,
-        )
+        ).astype(COMPUTE_DTYPE, copy=False)
         radius = _fixed_peak_radius(
             np.float64(0.5) * np.float64(header.resolution[1]), grid
         ) if peak else None
@@ -1359,57 +1369,71 @@ def _accumulate_usgs30(path, grid, sums, counts, input_datum="NAS-C", *, maxima=
 
 
 def _geotiff_geometry(path: Path):
-    """Read the GeoTIFF CRS, pixel-centre geometry, and one elevation band."""
-    with tifffile.TiffFile(path) as source:
-        metadata = source.geotiff_metadata or {}
-        epsg = metadata.get("ProjectedCSTypeGeoKey") or metadata.get("GeographicTypeGeoKey")
-        page = source.pages[0]
-        scale = metadata.get("ModelPixelScale")
-        tie = metadata.get("ModelTiepoint")
-        if scale is None and page.tags.get(33550):
-            scale = page.tags[33550].value
-        if tie is None and page.tags.get(33922):
-            tie = page.tags[33922].value
-        if epsg is None or scale is None or tie is None:
-            raise ValueError(f"terrain GeoTIFF has incomplete georeferencing: {path}")
-        data = np.asarray(source.asarray())
-        raster_type = int(metadata.get("GTRasterTypeGeoKey", 1))
-        orientation = int(page.tags[274].value) if 274 in page.tags else 1
-        elevation_scale = 0.3048 if int(metadata.get("VerticalUnitsGeoKey", 9001)) == 9002 else 1.0
+    """Read one standard GeoTIFF band, validity mask, and centre geometry."""
+    path = Path(path)
+    try:
+        with rasterio.open(path) as source:
+            if source.count != 1:
+                raise ValueError("terrain GeoTIFF must contain one numeric two-dimensional band")
+            if source.crs is None:
+                raise ValueError(f"terrain GeoTIFF has no CRS: {path}")
+            data = source.read(1)
+            valid = source.read_masks(1) != 0
+            source_crs = CRS.from_user_input(source.crs)
+            transform = source.transform
+            units = (source.units[0] or "").casefold()
+    except RasterioIOError as error:
+        raise ValueError(f"unable to read terrain GeoTIFF: {path}") from error
     if data.ndim != 2 or data.dtype.kind not in {"u", "i", "f"}:
         raise ValueError("terrain GeoTIFF must contain one numeric two-dimensional band")
-    if len(scale) < 2 or len(tie) < 6:
-        raise ValueError(f"terrain GeoTIFF has invalid scale or tiepoint tags: {path}")
-    dx, dy = float(scale[0]), float(scale[1])
-    if dx <= 0.0 or dy <= 0.0:
-        raise ValueError("terrain GeoTIFF pixel scale must be positive")
-    if orientation not in {1, 4}:
-        raise ValueError(f"unsupported terrain GeoTIFF orientation {orientation}")
-    half = 0.5 if raster_type == 1 else 0.0
-    x0 = float(tie[3]) + (half - float(tie[0])) * dx
-    if orientation == 1:
-        y0 = float(tie[4]) - (half - float(tie[1])) * dy
-    else:
-        # TIFF orientation 4 stores the bottom row first.  LOADTIFF accepts
-        # it explicitly; normalize to the top-to-bottom row order used by the
-        # vectorized reader while retaining the same pixel-centre geometry.
-        first_y = float(tie[4]) + (half - float(tie[1])) * dy
-        y0 = first_y + (data.shape[0] - 1) * dy
-        data = data[::-1]
-    return CRS.from_epsg(int(epsg)), x0, y0, dx, dy, elevation_scale, data
+    if not np.isclose(transform.b, 0.0) or not np.isclose(transform.d, 0.0):
+        raise ValueError("rotated terrain GeoTIFF grids are not supported")
+    dx, dy = float(transform.a), float(transform.e)
+    if dx <= 0.0 or dy == 0.0:
+        raise ValueError("terrain GeoTIFF pixel spacing is invalid")
+    x0, y0 = transform @ (0.5, 0.5)
+    elevation_scale = 0.3048 if units in {"foot", "feet", "ft", "us survey foot"} else 1.0
+
+    # GDAL does not expose TIFF orientation 4 and returns its stored row order.
+    # Keep this narrow metadata fallback for uncommon bottom-up TIFFs; all CRS,
+    # affine, band, unit, and pixel reads above still go through Rasterio.
+    with tifffile.TiffFile(path) as tiff:
+        page = tiff.pages[0]
+        orientation = int(page.tags[274].value) if 274 in page.tags else 1
+        if orientation not in {1, 4}:
+            raise ValueError(f"unsupported terrain GeoTIFF orientation {orientation}")
+        if orientation == 4:
+            metadata = tiff.geotiff_metadata or {}
+            scale = metadata.get("ModelPixelScale")
+            tie = metadata.get("ModelTiepoint")
+            if scale is None or tie is None or len(scale) < 2 or len(tie) < 6:
+                raise ValueError(f"terrain GeoTIFF has invalid scale or tiepoint tags: {path}")
+            raster_type = int(metadata.get("GTRasterTypeGeoKey", 1))
+            half = 0.5 if raster_type == 1 else 0.0
+            x0 = float(tie[3]) + (half - float(tie[0])) * dx
+            pixel_height = abs(dy)
+            first_y = float(tie[4]) + (half - float(tie[1])) * pixel_height
+            y0 = first_y + (data.shape[0] - 1) * pixel_height
+            dy = -pixel_height
+            data = data[::-1]
+            valid = valid[::-1]
+    valid &= np.isfinite(data)
+    return source_crs, float(x0), float(y0), dx, dy, elevation_scale, data, valid
 
 
 def _accumulate_geotiff(path, grid, sums, counts, input_datum="WGS-84", *, maxima=None,
                         peak=False, receptors=None, terrain_filter=None) -> int:
     """Accumulate GeoTIFF pixel values following LOADTIFF/SAVEELEV."""
-    source_crs, x0, y0, dx, dy, elevation_scale, data = _geotiff_geometry(Path(path))
+    source_crs, x0, y0, dx, dy, elevation_scale, data, valid_data = _geotiff_geometry(
+        Path(path)
+    )
     to_geographic = Transformer.from_crs(source_crs, source_crs.geodetic_crs, always_xy=True)
     source_x = x0 + dx * np.arange(data.shape[1], dtype=np.float64)
     radius = None
     if peak:
         corner_source_x = np.array([source_x[0], source_x[-1], source_x[-1], source_x[0]])
-        corner_source_y = np.array([y0, y0, y0 - dy * (data.shape[0] - 1),
-                                    y0 - dy * (data.shape[0] - 1)])
+        last_y = y0 + dy * (data.shape[0] - 1)
+        corner_source_y = np.array([y0, y0, last_y, last_y])
         corner_lon, corner_lat = to_geographic.transform(corner_source_x, corner_source_y)
         corner_x, corner_y = project_geographic(corner_lon, corner_lat, grid, input_datum)
         dx_m = min(abs(corner_x[1] - corner_x[0]),
@@ -1421,13 +1445,16 @@ def _accumulate_geotiff(path, grid, sums, counts, input_datum="WGS-84", *, maxim
         )
     inside_total = 0
     for row, raw in enumerate(data):
-        source_y = np.full(source_x.shape, y0 - dy * row)
+        source_y = np.full(source_x.shape, y0 + dy * row)
         longitude, latitude = to_geographic.transform(source_x, source_y)
         x, y = project_geographic(longitude, latitude, grid, input_datum)
         x = np.asarray(x, dtype=np.float64)
         y = np.asarray(y, dtype=np.float64)
-        elevation = np.asarray(raw, dtype=np.float64) * elevation_scale
-        elevation[(elevation > 20000.0) | (elevation < -10000.0)] = 0.0
+        elevation = np.asarray(raw, dtype=COMPUTE_DTYPE) * COMPUTE_DTYPE(elevation_scale)
+        valid = valid_data[row]
+        out_of_range = valid & ((elevation > 20000.0) | (elevation < -10000.0))
+        elevation[out_of_range] = 0.0
+        elevation[~valid] = COMPUTE_DTYPE(-32768.0)
         inside_total += _accumulate_points(
             x, y, elevation, grid, sums, counts, maxima, radius, receptors,
             terrain_filter
@@ -1442,7 +1469,7 @@ def _write_netcdf(path, terrain, counts, grid, datum, *, peak=False) -> None:
         ds.createDimension(y_dimension, grid.ny)
         ds.createDimension(x_dimension, grid.nx)
         ds.Conventions = "CF-1.8"
-        ds.source = "PyCALMET TERREL NumPy port (legacy MSHEET=0)"
+        ds.source = "PyCALMET TERREL terrain preprocessing"
         ds.projection, ds.datum = grid.projection.upper(), datum
         ds.lat_0, ds.lon_0, ds.lat_1, ds.lat_2 = grid.lat0, grid.lon0, grid.lat1, grid.lat2
         ds.ttm_scale = grid.ttm_scale
@@ -1464,36 +1491,26 @@ def _write_netcdf(path, terrain, counts, grid, datum, *, peak=False) -> None:
             xv[:] = grid.x_origin_km + (np.arange(grid.nx) + 0.5) * grid.dx_km
             yv[:] = grid.y_origin_km + (np.arange(grid.ny) + 0.5) * grid.dy_km
         tv = ds.createVariable("terrain_height", "f4", (y_dimension, x_dimension),
-                               fill_value=np.float64(-999.0), zlib=True)
+                               fill_value=COMPUTE_DTYPE(-999.0), zlib=True)
         tv.units = "m"
         tv.long_name = ("grid-cell peak terrain elevation above mean sea level" if peak else
                         "grid-cell mean terrain elevation above mean sea level")
-        tv[:] = terrain.astype(np.float64)
+        tv[:] = np.asarray(terrain,dtype=COMPUTE_DTYPE).reshape(grid.ny,grid.nx)
         ds.createVariable("sample_count", "i4", (y_dimension, x_dimension),
                           zlib=True)[:] = counts.reshape(grid.ny, grid.nx)
 
 
 def _cell_type_coordinates(grid):
-    """Return the floating-point cell coordinates used by HEIGHTS/IPTYPE.
-
-    HEIGHTS historically applies its Cartesian ``SIZEK`` expression even to
-    polar output.  Retain that behaviour: changing it to ring/ray centres can
-    select another coastline type and therefore another terrain replacement.
-    """
-    f32=np.float64
-    x_origin=f32(grid.x_origin_km); y_origin=f32(grid.y_origin_km)
+    """Return projected cell-centre coordinates for terrain classification."""
+    x_origin=float(grid.x_origin_km); y_origin=float(grid.y_origin_km)
     if grid.grid_type==3:
-        radial_km,_=_polar_boundaries_km(grid)
-        outer_km=radial_km[-1]
-        x_origin=np.asarray(x_origin-outer_km,dtype=f32)
-        y_origin=np.asarray(y_origin-outer_km,dtype=f32)
-    size=f32(grid.dx_km)
-    x_index=np.arange(grid.nx,dtype=f32)
-    y_index=np.arange(grid.ny,dtype=f32)
-    x=np.asarray(np.asarray(x_index+f32(.5),dtype=f32)*size,dtype=f32)
-    y=np.asarray(np.asarray(y_index+f32(.5),dtype=f32)*size,dtype=f32)
-    x=np.asarray(x+x_origin,dtype=f32)
-    y=np.asarray(y+y_origin,dtype=f32)
+        distances=np.asarray(grid.ring_distances_km,dtype=COORD_DTYPE)
+        angles=np.radians(np.asarray(grid.ray_angles_deg,dtype=COORD_DTYPE))
+        x=x_origin+np.sin(angles)[:,None]*distances[None,:]
+        y=y_origin+np.cos(angles)[:,None]*distances[None,:]
+        return x,y
+    x=x_origin+(np.arange(grid.nx,dtype=COORD_DTYPE)+.5)*float(grid.dx_km)
+    y=y_origin+(np.arange(grid.ny,dtype=COORD_DTYPE)+.5)*float(grid.dy_km)
     return np.meshgrid(x,y,indexing="xy")
 
 
@@ -1503,67 +1520,58 @@ def _cell_types(grid, terrain_filter):
 
 
 def _cell_averages(sums, counts):
-    """Reproduce HEIGHTS' SUM/FLOAT(KNT) floating-point division."""
-    totals=np.asarray(sums,dtype=np.float64)
+    """Finish high-precision terrain sums as the model's FP32 field."""
+    totals=np.asarray(sums,dtype=ACCUM_DTYPE)
     hits=np.asarray(counts)
-    denominator=np.asarray(hits,dtype=np.float64)
-    average=np.full(totals.shape,np.float64(-999.),dtype=np.float64)
+    denominator=np.asarray(hits,dtype=ACCUM_DTYPE)
+    average=np.full(totals.shape,-999.,dtype=ACCUM_DTYPE)
     np.divide(totals,denominator,out=average,where=hits>0)
-    return average
+    return average.astype(COMPUTE_DTYPE)
 
 
-def _cell_average(total, count):
-    return np.asarray(np.float64(total)/np.float64(count),dtype=np.float64)
+def _fill_polar_angular_gaps(terrain, missing_threshold=-9999.0,
+                             ray_angles_deg=None):
+    """Fill each missing polar cell from the nearest populated ray.
 
-
-def _cell_search_count(radius_km, cell_size_km):
-    f32=np.float64
-    radius=max(f32(radius_km),f32(cell_size_km))
-    ratio=np.asarray(radius/f32(cell_size_km),dtype=f32)
-    return max(int(np.asarray(ratio+f32(.1),dtype=f32)),1)
-
-
-def _fill_polar_angular_gaps(terrain, missing_threshold=-9999.0):
-    """Reproduce FILLANG's circular, order-dependent nearest fill.
-
-    Rays are the first dimension and rings the second, matching the shaped
-    Fortran ``HT(ix+(iy-1)*nx)`` array.  The ring columns are independent, so
-    they remain vectorised; the ray loop is retained because a value filled at
-    one ray is deliberately visible to the following ray in the same pass.
+    Rays are circular and form the first dimension.  Ties choose the lower
+    original ray index, making the result independent of traversal order.
     """
-    f32=np.float64
+    f32=COMPUTE_DTYPE
     values=np.asarray(terrain,dtype=f32).copy()
     if values.ndim!=2:
         raise ValueError("TERREL FILLANG terrain must be a two-dimensional array")
     missing_limit=f32(missing_threshold)
-    entirely_missing=np.all(values<=missing_limit,axis=0)
+    missing=values<=missing_limit
+    entirely_missing=np.all(missing,axis=0)
     if np.any(entirely_missing):
         rings=", ".join(str(index+1) for index in np.flatnonzero(entirely_missing))
         raise ValueError(f"TERREL FILLANG cannot fill entirely empty polar ring(s): {rings}")
-    repeat=True
-    while repeat:
-        repeat=False
-        last=values[-1].copy()
-        for ray in range(values.shape[0]):
-            current=values[ray]
-            following=values[(ray+1)%values.shape[0]]
-            missing=current<=missing_limit
-            if not np.any(missing):
-                last=current.copy()
-                continue
-            last_missing=last<=missing_limit
-            following_missing=following<=missing_limit
-            unresolved=missing&last_missing&following_missing
-            repeat=repeat or bool(np.any(unresolved))
-            use_following=missing&last_missing&~following_missing
-            use_last=missing&~last_missing&following_missing
-            average=missing&~last_missing&~following_missing
-            current[use_following]=following[use_following]
-            current[use_last]=last[use_last]
-            if np.any(average):
-                total=np.asarray(last[average]+following[average],dtype=f32)
-                current[average]=np.asarray(total/f32(2.),dtype=f32)
-            last=current.copy()
+    ray_count=values.shape[0]
+    rays=np.arange(ray_count,dtype=np.int64)
+    if ray_angles_deg is None:
+        angles=np.linspace(0.,2.*np.pi,ray_count,endpoint=False,dtype=COORD_DTYPE)
+    else:
+        angles=np.radians(np.asarray(ray_angles_deg,dtype=COORD_DTYPE))
+        if angles.shape!=(ray_count,):
+            raise ValueError("TERREL polar ray angles must match the terrain ray dimension")
+    ray_coordinates=np.column_stack((np.sin(angles),np.cos(angles)))
+    for ring in range(values.shape[1]):
+        missing_rays=rays[missing[:,ring]]
+        if not missing_rays.size:
+            continue
+        populated_rays=rays[~missing[:,ring]]
+        candidate_count=min(2,populated_rays.size)
+        distance,index=cKDTree(ray_coordinates[populated_rays]).query(
+            ray_coordinates[missing_rays],k=candidate_count)
+        if candidate_count==1:
+            nearest=np.full(missing_rays.shape,populated_rays[int(index[0])],dtype=np.int64)
+        else:
+            nearest=populated_rays[index[:,0]]
+            tied=np.isclose(distance[:,0],distance[:,1],rtol=1e-12,atol=1e-12)
+            if np.any(tied):
+                nearest[tied]=np.minimum(populated_rays[index[tied,0]],
+                                         populated_rays[index[tied,1]])
+        values[missing_rays,ring]=values[nearest,ring]
     return values
 
 
@@ -1577,7 +1585,8 @@ def _finalize_terrain(sums,counts,maxima,grid,peak,terrain_filter):
     if grid.grid_type==3:
         # Python represents HEIGHTS' internal -32000 void as -999.  FILLANG
         # runs before output and fills either representation identically.
-        final=_fill_polar_angular_gaps(final,missing_threshold=-998.)
+        final=_fill_polar_angular_gaps(
+            final,missing_threshold=-998.,ray_angles_deg=grid.ray_angles_deg)
     return final
 
 
@@ -1613,200 +1622,135 @@ def _write_plot_output(path,terrain,grid):
 
 
 def _interp2d(x_vertices, y_vertices, values, distances, x, y, distance_max):
-    """Port TERREL INTERP2D's four-sided linear interpolation."""
-    f32=np.float64
-    xo=np.asarray(x_vertices,dtype=f32); yo=np.asarray(y_vertices,dtype=f32)
-    zo=np.asarray(values,dtype=f32); dist=np.asarray(distances,dtype=f32)
-    x=f32(x); y=f32(y); distance_max=f32(distance_max)
-    def atan2_real(a,b):
-        return np.asarray(np.arctan2(np.float64(f32(a)),np.float64(f32(b))),dtype=f32)
-    def sin_real(a): return np.asarray(np.sin(np.float64(f32(a))),dtype=f32)
-    def cos_real(a): return np.asarray(np.cos(np.float64(f32(a))),dtype=f32)
-    def sqrt_real(a): return np.asarray(np.sqrt(np.float64(f32(a))),dtype=f32)
+    """Interpolate a value from the nearest point in each quadrant."""
+    xo=np.asarray(x_vertices,dtype=COORD_DTYPE)
+    yo=np.asarray(y_vertices,dtype=COORD_DTYPE)
+    zo=np.asarray(values,dtype=COMPUTE_DTYPE)
+    dist=np.asarray(distances,dtype=COORD_DTYPE)
+    x=float(x); y=float(y); distance_max=float(distance_max)
     minimum = np.min(dist)
-    if minimum<=f32(1.e-3): return zo[np.flatnonzero(dist==minimum)[0]]
-    if np.min(zo)<f32(-998.) or np.max(dist)>distance_max: return f32(-999.)
-    angle_point=np.empty(4,dtype=f32)
-    for index in range(4):
-        dx=np.asarray(x-xo[index],dtype=f32); dy=np.asarray(y-yo[index],dtype=f32)
-        angle_point[index]=(f32(0.) if dx==f32(0.) and dy==f32(0.)
-                            else atan2_real(dy,dx))
+    if minimum<=1.e-3:
+        return COMPUTE_DTYPE(zo[np.flatnonzero(dist==minimum)[0]])
+    if np.min(zo)<-998. or np.max(dist)>distance_max:
+        return COMPUTE_DTYPE(-999.)
+    dx_point=x-xo; dy_point=y-yo
+    angle_point=np.arctan2(dy_point,dx_point)
+    angle_point[(dx_point==0.)&(dy_point==0.)]=0.
     minimum_y = np.min(yo)
     candidates = np.flatnonzero(yo == minimum_y)
     first = int(candidates[np.argmin(xo[candidates])])
     other = [index for index in range(4) if index != first]
-    pi=np.abs(atan2_real(f32(0.),f32(-1.)))
     angles=[]
     for index in other:
-        dy=np.asarray(yo[index]-yo[first],dtype=f32)
-        dx=np.asarray(np.asarray(xo[index]-xo[first],dtype=f32)+f32(1.e-30),dtype=f32)
-        angle=atan2_real(dy,dx)
-        if angle<np.asarray(-pi/f32(2.),dtype=f32):
-            angle=np.asarray(angle+np.asarray(f32(2.)*pi,dtype=f32),dtype=f32)
+        dy=yo[index]-yo[first]
+        dx=xo[index]-xo[first]+1.e-30
+        angle=np.arctan2(dy,dx)
+        if angle< -np.pi/2.:
+            angle+=2.*np.pi
         angles.append(angle)
-    angles=np.asarray(angles,dtype=f32)
+    angles=np.asarray(angles,dtype=COORD_DTYPE)
     second = other[int(np.argmin(angles))]
     fourth = other[int(np.argmax(angles))]
     third = 6 - first - second - fourth
     order = [first, second, third, fourth, first]
-    perpendicular = np.empty(4, dtype=np.float64)
-    edge_values = np.empty(4, dtype=np.float64)
+    perpendicular = np.empty(4, dtype=COORD_DTYPE)
+    edge_values = np.empty(4, dtype=COORD_DTYPE)
     for edge in range(4):
         start, end = order[edge], order[edge + 1]
-        dx=np.asarray(xo[start]-xo[end],dtype=f32); dy=np.asarray(yo[start]-yo[end],dtype=f32)
-        square=np.asarray(np.asarray(dx*dx,dtype=f32)+np.asarray(dy*dy,dtype=f32),dtype=f32)
-        side=sqrt_real(square)
-        angle=atan2_real(dy,dx) if dx!=f32(0.) or dy!=f32(0.) else f32(0.)
-        relative=np.asarray(angle_point[start]-angle,dtype=f32)
-        along=np.abs(np.asarray(dist[start]*cos_real(relative),dtype=f32))
-        perpendicular[edge]=np.abs(np.asarray(dist[start]*sin_real(relative),dtype=f32))
-        first_term=np.asarray(along*zo[end],dtype=f32)
-        remainder=np.asarray(side-along,dtype=f32)
-        second_term=np.asarray(remainder*zo[start],dtype=f32)
-        edge_values[edge]=np.asarray(np.asarray(first_term+second_term,dtype=f32)/side,dtype=f32)
-        if perpendicular[edge]<f32(1.e-3): return edge_values[edge]
+        dx=xo[start]-xo[end]; dy=yo[start]-yo[end]
+        side=np.hypot(dx,dy)
+        angle=np.arctan2(dy,dx) if dx!=0. or dy!=0. else 0.
+        relative=angle_point[start]-angle
+        along=abs(dist[start]*np.cos(relative))
+        perpendicular[edge]=abs(dist[start]*np.sin(relative))
+        edge_values[edge]=(along*zo[end]+(side-along)*zo[start])/side
+        if perpendicular[edge]<1.e-3:
+            return COMPUTE_DTYPE(edge_values[edge])
     def opposite(first,third):
-        numerator=np.asarray(
-            np.asarray(edge_values[first]*perpendicular[third],dtype=f32)+
-            np.asarray(edge_values[third]*perpendicular[first],dtype=f32),dtype=f32)
-        denominator=np.asarray(perpendicular[first]+perpendicular[third],dtype=f32)
-        return np.asarray(numerator/denominator,dtype=f32)
+        numerator=(edge_values[first]*perpendicular[third]+
+                   edge_values[third]*perpendicular[first])
+        return numerator/(perpendicular[first]+perpendicular[third])
     first_estimate=opposite(0,2); second_estimate=opposite(1,3)
-    p24=np.asarray(perpendicular[1]+perpendicular[3],dtype=f32)
-    p13=np.asarray(perpendicular[0]+perpendicular[2],dtype=f32)
-    numerator=np.asarray(np.asarray(first_estimate*p24,dtype=f32)+
-                         np.asarray(second_estimate*p13,dtype=f32),dtype=f32)
-    denominator=np.asarray(
-        np.asarray(np.asarray(perpendicular[0]+perpendicular[1],dtype=f32)+
-                   perpendicular[2],dtype=f32)+perpendicular[3],dtype=f32)
-    return np.asarray(numerator/denominator,dtype=f32)
+    p24=perpendicular[1]+perpendicular[3]
+    p13=perpendicular[0]+perpendicular[2]
+    numerator=first_estimate*p24+second_estimate*p13
+    return COMPUTE_DTYPE(numerator/np.sum(perpendicular))
 
 
 def _fill_void_cells(sums, counts, grid, radius_km, maxima=None) -> int:
-    """Fill average-terrain voids in CELLFILL's mutation order."""
-    if not np.isclose(grid.dx_km, grid.dy_km):
-        raise ValueError("legacy TERREL CELLFILL requires square grid cells")
-    if radius_km <= grid.dx_km:
-        raise ValueError("CELLRADKM must be larger than DGRIDKM")
-    sums = sums.reshape(grid.ny, grid.nx)
-    counts = counts.reshape(grid.ny, grid.nx)
-    maxima_grid = None if maxima is None else maxima.reshape(grid.ny, grid.nx)
-    cells = _cell_search_count(radius_km,grid.dx_km)
-    filled = 0
+    """Fill voids from the nearest original cell within a physical radius.
 
-    def fill_boundary(target_y, target_x, y_range, x_range, *, x_outer):
-        nonlocal filled
-        if counts[target_y, target_x] != 0:
-            return
-        sums[target_y, target_x] = 0.0
-        if maxima_grid is not None:
-            maxima_grid[target_y, target_x] = 0.0
-        nearest = np.float64(1.0e32)
-        tied = 0
-        outer=x_range if x_outer else y_range
-        inner=y_range if x_outer else x_range
-        for first in outer:
-            for second in inner:
-                source_x,source_y=((first,second) if x_outer else (second,first))
-                distance = np.sqrt(np.float64(
-                    (source_x - target_x) ** 2 + (source_y - target_y) ** 2
-                ))
-                if counts[source_y, source_x] > 0 and distance <= nearest:
-                    value = _cell_average(sums[source_y, source_x],
-                                          counts[source_y, source_x])
-                    if distance < nearest:
-                        nearest = distance
-                        sums[target_y, target_x] = value
-                        tied = 1
-                        if maxima_grid is not None:
-                            maxima_grid[target_y, target_x] = maxima_grid[source_y, source_x]
-                    else:
-                        sums[target_y, target_x] += value
-                        tied += 1
-                        if maxima_grid is not None:
-                            maxima_grid[target_y, target_x] = max(
-                                maxima_grid[target_y, target_x], maxima_grid[source_y, source_x]
-                            )
-                    counts[target_y, target_x] = tied
-        if counts[target_y, target_x] > 0:
-            sums[target_y, target_x] = _cell_average(
-                sums[target_y, target_x],counts[target_y, target_x])
-            counts[target_y, target_x] = -1
-            filled += 1
+    Coordinates are expressed in kilometres, so rectangular cells are handled
+    directly.  Every target is evaluated against the same immutable set of
+    populated cells; newly filled values never affect later targets.  Exact
+    nearest-neighbour ties are averaged (and peak ties take their maximum),
+    which also removes traversal-order dependence.
+    """
+    radius_km = float(radius_km)
+    if not np.isfinite(radius_km) or radius_km <= 0.0:
+        raise ValueError("CELLRADKM must be a positive finite distance")
 
-    for x in range(grid.nx):
-        x_range = range(max(x - cells, 0), min(x + cells + 1, grid.nx))
-        fill_boundary(0, x, range(0, min(cells, grid.ny)), x_range,x_outer=True)
-        fill_boundary(grid.ny - 1, x,
-                      range(max(grid.ny - cells, 0), grid.ny), x_range,x_outer=True)
-    for y in range(grid.ny):
-        y_range = range(max(y - cells, 0), min(y + cells + 1, grid.ny))
-        fill_boundary(y, 0, y_range, range(0, min(cells, grid.nx)),x_outer=False)
-        fill_boundary(y, grid.nx - 1, y_range,
-                      range(max(grid.nx - cells, 0), grid.nx),x_outer=False)
-    counts[(counts == -1) & _boundary_mask(grid.ny, grid.nx)] = 1
+    sums_grid = np.asarray(sums).reshape(grid.ny, grid.nx)
+    counts_grid = np.asarray(counts).reshape(grid.ny, grid.nx)
+    maxima_grid = None if maxima is None else np.asarray(maxima).reshape(grid.ny, grid.nx)
+    populated = counts_grid > 0
+    missing = ~populated
+    if not np.any(missing) or not np.any(populated):
+        return 0
 
-    for x in range(grid.nx):
-        for y in range(grid.ny):
-            if counts[y, x] != 0:
-                continue
-            x_start, x_end = max(x - cells, 0), min(x + cells, grid.nx - 1)
-            y_start, y_end = max(y - cells, 0), min(y + cells, grid.ny - 1)
-            vertices_x = np.array([x_start - 1, x_end + 1, x_end + 1, x_start - 1], dtype=np.float64)
-            vertices_y = np.array([y_start - 1, y_start - 1, y_end + 1, y_end + 1], dtype=np.float64)
-            distances = np.sqrt((x - vertices_x) ** 2 + (y - vertices_y) ** 2)
-            values = np.full(4, -999.0, dtype=np.float64)
-            peak_values = np.full(4, -999.0, dtype=np.float64)
-            for source_y in range(y_start, y_end + 1):
-                for source_x in range(x_start, x_end + 1):
-                    if source_x == x and source_y == y or counts[source_y, source_x] <= 0:
-                        continue
-                    distance = np.sqrt(np.float64((x - source_x) ** 2 + (y - source_y) ** 2))
-                    if source_x < x or (source_x == 0 and x == 0):
-                        if source_y > y or (source_y == grid.ny - 1 and y == grid.ny - 1):
-                            quadrant = 3
-                        elif source_y <= y and y != grid.ny - 1:
-                            quadrant = 0
-                        else:
-                            continue
-                    elif source_x >= x and x != grid.nx - 1:
-                        if source_y > y or (source_y == grid.ny - 1 and y == grid.ny - 1):
-                            quadrant = 2
-                        elif source_y <= y and y != grid.ny - 1:
-                            quadrant = 1
-                        else:
-                            continue
-                    else:
-                        continue
-                    if distance < distances[quadrant]:
-                        vertices_x[quadrant] = source_x
-                        vertices_y[quadrant] = source_y
-                        distances[quadrant] = distance
-                        values[quadrant] = _cell_average(
-                            sums[source_y, source_x],counts[source_y, source_x])
-                        if maxima_grid is not None:
-                            peak_values[quadrant] = maxima_grid[source_y, source_x]
-            average_value = _interp2d(vertices_x, vertices_y, values, distances,
-                                      float(x), float(y), radius_km)
-            sums[y, x] = average_value
-            filled_value = average_value
-            if maxima_grid is not None:
-                peak_value = _interp2d(vertices_x, vertices_y, peak_values, distances,
-                                       float(x), float(y), radius_km)
-                maxima_grid[y, x] = peak_value
-                filled_value = peak_value
-            if filled_value > -998.0:
-                counts[y, x] = -1
-                filled += 1
-    counts[counts < 0] = 1
-    return filled
+    y_index, x_index = np.indices((grid.ny, grid.nx), dtype=np.float64)
+    coordinates = np.column_stack((
+        ((x_index + 0.5) * float(grid.dx_km)).ravel(),
+        ((y_index + 0.5) * float(grid.dy_km)).ravel(),
+    ))
+    populated_flat = populated.ravel()
+    missing_flat = missing.ravel()
+    source_coordinates = coordinates[populated_flat]
+    target_coordinates = coordinates[missing_flat]
+    source_values = (
+        sums_grid[populated].astype(ACCUM_DTYPE, copy=False)
+        / counts_grid[populated].astype(ACCUM_DTYPE, copy=False)
+    )
 
+    tree = cKDTree(source_coordinates)
+    distances, nearest = tree.query(
+        target_coordinates, k=1, distance_upper_bound=radius_km
+    )
+    fillable = np.isfinite(distances)
+    if not np.any(fillable):
+        return 0
 
-def _boundary_mask(ny, nx):
-    mask = np.zeros((ny, nx), dtype=bool)
-    mask[[0, -1], :] = True
-    mask[:, [0, -1]] = True
-    return mask
+    target_flat_indices = np.flatnonzero(missing_flat)[fillable]
+    filled_values = np.empty(np.count_nonzero(fillable), dtype=ACCUM_DTYPE)
+    filled_maxima = (
+        np.empty(np.count_nonzero(fillable), dtype=COMPUTE_DTYPE)
+        if maxima_grid is not None else None
+    )
+    source_maxima = maxima_grid[populated] if maxima_grid is not None else None
+    for output_index, (point, distance, nearest_index) in enumerate(zip(
+        target_coordinates[fillable], distances[fillable], nearest[fillable]
+    )):
+        tolerance = max(1.0e-12, float(distance) * 1.0e-12)
+        candidates = np.asarray(
+            tree.query_ball_point(point, float(distance) + tolerance), dtype=np.int64
+        )
+        candidate_distances = np.linalg.norm(
+            source_coordinates[candidates] - point, axis=1
+        )
+        tied = candidates[np.isclose(
+            candidate_distances, distance, rtol=1.0e-12, atol=tolerance
+        )]
+        if not tied.size:
+            tied = np.asarray([nearest_index], dtype=np.int64)
+        filled_values[output_index] = np.mean(source_values[tied], dtype=ACCUM_DTYPE)
+        if filled_maxima is not None:
+            filled_maxima[output_index] = np.max(source_maxima[tied])
+
+    sums_grid.ravel()[target_flat_indices] = filled_values
+    counts_grid.ravel()[target_flat_indices] = 1
+    if maxima_grid is not None:
+        maxima_grid.ravel()[target_flat_indices] = filled_maxima
+    return int(target_flat_indices.size)
 
 
 def _write_legacy_header(stream, grid, datum, *, dataset="TERREL.DAT", version="2.0") -> None:
@@ -1940,9 +1884,9 @@ def run(config: TerrelConfig) -> TerrainResult:
     grid = (replace(config.grid, polar_processing=processing_method)
             if config.grid.grid_type == 3 else config.grid)
     projection_grid=replace(grid,datum=config.datum)
-    sums = np.zeros(grid.nx * grid.ny, dtype=np.float64)
+    sums = np.zeros(grid.nx * grid.ny, dtype=ACCUM_DTYPE)
     counts = np.zeros(grid.nx * grid.ny, dtype=np.int64)
-    maxima = np.full(grid.nx * grid.ny, -999.0, dtype=np.float64)
+    maxima = np.full(grid.nx * grid.ny, -999.0, dtype=COMPUTE_DTYPE)
     receptors = _read_receptors(config)
     terrain_filter=_terrain_filter(config)
     if config.previous_save is not None:
@@ -1993,9 +1937,9 @@ def _run_sources(config: TerrelConfig, sources: list[TerrelSource]) -> TerrainRe
     grid=(replace(config.grid,polar_processing=processing_method)
           if config.grid.grid_type==3 else config.grid)
     projection_grid=replace(grid,datum=config.datum)
-    sums=np.zeros(grid.nx*grid.ny,dtype=np.float64)
+    sums=np.zeros(grid.nx*grid.ny,dtype=ACCUM_DTYPE)
     counts=np.zeros(grid.nx*grid.ny,dtype=np.int64)
-    maxima=np.full(grid.nx*grid.ny,-999.,dtype=np.float64)
+    maxima=np.full(grid.nx*grid.ny,-999.,dtype=COMPUTE_DTYPE)
     receptors=_read_receptors(config)
     terrain_filter=_terrain_filter(config)
     if config.previous_save is not None:

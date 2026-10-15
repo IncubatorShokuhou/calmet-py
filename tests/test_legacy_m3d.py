@@ -16,6 +16,40 @@ from pycalmet.calmet_solver import dataset_timestamp
 import netCDF4 as nc
 
 
+def _surface_line(timestamp, i):
+    return (f'{timestamp}{i:3d}{1:3d}{1000.:7.1f}{0.:5.2f}{0:2d}'
+            f'{0.:8.1f}{0.:8.1f}{280.:8.1f}{5.:8.2f}{180.:8.1f}'
+            f'{5.:8.1f}{279.:8.1f}\n')
+
+
+def _level_line():
+    return (f'{900:4d}{100:6d}{280.:6.1f}{180:4d}{5.:5.1f}{0.:6.2f}'
+            f'{50:3d}{5.:5.2f}{-5.:6.3f}\n')
+
+
+def _formatted_m3d(hours):
+    """Return a tiny two-cell formatted M3D with explicit cell timestamps."""
+    lines=['3D.DAT         2.1\n','0\n','1 1 1 1 1 0\n',
+           'LCC 30 120 30 60 0 0 1 2 1 1\n','0\n',
+           f'{hours[0][0]} {len(hours)} 2 1 1\n','1 1 2 1 1 1\n',
+           '.900\n','1 1 30 120 0 21\n','2 1 30 121 0 21\n']
+    for stamps in hours:
+        for i,stamp in enumerate(stamps,1):
+            lines.extend((_surface_line(stamp,i),_level_line()))
+    return ''.join(lines)
+
+
+def _formatted_m2d(timestamps):
+    lines=['2D.DAT         2.1\n','3\n','producer\n',
+           '1 Number of 2D Variables\n','1 TEMP\n','1 1 1 1 1 1\n',
+           'LCC 30 120 30 60 0 0 1 1 1 1\n','0\n',
+           f'{timestamps[0]} {len(timestamps)} 1 1 1\n','1 1 1 1 1 1\n',
+           '.900\n','1 1 30 120 0 21\n']
+    for index,stamp in enumerate(timestamps):
+        lines.extend((f'{stamp}  TEMP    \n',f'{280.+index:10.3f}\n'))
+    return ''.join(lines)
+
+
 def test_legacy_unit_scaling_retains_default_real_rounding():
     pressure=np.float32(101015.)
     vapor=np.float32(.002105)
@@ -37,7 +71,7 @@ def test_legacy_vertical_velocity_uses_calwrf_threshold():
 def test_fixed_width_surface_parser():
     line = b"2018031800  1  1 1005.3 0.00 0     0.0     0.0   296.4   16.17   125.6     4.8   296.3\n"
     date, i, j, values = _surface(line)
-    assert (date, i, j) == (2018031800, 1, 1)
+    assert (date, i, j) == (datetime(2018,3,18), 1, 1)
     np.testing.assert_allclose(values, [1005.3, 0, 0, 0, 0, 296.4, 16.17, 125.6, 4.8, 296.3])
 
 
@@ -48,6 +82,85 @@ def test_fixed_width_level_parser_ignores_compressed_tail():
                                   np.zeros(5))
     np.testing.assert_allclose(_water(b"1010    34 296.4 126  4.8  0.00 9216.13 0.100 0.020\n"),
                                [.1,.02])
+
+
+def test_formatted_m3d_exposes_datetime_across_year_boundary(tmp_path):
+    path=tmp_path/'cross-year.m3d'
+    path.write_text(_formatted_m3d([
+        ('2018123123','2018123123'),
+        ('2019010100','2019010100'),
+    ]),encoding='ascii')
+
+    header,cells=M3DReader(path).cells()
+
+    assert header.start==datetime(2018,12,31,23)
+    assert header.wire_start=='2018123123'
+    records=list(cells)
+    assert [record.timestamp for record in records]==[
+        datetime(2018,12,31,23),datetime(2018,12,31,23),
+        datetime(2019,1,1),datetime(2019,1,1),
+    ]
+    assert records[-1].wire_date=='2019010100'
+
+
+def test_formatted_m3d_rejects_mixed_cell_times_within_hour(tmp_path):
+    path=tmp_path/'mixed-times.m3d'
+    path.write_text(_formatted_m3d([
+        ('2018123123','2019010100'),
+    ]),encoding='ascii')
+    _,cells=M3DReader(path).cells()
+    with pytest.raises(ValueError,match='inconsistent within an hour'):
+        list(cells)
+
+
+@pytest.mark.parametrize('timestamp',['2019022900','201901010 ','2019AA0100'])
+def test_formatted_m3d_rejects_invalid_fixed_width_timestamp(tmp_path,timestamp):
+    path=tmp_path/'invalid-time.m3d'
+    path.write_text(_formatted_m3d([(timestamp,timestamp)]),encoding='ascii')
+    with pytest.raises(ValueError,match='M3D .* timestamp'):
+        M3DReader(path).cells()
+
+
+def test_formatted_m2d_exposes_datetime_across_year_boundary(tmp_path):
+    path=tmp_path/'cross-year.m2d'
+    path.write_text(_formatted_m2d(['2018123123','2019010100']),encoding='ascii')
+
+    header,records=M2DReader(path).records()
+
+    assert header.start==datetime(2018,12,31,23)
+    assert header.wire_start=='2018123123'
+    records=list(records)
+    assert [record.timestamp for record in records]==[
+        datetime(2018,12,31,23),datetime(2019,1,1)]
+    assert records[-1].wire_date=='2019010100'
+
+
+@pytest.mark.parametrize('timestamp',['2019022900','201901010 ','2019AA0100'])
+def test_formatted_m2d_rejects_invalid_fixed_width_timestamp(tmp_path,timestamp):
+    path=tmp_path/'invalid-time.m2d'
+    path.write_text(_formatted_m2d([timestamp]),encoding='ascii')
+    with pytest.raises(ValueError,match='M2D .* timestamp'):
+        M2DReader(path).records()
+
+
+@pytest.mark.parametrize('timestamp',[
+    '2018-03-18_01:30:00',
+    '2018-03-18_01:00:01',
+])
+def test_legacy_calwrf_writer_rejects_non_hour_canonical_times(tmp_path,timestamp):
+    canonical=tmp_path/'subhourly.nc'
+    with nc.Dataset(canonical,'w') as dataset:
+        dataset.createDimension('time',1)
+        dataset.createDimension('date_strlen',19)
+        dataset.createVariable('time_text','S1',('time','date_strlen'))[:]=(
+            np.frombuffer(timestamp.encode('ascii'),dtype='S1')[None,:])
+    output=tmp_path/'out.m3d'; surface=tmp_path/'out.m2d'
+
+    with pytest.raises(ValueError,match='whole-hour'):
+        write_m3d(canonical,output,surface)
+
+    assert not output.exists()
+    assert not surface.exists()
 
 
 def test_legacy_writer_round_trips_canonical_calwrf_fields(tmp_path):
@@ -88,20 +201,22 @@ def test_legacy_writer_round_trips_canonical_calwrf_fields(tmp_path):
     level_at=comment.index('Level: ')+len('Level: ')
     assert int(comment[level_at:level_at+6])==131108
     header,cells=M3DReader(output).cells(); cell=next(iter(cells))
-    assert (header.nx,header.ny,header.nz,header.start)==(1,1,1,2018031801)
+    assert (header.nx,header.ny,header.nz,header.start)==(
+        1,1,1,datetime(2018,3,18,1))
     assert (header.source_nx,header.source_ny,header.source_nz)==(4,5,3)
     assert (header.i_start,header.j_start,header.k_start)==(3,4,2)
     assert (cell.i,cell.j)==(3,4)
     np.testing.assert_allclose(cell.surface,[1000.,.2,0.,300.,200.,290.,10.,180.,4.,289.])
     np.testing.assert_allclose(cell.levels[0,:6],[900.,1000.,280.,270.,5.,0.])
     header,records=M2DReader(surface).records(); records=list(records)
-    assert (header.nx,header.ny,header.nz,header.start)==(1,1,1,2018031801)
+    assert (header.nx,header.ny,header.nz,header.start)==(
+        1,1,1,datetime(2018,3,18,1))
     assert (header.source_nx,header.source_ny,header.source_nz)==(4,5,3)
     assert (header.i_start,header.j_start,header.k_start)==(3,4,2)
     assert header.variables==('PSFC','RAIN','SNOWC','SWDOWN','GLW','T2','Q2','WD10',
         'WS10','SST','TSK','PBLH','HFX','LH','UST','RAINC','RAINNC')
-    assert [(record.date,record.name) for record in records]==[
-        (2018031801,name) for name in header.variables]
+    assert [(record.timestamp,record.name) for record in records]==[
+        (datetime(2018,3,18,1),name) for name in header.variables]
     expected=[1000.,.2,0.,300.,200.,290.,10.,180.,4.,289.,291.,500.,20.,30.,.3,.05,.15]
     np.testing.assert_allclose([record.values.item() for record in records],expected,
         rtol=0,atol=5e-4)

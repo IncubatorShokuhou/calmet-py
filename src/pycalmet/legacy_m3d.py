@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, Iterable
 
@@ -24,7 +25,7 @@ class M3DHeader:
     ny: int
     nz: int
     nhours: int
-    start: int
+    start: datetime
     sigma: np.ndarray
     latitude: np.ndarray
     longitude: np.ndarray
@@ -37,19 +38,48 @@ class M3DHeader:
     j_start: int = 1
     k_start: int = 1
 
+    @property
+    def wire_start(self) -> str:
+        """Ten-column timestamp stored in the formatted M3D header."""
+        return self.start.strftime("%Y%m%d%H")
+
 
 @dataclass(frozen=True, slots=True)
 class M3DCell:
-    date: int
+    timestamp: datetime
     i: int
     j: int
     surface: np.ndarray
     levels: np.ndarray
     water: np.ndarray
 
+    @property
+    def date(self) -> datetime:
+        """Compatibility name for the structured record timestamp."""
+        return self.timestamp
+
+    @property
+    def wire_date(self) -> str:
+        """Ten-column timestamp stored in the formatted surface record."""
+        return self.timestamp.strftime("%Y%m%d%H")
+
 
 def _ints(line: bytes) -> list[int]:
     return [int(x) for x in line.split()]
+
+
+def _timestamp(field: bytes,description: str) -> datetime:
+    """Decode one exact-width ``YYYYMMDDHH`` field at the file boundary."""
+    try:
+        text=field.decode('ascii')
+    except UnicodeDecodeError as error:
+        raise ValueError(f'invalid M3D {description} timestamp') from error
+    if len(text)!=10 or not text.isdecimal():
+        raise ValueError(f'invalid M3D {description} timestamp {text!r}')
+    try:
+        return datetime.strptime(text,'%Y%m%d%H')
+    except ValueError as error:
+        raise ValueError(f'invalid M3D {description} timestamp {text!r}') from error
 
 
 def _read_header(stream: BinaryIO) -> M3DHeader:
@@ -63,10 +93,14 @@ def _read_header(stream: BinaryIO) -> M3DHeader:
     lat0,lon0,lat1,lat2,x0,y0,spacing=map(float,grid[1:8])
     source_nx, source_ny, source_nz = map(int, grid[8:11])
     stream.readline()  # physics flags
-    period = _ints(stream.readline())
+    period = stream.readline().split()
     if len(period)<5:
         raise ValueError('M3D period record is incomplete')
-    start, nhours, nx, ny, nz = period[:5]
+    start=_timestamp(period[0],'header')
+    try:
+        nhours,nx,ny,nz=map(int,period[1:5])
+    except ValueError as error:
+        raise ValueError('invalid M3D period dimensions') from error
     bounds=stream.readline().split()
     if len(bounds)<6:
         raise ValueError('M3D extraction-bounds record is incomplete')
@@ -88,16 +122,17 @@ def _read_header(stream: BinaryIO) -> M3DHeader:
                      source_nx,source_ny,source_nz,i_start,j_start,k_start)
 
 
-def _surface(line: bytes) -> tuple[int, int, int, np.ndarray]:
+def _surface(line: bytes) -> tuple[datetime, int, int, np.ndarray]:
     # Fortran 221: i10,2i3,f7.1,f5.2,i2,3f8.1,f8.2,3f8.1
-    date = int(line[0:10]); i = int(line[10:13]); j = int(line[13:16])
+    timestamp=_timestamp(line[0:10],'surface-record')
+    i = int(line[10:13]); j = int(line[13:16])
     values = np.array([
         float(line[16:23]), float(line[23:28]), float(line[28:30]),
         float(line[30:38]), float(line[38:46]), float(line[46:54]),
         float(line[54:62]), float(line[62:70]), float(line[70:78]),
         float(line[78:86]),
     ], dtype="f4")
-    return date, i, j, values
+    return timestamp, i, j, values
 
 
 def _level(line: bytes) -> np.ndarray:
@@ -134,12 +169,18 @@ class M3DReader:
         def generate():
             try:
                 for _time in range(header.nhours):
+                    hour_timestamp=None
                     for _j in range(header.ny):
                         for _i in range(header.nx):
                             line = stream.readline()
                             if not line:
                                 raise EOFError("m3d ended inside a surface record")
-                            date, i, j, surface = _surface(line)
+                            timestamp, i, j, surface = _surface(line)
+                            if hour_timestamp is None:
+                                hour_timestamp=timestamp
+                            elif timestamp!=hour_timestamp:
+                                raise ValueError(
+                                    'M3D cell timestamps are inconsistent within an hour')
                             lines=[stream.readline() for _ in range(header.nz)]
                             if any(not line for line in lines):
                                 raise EOFError('m3d ended inside a level record')
@@ -149,7 +190,7 @@ class M3DReader:
                                 values=_water(line)
                                 if values.size>5: raise ValueError('M3D water record has more than five fields')
                                 water[level,:values.size]=values
-                            yield M3DCell(date,i,j,surface,levels,water)
+                            yield M3DCell(timestamp,i,j,surface,levels,water)
             finally:
                 stream.close()
 
@@ -186,15 +227,14 @@ class M3DReader:
             for time_index in range(header.nhours):
                 surface=np.empty((10,header.ny,header.nx),dtype='f4')
                 levels=np.empty((13,header.nz,header.ny,header.nx),dtype='f4')
-                date=None
+                timestamp=None
                 for _ in range(header.nx*header.ny):
-                    cell=next(cells); date=cell.date
+                    cell=next(cells); timestamp=cell.timestamp
                     j=cell.j-header.j_start; i=cell.i-header.i_start
                     surface[:,j,i]=cell.surface
                     levels[:8,:,j,i]=cell.levels.T
                     levels[8:,:,j,i]=cell.water.T
-                stamp=f'{date:010d}'
-                text=f'{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]}_{stamp[8:]}:00:00'
+                text=timestamp.strftime('%Y-%m-%d_%H:%M:%S')
                 time_text[time_index]=np.frombuffer(text.encode('ascii'),dtype='S1')
                 scales=(100.,10.,1.,1.,1.,1.,.001,1.,1.,1.)
                 for index,name in enumerate(surface_names): surface_vars[name][time_index]=surface[index]*scales[index]

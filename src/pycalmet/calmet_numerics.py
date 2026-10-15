@@ -1,205 +1,208 @@
-"""Small, independently testable numerical kernels from CALMET 6.5.
+"""Small, independently testable numerical kernels for the CALMET model.
 
 Array axes follow the Python convention ``(..., y, x)``.  These routines are
-kept free of model-global state so the main solver can compose and regress
-them one Fortran subroutine at a time.
+kept free of model-global state so the main solver can compose them directly.
 """
 from __future__ import annotations
 from functools import lru_cache
 import numpy as np
 
 
-def _psiud(z_over_l):
-    """CALMET's double-precision COARE/Dyer wind stability function."""
-    return psi_momentum_dyer(z_over_l)
+# Physical fields and model state use single precision throughout the modern
+# solver.  Double precision is reserved for coordinates, reductions, and
+# nonlinear convergence work where single-precision cancellation can change
+# a grid-cell classification or prevent convergence.
+MODEL_DTYPE = np.float32
+ACCUMULATION_DTYPE = np.float64
+COORDINATE_DTYPE = np.float64
 
 
-def _psiuc(height,monin_obukhov,fit=16):
-    """Legacy REAL PSIUC stability function used when IPSIFCN=1."""
+def _model_array(value):
+    """Return a model-state array at the public numerical boundary."""
+    return np.asarray(value, dtype=MODEL_DTYPE)
+
+
+def _psiud(z_over_l,*,dtype=MODEL_DTYPE):
+    """CALMET's COARE/Dyer wind stability function."""
+    return psi_momentum_dyer(z_over_l,dtype=dtype)
+
+
+def _psiuc(height,monin_obukhov,fit=16,*,dtype=MODEL_DTYPE):
+    """PSIUC stability function used when ``IPSIFCN=1``."""
     if fit not in {15,16}: raise ValueError('PSIUC fit must be 15 or 16')
-    f32=np.float64
-    height,length=np.broadcast_arrays(np.asarray(height,dtype=f32),
-                                      np.asarray(monin_obukhov,dtype=f32))
-    output=np.empty(height.shape,dtype=f32); stable=length>f32(0.)
+    work_dtype=np.dtype(dtype).type
+    height,length=np.broadcast_arrays(np.asarray(height,dtype=work_dtype),
+                                      np.asarray(monin_obukhov,dtype=work_dtype))
+    output=np.empty(height.shape,dtype=work_dtype)
+    stable=length>0.
     if stable.any():
-        ratio=np.asarray(np.asarray(-f32(.29)*height,dtype=f32)/length,dtype=f32)
-        output[stable]=np.asarray(-f32(17.)*np.asarray(
-            f32(1.)-np.exp(ratio[stable]),dtype=f32),dtype=f32)
+        ratio=-.29*height/length
+        output[stable]=-17.*(1.-np.exp(ratio[stable]))
     unstable=~stable
     if unstable.any():
-        ratio=np.asarray(np.asarray(f32(fit)*height,dtype=f32)/length,dtype=f32)
-        x=np.power(np.asarray(f32(1.)-ratio,dtype=f32),f32(.25))
-        first=np.log(np.asarray(f32(.5)*np.asarray(f32(1.)+x,dtype=f32),dtype=f32))
-        second=np.log(np.asarray(f32(.5)*np.asarray(
-            f32(1.)+np.asarray(x*x,dtype=f32),dtype=f32),dtype=f32))
-        output[unstable]=np.asarray(
-            np.asarray(f32(2.)*first[unstable],dtype=f32)+second[unstable]-
-            np.asarray(f32(2.)*np.arctan(x[unstable]),dtype=f32)+
-            f32(1.5707963),dtype=f32)
+        ratio=fit*height/length
+        x=np.power(1.-ratio,.25)
+        first=np.log(.5*(1.+x))
+        second=np.log(.5*(1.+x*x))
+        output[unstable]=(2.*first[unstable]+second[unstable]-
+                          2.*np.arctan(x[unstable])+np.pi/2.)
     return output
 
 
 def similarity_wind_profiles(u,v,anemometer_height_m,z_centers_m,z_faces_m,
         roughness_m,monin_obukhov_m,mixing_height_m,station_latitude,*,
         ipsifcn=0,minimum_mixing_height_m=50.):
-    """Vectorized SIMILT station profiles with CALMET REAL precision."""
-    f32=np.float64
-    u=np.asarray(u,dtype=f32); v=np.asarray(v,dtype=f32)
-    anem=np.asarray(anemometer_height_m,dtype=f32)
-    roughness=np.asarray(roughness_m,dtype=f32); ell=np.asarray(monin_obukhov_m,dtype=f32)
-    mixing=np.asarray(mixing_height_m,dtype=f32); latitude=np.asarray(station_latitude,dtype=f32)
-    centers=np.asarray(z_centers_m,dtype=f32); faces=np.asarray(z_faces_m,dtype=f32)
+    """Vectorized SIMILT station profiles in the model's default precision."""
+    u=np.asarray(u,dtype=MODEL_DTYPE); v=np.asarray(v,dtype=MODEL_DTYPE)
+    anem=np.asarray(anemometer_height_m,dtype=MODEL_DTYPE)
+    roughness=np.asarray(roughness_m,dtype=MODEL_DTYPE)
+    ell=np.asarray(monin_obukhov_m,dtype=MODEL_DTYPE)
+    mixing=np.asarray(mixing_height_m,dtype=MODEL_DTYPE)
+    latitude=np.asarray(station_latitude,dtype=MODEL_DTYPE)
+    centers=np.asarray(z_centers_m,dtype=MODEL_DTYPE)
+    faces=np.asarray(z_faces_m,dtype=MODEL_DTYPE)
     if any(value.shape!=u.shape for value in (v,anem,roughness,ell,mixing,latitude)):
         raise ValueError('SIMILT station inputs must have identical shapes')
     if centers.ndim!=1 or faces.shape!=(centers.size+1,):
         raise ValueError('SIMILT vertical coordinates are inconsistent')
     if ipsifcn not in {0,1}: raise ValueError('IPSIFCN must be zero or one')
-    adjusted=ell.copy(); short=np.abs(adjusted)<np.asarray(f32(5.)*roughness,dtype=f32)
-    adjusted[short]=np.where(adjusted[short]<f32(0.),
-        np.asarray(-f32(5.)*roughness[short],dtype=f32),
-        np.asarray(f32(5.)*roughness[short],dtype=f32))
-    inverse=np.where(np.abs(adjusted)>=f32(10000.),f32(0.),
-                     np.asarray(f32(1.)/adjusted,dtype=f32)).astype(f32)
-    speed=np.sqrt(np.asarray(
-        np.asarray(u*u,dtype=f32)+np.asarray(v*v,dtype=f32),dtype=f32))
-    angle=np.asarray(f32(270.)-np.asarray(
-        np.arctan2(v,u)*f32(57.2957795),dtype=f32),dtype=f32)
-    direction=np.asarray(np.fmod(angle,f32(360.)),dtype=f32)
-    direction=np.where(direction==f32(0.),f32(360.),direction).astype(f32)
-    log_anem=np.log(np.asarray(anem/roughness,dtype=f32))
-    neutral=np.abs(inverse)<f32(.00005)
-    psi_anem=(np.asarray(_psiud(np.asarray(anem/adjusted,dtype=f32).astype(np.float64)),dtype=f32)
+    adjusted=ell.copy(); short=np.abs(adjusted)<5.*roughness
+    adjusted[short]=np.where(adjusted[short]<0.,
+                             -5.*roughness[short],5.*roughness[short])
+    inverse=np.where(np.abs(adjusted)>=10000.,0.,1./adjusted)
+    speed=np.sqrt(u*u+v*v)
+    angle=270.-np.rad2deg(np.arctan2(v,u))
+    direction=np.fmod(angle,360.)
+    direction=np.where(direction==0.,360.,direction)
+    log_anem=np.log(anem/roughness)
+    neutral=np.abs(inverse)<.00005
+    psi_anem=(_psiud(anem/adjusted)
               if ipsifcn==0 else _psiuc(anem,adjusted,16))
-    psi_anem=np.where(neutral,f32(0.),psi_anem).astype(f32)
+    psi_anem=np.where(neutral,0.,psi_anem)
     inverse_table=np.array([-.03333333,-.01,-.0027027,0.,.002857,.007692,
-                            .0166667,.05,.1111111],dtype=f32)
-    angle_table=np.array([12.,10.,9.,12.,18.,28.,35.,38.,39.],dtype=f32)
+                            .0166667,.05,.1111111],dtype=MODEL_DTYPE)
+    angle_table=np.array([12.,10.,9.,12.,18.,28.,35.,38.,39.],dtype=MODEL_DTYPE)
     indices=np.searchsorted(inverse_table,inverse,side='left')
-    turn=np.full(u.shape,angle_table[-1],dtype=f32); low=indices==0; turn[low]=angle_table[0]
+    turn=np.full(u.shape,angle_table[-1],dtype=MODEL_DTYPE)
+    low=indices==0; turn[low]=angle_table[0]
     middle=(indices>0)&(indices<inverse_table.size); lower=indices[middle]-1; upper=indices[middle]
-    ratio=np.asarray(np.asarray(inverse[middle]-inverse_table[lower],dtype=f32)/
-                     np.asarray(inverse_table[upper]-inverse_table[lower],dtype=f32),dtype=f32)
-    turn[middle]=np.asarray(angle_table[lower]+np.asarray(
-        np.asarray(angle_table[upper]-angle_table[lower],dtype=f32)*ratio,dtype=f32),dtype=f32)
-    turn=np.where(neutral,f32(12.),turn).astype(f32)
-    decay_anem=np.exp(np.asarray(-anem/f32(200.),dtype=f32))
-    at_anem=np.asarray(np.asarray(turn*f32(1.58),dtype=f32)*
-                       np.asarray(f32(1.)-decay_anem,dtype=f32),dtype=f32)
-    output_u=np.full((centers.size,u.size),f32(9999.),dtype=f32)
-    output_v=np.full_like(output_u,f32(9999.))
-    limit=np.maximum(np.asarray(mixing+f32(.001),dtype=f32),f32(minimum_mixing_height_m))
+    ratio=((inverse[middle]-inverse_table[lower])/
+           (inverse_table[upper]-inverse_table[lower]))
+    turn[middle]=angle_table[lower]+(angle_table[upper]-angle_table[lower])*ratio
+    turn=np.where(neutral,12.,turn)
+    decay_anem=np.exp(-anem/200.)
+    at_anem=turn*1.58*(1.-decay_anem)
+    output_u=np.full((centers.size,u.size),9999.,dtype=MODEL_DTYPE)
+    output_v=np.full_like(output_u,9999.)
+    limit=np.maximum(mixing+.001,minimum_mixing_height_m)
     for level,center in enumerate(centers):
         active=faces[level+1]<=limit
         if not active.any(): continue
-        log_level=np.log(np.asarray(center/roughness,dtype=f32))
-        psi=(np.asarray(_psiud(np.asarray(center/adjusted,dtype=f32).astype(np.float64)),dtype=f32)
+        log_level=np.log(center/roughness)
+        psi=(_psiud(center/adjusted)
              if ipsifcn==0 else _psiuc(np.full_like(adjusted,center),adjusted,16))
-        psi=np.where(neutral,f32(0.),psi).astype(f32)
-        numerator=np.asarray(speed*np.asarray(log_level-psi,dtype=f32),dtype=f32)
-        magnitude=np.asarray(numerator/np.asarray(log_anem-psi_anem,dtype=f32),dtype=f32)
-        decay=np.exp(np.full(u.shape,-center/f32(200.),dtype=f32))
-        shear=np.asarray(np.asarray(turn*f32(1.58),dtype=f32)*
-                         np.asarray(f32(1.)-decay,dtype=f32),dtype=f32)
-        north=np.asarray(np.asarray(direction+shear,dtype=f32)-at_anem,dtype=f32)
-        north=np.where(north>f32(360.),np.asarray(north-f32(360.),dtype=f32),north)
-        south=np.asarray(np.asarray(direction-shear,dtype=f32)+at_anem,dtype=f32)
-        south=np.where(south<=f32(0.),np.asarray(f32(360.)+south,dtype=f32),south)
-        wd=np.where(latitude>f32(0.),north,south).astype(f32)
-        radians=np.asarray(f32(.0174533)*wd,dtype=f32)
-        output_u[level,active]=np.asarray(-magnitude[active]*np.sin(radians[active]),dtype=f32)
-        output_v[level,active]=np.asarray(-magnitude[active]*np.cos(radians[active]),dtype=f32)
+        psi=np.where(neutral,0.,psi)
+        magnitude=speed*(log_level-psi)/(log_anem-psi_anem)
+        decay=np.exp(np.full(u.shape,-center/200.,dtype=MODEL_DTYPE))
+        shear=turn*1.58*(1.-decay)
+        north=direction+shear-at_anem
+        north=np.where(north>360.,north-360.,north)
+        south=direction-shear+at_anem
+        south=np.where(south<=0.,360.+south,south)
+        wd=np.where(latitude>0.,north,south)
+        radians=np.deg2rad(wd)
+        output_u[level,active]=-magnitude[active]*np.sin(radians[active])
+        output_v[level,active]=-magnitude[active]*np.cos(radians[active])
     return output_u,output_v
 
 def cloud_liquid_water_profile(
         cloud_water_g_kg,height_agl_m,z_faces_m,threshold_g_kg=.005):
     """Vectorized Z2FACE/PRFVAR mapping used by CALMET.AUX output."""
-    cloud=np.asarray(cloud_water_g_kg,dtype=np.float64)
-    height=np.asarray(height_agl_m,dtype=np.float64)
-    target=np.asarray(z_faces_m,dtype=np.float64)
+    cloud=np.asarray(cloud_water_g_kg,dtype=MODEL_DTYPE)
+    height=np.asarray(height_agl_m,dtype=MODEL_DTYPE)
+    target=np.asarray(z_faces_m,dtype=MODEL_DTYPE)
     if cloud.shape!=height.shape or cloud.ndim<1 or cloud.shape[0]<1:
         raise ValueError('cloud water and height profiles must have identical shapes')
     if target.ndim!=1 or target.size<2 or np.any(np.diff(target)<=0.):
         raise ValueError('CALMET cloud-water faces must be a strictly increasing vector')
     levels=cloud.shape[0]
-    source_faces=np.empty((levels+1,*cloud.shape[1:]),dtype=np.float64)
-    source_faces[0]=np.where(height[0]<=np.float64(0.),
-                             height[0]-np.float64(1.),np.float64(0.))
+    source_faces=np.empty((levels+1,*cloud.shape[1:]),dtype=MODEL_DTYPE)
+    source_faces[0]=np.where(height[0]<=MODEL_DTYPE(0.),
+                             height[0]-MODEL_DTYPE(1.),MODEL_DTYPE(0.))
     if levels>1:
-        source_faces[1:levels]=np.asarray(
-            np.float64(.5)*np.asarray(height[:-1]+height[1:],dtype=np.float64),
-            dtype=np.float64)
-    source_faces[-1]=np.asarray(
-        np.float64(2.)*height[-1]-source_faces[-2],dtype=np.float64)
+        source_faces[1:levels]=.5*(height[:-1]+height[1:])
+    source_faces[-1]=2.*height[-1]-source_faces[-2]
 
-    mapped=np.zeros((target.size-1,*cloud.shape[1:]),dtype=np.float64)
+    mapped=np.zeros((target.size-1,*cloud.shape[1:]),dtype=MODEL_DTYPE)
     for output_index,(bottom_face,top_face) in enumerate(zip(target[:-1],target[1:])):
-        thickness=np.float64(top_face-bottom_face)
+        thickness=top_face-bottom_face
         for source_index in range(levels):
             upper=source_faces[source_index+1]
-            lower=np.maximum(source_faces[source_index],np.float64(0.))
-            overlap=(upper>bottom_face)&(lower<top_face)&(upper>np.float64(0.))
-            depth=np.asarray(
-                np.minimum(top_face,upper)-np.maximum(bottom_face,lower),
-                dtype=np.float64)
-            contribution=np.asarray(
-                cloud[source_index]*depth/thickness,dtype=np.float64)
+            lower=np.maximum(source_faces[source_index],0.)
+            overlap=(upper>bottom_face)&(lower<top_face)&(upper>0.)
+            depth=np.minimum(top_face,upper)-np.maximum(bottom_face,lower)
+            contribution=cloud[source_index]*depth/thickness
             mapped[output_index]=np.where(
-                overlap,np.asarray(mapped[output_index]+contribution,dtype=np.float64),
-                mapped[output_index])
+                overlap,mapped[output_index]+contribution,mapped[output_index])
 
-    threshold=np.float64(threshold_g_kg)
+    threshold=MODEL_DTYPE(threshold_g_kg)
     model_top=target[-1]
-    weighted=np.zeros(cloud.shape[1:],dtype=np.float64)
-    weight=np.zeros(cloud.shape[1:],dtype=np.float64)
-    bottom=np.asarray(source_faces[-1],dtype=np.float64).copy()
-    top=np.zeros(cloud.shape[1:],dtype=np.float64)
+    weighted=np.zeros(cloud.shape[1:],dtype=MODEL_DTYPE)
+    weight=np.zeros(cloud.shape[1:],dtype=MODEL_DTYPE)
+    bottom=source_faces[-1].copy()
+    top=np.zeros(cloud.shape[1:],dtype=MODEL_DTYPE)
     for source_index in range(levels):
         lower=source_faces[source_index]; upper=source_faces[source_index+1]
         selected=(upper>model_top)&(cloud[source_index]>=threshold)
-        depth=np.asarray(upper-lower,dtype=np.float64)
-        weighted=np.where(selected,np.asarray(
-            weighted+np.asarray(cloud[source_index]*depth,dtype=np.float64),
-            dtype=np.float64),weighted)
-        weight=np.where(selected,np.asarray(weight+depth,dtype=np.float64),weight)
+        depth=upper-lower
+        weighted=np.where(selected,weighted+cloud[source_index]*depth,weighted)
+        weight=np.where(selected,weight+depth,weight)
         bottom=np.where(selected,np.minimum(bottom,lower),bottom)
         top=np.where(selected,np.maximum(top,upper),top)
     average=np.divide(weighted,weight,out=np.zeros_like(weighted),where=weight>0.)
     reported=average>=threshold
-    return (mapped,np.where(reported,average,0.).astype(np.float64),
-            np.where(reported,bottom,0.).astype(np.float64),
-            np.where(reported,top,0.).astype(np.float64))
+    return tuple(_model_array(value) for value in (
+        mapped,np.where(reported,average,0.),np.where(reported,bottom,0.),
+        np.where(reported,top,0.)))
 
 def air_density(pressure_mb, temperature_k, nearest_station):
     """AIRDen: ideal-gas density using the nearest surface station."""
-    pressure=np.asarray(pressure_mb,dtype=np.float64)
+    pressure=np.asarray(pressure_mb,dtype=MODEL_DTYPE)
     nearest=np.asarray(nearest_station,dtype=np.intp)
     return density_from_pressure_temperature(pressure[nearest],temperature_k)
 
 def density_from_pressure_temperature(pressure_mb,temperature_k):
-    """AIRDEN's left-to-right floating-point ideal-gas expression."""
-    numerator=np.asarray(np.float64(.3484321)*np.asarray(pressure_mb,dtype=np.float64),
-                         dtype=np.float64)
-    return np.asarray(numerator/np.asarray(temperature_k,dtype=np.float64),dtype=np.float64)
+    """AIRDEN ideal-gas density expression."""
+    pressure=np.asarray(pressure_mb,dtype=MODEL_DTYPE)
+    temperature=np.asarray(temperature_k,dtype=MODEL_DTYPE)
+    return _model_array(.3484321*pressure/temperature)
 
 def coriolis_parameter(latitude_degrees, configured_value=999.):
     """MICROI absolute Coriolis field, including its equatorial floor."""
     latitude=np.asarray(latitude_degrees,dtype=np.float64)
     if configured_value>998.:
-        twopi=np.float64(np.float64(2.)*np.float64(3.141592))
-        omega=np.asarray(twopi/np.float64(86400.),dtype=np.float64)
-        angle=np.asarray(latitude*twopi/np.float64(360.),dtype=np.float64)
-        value=np.asarray(np.float64(2.)*omega*np.sin(angle),dtype=np.float64)
+        omega=2.*np.pi/86400.
+        angle=np.deg2rad(latitude)
+        value=2.*omega*np.sin(angle)
     else:
         value=np.full_like(latitude,np.float64(configured_value))
-    return np.maximum(np.abs(value),np.float64(.25e-4)).astype(np.float64)
+    return _model_array(np.maximum(np.abs(value),np.float64(.25e-4)))
 
 def inverse_distance_squared(values, point_x, point_y, sample_x, sample_y, *, ignore_zero=False):
     """R2INTERP/CINTERP, vectorised over any leading target dimensions."""
-    values=np.asarray(values); dx=np.asarray(sample_x)-np.asarray(point_x)[...,None]; dy=np.asarray(sample_y)-np.asarray(point_y)[...,None]
+    values=np.asarray(values,dtype=MODEL_DTYPE)
+    dx=np.asarray(sample_x,dtype=COORDINATE_DTYPE)-np.asarray(
+        point_x,dtype=COORDINATE_DTYPE)[...,None]
+    dy=np.asarray(sample_y,dtype=COORDINATE_DTYPE)-np.asarray(
+        point_y,dtype=COORDINATE_DTYPE)[...,None]
     weights=1.0/np.maximum(dx*dx+dy*dy,0.001)
-    if ignore_zero: weights=np.where(values>=1.e-6,weights,0.0)
-    denominator=weights.sum(axis=-1)
-    return np.divide((values*weights).sum(axis=-1),denominator,out=np.zeros_like(denominator,dtype=np.result_type(values,float)),where=denominator>1.e-9)
+    if ignore_zero:
+        weights=np.where(values>=MODEL_DTYPE(1.e-6),weights,0.0)
+    denominator=weights.sum(axis=-1,dtype=ACCUMULATION_DTYPE)
+    numerator=(values*weights).sum(axis=-1,dtype=ACCUMULATION_DTYPE)
+    result=np.divide(numerator,denominator,out=np.zeros_like(denominator),
+                     where=denominator>1.e-9)
+    return _model_array(result)
 
 
 def lake_breeze_adjust(u, v, station_u, station_v, station_xy_m,
@@ -209,13 +212,14 @@ def lake_breeze_adjust(u, v, station_u, station_v, station_xy_m,
     Region tuples contain ``XG1,XG2,YG1,YG2`` grid-line bounds, two
     coastline endpoints in relative metres, and the ordered station IDs.
     """
-    result_u=np.asarray(u).copy()
-    result_v=np.asarray(v).copy()
+    result_u=np.asarray(u,dtype=MODEL_DTYPE).copy()
+    result_v=np.asarray(v,dtype=MODEL_DTYPE).copy()
     if result_u.shape!=result_v.shape or result_u.ndim!=3:
         raise ValueError('lake-breeze U/V fields must share (level,y,x) shape')
     ids=np.asarray(station_ids,dtype=np.int64)
     xy=np.asarray(station_xy_m,dtype=np.float64)
-    su=np.asarray(station_u,dtype=np.float64); sv=np.asarray(station_v,dtype=np.float64)
+    su=np.asarray(station_u,dtype=MODEL_DTYPE)
+    sv=np.asarray(station_v,dtype=MODEL_DTYPE)
     if xy.shape!=(ids.size,2) or su.shape!=(ids.size,) or sv.shape!=(ids.size,):
         raise ValueError('lake-breeze station arrays have inconsistent shapes')
     ny,nx=result_u.shape[1:]
@@ -290,32 +294,28 @@ def lake_breeze_adjust(u, v, station_u, station_v, station_xy_m,
 
 def wind_speed_direction(u,v):
     """RTHETA meteorological speed and direction (calm direction is zero)."""
-    f32=np.float64
-    u=np.asarray(u,dtype=f32); v=np.asarray(v,dtype=f32)
-    squared=np.asarray(u*u+v*v,dtype=f32); speed=np.sqrt(squared)
-    factor=f32(f32(180.)/f32(3.141592654))
-    angle=np.asarray(f32(270.)-np.asarray(np.arctan2(v,u)*factor,dtype=f32),dtype=f32)
-    direction=np.fmod(angle,f32(360.)).astype(f32)
-    direction=np.where(squared<f32(1.e-10),f32(0.),
-                       np.where(direction==f32(0.),f32(360.),direction)).astype(f32)
-    return speed,direction
+    u=np.asarray(u,dtype=MODEL_DTYPE); v=np.asarray(v,dtype=MODEL_DTYPE)
+    squared=u*u+v*v
+    speed=np.sqrt(squared)
+    direction=np.fmod(270.-np.rad2deg(np.arctan2(v,u)),360.)
+    direction=np.where(squared<1.e-10,0.,
+                       np.where(direction==0.,360.,direction))
+    return _model_array(speed),_model_array(direction)
 
 def cloud_fraction(relative_humidity_percent):
     """CLOUD3 Teixeira diagnostic cloud fraction."""
-    f32=np.float64
-    rh=np.asarray(relative_humidity_percent,dtype=f32)
-    rhd=np.asarray(rh/f32(100.),dtype=f32); gap=np.asarray(f32(1.)-rhd,dtype=f32)
-    result=np.ones_like(rhd,dtype=f32)
-    active=rh<f32(99.)
-    root=np.sqrt(np.asarray(f32(1.)+
-        np.asarray(f32(100.)*gap[active],dtype=f32),dtype=f32))
-    result[active]=np.asarray(f32(.02)*np.asarray(f32(-1.)+root,dtype=f32)/gap[active],dtype=f32)
+    rh=np.asarray(relative_humidity_percent,dtype=MODEL_DTYPE)
+    rhd=rh/100.; gap=1.-rhd
+    result=np.ones_like(rhd)
+    active=rh<99.
+    root=np.sqrt(1.+100.*gap[active])
+    result[active]=.02*(-1.+root)/gap[active]
     return result
 
 def cloud_cover_teixeira_850(relative_humidity_percent,pressure_mb):
     """CLOUD3 cover using the last prognostic level at or above 850 mb."""
-    rh=np.asarray(relative_humidity_percent,dtype=np.float64)
-    pressure=np.asarray(pressure_mb,dtype=np.float64)
+    rh=np.asarray(relative_humidity_percent,dtype=MODEL_DTYPE)
+    pressure=np.asarray(pressure_mb,dtype=MODEL_DTYPE)
     if rh.shape!=pressure.shape or rh.ndim!=3:
         raise ValueError('cloud profiles must share shape (z,y,x)')
     below=pressure<850.; first=np.argmax(below,axis=0); level=np.maximum(first-1,0)
@@ -329,10 +329,9 @@ def cloud_cover_mm5(relative_humidity_percent, pressure_mb, height_m):
     Inputs use ``(z, y, x)`` axes.  The pressure thresholds and integer
     midpoint choice intentionally match CALMET's original CLOUD4 routine.
     """
-    f32=np.float64
-    rh=np.asarray(relative_humidity_percent,dtype=f32)
-    pressure=np.asarray(pressure_mb,dtype=f32)
-    height=np.asarray(height_m,dtype=f32)
+    rh=np.asarray(relative_humidity_percent,dtype=MODEL_DTYPE)
+    pressure=np.asarray(pressure_mb,dtype=MODEL_DTYPE)
+    height=np.asarray(height_m,dtype=MODEL_DTYPE)
     if rh.shape!=pressure.shape or rh.shape!=height.shape or rh.ndim!=3: raise ValueError('cloud profiles must share shape (z,y,x)')
     nz=rh.shape[0]; levels=np.arange(nz)[:,None,None]
     def first_below(threshold):
@@ -342,99 +341,80 @@ def cloud_cover_mm5(relative_humidity_percent, pressure_mb, height_m):
     def band_max(start,stop=None):
         mask=levels>=start[None,:,:]
         if stop is not None: mask &= levels<stop[None,:,:]
-        return np.max(np.where(mask,rh,f32(0.)),axis=0)
-    low=np.asarray(f32(4.)*band_max(klo,kmid)/f32(100.)-f32(3.),dtype=f32)
-    middle=np.asarray(f32(4.)*band_max(kmid,khi)/f32(100.)-f32(3.),dtype=f32)
-    high=np.asarray(f32(2.5)*band_max(khi)/f32(100.)-f32(1.5),dtype=f32)
-    low=np.clip(low,f32(0.),f32(1.)); middle=np.clip(middle,f32(0.),f32(1.))
-    high=np.clip(high,f32(0.),f32(1.))
+        return np.max(np.where(mask,rh,0.),axis=0)
+    low=4.*band_max(klo,kmid)/100.-3.
+    middle=4.*band_max(kmid,khi)/100.-3.
+    high=2.5*band_max(khi)/100.-1.5
+    low=np.clip(low,0.,1.); middle=np.clip(middle,0.,1.)
+    high=np.clip(high,0.,1.)
     cover=np.maximum.reduce((low,middle,high))
     low_level=klo+(kmid-klo)//2; middle_level=kmid+(khi-kmid)//2
     ceiling_level=np.where(low>=.5,low_level,np.where(middle>=.5,middle_level,np.where(high>=.5,khi,
         np.where((low>=middle)&(low>=high),low_level,np.where((middle>=low)&(middle>=high),middle_level,khi)))))
     valid=(cover>1.e-9)&(ceiling_level<nz)
-    ceiling=np.zeros_like(cover,dtype=f32)
+    ceiling=np.zeros_like(cover)
     yy,xx=np.indices(cover.shape); ceiling[valid]=height[ceiling_level[valid],yy[valid],xx[valid]]
     return cover,ceiling
 
 def lapse_rate(temperature_k, previous_convective_height_m, z_centers_m, height_m=200., *, spatial=True):
     """CGAMMA2 prognostic temperature lapse rate (K/m)."""
-    f32=np.float64
-    temp=np.asarray(temperature_k,dtype=f32)
-    zi=np.asarray(previous_convective_height_m,dtype=f32)
-    centers=np.asarray(z_centers_m,dtype=f32); height=f32(height_m)
+    temp=np.asarray(temperature_k,dtype=MODEL_DTYPE)
+    zi=np.asarray(previous_convective_height_m,dtype=MODEL_DTYPE)
+    centers=np.asarray(z_centers_m,dtype=MODEL_DTYPE)
+    height=MODEL_DTYPE(height_m)
     if temp.ndim!=3 or temp.shape[1:]!=zi.shape or temp.shape[0]!=centers.size: raise ValueError('temperature must be (z,y,x) and match heights/grid')
     upper=np.flatnonzero(centers>=height)
     if not upper.size: raise ValueError('lapse-rate height is above the top model level')
     k=int(upper[0])
     if k==0: raise ValueError('lapse-rate height is below the lowest model midpoint')
-    ratio=f32(f32(centers[k]-height)/f32(centers[k]-centers[k-1]))
-    at_height=np.asarray(temp[k]-np.asarray((temp[k]-temp[k-1])*ratio,dtype=f32),dtype=f32)
-    diagnosed=np.asarray((at_height-temp[0])/f32(height-centers[0]),dtype=f32)
-    gamma=np.where(zi>=height,f32(-.0098),diagnosed).astype(f32)
+    ratio=(centers[k]-height)/(centers[k]-centers[k-1])
+    at_height=temp[k]-(temp[k]-temp[k-1])*ratio
+    diagnosed=(at_height-temp[0])/(height-centers[0])
+    gamma=np.where(zi>=height,-.0098,diagnosed)
     if spatial: return gamma
-    average=f32(0.)
-    for i in range(gamma.shape[1]):
-        for j in range(gamma.shape[0]): average=f32(average+gamma[j,i])
-    average=f32(average/f32(gamma.size))
-    return np.full_like(gamma,average,dtype=f32)
+    average=np.mean(gamma,dtype=ACCUMULATION_DTYPE)
+    return np.full_like(gamma,average)
 
 def froude_adjustment(u, v, terrain_m, maximum_terrain_m, gamma_k_per_m,
                       temperature_k, z_centers_m, critical_froude,
                       dx_m, dy_m):
     """FRADJ terrain-blocking rotation with wind speed conserved."""
-    u=np.array(u,dtype=np.float64,copy=True)
-    v=np.array(v,dtype=np.float64,copy=True)
-    f32=np.float64
-    terrain=np.asarray(terrain_m,dtype=f32); maximum=np.asarray(maximum_terrain_m,dtype=f32)
-    gamma=np.asarray(gamma_k_per_m,dtype=f32); temp=np.asarray(temperature_k,dtype=f32)
-    centers=np.asarray(z_centers_m,dtype=f32)
+    u=np.array(u,dtype=MODEL_DTYPE,copy=True)
+    v=np.array(v,dtype=MODEL_DTYPE,copy=True)
+    terrain=np.asarray(terrain_m,dtype=MODEL_DTYPE)
+    maximum=np.asarray(maximum_terrain_m,dtype=MODEL_DTYPE)
+    gamma=np.asarray(gamma_k_per_m,dtype=MODEL_DTYPE)
+    temp=np.asarray(temperature_k,dtype=MODEL_DTYPE)
+    centers=np.asarray(z_centers_m,dtype=MODEL_DTYPE)
     if u.shape!=v.shape or u.ndim!=3 or u.shape[1:]!=terrain.shape or u.shape[0]!=centers.size: raise ValueError('wind must have shape (z,y,x) matching grid and centers')
     west=np.concatenate((terrain[:,:1],terrain[:,:-1]),axis=1)
     east=np.concatenate((terrain[:,1:],terrain[:,-1:]),axis=1)
     south=np.concatenate((terrain[:1,:],terrain[:-1,:]),axis=0)
     north=np.concatenate((terrain[1:,:],terrain[-1:,:]),axis=0)
-    gx=np.asarray((east-west)*(f32(.5)/f32(dx_m)),dtype=f32)
-    gy=np.asarray((north-south)*(f32(.5)/f32(dy_m)),dtype=f32)
-    flat=(np.abs(gx)<f32(.00015))&(np.abs(gy)<f32(.00015))
-    gx=np.where(flat,f32(0.),gx).astype(f32); gy=np.where(flat,f32(0.),gy).astype(f32)
-    magnitude=np.sqrt(np.asarray(gx*gx+gy*gy,dtype=f32))
-    fx=np.asarray(gx,dtype=np.float64); fy=np.asarray(gy,dtype=np.float64)
-    thetp=np.asarray(np.arctan(np.divide(
-        fy,fx,out=np.zeros_like(fy),where=fx!=0.))*np.float64(57.296),dtype=np.float64)
-    theta=np.zeros_like(fx)
-    theta=np.where((fx==0.)&(fy<0.),np.float64(270.),theta)
-    theta=np.where((fx==0.)&(fy>0.),np.float64(90.),theta)
-    theta=np.where(fx<0.,thetp+np.float64(180.),theta)
-    theta=np.where((fx>0.)&(fy>0.),thetp,theta)
-    theta=np.where((fx>0.)&(fy<=0.),thetp+np.float64(360.),theta)
-    thetad=np.where((theta>=0.)&(theta<=90.),np.float64(90.)-theta,
-                    np.float64(450.)-theta)
-    angle=np.asarray((np.float64(270.)-thetad)*np.float64(.017453),
-                     dtype=np.float64)
-    drx=np.asarray(-np.cos(angle),dtype=np.float64)
-    dry=np.asarray(-np.sin(angle),dtype=np.float64)
-    drx=np.where(magnitude>0.,drx,0.); dry=np.where(magnitude>0.,dry,0.)
-    speed=np.asarray(np.power(np.asarray(u*u+v*v,dtype=f32),f32(.5)),
-                     dtype=f32)
-    obstacle=np.asarray(maximum[None,:,:]-
-                        (terrain[None,:,:]+centers[:,None,None]),dtype=f32)
-    gamma2=np.asarray(gamma+f32(.01),dtype=f32)
-    frequency=np.asarray(np.power(np.maximum(
-        f32(0.),np.asarray(f32(9.8)*gamma2/temp,dtype=f32)),f32(.5)),dtype=f32)
-    denominator=np.asarray(frequency[None,:,:]*obstacle,dtype=f32)
+    gx=(east-west)*(.5/dx_m)
+    gy=(north-south)*(.5/dy_m)
+    flat=(np.abs(gx)<.00015)&(np.abs(gy)<.00015)
+    gx=np.where(flat,0.,gx); gy=np.where(flat,0.,gy)
+    magnitude=np.hypot(gx,gy)
+    drx=np.divide(gx,magnitude,out=np.zeros_like(gx),where=magnitude>0.)
+    dry=np.divide(gy,magnitude,out=np.zeros_like(gy),where=magnitude>0.)
+    speed=np.sqrt(u*u+v*v)
+    obstacle=maximum[None,:,:]-(terrain[None,:,:]+centers[:,None,None])
+    gamma2=gamma+.01
+    frequency=np.sqrt(np.maximum(0.,9.8*gamma2/temp))
+    denominator=frequency[None,:,:]*obstacle
     froude=np.divide(speed,denominator,out=np.full_like(speed,np.inf),where=denominator>0)
     un=np.divide(u,speed,out=np.zeros_like(u),where=speed>0)
     vn=np.divide(v,speed,out=np.zeros_like(v),where=speed>0)
-    toward=np.asarray(drx[None,:,:]*un+dry[None,:,:]*vn,dtype=f32)
-    tangent=np.asarray(-dry[None,:,:]*un+drx[None,:,:]*vn,dtype=f32)
-    tangent_sign=np.where(tangent>f32(0.),f32(1.),f32(-1.))
+    toward=drx[None,:,:]*un+dry[None,:,:]*vn
+    tangent=-dry[None,:,:]*un+drx[None,:,:]*vn
+    tangent_sign=np.where(tangent>0.,1.,-1.)
     active=((speed>0)&(obstacle>0)&(gamma2[None,:,:]>0)&
-            (froude<=f32(critical_froude))&(toward>0)&(magnitude[None,:,:]>0))
+            (froude<=critical_froude)&(toward>0)&(magnitude[None,:,:]>0))
     tangent_u=tangent_sign*(-dry[None,:,:]); tangent_v=tangent_sign*drx[None,:,:]
-    u=np.where(active,np.asarray(tangent_u*speed,dtype=f32),u).astype(f32)
-    v=np.where(active,np.asarray(tangent_v*speed,dtype=f32),v).astype(f32)
-    return u,v
+    u=np.where(active,tangent_u*speed,u)
+    v=np.where(active,tangent_v*speed,v)
+    return _model_array(u),_model_array(v)
 
 def profile_temperature_layer(temperature_k, height_m, bottom_m, depth_m=200., *, minimum_lapse=.001):
     """MIXDT2 temperatures and potential-temperature lapse above ``bottom``.
@@ -443,26 +423,23 @@ def profile_temperature_layer(temperature_k, height_m, bottom_m, depth_m=200., *
     Unlike a generic interpolator this reproduces MIXDT2's linear interpolation
     and its dry-adiabatic conversion to potential-temperature lapse.
     """
-    temperature=np.asarray(temperature_k,dtype=np.float64)
-    height=np.asarray(height_m,dtype=np.float64)
-    bottom=np.asarray(bottom_m,dtype=np.float64)
+    temperature=np.asarray(temperature_k,dtype=MODEL_DTYPE)
+    height=np.asarray(height_m,dtype=MODEL_DTYPE)
+    bottom=np.asarray(bottom_m,dtype=MODEL_DTYPE)
     if temperature.shape!=height.shape or temperature.ndim!=3 or temperature.shape[1:]!=bottom.shape: raise ValueError('profiles must be (z,y,x) and bottom must match their grid')
     flat_t=temperature.reshape(temperature.shape[0],-1); flat_z=height.reshape(height.shape[0],-1); columns=np.arange(flat_t.shape[1])
     def interpolate(target):
-        target=np.asarray(target,dtype=np.float64).ravel()
+        target=np.asarray(target,dtype=MODEL_DTYPE).ravel()
         upper=np.sum(flat_z<=target[None,:],axis=0)
         if np.any(upper==0) or np.any(upper>=flat_z.shape[0]): raise ValueError('temperature profile does not bracket mixing-height layer')
         lower=upper-1; zl=flat_z[lower,columns]; zu=flat_z[upper,columns]
         if np.any(zu<=zl): raise ValueError('temperature profile heights must increase strictly')
-        value=np.asarray(flat_t[upper,columns]-
-            (flat_t[upper,columns]-flat_t[lower,columns])*(zu-target)/(zu-zl),
-            dtype=np.float64)
+        value=(flat_t[upper,columns]-
+               (flat_t[upper,columns]-flat_t[lower,columns])*(zu-target)/(zu-zl))
         return value.reshape(bottom.shape)
-    depth=np.float64(depth_m)
-    lower=interpolate(bottom); upper=interpolate(np.asarray(bottom+depth,dtype=np.float64))
-    lapse=np.maximum(np.asarray((upper-lower)/depth+np.float64(.0098),dtype=np.float64),
-                     np.float64(minimum_lapse))
-    return lower,upper,lapse
+    lower=interpolate(bottom); upper=interpolate(bottom+depth_m)
+    lapse=np.maximum((upper-lower)/depth_m+.0098,minimum_lapse)
+    return tuple(_model_array(value) for value in (lower,upper,lapse))
 
 def mixing_height_maul_carson(temperature_profile_k, profile_height_m, previous_convective_height_m,
                                temperature_jump_k, friction_velocity, monin_obukhov_m,
@@ -476,54 +453,46 @@ def mixing_height_maul_carson(temperature_profile_k, profile_height_m, previous_
     Returns total height, convective height, and the updated temperature jump.
     The implementation is array-vectorised across the horizontal grid.
     """
-    old=np.asarray(previous_convective_height_m,dtype=np.float64)
-    jump=np.asarray(temperature_jump_k,dtype=np.float64)
-    ustar=np.asarray(friction_velocity,dtype=np.float64)
-    length=np.asarray(monin_obukhov_m,dtype=np.float64)
-    qh=np.asarray(sensible_heat_flux,dtype=np.float64)
-    rho=np.asarray(density,dtype=np.float64); f=np.asarray(coriolis,dtype=np.float64)
+    old=np.asarray(previous_convective_height_m,dtype=MODEL_DTYPE)
+    jump=np.asarray(temperature_jump_k,dtype=MODEL_DTYPE)
+    ustar=np.asarray(friction_velocity,dtype=MODEL_DTYPE)
+    length=np.asarray(monin_obukhov_m,dtype=MODEL_DTYPE)
+    qh=np.asarray(sensible_heat_flux,dtype=MODEL_DTYPE)
+    rho=np.asarray(density,dtype=MODEL_DTYPE); f=np.asarray(coriolis,dtype=MODEL_DTYPE)
     tht,thtp,gamma=profile_temperature_layer(temperature_profile_k,profile_height_m,old,depth_m,minimum_lapse=minimum_lapse)
     daytime=qh>=0.
-    wt=np.asarray(qh/(rho*np.float64(996.)),dtype=np.float64)
-    wto=np.asarray(np.float64(threshold_flux_per_m)*old/
-                   (np.float64(1.2)*np.float64(996.)),dtype=np.float64)
-    net=np.asarray(wt-wto,dtype=np.float64)
-    twodte=np.float64(np.float64(2.)*np.float64(timestep_s)*np.float64(conste))
-    onedte=np.float64(np.float64(timestep_s)*(np.float64(1.)+np.float64(conste)))
-    next_jump=np.sqrt(np.maximum(
-        np.asarray(gamma*twodte*net,dtype=np.float64),np.float64(0.)))
-    radicand=np.asarray(old*old+np.float64(2.)*
-        (net*onedte-jump*old)/gamma,dtype=np.float64)
-    convective=np.asarray(np.sqrt(np.maximum(radicand,np.float64(0.)))+
-                          next_jump/gamma,dtype=np.float64)
+    wt=qh/(rho*996.)
+    wto=threshold_flux_per_m*old/(1.2*996.)
+    net=wt-wto
+    twodte=2.*timestep_s*conste
+    onedte=timestep_s*(1.+conste)
+    next_jump=np.sqrt(np.maximum(gamma*twodte*net,0.))
+    radicand=old*old+2.*(net*onedte-jump*old)/gamma
+    convective=np.sqrt(np.maximum(radicand,0.))+next_jump/gamma
     if relaxation and threshold_flux_per_m>0.:
         equilibrium=1.2*996.*wt/threshold_flux_per_m
-        relaxed=equilibrium+(old-equilibrium)*np.exp(-timestep_s/relaxation_time_s)
+        relaxation_decay=MODEL_DTYPE(np.exp(-timestep_s/relaxation_time_s))
+        relaxed=equilibrium+(old-equilibrium)*relaxation_decay
         relaxing=(wt>0.)&(net<=0.)
         convective=np.where(relaxing,relaxed,convective)
         next_jump=np.where(relaxing,jump,next_jump)
-    convective=np.where((wt<=0.) if relaxation else (net<=0.),np.float64(0.),
-                        np.clip(convective,np.float64(0.),np.float64(maximum_height_m))).astype(np.float64)
-    tave=np.asarray(np.float64(.5)*(tht+thtp),dtype=np.float64)
-    bvf=np.asarray(np.power(
-        np.asarray(np.float64(9.81)*gamma/tave,dtype=np.float64),np.float64(.25)),
-        dtype=np.float64)
-    cmech=np.asarray(np.float64(constb)/np.sqrt(np.maximum(
-        np.abs(f),np.float64(1.e-30))),dtype=np.float64)
-    mechanical=np.asarray(cmech*ustar/bvf,dtype=np.float64)
-    total=np.clip(np.maximum(mechanical,convective),np.float64(minimum_height_m),
-                  np.float64(maximum_height_m))
-    stable1=np.asarray(np.float64(constn)*np.power(ustar,np.float64(1.5)),
-                       dtype=np.float64)
-    stable2=np.asarray(np.float64(.4)*np.sqrt(np.maximum(
-        ustar*length/np.maximum(np.abs(f),np.float64(1.e-30)),np.float64(0.))),
-        dtype=np.float64)
+    convective=np.where((wt<=0.) if relaxation else (net<=0.),0.,
+                        np.clip(convective,0.,maximum_height_m))
+    tave=.5*(tht+thtp)
+    bvf=np.power(9.81*gamma/tave,.25)
+    cmech=constb/np.sqrt(np.maximum(np.abs(f),1.e-30))
+    mechanical=cmech*ustar/bvf
+    total=np.clip(np.maximum(mechanical,convective),minimum_height_m,
+                  maximum_height_m)
+    stable1=constn*np.power(ustar,1.5)
+    stable2=.4*np.sqrt(np.maximum(
+        ustar*length/np.maximum(np.abs(f),1.e-30),0.))
     total=np.where(daytime,total,np.clip(np.minimum(stable1,stable2),minimum_height_m,maximum_height_m))
-    convective=np.where(daytime,convective,np.float64(0.)).astype(np.float64)
-    next_jump=np.where(daytime,next_jump,np.float64(0.)).astype(np.float64)
+    convective=np.where(daytime,convective,0.)
+    next_jump=np.where(daytime,next_jump,0.)
     if land_mask is not None:
         land=np.asarray(land_mask,dtype=bool); total=np.where(land,total,np.nan); convective=np.where(land,convective,np.nan); next_jump=np.where(land,next_jump,np.nan)
-    return total,convective,next_jump
+    return tuple(_model_array(value) for value in (total,convective,next_jump))
 
 
 def convective_height_maul_carson(previous_convective_height_m,temperature_jump_k,
@@ -536,31 +505,28 @@ def convective_height_maul_carson(previous_convective_height_m,temperature_jump_
     WATER supplies ``WT`` directly, unlike the land wrapper which derives it
     from sensible heat flux and density.  Arrays are evaluated simultaneously.
     """
-    f32=np.float64
-    old=np.asarray(previous_convective_height_m,dtype=f32)
-    jump=np.asarray(temperature_jump_k,dtype=f32)
-    wt=np.asarray(buoyancy_flux_k_m_s,dtype=f32)
-    gamma=np.maximum(np.asarray(potential_lapse_k_m,dtype=f32),f32(minimum_lapse))
-    wto=np.asarray(f32(threshold_flux_per_m)*old/(f32(1.2)*f32(996.)),dtype=f32)
-    net=np.asarray(wt-wto,dtype=f32)
-    twodte=f32(f32(2.)*f32(timestep_s)*f32(conste))
-    onedte=f32(f32(timestep_s)*f32(f32(1.)+f32(conste)))
-    next_jump=np.sqrt(np.maximum(
-        np.asarray(gamma*twodte*net,dtype=f32),f32(0.)))
-    radicand=np.asarray(old*old+f32(2.)*(net*onedte-jump*old)/gamma,dtype=f32)
-    convective=np.asarray(np.sqrt(np.maximum(radicand,f32(0.)))+
-                          next_jump/gamma,dtype=f32)
+    old=np.asarray(previous_convective_height_m,dtype=MODEL_DTYPE)
+    jump=np.asarray(temperature_jump_k,dtype=MODEL_DTYPE)
+    wt=np.asarray(buoyancy_flux_k_m_s,dtype=MODEL_DTYPE)
+    gamma=np.maximum(np.asarray(potential_lapse_k_m,dtype=MODEL_DTYPE),minimum_lapse)
+    wto=threshold_flux_per_m*old/(1.2*996.)
+    net=wt-wto
+    twodte=2.*timestep_s*conste
+    onedte=timestep_s*(1.+conste)
+    next_jump=np.sqrt(np.maximum(gamma*twodte*net,0.))
+    radicand=old*old+2.*(net*onedte-jump*old)/gamma
+    convective=np.sqrt(np.maximum(radicand,0.))+next_jump/gamma
     if relaxation and threshold_flux_per_m>0.:
-        equilibrium=np.asarray(f32(1.2)*f32(996.)*wt/f32(threshold_flux_per_m),dtype=f32)
-        decay=f32(np.exp(f32(-f32(timestep_s)/f32(relaxation_time_s))))
-        relaxed=np.asarray(equilibrium+(old-equilibrium)*decay,dtype=f32)
-        relaxing=(wt>f32(0.))&(net<=f32(0.))
+        equilibrium=1.2*996.*wt/threshold_flux_per_m
+        decay=MODEL_DTYPE(np.exp(-timestep_s/relaxation_time_s))
+        relaxed=equilibrium+(old-equilibrium)*decay
+        relaxing=(wt>0.)&(net<=0.)
         convective=np.where(relaxing,relaxed,convective)
         next_jump=np.where(relaxing,jump,next_jump)
-    active=(wt>f32(0.)) if relaxation else (net>f32(0.))
-    convective=np.where(active,np.clip(convective,f32(0.),f32(maximum_height_m)),f32(0.))
-    next_jump=np.where(active,next_jump,f32(0.))
-    return convective.astype(f32),next_jump.astype(f32)
+    active=(wt>0.) if relaxation else (net>0.)
+    convective=np.where(active,np.clip(convective,0.,maximum_height_m),0.)
+    next_jump=np.where(active,next_jump,0.)
+    return _model_array(convective),_model_array(next_jump)
 
 
 def convective_height_batchvarova_gryning(
@@ -593,7 +559,7 @@ def convective_height_batchvarova_gryning(
     elif not relaxation:
         convective=np.where((length<=0.)&(net==0.),old,convective)
 
-    # Constants and false-position iterations are literal MIXHBG/FBG translations.
+    # Solve the Batchvarova--Gryning equation with false-position iterations.
     a=np.where(active,np.asarray(net/gamma,dtype=np.float64),np.float64(1.)).astype(np.float64)
     b=np.asarray(np.float64(8.)*ustar**np.float64(2.)*tk/
                  (gamma*np.float64(9.81)),dtype=np.float64)
@@ -610,8 +576,8 @@ def convective_height_batchvarova_gryning(
     r5=np.asarray(e/d,dtype=np.float64)
 
     def fbg(zeta,zetap):
-        # Scalar Fortran never calls FBG after a non-positive-argument test;
-        # inactive vector lanes use benign placeholders to preserve that flow.
+        # Inactive vector lanes use benign placeholders because logarithms
+        # require positive arguments even though those lanes are discarded.
         safe_zeta=np.where(zeta>0.,zeta,np.float64(1.)).astype(np.float64)
         safe_zetap=np.where(zetap>0.,zetap,np.float64(1.)).astype(np.float64)
         return np.asarray(safe_zeta**np.float64(2.)+r1*safe_zeta+
@@ -622,11 +588,11 @@ def convective_height_batchvarova_gryning(
     square=np.asarray(h0*h0+np.float64(2.)*d*a*np.float64(timestep_s),dtype=np.float64)
     cube=np.asarray(h0**np.float64(3.)-np.float64(6.)*a*c*np.float64(timestep_s),
                     dtype=np.float64)
-    # np.where evaluates both branches; only evaluate the Fortran-selected lanes
-    # so a negative inactive CUBE does not emit a fractional-power warning.
+    # Evaluate the selected lanes separately so a negative inactive cube does
+    # not emit a fractional-power warning.
     h=np.empty_like(h0,dtype=np.float64)
     h[weak]=np.sqrt(square[weak]).astype(np.float64)
-    h[~weak]=(cube[~weak]**np.float64(.333)).astype(np.float64)
+    h[~weak]=np.cbrt(cube[~weak])
     zeta1=np.asarray(d*h-np.float64(2.)*c,dtype=np.float64)
     zetap1=np.asarray(e*h-c,dtype=np.float64)
     f1=np.asarray(r4*fbg(zeta1,zetap1)-time,dtype=np.float64)
@@ -661,9 +627,11 @@ def convective_height_batchvarova_gryning(
         converged|=work&~bad&(np.abs(f3)<=1.)
     fallback=active&~converged
     h=np.where(fallback,((zeta1+zeta2)*np.float64(.5)+np.float64(2.)*c)/d,h).astype(np.float64)
-    # Preserve MIXHBG's historical overwrite: MAX(H,ZIMN) replaces the
-    # preceding MIN(H,ZIMX), so the convective result itself is not capped.
-    return np.where(active,np.maximum(h,np.float64(minimum_height_m)),convective).astype(np.float64)
+    result=np.where(
+        active,
+        np.clip(h,np.float64(minimum_height_m),np.float64(maximum_height_m)),
+        convective)
+    return _model_array(result)
 
 
 def mixing_height_batchvarova_gryning(temperature_profile_k, profile_height_m,
@@ -678,8 +646,8 @@ def mixing_height_batchvarova_gryning(temperature_profile_k, profile_height_m,
                                       relaxation_time_s=800., land_mask=None):
     """Vectorised CALMET ``MIXHBG`` plus the common ``MIXHT2`` mechanics.
 
-    The nonlinear Batchvarova--Gryning equation follows the legacy false-image
-    secant solver.  Its ten iterations operate on whole arrays; no horizontal
+    The nonlinear Batchvarova--Gryning equation uses a false-position secant
+    solver.  Its ten iterations operate on whole arrays; no horizontal
     Python loop is used.  The temperature jump is unchanged because MIXHBG,
     unlike MIXHMC, does not update CALMET's ``DPTT`` state.
     """
@@ -720,14 +688,12 @@ def mixing_height_batchvarova_gryning(temperature_profile_k, profile_height_m,
     if land_mask is not None:
         land=np.asarray(land_mask,dtype=bool)
         total=np.where(land,total,np.nan); convective=np.where(land,convective,np.nan)
-    return total,convective,jump.copy()
+    return tuple(_model_array(value) for value in (total,convective,jump))
 
 def hosker_roughness(speed_m_s):
     """Hosker wind-dependent water roughness with floating-point power semantics."""
-    f32=np.float64
-    speed=np.asarray(speed_m_s,dtype=f32)
-    powered=np.asarray(np.power(speed,f32(2.5)),dtype=f32)
-    return np.maximum(f32(2.e-6),np.asarray(f32(2.e-6)*powered,dtype=f32)).astype(f32)
+    speed=np.asarray(speed_m_s,dtype=MODEL_DTYPE)
+    return _model_array(np.maximum(2.e-6,2.e-6*np.power(speed,2.5)))
 
 
 def neutral_water_parameters(u10, v10, coriolis, *, constw=.16,
@@ -739,17 +705,14 @@ def neutral_water_parameters(u10, v10, coriolis, *, constw=.16,
     the legacy routine has zero buoyancy flux and therefore zero convective
     mixing height even when ``IMIXH=1``.
     """
-    u=np.asarray(u10,dtype=np.float64); v=np.asarray(v10,dtype=np.float64)
-    f=np.asarray(coriolis,dtype=np.float64)
-    speed=np.sqrt(np.asarray(u**np.float64(2.)+v**np.float64(2.),dtype=np.float64))
+    u=np.asarray(u10,dtype=MODEL_DTYPE); v=np.asarray(v10,dtype=MODEL_DTYPE)
+    f=np.asarray(coriolis,dtype=MODEL_DTYPE)
+    speed=np.sqrt(u*u+v*v)
     roughness=hosker_roughness(speed)
-    friction=np.maximum(np.asarray(np.float64(.4)*speed/
-        np.log(np.asarray(np.float64(10.)/roughness,dtype=np.float64)),
-        dtype=np.float64),
-        np.float64(1.e-9)).astype(np.float64)
+    friction=np.maximum(.4*speed/np.log(10./roughness),1.e-9)
     mixing=water_mechanical_height(friction,f,constw=constw,
         minimum_height_m=minimum_height_m,maximum_height_m=maximum_height_m)
-    return (roughness,friction,np.full_like(speed,np.float64(9.9e9)),
+    return (roughness,_model_array(friction),np.full_like(speed,9.9e9),
             np.zeros_like(speed),mixing,np.zeros_like(speed))
 
 
@@ -757,40 +720,33 @@ def neutral_water_station_profiles(u,v,anemometer_height_m,current_mixing_height
         coriolis,z_centers_m,z_faces_m,station_latitude,*,constw=.16,
         minimum_height_m=50.,maximum_height_m=2500.,ipsifcn=0):
     """WATER2 neutral/missing-sea-data station path followed by SIMILT."""
-    f32=np.float64
-    u=np.asarray(u,dtype=f32); v=np.asarray(v,dtype=f32)
-    values=tuple(np.asarray(value,dtype=f32) for value in (
+    u=np.asarray(u,dtype=MODEL_DTYPE); v=np.asarray(v,dtype=MODEL_DTYPE)
+    values=tuple(np.asarray(value,dtype=MODEL_DTYPE) for value in (
         anemometer_height_m,current_mixing_height_m,coriolis,station_latitude))
     if u.ndim!=1 or v.shape!=u.shape or any(value.shape!=u.shape for value in values):
         raise ValueError('WATER2 station inputs must be matching one-dimensional arrays')
     anemometer,current_mixing,coriolis_value,latitude=values
-    centers=np.asarray(z_centers_m,dtype=f32)
-    output_u=np.full((centers.size,u.size),f32(9999.),dtype=f32)
-    output_v=np.full_like(output_u,f32(9999.)); output_u[0]=u; output_v[0]=v
-    state=[np.full(u.shape,np.nan,dtype=f32) for _ in range(4)]
-    speed=np.sqrt(np.asarray(
-        np.asarray(u*u,dtype=f32)+np.asarray(v*v,dtype=f32),dtype=f32))
-    active=(u<=f32(990.))&(v<=f32(990.))&(speed>=f32(.0001))
-    if not active.any(): return (output_u,output_v,*state,warm_layer_state)
+    centers=np.asarray(z_centers_m,dtype=MODEL_DTYPE)
+    output_u=np.full((centers.size,u.size),9999.,dtype=MODEL_DTYPE)
+    output_v=np.full_like(output_u,9999.); output_u[0]=u; output_v[0]=v
+    state=[np.full(u.shape,np.nan,dtype=MODEL_DTYPE) for _ in range(4)]
+    speed=np.sqrt(u*u+v*v)
+    active=(u<=990.)&(v<=990.)&(speed>=.0001)
+    if not active.any(): return (output_u,output_v,*state)
     selected_speed=speed[active]; selected_height=anemometer[active]
     roughness=hosker_roughness(selected_speed)
     rescale=np.trunc(selected_height).astype(np.int32)!=10
     speed10=selected_speed.copy()
-    speed10[rescale]=np.asarray(selected_speed[rescale]*
-        np.log(np.asarray(f32(10.)/roughness[rescale],dtype=f32))/
-        np.log(np.asarray(selected_height[rescale]/roughness[rescale],dtype=f32)),
-        dtype=f32)
+    speed10[rescale]=(selected_speed[rescale]*
+        np.log(10./roughness[rescale])/
+        np.log(selected_height[rescale]/roughness[rescale]))
     # WATER2 does not repeat Z0MIN after adjusting a non-10 m observation.
-    roughness[rescale]=np.asarray(f32(2.e-6)*
-        np.power(speed10[rescale],f32(2.5)),dtype=f32)
-    friction=np.maximum(np.asarray(f32(.4)*speed10/
-        np.log(np.asarray(f32(10.)/roughness,dtype=f32)),dtype=f32),
-        f32(1.e-9)).astype(f32)
-    length=np.full_like(friction,f32(9.9e9))
+    roughness[rescale]=2.e-6*np.power(speed10[rescale],2.5)
+    friction=np.maximum(.4*speed10/np.log(10./roughness),1.e-9)
+    length=np.full_like(friction,9.9e9)
     mixing=water_mechanical_height(friction,coriolis_value[active],constw=constw,
         minimum_height_m=minimum_height_m,maximum_height_m=maximum_height_m)
-    mixing=np.maximum(np.minimum(mixing,current_mixing[active]),
-                      f32(minimum_height_m)).astype(f32)
+    mixing=np.maximum(np.minimum(mixing,current_mixing[active]),minimum_height_m)
     profile_u,profile_v=similarity_wind_profiles(
         u[active],v[active],selected_height,centers,z_faces_m,roughness,length,mixing,
         latitude[active],ipsifcn=ipsifcn,minimum_mixing_height_m=minimum_height_m)
@@ -803,22 +759,23 @@ def neutral_water_station_profiles(u,v,anemometer_height_m,current_mixing_height
 def water_mechanical_height(friction_velocity,coriolis,*,constw=.16,
                             minimum_height_m=50.,maximum_height_m=2500.):
     """WATER's floating-point ``ZIMECH=CONSTW*USTAR/FCORI`` calculation."""
-    value=np.asarray(np.float64(constw)*np.asarray(friction_velocity,dtype=np.float64)/
-                     np.asarray(coriolis,dtype=np.float64),dtype=np.float64)
-    return np.clip(value,np.float64(minimum_height_m),
-                   np.float64(maximum_height_m)).astype(np.float64)
+    friction=np.asarray(friction_velocity,dtype=MODEL_DTYPE)
+    coriolis=np.asarray(coriolis,dtype=MODEL_DTYPE)
+    return _model_array(np.clip(constw*friction/coriolis,
+                                minimum_height_m,maximum_height_m))
 
 
 def saturation_vapor_pressure_lowe(temperature_c):
-    """CALMET ``ESAT`` Lowe polynomial in the source's floating-point precision."""
-    value=np.asarray(temperature_c,dtype=np.float64)
-    coefficients=tuple(map(np.float64,
+    """CALMET ``ESAT`` Lowe polynomial in model precision."""
+    value=np.asarray(temperature_c,dtype=MODEL_DTYPE)
+    coefficients=np.asarray(
         (6.107799961,.4436518521,.01428945805,.0002650648471,
-         .000003031240396,.00000002034080948,.00000000006136820929)))
-    result=np.full_like(value,coefficients[-1],dtype=np.float64)
+         .000003031240396,.00000002034080948,.00000000006136820929),
+        dtype=MODEL_DTYPE)
+    result=np.full_like(value,coefficients[-1],dtype=MODEL_DTYPE)
     for coefficient in reversed(coefficients[:-1]):
-        result=np.asarray(coefficient+value*result,dtype=np.float64)
-    return result.astype(np.float64)
+        result=coefficient+value*result
+    return _model_array(result)
 
 
 def overwater_delta_temperature_state(air_temperature_k,sea_temperature_k,
@@ -826,32 +783,30 @@ def overwater_delta_temperature_state(air_temperature_k,sea_temperature_k,
                                       measurement_height_m):
     """Prepare WATER's virtual-potential-temperature inputs to ``DELTAT``.
 
-    Every assignment follows the floating-point statements in ``WATER``.  The
-    returned tuple is ``(theta, delta_theta_z, delta_theta_10m, theta_10m)``.
+    The returned tuple is ``(theta, delta_theta_z, delta_theta_10m,
+    theta_10m)``.
     """
     air,sea,rh,height=np.broadcast_arrays(
-        np.asarray(air_temperature_k,dtype=np.float64),
-        np.asarray(sea_temperature_k,dtype=np.float64),
-        np.asarray(relative_humidity_percent,dtype=np.float64),
-        np.asarray(measurement_height_m,dtype=np.float64))
-    r=np.float64
-    air_c=np.asarray(air-r(273.15),dtype=np.float64)
+        np.asarray(air_temperature_k,dtype=MODEL_DTYPE),
+        np.asarray(sea_temperature_k,dtype=MODEL_DTYPE),
+        np.asarray(relative_humidity_percent,dtype=MODEL_DTYPE),
+        np.asarray(measurement_height_m,dtype=MODEL_DTYPE))
+    air_c=air-273.15
     saturation=saturation_vapor_pressure_lowe(air_c)
-    vapor=np.asarray(r(.01)*rh*saturation,dtype=np.float64)
-    mixing=np.asarray(r(.622)*vapor/(r(1000.)-vapor),dtype=np.float64)
-    virtual=np.asarray(air*(r(1.)+r(.61)*mixing),dtype=np.float64)
-    theta=np.asarray(virtual+r(.01)*height,dtype=np.float64)
+    vapor=.01*rh*saturation
+    mixing=.622*vapor/(1000.-vapor)
+    virtual=air*(1.+.61*mixing)
+    theta=virtual+.01*height
 
-    sea_c=np.asarray(sea-r(273.15),dtype=np.float64)
+    sea_c=sea-273.15
     sea_saturation=saturation_vapor_pressure_lowe(sea_c)
-    saturated_mixing=np.asarray(
-        r(.622)*sea_saturation/(r(1000.)-sea_saturation),dtype=np.float64)
-    surface_theta=np.asarray(sea*(r(1.)+r(.61)*saturated_mixing),dtype=np.float64)
-    difference=np.asarray(theta-surface_theta,dtype=np.float64)
-    difference_10m=np.asarray(
-        difference*r(11.512925)/(np.log(height)+r(9.2103404)),dtype=np.float64)
-    theta_10m=np.asarray(surface_theta+difference_10m,dtype=np.float64)
-    return theta,difference,difference_10m,theta_10m
+    saturated_mixing=.622*sea_saturation/(1000.-sea_saturation)
+    surface_theta=sea*(1.+.61*saturated_mixing)
+    difference=theta-surface_theta
+    difference_10m=difference*11.512925/(np.log(height)+9.2103404)
+    theta_10m=surface_theta+difference_10m
+    return tuple(_model_array(value) for value in
+                 (theta,difference,difference_10m,theta_10m))
 
 
 def delta_temperature_flux(wind_speed_10m,measurement_height_m,
@@ -860,7 +815,7 @@ def delta_temperature_flux(wind_speed_10m,measurement_height_m,
                            virtual_potential_temperature_10m_k,
                            measurement_virtual_potential_temperature_k,
                            roughness_m):
-    """Vectorized CALMET ``DELTAT`` with its original floating-point arithmetic."""
+    """Vectorized CALMET ``DELTAT`` with double-precision nonlinear iteration."""
     wind,height,difference,difference_10m,theta_10m,theta,z0=np.broadcast_arrays(
         np.asarray(wind_speed_10m,dtype=np.float64),
         np.asarray(measurement_height_m,dtype=np.float64),
@@ -891,14 +846,13 @@ def delta_temperature_flux(wind_speed_10m,measurement_height_m,
         wind_ratio=np.asarray(r(10.)/safe_length,dtype=np.float64)
         temperature_ratio=np.asarray(height/safe_length,dtype=np.float64)
         stable=safe_length>r(0.)
-        # NumPy evaluates both arms of ``where``.  Feed the unstable-only
-        # intrinsics benign values on stable/inactive lanes, mirroring the
-        # Fortran IF without spurious invalid-power warnings.
+        # NumPy evaluates both arms of ``where``. Feed unstable-only
+        # expressions benign values on stable or inactive lanes.
         unstable_x_base=np.where(~stable,r(1.)-r(15.)*wind_ratio,r(1.))
         x=np.asarray(unstable_x_base**r(.25),dtype=np.float64)
         psi_u_unstable=np.asarray(
             r(2.)*np.log(r(.5)*(r(1.)+x))+
-            np.log(r(.5)*(r(1.)+x*x))-r(2.)*np.arctan(x)+r(1.5707963),
+            np.log(r(.5)*(r(1.)+x*x))-r(2.)*np.arctan(x)+np.pi/r(2.),
             dtype=np.float64)
         unstable_y_base=np.where(~stable,r(1.)-r(9.)*temperature_ratio,r(1.))
         y=np.asarray(np.sqrt(unstable_y_base),dtype=np.float64)
@@ -926,8 +880,8 @@ def delta_temperature_flux(wind_speed_10m,measurement_height_m,
         old=np.where(active,length,old)
     buoyancy_flux_w_m2=np.asarray(-r(1195.2)*theta*ustar**3/(vkg*length),
                                   dtype=np.float64)
-    return (length.astype(np.float64),ustar.astype(np.float64),
-            buoyancy_flux_w_m2)
+    return tuple(_model_array(value) for value in
+                 (length,ustar,buoyancy_flux_w_m2))
 
 
 def delta_temperature_water_station_profiles(u,v,anemometer_height_m,
@@ -938,14 +892,13 @@ def delta_temperature_water_station_profiles(u,v,anemometer_height_m,
         maximum_height_m=2500.,threshold_flux_per_m=.05,ipsifcn=0,
         temperature_measurement_height_m=None,sea_temperature_k=None,**mixing_options):
     """WATER2 station DeltaT branch, with neutral fallback, through SIMILT."""
-    f32=np.float64
     base=neutral_water_station_profiles(u,v,anemometer_height_m,
         current_mixing_height_m,coriolis,z_centers_m,z_faces_m,station_latitude,
         constw=constw,minimum_height_m=minimum_height_m,
         maximum_height_m=maximum_height_m,ipsifcn=ipsifcn)
     output_u,output_v=(base[0].copy(),base[1].copy())
-    u=np.asarray(u,dtype=f32); v=np.asarray(v,dtype=f32)
-    station_inputs=tuple(np.asarray(value,dtype=f32) for value in (
+    u=np.asarray(u,dtype=MODEL_DTYPE); v=np.asarray(v,dtype=MODEL_DTYPE)
+    station_inputs=tuple(np.asarray(value,dtype=MODEL_DTYPE) for value in (
         anemometer_height_m,air_temperature_k,air_minus_sea_temperature_k,
         relative_humidity_percent,observed_mixing_height_m,current_mixing_height_m,
         coriolis,potential_lapse_k_m,previous_temperature_jump_k,station_latitude))
@@ -953,42 +906,39 @@ def delta_temperature_water_station_profiles(u,v,anemometer_height_m,
         raise ValueError('WATER2 DeltaT station inputs must have identical shapes')
     (anemometer,air,delta,rh,observed,current,coriolis_value,lapse,
      previous_jump,latitude)=station_inputs
-    speed=np.sqrt(np.asarray(
-        np.asarray(u*u,dtype=f32)+np.asarray(v*v,dtype=f32),dtype=f32))
-    active=(u<=f32(990.))&(v<=f32(990.))&(speed>=f32(.0001))&(delta<f32(990.))
+    speed=np.sqrt(u*u+v*v)
+    active=(u<=990.)&(v<=990.)&(speed>=.0001)&(delta<990.)
     state=[np.array(value,copy=True) for value in base[2:]]
     # DeltaT-specific state: convective height, jump, and buoyancy heat flux.
-    state.extend(np.full(u.shape,np.nan,dtype=f32) for _ in range(3))
+    state.extend(np.full(u.shape,np.nan,dtype=MODEL_DTYPE) for _ in range(3))
     if not active.any(): return (output_u,output_v,*state)
     height=anemometer[active]
     thermal_height=(height if temperature_measurement_height_m is None else
-        np.broadcast_to(np.asarray(temperature_measurement_height_m,dtype=f32),u.shape)[active])
-    selected_air=np.where(air[active]<f32(990.),air[active],f32(288.7)).astype(f32)
-    selected_rh=np.where(rh[active]<f32(990.),rh[active],f32(100.)).astype(f32)
-    sea=(np.asarray(selected_air-delta[active],dtype=f32)
+        np.broadcast_to(np.asarray(temperature_measurement_height_m,dtype=MODEL_DTYPE),u.shape)[active])
+    selected_air=np.where(air[active]<990.,air[active],288.7)
+    selected_rh=np.where(rh[active]<990.,rh[active],100.)
+    sea=(selected_air-delta[active]
          if sea_temperature_k is None else
-         np.broadcast_to(np.asarray(sea_temperature_k,dtype=f32),u.shape)[active])
+         np.broadcast_to(np.asarray(sea_temperature_k,dtype=MODEL_DTYPE),u.shape)[active])
     theta,difference,difference_10m,theta_10m=overwater_delta_temperature_state(
         selected_air,sea,selected_rh,thermal_height)
     initial_z0=hosker_roughness(speed[active])
     rescale=np.trunc(height).astype(np.int32)!=10
     speed10=speed[active].copy()
-    speed10[rescale]=np.asarray(speed10[rescale]*
-        np.log(np.asarray(f32(10.)/initial_z0[rescale],dtype=f32))/
-        np.log(np.asarray(height[rescale]/initial_z0[rescale],dtype=f32)),
-        dtype=f32)
+    speed10[rescale]=(speed10[rescale]*
+        np.log(10./initial_z0[rescale])/
+        np.log(height[rescale]/initial_z0[rescale]))
     roughness=initial_z0.copy()
-    roughness[rescale]=np.asarray(f32(2.e-6)*
-        np.power(speed10[rescale],f32(2.5)),dtype=f32)
+    roughness[rescale]=2.e-6*np.power(speed10[rescale],2.5)
     length,friction,flux=delta_temperature_flux(
         speed10,thermal_height,difference,difference_10m,theta_10m,theta,roughness)
     mechanical=water_mechanical_height(friction,coriolis_value[active],constw=constw,
         minimum_height_m=minimum_height_m,maximum_height_m=maximum_height_m)
-    has_observed=observed[active]<f32(990.)
-    initial=np.where(has_observed,observed[active],mechanical).astype(f32)
-    initial=np.maximum(np.minimum(initial,current[active]),f32(minimum_height_m)).astype(f32)
+    has_observed=observed[active]<990.
+    initial=np.where(has_observed,observed[active],mechanical)
+    initial=np.maximum(np.minimum(initial,current[active]),minimum_height_m)
     convective=np.zeros_like(initial); next_jump=previous_jump[active].copy()
-    buoyancy=np.asarray(flux/f32(1195.2),dtype=f32)
+    buoyancy=flux/1195.2
     options=dict(mixing_options)
     if int(mixing_method)==1:
         convective,next_jump=convective_height_maul_carson(
@@ -1002,11 +952,11 @@ def delta_temperature_water_station_profiles(u,v,anemometer_height_m,
             threshold_flux_per_m=threshold_flux_per_m,**options)
     elif int(mixing_method) not in {-2,-1}:
         raise ValueError('mixing_method must be one of -2, -1, 1, or 2')
-    calculated=np.clip(np.maximum(mechanical,convective),f32(minimum_height_m),
-                       f32(maximum_height_m)).astype(f32)
-    mixing=np.where(has_observed,initial,calculated).astype(f32)
-    convective=np.where(has_observed,np.nan,convective).astype(f32)
-    next_jump=np.where(has_observed,np.nan,next_jump).astype(f32)
+    calculated=np.clip(np.maximum(mechanical,convective),minimum_height_m,
+                       maximum_height_m)
+    mixing=np.where(has_observed,initial,calculated)
+    convective=np.where(has_observed,np.nan,convective)
+    next_jump=np.where(has_observed,np.nan,next_jump)
     profile_u,profile_v=similarity_wind_profiles(
         u[active],v[active],height,z_centers_m,z_faces_m,roughness,length,mixing,
         latitude[active],ipsifcn=ipsifcn,minimum_mixing_height_m=minimum_height_m)
@@ -1033,35 +983,33 @@ def coare_water_station_profiles(u,v,anemometer_height_m,air_sensor_height_m,
 
     if abs(int(coare_method)) not in {10,11,12}:
         raise ValueError('COARE station method must be +/-10, +/-11, or +/-12')
-    f32=np.float64
     base=neutral_water_station_profiles(u,v,anemometer_height_m,
         current_mixing_height_m,coriolis,z_centers_m,z_faces_m,station_latitude,
         constw=constw,minimum_height_m=minimum_height_m,
         maximum_height_m=maximum_height_m,ipsifcn=ipsifcn)
     output_u,output_v=base[0].copy(),base[1].copy()
-    u=np.asarray(u,dtype=f32); v=np.asarray(v,dtype=f32)
+    u=np.asarray(u,dtype=MODEL_DTYPE); v=np.asarray(v,dtype=MODEL_DTYPE)
     named=(anemometer_height_m,air_sensor_height_m,air_temperature_k,
         air_minus_sea_temperature_k,relative_humidity_percent,
         observed_mixing_height_m,current_mixing_height_m,coriolis,
         potential_lapse_k_m,previous_temperature_jump_k,station_latitude,
         shortwave_down_w_m2,longwave_down_w_m2,rainfall_mm_h)
-    values=tuple(np.asarray(value,dtype=f32) for value in named)
+    values=tuple(np.asarray(value,dtype=MODEL_DTYPE) for value in named)
     if any(value.shape!=u.shape for value in values):
         raise ValueError('COARE WATER2 station inputs must have identical shapes')
     (anemometer,air_height,air,delta,rh,observed,current,coriolis_value,lapse,
      previous_jump,latitude,shortwave,longwave,rainfall)=values
-    speed=np.sqrt(np.asarray(
-        np.asarray(u*u,dtype=f32)+np.asarray(v*v,dtype=f32),dtype=f32))
-    active=(u<=f32(990.))&(v<=f32(990.))&(speed>=f32(.0001))&(delta<f32(990.))
+    speed=np.sqrt(u*u+v*v)
+    active=(u<=990.)&(v<=990.)&(speed>=.0001)&(delta<990.)
     state=[np.array(value,copy=True) for value in base[2:]]
-    state.extend(np.full(u.shape,np.nan,dtype=f32) for _ in range(3))
-    if not active.any(): return (output_u,output_v,*state)
-    selected_air=np.where(air[active]<f32(990.),air[active],f32(288.7)).astype(f32)
-    selected_rh=np.where(rh[active]<f32(990.),rh[active],f32(100.)).astype(f32)
-    sea=(np.asarray(selected_air-delta[active],dtype=f32)
+    state.extend(np.full(u.shape,np.nan,dtype=MODEL_DTYPE) for _ in range(3))
+    if not active.any(): return (output_u,output_v,*state,warm_layer_state)
+    selected_air=np.where(air[active]<990.,air[active],288.7)
+    selected_rh=np.where(rh[active]<990.,rh[active],100.)
+    sea=(selected_air-delta[active]
          if sea_temperature_k is None else
-         np.broadcast_to(np.asarray(sea_temperature_k,dtype=f32),u.shape)[active])
-    sea=np.maximum(sea,f32(270.15))
+         np.broadcast_to(np.asarray(sea_temperature_k,dtype=MODEL_DTYPE),u.shape)[active])
+    sea=np.maximum(sea,270.15)
     next_warm_state=warm_layer_state
     if warm_layer_state is not None:
         if solar_time_s is None:
@@ -1076,16 +1024,16 @@ def coare_water_station_profiles(u,v,anemometer_height_m,air_sensor_height_m,
         sea,selected_warm_state,_=advance_warm_layer(
             selected_warm_state,solar,sea,depth,
             shortwave[active],longwave[active])
-    saturation=saturation_vapor_pressure_lowe(selected_air-f32(273.15))
-    vapor=np.asarray(f32(.01)*selected_rh*saturation,dtype=f32)
-    ratio=np.asarray(f32(.622)*vapor/(f32(1000.)-vapor),dtype=f32)
-    humidity=np.asarray(ratio/(f32(1.)+ratio)*f32(1000.),dtype=f32)
+    saturation=saturation_vapor_pressure_lowe(selected_air-273.15)
+    vapor=.01*selected_rh*saturation
+    ratio=.622*vapor/(1000.-vapor)
+    humidity=ratio/(1.+ratio)*1000.
     neutral_friction=base[3][active]
     mechanical=water_mechanical_height(neutral_friction,coriolis_value[active],constw=constw,
         minimum_height_m=minimum_height_m,maximum_height_m=maximum_height_m)
-    has_observed=observed[active]<f32(990.)
-    initial=np.where(has_observed,observed[active],mechanical).astype(f32)
-    initial=np.maximum(np.minimum(initial,current[active]),f32(minimum_height_m)).astype(f32)
+    has_observed=observed[active]<990.
+    initial=np.where(has_observed,observed[active],mechanical)
+    initial=np.maximum(np.minimum(initial,current[active]),minimum_height_m)
     flux=surface_flux(speed[active],selected_air,sea,humidity,
         wind_height_m=anemometer[active],temperature_height_m=air_height[active],
         pressure_mb=1008.,boundary_layer_height_m=initial,
@@ -1109,12 +1057,11 @@ def coare_water_station_profiles(u,v,anemometer_height_m,air_sensor_height_m,
             next_warm_state=WarmLayerState(*merged)
         else:
             next_warm_state=selected_warm_state
-    roughness=np.asarray(flux.roughness_m,dtype=f32)
-    friction=np.asarray(flux.friction_velocity_m_s,dtype=f32)
-    length=np.asarray(flux.monin_obukhov_m,dtype=f32)
-    length=np.where(np.abs(length)<f32(5.),np.where(length<f32(0.),f32(-5.),f32(5.)),
-                    length).astype(f32)
-    buoyancy=np.asarray(flux.buoyancy_flux_k_m_s,dtype=f32)
+    roughness=np.asarray(flux.roughness_m,dtype=MODEL_DTYPE)
+    friction=np.asarray(flux.friction_velocity_m_s,dtype=MODEL_DTYPE)
+    length=np.asarray(flux.monin_obukhov_m,dtype=MODEL_DTYPE)
+    length=np.where(np.abs(length)<5.,np.where(length<0.,-5.,5.),length)
+    buoyancy=np.asarray(flux.buoyancy_flux_k_m_s,dtype=MODEL_DTYPE)
     mechanical=water_mechanical_height(friction,coriolis_value[active],constw=constw,
         minimum_height_m=minimum_height_m,maximum_height_m=maximum_height_m)
     convective=np.zeros_like(initial); next_jump=previous_jump[active].copy()
@@ -1131,113 +1078,124 @@ def coare_water_station_profiles(u,v,anemometer_height_m,air_sensor_height_m,
             threshold_flux_per_m=threshold_flux_per_m,**options)
     elif int(mixing_method) not in {-2,-1}:
         raise ValueError('mixing_method must be one of -2, -1, 1, or 2')
-    calculated=np.clip(np.maximum(mechanical,convective),f32(minimum_height_m),
-                       f32(maximum_height_m)).astype(f32)
-    mixing=np.where(has_observed,initial,calculated).astype(f32)
-    convective=np.where(has_observed,np.nan,convective).astype(f32)
-    next_jump=np.where(has_observed,np.nan,next_jump).astype(f32)
+    calculated=np.clip(np.maximum(mechanical,convective),minimum_height_m,
+                       maximum_height_m)
+    mixing=np.where(has_observed,initial,calculated)
+    convective=np.where(has_observed,np.nan,convective)
+    next_jump=np.where(has_observed,np.nan,next_jump)
     profile_u,profile_v=similarity_wind_profiles(
         u[active],v[active],anemometer[active],z_centers_m,z_faces_m,roughness,length,
         mixing,latitude[active],ipsifcn=ipsifcn,
         minimum_mixing_height_m=minimum_height_m)
     output_u[:,active]=profile_u; output_v[:,active]=profile_v
-    buoyancy_flux=np.asarray(buoyancy*f32(1195.2),dtype=f32)
+    buoyancy_flux=buoyancy*1195.2
     for destination,source in zip(state,(roughness,friction,length,mixing,convective,
             next_jump,buoyancy_flux),strict=True): destination[active]=source
     return (output_u,output_v,*state,next_warm_state)
 
 
-def upwind_mixing_average(u, v, mixing_height, convective_height, grid_spacing_m,
-                          *, minimum_radius_cells=10, half_angle_degrees=30., timestep_s=3600.):
+def upwind_mixing_average(u, v, mixing_height, convective_height, dx_m=None,
+                          dy_m=None, *, grid_spacing_m=None,
+                          minimum_radius_cells=10, half_angle_degrees=30.,
+                          timestep_s=3600.):
     """AVEMIX upwind-cone spatial averaging of ``ZI`` and ``ZICONV``.
 
     The target-cell loop is retained because every target has a differently
     oriented and sized search window; all candidate-cell calculations inside
-    that window are NumPy-vectorised.  This follows the legacy integer vertex,
-    angular inclusion, boundary clipping, and displaced inverse-square weight.
+    that window are NumPy-vectorised.  Trajectories, cone angles, and distance
+    weights are evaluated in physical metres, which supports rectangular grid
+    cells.  Omitting ``dy_m`` retains the former square-grid calling form;
+    ``grid_spacing_m`` remains an alias for its old keyword spelling.
     """
     u=np.asarray(u,dtype=np.float64); v=np.asarray(v,dtype=np.float64)
     zi=np.asarray(mixing_height,dtype=np.float64); zic=np.asarray(convective_height,dtype=np.float64)
     if u.shape!=v.shape or u.shape!=zi.shape or u.shape!=zic.shape or u.ndim!=2: raise ValueError('AVEMIX fields must share a two-dimensional grid')
     ny,nx=u.shape; result=np.empty_like(zi); result_convective=np.empty_like(zic)
-    degree=np.float64(.01745329)
-    # AVEMIX/AVETMP declare DTIME as DATA /3600./ rather than receiving the
-    # model output step.  Keep the keyword for API compatibility, but preserve
-    # that legacy one-hour trajectory even for sub-hour CALMET runs.
-    del timestep_s
-    scale=np.float64(np.float64(3600.)/np.float64(grid_spacing_m))
-    tangent=np.asarray(np.tan(np.float64(degree*np.float64(half_angle_degrees))),
-                       dtype=np.float64)
+    if dx_m is None:
+        dx_m=grid_spacing_m
+    elif grid_spacing_m is not None:
+        raise TypeError('pass dx_m or grid_spacing_m, not both')
+    if dy_m is None: dy_m=dx_m
+    dx_m=float(dx_m); dy_m=float(dy_m); timestep_s=float(timestep_s)
+    if (not np.isfinite(timestep_s) or timestep_s<=0. or
+            not np.isfinite(dx_m) or dx_m<=0. or
+            not np.isfinite(dy_m) or dy_m<=0.):
+        raise ValueError('AVEMIX timestep and grid spacing must be finite and positive')
+    if (not np.isfinite(half_angle_degrees) or half_angle_degrees<0. or
+            half_angle_degrees>=90.):
+        raise ValueError('AVEMIX half angle must be finite and in [0, 90) degrees')
+    if minimum_radius_cells<0:
+        raise ValueError('AVEMIX minimum radius must be nonnegative')
+    radius=int(minimum_radius_cells)
+    tangent=np.tan(np.deg2rad(half_angle_degrees))
+    # The area-equivalent cell width supplies the one-cell softening distance.
+    # For square cells every weight is the old cell-unit weight times the same
+    # constant, so normalized square-grid results retain their scale.
+    softening_m=np.sqrt(dx_m)*np.sqrt(dy_m)
     @lru_cache(maxsize=4096)
     def window_geometry(left,right,down,up):
         rx_integer=np.arange(left,-right-1,-1,dtype=np.int64)[None,:]
         ry_integer=np.arange(down,-up-1,-1,dtype=np.int64)[:,None]
-        rx=rx_integer.astype(np.float64); ry=ry_integer.astype(np.float64)
+        rx=rx_integer.astype(COORDINATE_DTYPE)*dx_m
+        ry=ry_integer.astype(COORDINATE_DTYPE)*dy_m
         local=(rx_integer==0)&(ry_integer==0)
-        square=(np.abs(rx_integer)<=minimum_radius_cells)&(
-            np.abs(ry_integer)<=minimum_radius_cells)
-        beta=np.fmod(np.float64(270.)-np.arctan2(
-            ry.astype(np.float64),rx.astype(np.float64))/degree,np.float64(360.))
-        return rx_integer,ry_integer,rx,ry,local,square,beta
+        square=(np.abs(rx_integer)<=radius)&(np.abs(ry_integer)<=radius)
+        return rx,ry,local,square
     for i in range(nx):
         for j in range(ny):
-            etax=np.float64(u[j,i]*scale); etay=np.float64(v[j,i]*scale)
-            eta2=np.float64(etax*etax+etay*etay)
-            eta=np.sqrt(eta2); inverse_eta=np.float64(1.)/eta if eta2>0. else np.float64(0.)
-            ix=int(etax); iy=int(etay); cross_x=int(etay*tangent); cross_y=int(etax*tangent)
-            upwind_x=i-ix; upwind_y=j-iy
-            ax=upwind_x+cross_x; bx=upwind_x-cross_x; ay=upwind_y-cross_y; by=upwind_y+cross_y
-            def boundary_angle(px,py):
-                if i!=px:
-                    return np.fmod(np.float64(270.)-np.arctan2(
-                        np.float64(j-py),np.float64(i-px))/degree,np.float64(360.))
-                return np.float64(180.) if j>=py else np.float64(0.)
-            alpha_a=boundary_angle(ax,ay); alpha_b=boundary_angle(bx,by)
-            xlo=max(0,min(ax,bx,i-minimum_radius_cells)); xhi=min(nx-1,max(ax,bx,i+minimum_radius_cells))
-            ylo=max(0,min(ay,by,j-minimum_radius_cells)); yhi=min(ny-1,max(ay,by,j+minimum_radius_cells))
+            etax=u[j,i]*timestep_s; etay=v[j,i]*timestep_s
+            if not np.isfinite(etax) or not np.isfinite(etay):
+                raise ValueError('AVEMIX wind fields must be finite')
+            eta2=etax*etax+etay*etay
+            eta=np.sqrt(eta2); inverse_eta=1./eta if eta2>0. else 0.
+            # Candidate displacement is target minus source.  The cone is
+            # bounded by the wind trajectory and its two perpendicular end
+            # points; convert only the window bounds back to array indices.
+            perpendicular_x=-etay*tangent
+            perpendicular_y=etax*tangent
+            end_ax=etax+perpendicular_x; end_bx=etax-perpendicular_x
+            end_ay=etay+perpendicular_y; end_by=etay-perpendicular_y
+            candidate_x=(i,i-end_ax/dx_m,i-end_bx/dx_m)
+            candidate_y=(j,j-end_ay/dy_m,j-end_by/dy_m)
+            xlo=max(0,min(int(np.floor(min(candidate_x))),i-radius))
+            xhi=min(nx-1,max(int(np.ceil(max(candidate_x))),i+radius))
+            ylo=max(0,min(int(np.floor(min(candidate_y))),j-radius))
+            yhi=min(ny-1,max(int(np.ceil(max(candidate_y))),j+radius))
             # The window is rectangular, so relative one-dimensional axes
             # broadcast to every expression below.  Constructing ``mgrid``
             # here formerly allocated two full candidate arrays for every
             # one of ~300k targets and dominated the model runtime.
-            # In AVEMIX/AVETMP the INTEGER offsets are converted to default
-            # REAL before each product with ETAX/ETAY.  Cache geometry shared
-            # by targets with the same clipped window extents; only wind-
-            # dependent cone and weight expressions remain per target.
+            # Cache geometry shared by targets with the same clipped window
+            # extents; only wind-dependent cone and weight expressions remain
+            # per target.
             geometry=window_geometry(i-xlo,xhi-i,j-ylo,yhi-j)
-            rx_integer,ry_integer,rx,ry,local,square,beta=geometry
-            cone=(beta>=alpha_a)&(beta<=alpha_b)&(
-                (rx_integer*rx_integer+ry_integer*ry_integer)<=eta2)
-            include=local|square|cone
+            rx,ry,local,square=geometry
+            distance2=rx*rx+ry*ry
             if eta>0.:
-                along=np.asarray(np.asarray(
-                    np.asarray(rx*etax,dtype=np.float64)+
-                    np.asarray(ry*etay,dtype=np.float64),dtype=np.float64)*inverse_eta,
-                    dtype=np.float64)
-                along=np.where(along<0.,eta-along,along).astype(np.float64)
-                across=np.asarray(np.abs(np.asarray(
-                    np.asarray(rx*etay,dtype=np.float64)-
-                    np.asarray(ry*etax,dtype=np.float64),dtype=np.float64))*inverse_eta,
-                    dtype=np.float64)
+                projected=(rx*etax+ry*etay)*inverse_eta
+                across=np.abs(rx*etay-ry*etax)*inverse_eta
+                tolerance=np.finfo(np.float64).eps*max(eta,dx_m,dy_m)*16.
+                cone=((projected>=-tolerance)&
+                      (distance2<=eta2+tolerance*max(eta,1.))&
+                      (across<=projected*tangent+tolerance))
+                along=np.where(projected<0.,eta-projected,projected)
             else:
-                along=np.hypot(rx,ry)
-                across=np.zeros_like(along,dtype=np.float64)
-            along_squared=np.asarray(along*along,dtype=np.float64)
-            displaced=np.asarray(np.float64(1.)+np.abs(across),dtype=np.float64)
-            displaced_squared=np.asarray(displaced*displaced,dtype=np.float64)
-            denominator=np.asarray(along_squared+displaced_squared,dtype=np.float64)
-            weight=np.asarray(np.float64(1.)/denominator,dtype=np.float64)
-            weight=np.where(local,np.float64(1.),weight)
-            weight=np.where(include,weight,np.float64(0.)).astype(np.float64)
-            ordered_weight=weight.T.ravel()
-            denominator=np.cumsum(ordered_weight,dtype=np.float64)[-1]
-            ordered_zi=np.asarray((weight*zi[ylo:yhi+1,xlo:xhi+1]).T.ravel(),
-                                  dtype=np.float64)
-            ordered_zic=np.asarray((weight*zic[ylo:yhi+1,xlo:xhi+1]).T.ravel(),
-                                   dtype=np.float64)
-            result[j,i]=np.float64(np.cumsum(ordered_zi,dtype=np.float64)[-1]/denominator)
-            result_convective[j,i]=np.float64(
-                np.cumsum(ordered_zic,dtype=np.float64)[-1]/denominator)
-    return result,result_convective
+                cone=np.zeros_like(local)
+                along=np.sqrt(distance2)
+                across=np.zeros_like(along)
+            include=local|square|cone
+            displaced=softening_m+across
+            denominator=along*along+displaced*displaced
+            weight=1./denominator
+            weight=np.where(local,1./(softening_m*softening_m),weight)
+            weight=np.where(include,weight,0.)
+            denominator=np.sum(weight,dtype=ACCUMULATION_DTYPE)
+            result[j,i]=np.sum(
+                weight*zi[ylo:yhi+1,xlo:xhi+1],dtype=ACCUMULATION_DTYPE)/denominator
+            result_convective[j,i]=np.sum(
+                weight*zic[ylo:yhi+1,xlo:xhi+1],
+                dtype=ACCUMULATION_DTYPE)/denominator
+    return _model_array(result),_model_array(result_convective)
 
 
 def mesopac_layer_average(u, v, mixing_height_m, z_faces_m, *,
@@ -1285,7 +1243,8 @@ def mesopac_layer_average(u, v, mixing_height_m, z_faces_m, *,
     layer_v=np.take_along_axis(v,ksav[None,:,:],axis=0)[0]
     upper_u=np.where(direct,layer_u,upper_u).astype(np.float64)
     upper_v=np.where(direct,layer_v,upper_v).astype(np.float64)
-    return lower_u,lower_v,upper_u,upper_v
+    return tuple(_model_array(value) for value in
+                 (lower_u,lower_v,upper_u,upper_v))
 
 def prognostic_temperature_3d(prognostic_temperature_k, surface_temperature_k,
                               convective_height_m, z_centers_m):
@@ -1295,30 +1254,29 @@ def prognostic_temperature_3d(prognostic_temperature_k, surface_temperature_k,
     retained aloft except levels inside the convective layer, where CALMET
     imposes a dry-adiabatic profile relative to the first model midpoint.
     """
-    source=np.asarray(prognostic_temperature_k,dtype=np.float64)
-    surface=np.asarray(surface_temperature_k,dtype=np.float64)
-    zic=np.asarray(convective_height_m,dtype=np.float64)
-    centers=np.asarray(z_centers_m,dtype=np.float64)
+    source=np.asarray(prognostic_temperature_k,dtype=MODEL_DTYPE)
+    surface=np.asarray(surface_temperature_k,dtype=MODEL_DTYPE)
+    zic=np.asarray(convective_height_m,dtype=MODEL_DTYPE)
+    centers=np.asarray(z_centers_m,dtype=MODEL_DTYPE)
     if source.ndim!=3 or source.shape[1:]!=surface.shape or surface.shape!=zic.shape or source.shape[0]!=centers.size: raise ValueError('TEMP3D inputs do not share CALMET dimensions')
     result=source.copy(); result[0]=surface
     if centers.size>1:
-        adiabatic=np.asarray(surface[None,:,:]-np.float64(.0098)*
-            (centers[1:,None,None]-centers[0]),dtype=np.float64)
+        adiabatic=surface[None,:,:]-.0098*(centers[1:,None,None]-centers[0])
         result[1:]=np.where(centers[1:,None,None]<=zic[None,:,:],adiabatic,result[1:])
     return result
 
 def pgt_stability(u10, v10, solar_elevation_sine, cloud_fraction_field,
                   ceiling_height_m, landuse, monin_obukhov_m, water_range=(50,55)):
     """PGTSTB Turner land classes plus WATER's Monin-Obukhov classes."""
-    u=np.asarray(u10,dtype=np.float64); v=np.asarray(v10,dtype=np.float64)
-    sun=np.asarray(solar_elevation_sine,dtype=np.float64)
-    cloud=np.asarray(cloud_fraction_field,dtype=np.float64)
-    ceiling=np.asarray(ceiling_height_m,dtype=np.float64)
-    lu=np.asarray(landuse); length=np.asarray(monin_obukhov_m,dtype=np.float64)
-    jcc=np.trunc(np.float64(10.)*cloud+np.float64(.5)).astype(int)
-    jceil=np.trunc(ceiling/np.float64(30.48)).astype(int)
-    nighttime=sun<=np.float64(0.); insolation=np.select(
-        (sun<=np.float64(.258819),sun<=np.float64(.5735764),sun<=np.float64(.8660254)),
+    u=np.asarray(u10,dtype=MODEL_DTYPE); v=np.asarray(v10,dtype=MODEL_DTYPE)
+    sun=np.asarray(solar_elevation_sine,dtype=MODEL_DTYPE)
+    cloud=np.asarray(cloud_fraction_field,dtype=MODEL_DTYPE)
+    ceiling=np.asarray(ceiling_height_m,dtype=MODEL_DTYPE)
+    lu=np.asarray(landuse); length=np.asarray(monin_obukhov_m,dtype=MODEL_DTYPE)
+    jcc=np.trunc(10.*cloud+.5).astype(int)
+    jceil=np.trunc(ceiling/30.48).astype(int)
+    nighttime=sun<=0.; insolation=np.select(
+        (sun<=.258819,sun<=.5735764,sun<=.8660254),
         (1,2,3),default=4)
     category=np.where(nighttime,np.where(jcc<=4,-2,np.where((jcc==10)&(jceil<70),0,-1)),insolation)
     heavy=(~nighttime)&(jcc>5)
@@ -1330,67 +1288,64 @@ def pgt_stability(u10, v10, solar_elevation_sine, cloud_fraction_field,
         4,4,4,4,4,4,4,4,4,4,4,4, 3,3,3,4,4,4,4,4,4,4,4,4,
         2,2,2,3,3,3,3,3,3,4,4,4, 1,2,2,2,2,2,2,3,3,3,3,4,
         1,1,1,1,1,2,2,2,2,3,3,3],dtype=np.int8).reshape((12,7),order='F')
-    speed=np.sqrt(np.asarray(u*u+v*v,dtype=np.float64))
-    knots=np.clip(np.trunc(np.float64(1.9438)*speed+np.float64(.5)).astype(int),1,12)
+    speed=np.sqrt(u*u+v*v)
+    knots=np.clip(np.trunc(1.9438*speed+.5).astype(int),1,12)
     result=table[knots-1,category+2]
     water=(lu>=water_range[0])&(lu<=water_range[1])
-    water_class=np.where(np.abs(length)>np.float64(25.),4,
-        np.where(length<np.float64(-10.),3,np.where(length<np.float64(0.),2,
-        np.where(length<=np.float64(10.),6,5))))
+    water_class=np.where(np.abs(length)>25.,4,
+        np.where(length<-10.,3,np.where(length<0.,2,
+        np.where(length<=10.,6,5))))
     return np.where(water,water_class,result).astype(np.int8)
 
 def convective_velocity_scale(convective_height_m, sensible_heat_flux, temperature_k,
                               density, landuse, water_range=(50,55)):
     """WATER/WSTARR convective velocity scale; zero for non-positive flux."""
-    zi=np.asarray(convective_height_m,dtype=np.float64)
-    qh=np.asarray(sensible_heat_flux,dtype=np.float64)
-    temp=np.asarray(temperature_k,dtype=np.float64)
-    rho=np.asarray(density,dtype=np.float64)
+    zi=np.asarray(convective_height_m,dtype=MODEL_DTYPE)
+    qh=np.asarray(sensible_heat_flux,dtype=MODEL_DTYPE)
+    temp=np.asarray(temperature_k,dtype=MODEL_DTYPE)
+    rho=np.asarray(density,dtype=MODEL_DTYPE)
     lu=np.asarray(landuse)
     if lu.shape!=zi.shape:
         raise ValueError('WSTARR landuse does not match the surface fields')
     water=(lu>=water_range[0])&(lu<=water_range[1])
-    land_argument=np.asarray(np.float64(9.81)*qh*zi/
-                             (temp*rho*np.float64(996.)),dtype=np.float64)
+    land_argument=9.81*qh*zi/(temp*rho*996.)
     # WATER stores RH0CP*<w'theta_v'> in QH and forms WSTAR before WSTARR,
     # which deliberately skips water cells.  RH0CP is the fixed 1195.2.
-    water_argument=np.asarray(np.float64(9.81)*(qh/np.float64(1195.2))*zi/temp,
-                              dtype=np.float64)
-    argument=np.where(water,water_argument,land_argument).astype(np.float64)
-    value=np.asarray(np.power(np.maximum(argument,np.float64(0.)),
-                                  np.float64(.3333333)),dtype=np.float64)
-    return np.where((qh>0.)&(zi>0.),value,np.float64(0.)).astype(np.float64)
+    water_argument=9.81*(qh/1195.2)*zi/temp
+    argument=np.where(water,water_argument,land_argument)
+    value=np.cbrt(np.maximum(argument,0.))
+    return _model_array(np.where((qh>0.)&(zi>0.),value,0.))
 
 def solar_sine(julian_day, base_timezone, latitude, longitude_east):
     """SOLAR: 26 half-hour solar-elevation sine fields."""
-    lat=np.asarray(latitude,dtype=np.float64)
-    lon=np.asarray(longitude_east,dtype=np.float64)
-    d=np.float64((np.float64(julian_day)-np.float64(1.))*np.float64(.9856479))
-    radd=np.float64(np.float64(.0174533)*d)
+    lat=np.asarray(latitude,dtype=COORDINATE_DTYPE)
+    lon=np.asarray(longitude_east,dtype=COORDINATE_DTYPE)
+    day=COORDINATE_DTYPE(julian_day)
+    timezone=COORDINATE_DTYPE(base_timezone)
+    d=(day-1.)*.9856479
+    radd=np.deg2rad(d)
     sd=np.sin(radd); cd=np.cos(radd)
-    rad2d=np.float64(np.float64(2.)*radd)
+    rad2d=2.*radd
     s2=np.sin(rad2d); c2=np.cos(rad2d)
-    em=np.float64(np.float64(12.)+np.float64(.12357)*sd-
-        np.float64(.004289)*cd+np.float64(.153809)*s2+np.float64(.060783)*c2)
-    sigma=np.float64(np.float64(279.9348)+d+np.float64(1.914827)*sd-
-        np.float64(.079525)*cd+np.float64(.019938)*s2-np.float64(.00162)*c2)
-    sincd=np.float64(np.float64(.39784989)*np.sin(np.float64(.0174533)*sigma))
+    em=12.+.12357*sd-.004289*cd+.153809*s2+.060783*c2
+    sigma=279.9348+d+1.914827*sd-.079525*cd+.019938*s2-.00162*c2
+    sincd=.39784989*np.sin(np.deg2rad(sigma))
     capd=np.arcsin(sincd); coscd=np.cos(capd)
-    radlat=np.asarray(np.float64(.0174533)*lat,dtype=np.float64)
+    radlat=np.deg2rad(lat)
     sinlat=np.sin(radlat); coslat=np.cos(radlat)
-    hours=np.asarray(np.arange(26,dtype=np.float64)-np.float64(.5)+
-                     np.float64(base_timezone),dtype=np.float64)
-    solha=np.asarray(np.float64(15.)*(hours[:,None,None]-em)+lon[None,:,:],
-                     dtype=np.float64)
-    return np.asarray(sinlat[None,:,:]*sincd+coslat[None,:,:]*coscd*
-                      np.cos(np.float64(.0174533)*solha),dtype=np.float64)
+    hours=np.arange(26,dtype=COORDINATE_DTYPE)-.5+timezone
+    solha=15.*(hours[:,None,None]-em)+lon[None,:,:]
+    result=sinlat[None,:,:]*sincd+coslat[None,:,:]*coscd*np.cos(
+        np.deg2rad(solha))
+    return _model_array(result)
 
 def terrain_gradients(terrain_m, dx_m, dy_m):
     """CALMET one-sided-at-boundary, centred-interior terrain gradients."""
-    h=np.asarray(terrain_m,dtype=float)
+    h=np.asarray(terrain_m,dtype=MODEL_DTYPE)
     west=np.concatenate((h[:,:1],h[:,:-1]),axis=1); east=np.concatenate((h[:,1:],h[:,-1:]),axis=1)
     south=np.concatenate((h[:1,:],h[:-1,:]),axis=0); north=np.concatenate((h[1:,:],h[-1:,:]),axis=0)
-    return (east-west)*(0.5/dx_m),(north-south)*(0.5/dy_m)
+    return (_model_array((east-west)*(.5/dx_m)),
+            _model_array((north-south)*(.5/dy_m)))
 
 def terrain_adjust_surface_wind(u, v, terrain_m, top_height_m, dx_m, dy_m,
                                 *, maximum_iterations=75, tolerance=.02,
@@ -1401,9 +1356,9 @@ def terrain_adjust_surface_wind(u, v, terrain_m, top_height_m, dx_m, dy_m,
     ``IWFCOD=0``.  The four alternating Gauss-Seidel sweeps are deliberately
     retained because every sweep immediately reuses updated neighbours.
     """
-    f32=np.float64
-    u=np.array(u,dtype=f32,copy=True); v=np.array(v,dtype=f32,copy=True)
-    terrain=np.asarray(terrain_m,dtype=f32)
+    work_dtype=ACCUMULATION_DTYPE
+    u=np.array(u,dtype=work_dtype,copy=True); v=np.array(v,dtype=work_dtype,copy=True)
+    terrain=np.asarray(terrain_m,dtype=work_dtype)
     if u.shape!=v.shape or u.ndim!=3 or u.shape[1:]!=terrain.shape:
         raise ValueError('wind must have shape (z,y,x) matching terrain')
     if top_height_m<=0. or dx_m<=0. or dy_m<=0.:
@@ -1412,26 +1367,27 @@ def terrain_adjust_surface_wind(u, v, terrain_m, top_height_m, dx_m, dy_m,
     east_h=np.concatenate((terrain[:,1:],terrain[:,-1:]),axis=1)
     south_h=np.concatenate((terrain[:1,:],terrain[:-1,:]),axis=0)
     north_h=np.concatenate((terrain[1:,:],terrain[-1:,:]),axis=0)
-    fx=f32(.5)/f32(dx_m)/f32(top_height_m)
-    fy=f32(.5)/f32(dy_m)/f32(top_height_m)
-    gx=np.asarray((east_h-west_h)*fx,dtype=f32)
-    gy=np.asarray((north_h-south_h)*fy,dtype=f32)
-    forcing=np.asarray(u[0]*gx+v[0]*gy,dtype=f32)
-    phi=np.zeros_like(terrain,dtype=f32)
+    fx=work_dtype(.5)/work_dtype(dx_m)/work_dtype(top_height_m)
+    fy=work_dtype(.5)/work_dtype(dy_m)/work_dtype(top_height_m)
+    gx=np.asarray((east_h-west_h)*fx,dtype=work_dtype)
+    gy=np.asarray((north_h-south_h)*fy,dtype=work_dtype)
+    forcing=np.asarray(u[0]*gx+v[0]*gy,dtype=work_dtype)
+    phi=np.zeros_like(terrain,dtype=work_dtype)
     west=forcing[:,0].copy(); east=forcing[:,-1].copy()
     south=forcing[0].copy(); north=forcing[-1].copy()
-    dx2=f32(f32(dx_m)*f32(dx_m)); dy2=f32(f32(dy_m)*f32(dy_m))
-    area=f32(dx2*dy2); factor=f32(f32(1.)/(f32(2.)*f32(dx2+dy2)))
-    relax=f32(relaxation); one_minus=f32(f32(1.)-relax)
+    dx2=np.float64(dx_m)**2
+    dy2=np.float64(dy_m)**2
+    area=dx2*dy2
+    factor=1./(2.*(dx2+dy2))
+    relax=np.float64(relaxation)
+    one_minus=1.-relax
     ny,nx=terrain.shape
     orders=((range(ny),range(nx)),(range(ny),range(nx-1,-1,-1)),
             (range(ny-1,-1,-1),range(nx)),
             (range(ny-1,-1,-1),range(nx-1,-1,-1)))
     for _ in range(maximum_iterations):
+        error=0.
         for rows,columns in orders:
-            # ADJUST resets ERROR for every IDIR and tests the value left by
-            # the fourth sweep, rather than the maximum over all four.
-            error=f32(-1.e9)
             for j in rows:
                 for i in columns:
                     old=phi[j,i]
@@ -1439,145 +1395,156 @@ def terrain_adjust_surface_wind(u, v, terrain_m, top_height_m, dx_m, dy_m,
                     right=phi[j,i+1] if i+1<nx else east[j]
                     below=phi[j-1,i] if j else south[i]
                     above=phi[j+1,i] if j+1<ny else north[i]
-                    xx=f32(dy2*f32(right+left)); yy=f32(dx2*f32(above+below))
-                    phi[j,i]=f32(one_minus*old+f32(relax*factor)*
-                                 f32(f32(xx+yy)-f32(area*forcing[j,i])))
+                    xx=dy2*(right+left)
+                    yy=dx2*(above+below)
+                    phi[j,i]=(one_minus*old+relax*factor*
+                              (xx+yy-area*forcing[j,i]))
                     if i==0: west[j]=phi[j,i]
                     if i==nx-1: east[j]=phi[j,i]
                     if j==0: south[i]=phi[j,i]
                     if j==ny-1: north[i]=phi[j,i]
                     if abs(old)>=1.e-10:
-                        error=max(error,f32(abs(f32(phi[j,i]-old)/old)))
+                        error=max(error,abs((phi[j,i]-old)/old))
         if error<=tolerance: break
     left=np.concatenate((west[:,None],phi[:,:-1]),axis=1)
     right=np.concatenate((phi[:,1:],east[:,None]),axis=1)
     below=np.concatenate((south[None,:],phi[:-1]),axis=0)
     above=np.concatenate((phi[1:],north[None,:]),axis=0)
-    dxi=f32(.5)/f32(dx_m); dyi=f32(.5)/f32(dy_m)
-    u[0]=np.asarray((right-left)*dxi+u[0],dtype=f32)
-    v[0]=np.asarray((above-below)*dyi+v[0],dtype=f32)
-    return u,v
+    dxi=.5/np.float64(dx_m)
+    dyi=.5/np.float64(dy_m)
+    u[0]=(right-left)*dxi+u[0]
+    v[0]=(above-below)*dyi+v[0]
+    return _model_array(u),_model_array(v)
 
 def terrain_extrema(terrain_m, radius_km, dx_m, dy_m):
-    """TERSET crest/valley heights and distances, preserving scan order."""
-    f32=np.float64
-    h=np.asarray(terrain_m,dtype=f32); ny,nx=h.shape
+    """Return local terrain extrema and their nearest physical distances.
+
+    The circular search and all comparisons use double precision.  When an
+    extremum occurs at more than one cell, its nearest occurrence is used;
+    completely equidistant occurrences are resolved by row-major source
+    index.  This makes the result independent of the order in which offsets
+    are visited.  Returned model fields remain single precision.
+    """
+    h=np.asarray(terrain_m,dtype=COORDINATE_DTYPE)
+    if h.ndim!=2:
+        raise ValueError('terrain must be a two-dimensional array')
+    dx=np.float64(dx_m); dy=np.float64(dy_m)
+    radius=np.float64(radius_km)*np.float64(1000.)
+    if not np.isfinite(dx) or dx<=0. or not np.isfinite(dy) or dy<=0.:
+        raise ValueError('terrain grid spacing must be finite and positive')
+    if not np.isfinite(radius) or radius<0.:
+        raise ValueError('terrain search radius must be finite and nonnegative')
+
+    ny,nx=h.shape
     highest=h.copy(); lowest=h.copy()
-    distance_high=np.zeros_like(h,dtype=f32); distance_low=np.zeros_like(h,dtype=f32)
-    dx_km=f32(f32(dx_m)*f32(.001)); dy_km=f32(f32(dy_m)*f32(.001))
-    radius=f32(radius_km)
-    irange=int(np.floor(f32(radius/dx_km)+f32(.5)))
-    jrange=int(np.floor(f32(radius/dy_km)+f32(.5)))
+    distance_high=np.zeros_like(h); distance_low=np.zeros_like(h)
+    source_indices=np.arange(ny*nx,dtype=np.int64).reshape(ny,nx)
+    source_high=source_indices.copy(); source_low=source_indices.copy()
+    irange=int(np.ceil(radius/dx))
+    jrange=int(np.ceil(radius/dy))
     for dj in range(-jrange,jrange+1):
         for di in range(-irange,irange+1):
-            xdistance=f32(f32(di)*dx_km); ydistance=f32(f32(dj)*dy_km)
-            distance=f32(np.sqrt(f32(f32(xdistance*xdistance)+f32(ydistance*ydistance))))
+            distance=np.hypot(np.float64(di)*dx,np.float64(dj)*dy)
             if distance>radius: continue
             target_y=slice(max(0,-dj),min(ny,ny-dj)); target_x=slice(max(0,-di),min(nx,nx-di))
             source_y=slice(max(0,dj),min(ny,ny+dj)); source_x=slice(max(0,di),min(nx,nx+di))
             candidate=h[source_y,source_x]
-            distance_m=f32(distance*f32(1000.))
-            hi=highest[target_y,target_x]; update=candidate>hi
-            hi[update]=candidate[update]; distance_high[target_y,target_x][update]=distance_m
-            lo=lowest[target_y,target_x]; update=candidate<lo
-            lo[update]=candidate[update]; distance_low[target_y,target_x][update]=distance_m
-    return highest,lowest,distance_high,distance_low
+            candidate_source=source_indices[source_y,source_x]
+
+            hi=highest[target_y,target_x]
+            dhi=distance_high[target_y,target_x]
+            shi=source_high[target_y,target_x]
+            update=(candidate>hi)|(
+                (candidate==hi)&((distance<dhi)|(
+                    (distance==dhi)&(candidate_source<shi))))
+            hi[update]=candidate[update]
+            dhi[update]=distance
+            shi[update]=candidate_source[update]
+
+            lo=lowest[target_y,target_x]
+            dlo=distance_low[target_y,target_x]
+            slo=source_low[target_y,target_x]
+            update=(candidate<lo)|(
+                (candidate==lo)&((distance<dlo)|(
+                    (distance==dlo)&(candidate_source<slo))))
+            lo[update]=candidate[update]
+            dlo[update]=distance
+            slo[update]=candidate_source[update]
+    return tuple(_model_array(value) for value in (
+        highest,lowest,distance_high,distance_low))
 
 def topographic_vertical_velocity(u,v,terrain_m,z_faces_m,gamma_k_per_m,temperature_k,alpha,dx_m,dy_m):
     """TOPOF2 terrain-following vertical velocity; wind axes are (z,y,x)."""
-    f32=np.float64
-    u=np.asarray(u,dtype=f32); v=np.asarray(v,dtype=f32); faces=np.asarray(z_faces_m,dtype=f32)
-    terrain=np.asarray(terrain_m,dtype=f32)
+    u=np.asarray(u,dtype=MODEL_DTYPE); v=np.asarray(v,dtype=MODEL_DTYPE)
+    faces=np.asarray(z_faces_m,dtype=MODEL_DTYPE)
+    terrain=np.asarray(terrain_m,dtype=MODEL_DTYPE)
     west=np.concatenate((terrain[:,:1],terrain[:,:-1]),axis=1)
     east=np.concatenate((terrain[:,1:],terrain[:,-1:]),axis=1)
     south=np.concatenate((terrain[:1,:],terrain[:-1,:]),axis=0)
     north=np.concatenate((terrain[1:,:],terrain[-1:,:]),axis=0)
-    gx=np.asarray((east-west)*(f32(.5)/f32(dx_m)),dtype=f32)
-    gy=np.asarray((north-south)*(f32(.5)/f32(dy_m)),dtype=f32)
-    gamma2=np.asarray(np.asarray(gamma_k_per_m,dtype=f32)-f32(-.01),dtype=f32)
-    stable=np.sqrt(np.maximum(
-        np.asarray(f32(9.8)*gamma2/np.asarray(temperature_k,dtype=f32),dtype=f32),f32(0.)))
-    stability=np.where(gamma2<f32(0.),f32(-1.),stable).astype(f32)
-    speed=np.sqrt(np.asarray(u[-1]*u[-1]+v[-1]*v[-1],dtype=f32))
-    speed=np.maximum(speed,f32(1.e-6))
-    wave=np.where(stability<=f32(0.),f32(2.)/f32(500.),stability/speed).astype(f32)
-    wtopo=np.asarray(u[0]*gx+v[0]*gy,dtype=f32); nz=u.shape[0]
-    decay=np.empty((nz+1,)+wtopo.shape,dtype=f32); decay[0]=wtopo
+    gx=(east-west)*(.5/dx_m)
+    gy=(north-south)*(.5/dy_m)
+    gamma2=np.asarray(gamma_k_per_m,dtype=MODEL_DTYPE)+.01
+    temperature=np.asarray(temperature_k,dtype=MODEL_DTYPE)
+    stable=np.sqrt(np.maximum(9.8*gamma2/temperature,0.))
+    stability=np.where(gamma2<0.,-1.,stable)
+    speed=np.maximum(np.sqrt(u[-1]*u[-1]+v[-1]*v[-1]),1.e-6)
+    wave=np.where(stability<=0.,2./500.,stability/speed)
+    wtopo=u[0]*gx+v[0]*gy; nz=u.shape[0]
+    decay=np.empty((nz+1,)+wtopo.shape,dtype=MODEL_DTYPE); decay[0]=wtopo
     w=np.empty_like(decay); w[0]=wtopo
     for k in range(nz):
-        bkz=np.minimum(np.asarray(wave*faces[k+1],dtype=f32),f32(50.))
-        decay[k+1]=np.asarray(wtopo*np.exp(-bkz),dtype=f32)
-        dzi=f32(1.)/f32(faces[k+1]-faces[k])
-        dwdz1=np.asarray((decay[k+1]-decay[k])*dzi,dtype=f32)
-        dwdz=np.asarray(f32(alpha)*dwdz1,dtype=f32)
-        w[k+1]=np.asarray(dwdz/dzi+w[k],dtype=f32)
-    w[0]=np.asarray(w[0]-u[0]*gx-v[0]*gy,dtype=f32)
-    w[1:]=np.asarray(w[1:]-u*gx[None,:,:]-v*gy[None,:,:],dtype=f32)
-    return w
+        bkz=np.minimum(wave*faces[k+1],50.)
+        decay[k+1]=wtopo*np.exp(-bkz)
+        dzi=1./(faces[k+1]-faces[k])
+        dwdz1=(decay[k+1]-decay[k])*dzi
+        w[k+1]=alpha*dwdz1/dzi+w[k]
+    w[0]=w[0]-u[0]*gx-v[0]*gy
+    w[1:]=w[1:]-u*gx[None,:,:]-v*gy[None,:,:]
+    return _model_array(w)
 
 def slope_flow(terrain_m,highest_m,lowest_m,distance_high_m,distance_low_m,sensible_heat_flux,temperature_k,landuse,z_faces_m,dx_m,dy_m,water_range=(50,55)):
     """SLOPE Mahrt/Horst-Doran shooting-flow parameterisation."""
-    h=np.asarray(terrain_m,dtype=np.float64)
-    qh=np.asarray(sensible_heat_flux,dtype=np.float64)
-    temp=np.asarray(temperature_k,dtype=np.float64)
-    dx_inverse=np.float64(.5)/np.float64(dx_m)
-    dy_inverse=np.float64(.5)/np.float64(dy_m)
+    h=np.asarray(terrain_m,dtype=MODEL_DTYPE)
+    qh=np.asarray(sensible_heat_flux,dtype=MODEL_DTYPE)
+    temp=np.asarray(temperature_k,dtype=MODEL_DTYPE)
     west=np.concatenate((h[:,:1],h[:,:-1]),axis=1)
     east=np.concatenate((h[:,1:],h[:,-1:]),axis=1)
     south=np.concatenate((h[:1,:],h[:-1,:]),axis=0)
     north=np.concatenate((h[1:,:],h[-1:,:]),axis=0)
-    gx=np.asarray((east-west)*dx_inverse,dtype=np.float64)
-    gy=np.asarray((north-south)*dy_inverse,dtype=np.float64)
-    magnitude=np.asarray(np.power(
-        np.asarray(gx*gx+gy*gy,dtype=np.float64),np.float64(.5)),dtype=np.float64)
+    gx=(east-west)*(.5/dx_m)
+    gy=(north-south)*(.5/dy_m)
+    magnitude=np.hypot(gx,gy)
     angle=np.arctan(magnitude)
-    active=(np.abs(angle)>=np.float64(.009))
+    active=(np.abs(angle)>=.009)
     active &= ~((np.asarray(landuse)>=water_range[0])&(np.asarray(landuse)<=water_range[1]))
     down=qh<0.
-    relief=np.where(down,np.asarray(highest_m,dtype=np.float64)-h,
-                    h-np.asarray(lowest_m,dtype=np.float64)).astype(np.float64)
-    hd=np.asarray(np.float64(.05)*relief,dtype=np.float64)
-    distance=np.where(down,np.asarray(distance_high_m,dtype=np.float64),
-                      np.asarray(distance_low_m,dtype=np.float64))
-    dcrest=np.sqrt(np.asarray(relief*relief+distance*distance,dtype=np.float64))
+    highest=np.asarray(highest_m,dtype=MODEL_DTYPE)
+    lowest=np.asarray(lowest_m,dtype=MODEL_DTYPE)
+    relief=np.where(down,highest-h,h-lowest)
+    hd=.05*relief
+    distance=np.where(down,np.asarray(distance_high_m,dtype=MODEL_DTYPE),
+                      np.asarray(distance_low_m,dtype=MODEL_DTYPE))
+    dcrest=np.sqrt(relief*relief+distance*distance)
     sinalf=np.sin(np.abs(angle))
     bounded=np.divide(relief,dcrest,out=np.zeros_like(relief),where=dcrest>0)
     sinalf=np.where(down,np.minimum(sinalf,bounded),sinalf)
-    exponent=np.maximum(np.asarray(-dcrest*np.float64(.08)/
-        np.maximum(hd,np.float64(1.e-30)),dtype=np.float64),np.float64(-50.))
-    one_third=np.float64(1.)/np.float64(3.)
-    downslope_base=np.asarray(sinalf*(np.float64(9.81)/temp)*np.abs(qh)*dcrest/
-                              np.float64(1229.9)/np.float64(.08),dtype=np.float64)
-    decay=np.asarray(np.float64(1.)-np.exp(exponent),dtype=np.float64)
-    downslope=-np.asarray(np.power(downslope_base,one_third)*
-                          np.power(decay,one_third),dtype=np.float64)
-    upslope_base=np.asarray((np.float64(9.81)/temp)*np.abs(qh)*relief/
-                            np.float64(1229.9),dtype=np.float64)
+    exponent=np.maximum(-dcrest*.08/np.maximum(hd,1.e-30),-50.)
+    one_third=MODEL_DTYPE(1./3.)
+    downslope_base=sinalf*(9.81/temp)*np.abs(qh)*dcrest/1229.9/.08
+    decay=1.-np.exp(exponent)
+    downslope=-np.power(downslope_base,one_third)*np.power(decay,one_third)
+    upslope_base=(9.81/temp)*np.abs(qh)*relief/1229.9
     upslope=np.power(upslope_base,one_third)
     velocity=np.where(down,downslope,upslope); velocity=np.where(active&(hd>.05),velocity,0.)
-    # SLOPE deliberately goes through rounded degrees and radians rather
-    # than normalising the gradient directly (the same legacy angle chain
-    # used by FRADJ).  It matters when a slope component nearly cancels the
-    # background wind.
-    theta_p=np.asarray(np.arctan(np.divide(
-        gy,gx,out=np.zeros_like(gy),where=gx!=0.))*
-                       np.float64(57.296),dtype=np.float64)
-    theta=np.where(gx<0.,theta_p+np.float64(180.),theta_p)
-    theta=np.where((gx>0.)&(gy<=0.),theta_p+np.float64(360.),theta)
-    theta=np.where((gx==0.)&(gy<0.),np.float64(270.),theta)
-    theta=np.where((gx==0.)&(gy>0.),np.float64(90.),theta)
-    theta_d=np.where((theta>=0.)&(theta<=90.),np.float64(90.)-theta,
-                     np.float64(450.)-theta)
-    direction=np.asarray((np.float64(270.)-theta_d)*np.float64(.017453),
-                         dtype=np.float64)
-    ux=np.asarray(-np.cos(direction)*velocity,dtype=np.float64)
-    vy=np.asarray(-np.sin(direction)*velocity,dtype=np.float64)
-    ux=np.where(magnitude>0.,ux,np.float64(0.)); vy=np.where(magnitude>0.,vy,np.float64(0.))
-    faces=np.asarray(z_faces_m,dtype=np.float64)
+    unit_x=np.divide(gx,magnitude,out=np.zeros_like(gx),where=magnitude>0.)
+    unit_y=np.divide(gy,magnitude,out=np.zeros_like(gy),where=magnitude>0.)
+    ux=unit_x*velocity
+    vy=unit_y*velocity
+    faces=np.asarray(z_faces_m,dtype=MODEL_DTYPE)
     ratios=np.clip((hd[None,:,:]-faces[:-1,None,None])/
-                   np.diff(faces)[:,None,None],np.float64(0.),np.float64(1.))
-    return np.asarray(ratios*ux[None,:,:],dtype=np.float64),\
-        np.asarray(ratios*vy[None,:,:],dtype=np.float64)
+                   np.diff(faces)[:,None,None],0.,1.)
+    return _model_array(ratios*ux[None,:,:]),_model_array(ratios*vy[None,:,:])
 
 def vertical_layer_average(values, heights_m, faces_m, *, missing=998.99):
     """VERTAV exact piecewise-linear layer mean for arbitrary profiles.
@@ -1586,8 +1553,9 @@ def vertical_layer_average(values, heights_m, faces_m, *, missing=998.99):
     independent profiles. ``heights_m`` may be one-dimensional or match the
     values array.
     """
-    values=np.asarray(values,dtype=float); heights=np.broadcast_to(np.asarray(heights_m,dtype=float),values.shape)
-    faces=np.asarray(faces_m,dtype=float)
+    values=np.asarray(values,dtype=ACCUMULATION_DTYPE)
+    heights=np.broadcast_to(np.asarray(heights_m,dtype=ACCUMULATION_DTYPE),values.shape)
+    faces=np.asarray(faces_m,dtype=ACCUMULATION_DTYPE)
     if values.shape[-1]<2 or faces.ndim!=1 or faces.size<2: raise ValueError('at least two source levels and two faces are required')
     z0,z1=heights[...,:-1],heights[...,1:]; v0,v1=values[...,:-1],values[...,1:]
     valid=(v0<missing)&(v1<missing)&(z1>z0)
@@ -1601,27 +1569,24 @@ def vertical_layer_average(values, heights_m, faces_m, *, missing=998.99):
         coverage=np.sum(np.where(use,width,0.),axis=-1)
         if np.any(np.abs(coverage-(top-bottom))>1.e-4): raise ValueError(f'sounding does not fully cover layer {bottom:g}-{top:g} m')
         output.append(integral/(top-bottom))
-    return np.stack(output,axis=-1)
+    return _model_array(np.stack(output,axis=-1))
 
 def vertical_interpolate(values, heights_m, targets_m, *, missing=998.99):
     """FACET/INTP piecewise-linear interpolation with missing-level skips."""
-    values=np.asarray(values,dtype=float); heights=np.broadcast_to(np.asarray(heights_m,dtype=float),values.shape)
-    targets=np.asarray(targets_m,dtype=float); leading=values.shape[:-1]; result=np.empty(leading+targets.shape)
+    values=np.asarray(values,dtype=ACCUMULATION_DTYPE)
+    heights=np.broadcast_to(np.asarray(heights_m,dtype=ACCUMULATION_DTYPE),values.shape)
+    targets=np.asarray(targets_m,dtype=ACCUMULATION_DTYPE)
+    leading=values.shape[:-1]
+    result=np.empty(leading+targets.shape,dtype=ACCUMULATION_DTYPE)
     for index in np.ndindex(leading):
         good=values[index]<missing; z=heights[index][good]; v=values[index][good]
         if z.size<2 or targets.min()<z.min() or targets.max()>z.max(): raise ValueError('valid sounding does not bracket interpolation targets')
         result[index]=np.interp(targets,z,v)
-    return result
+    return _model_array(result)
 
 def smooth_wind(u,v,passes):
-    """SMOOTH's in-place Gauss-Seidel stencil, including fixed boundaries.
-
-    Both axes remain sequential because Fortran immediately reuses updated
-    western and southern neighbours.  Each addition in the four-neighbour
-    sum also rounds to floating-point; regrouping it as a linear recurrence changes
-    that association and can produce one-ulp wind errors.
-    """
-    u=np.array(u,dtype=np.float64,copy=True); v=np.array(v,dtype=np.float64,copy=True)
+    """Apply the in-place Gauss-Seidel wind-smoothing stencil."""
+    u=np.array(u,dtype=MODEL_DTYPE,copy=True); v=np.array(v,dtype=MODEL_DTYPE,copy=True)
     if u.shape!=v.shape or u.ndim!=3: raise ValueError('wind arrays must have shape (z,y,x)')
     counts=np.broadcast_to(np.asarray(passes,dtype=int), (u.shape[0],))
     ub_left=u[:,:,0].copy(); ub_right=u[:,:,-1].copy()
@@ -1635,63 +1600,61 @@ def smooth_wind(u,v,passes):
                     ue=ub_right[k,j] if i+1==u.shape[2] else u[k,j,i+1]
                     us=uc if j==0 else u[k,j-1,i]
                     un=uc if j+1==u.shape[1] else u[k,j+1,i]
-                    total=np.float64(np.float64(np.float64(ue+uw)+un)+us)
-                    u[k,j,i]=np.float64(np.float64(np.float64(.5)*uc)+
-                                        np.float64(np.float64(.125)*total))
+                    total=ue+uw+un+us
+                    u[k,j,i]=MODEL_DTYPE(.5)*uc+MODEL_DTYPE(.125)*total
 
                     vc=v[k,j,i]
                     vw=vc if i==0 else v[k,j,i-1]
                     ve=vc if i+1==v.shape[2] else v[k,j,i+1]
                     vs=vb_bottom[k,i] if j==0 else v[k,j-1,i]
                     vn=vb_top[k,i] if j+1==v.shape[1] else v[k,j+1,i]
-                    total=np.float64(np.float64(np.float64(ve+vw)+vn)+vs)
-                    v[k,j,i]=np.float64(np.float64(np.float64(.5)*vc)+
-                                        np.float64(np.float64(.125)*total))
+                    total=ve+vw+vn+vs
+                    v[k,j,i]=MODEL_DTYPE(.5)*vc+MODEL_DTYPE(.125)*total
     return u,v
 
 def divergence_and_vertical_velocity(u,v,z_faces_m,dx_m,dy_m,*,obrien=False,boundaries=None):
     """DIVCEL plus vertical integration and optional O'Brien correction."""
-    f32=np.float64
-    u=np.asarray(u,dtype=f32); v=np.asarray(v,dtype=f32); faces=np.asarray(z_faces_m,dtype=f32)
+    work_dtype=ACCUMULATION_DTYPE
+    u=np.asarray(u,dtype=work_dtype); v=np.asarray(v,dtype=work_dtype); faces=np.asarray(z_faces_m,dtype=work_dtype)
     if boundaries is None:
         u_west,u_east,v_south,v_north=u[:,:,0],u[:,:,-1],v[:,0,:],v[:,-1,:]
     else:
-        u_west,u_east,v_south,v_north=(np.asarray(value,dtype=f32) for value in boundaries)
+        u_west,u_east,v_south,v_north=(np.asarray(value,dtype=work_dtype) for value in boundaries)
     up=np.concatenate((u_west[:,:,None],u,u_east[:,:,None]),axis=2)
     vp=np.concatenate((v_south[:,None,:],v,v_north[:,None,:]),axis=1)
-    dxi=f32(1.)/(f32(2.)*f32(dx_m)); dyi=f32(1.)/(f32(2.)*f32(dy_m))
+    dxi=work_dtype(1.)/(work_dtype(2.)*work_dtype(dx_m)); dyi=work_dtype(1.)/(work_dtype(2.)*work_dtype(dy_m))
     divergence=np.asarray((up[:,:,2:]-up[:,:,:-2])*dxi+
-                          (vp[:,2:,:]-vp[:,:-2,:])*dyi,dtype=f32)
-    w=np.zeros((u.shape[0]+1,)+u.shape[1:],dtype=f32)
-    # The vertical recurrence rounds after every model layer in DIAGNO.
+                          (vp[:,2:,:]-vp[:,:-2,:])*dyi,dtype=work_dtype)
+    w=np.zeros((u.shape[0]+1,)+u.shape[1:],dtype=work_dtype)
+    # Integrate successively because every face depends on the one below it.
     for k in range(u.shape[0]):
-        w[k+1]=np.asarray(-((faces[k+1]-faces[k])*divergence[k])+w[k],dtype=f32)
+        w[k+1]=np.asarray(-((faces[k+1]-faces[k])*divergence[k])+w[k],dtype=work_dtype)
     if obrien:
         top=w[-1].copy()
         for k in range(u.shape[0]):
-            ratio=f32(faces[k+1]/faces[-1])
-            w[k+1]=np.asarray(w[k+1]-ratio*top,dtype=f32)
-    return divergence,w
+            ratio=work_dtype(faces[k+1]/faces[-1])
+            w[k+1]=np.asarray(w[k+1]-ratio*top,dtype=work_dtype)
+    return _model_array(divergence),_model_array(w)
 
 def minimize_divergence(u,v,w,z_faces_m,dx_m,dy_m,*,boundaries=None,
                         maximum_iterations=50,limit=5.e-6):
     """MINIM four-sweep horizontal mass-consistency adjustment."""
-    f32=np.float64
-    u=np.array(u,dtype=f32,copy=True); v=np.array(v,dtype=f32,copy=True)
-    w=np.asarray(w,dtype=f32); faces=np.asarray(z_faces_m,dtype=f32)
+    work_dtype=ACCUMULATION_DTYPE
+    u=np.array(u,dtype=work_dtype,copy=True); v=np.array(v,dtype=work_dtype,copy=True)
+    w=np.asarray(w,dtype=work_dtype); faces=np.asarray(z_faces_m,dtype=work_dtype)
     if u.shape!=v.shape or w.shape!=(u.shape[0]+1,*u.shape[1:]):
         raise ValueError('MINIM wind arrays have inconsistent dimensions')
     if boundaries is None:
         boundaries=(u[:,:,0].copy(),u[:,:,-1].copy(),v[:,0,:].copy(),v[:,-1,:].copy())
-    west,east,south,north=(np.array(value,dtype=f32,copy=True) for value in boundaries)
+    west,east,south,north=(np.array(value,dtype=work_dtype,copy=True) for value in boundaries)
     divergence=np.empty_like(u); iterations=np.zeros(u.shape[0],dtype=np.int32)
 
     def layer_divergence(k):
         up=np.concatenate((west[k,:,None],u[k],east[k,:,None]),axis=1)
         vp=np.concatenate((south[k,None,:],v[k],north[k,None,:]),axis=0)
-        dxi=f32(1.)/(f32(2.)*f32(dx_m)); dyi=f32(1.)/(f32(2.)*f32(dy_m))
+        dxi=work_dtype(1.)/(work_dtype(2.)*work_dtype(dx_m)); dyi=work_dtype(1.)/(work_dtype(2.)*work_dtype(dy_m))
         horizontal=(up[:,2:]-up[:,:-2])*dxi+(vp[2:]-vp[:-2])*dyi
-        return np.asarray(horizontal+(w[k+1]-w[k])/(faces[k+1]-faces[k]),dtype=f32)
+        return np.asarray(horizontal+(w[k+1]-w[k])/(faces[k+1]-faces[k]),dtype=work_dtype)
 
     for k in range(u.shape[0]):
         divergence[k]=layer_divergence(k)
@@ -1705,19 +1668,19 @@ def minimize_divergence(u,v,w,z_faces_m,dx_m,dy_m,*,boundaries=None,
                         else range(u.shape[1]-1,-1,-1))
                 for j in jrange:
                     for i in irange:
-                        if div[j,i]==f32(0.): continue
-                        ut=f32(-f32(2.)*(div[j,i]*f32(dx_m))/f32(2.))
-                        vt=f32(-f32(2.)*(div[j,i]*f32(dy_m))/f32(2.))
-                        if i>0: u[k,j,i-1]=f32(u[k,j,i-1]-f32(.5)*ut)
-                        if i+1<u.shape[2]: u[k,j,i+1]=f32(u[k,j,i+1]+f32(.5)*ut)
-                        if j>0: v[k,j-1,i]=f32(v[k,j-1,i]-f32(.5)*vt)
-                        if j+1<u.shape[1]: v[k,j+1,i]=f32(v[k,j+1,i]+f32(.5)*vt)
+                        if div[j,i]==work_dtype(0.): continue
+                        ut=work_dtype(-work_dtype(2.)*(div[j,i]*work_dtype(dx_m))/work_dtype(2.))
+                        vt=work_dtype(-work_dtype(2.)*(div[j,i]*work_dtype(dy_m))/work_dtype(2.))
+                        if i>0: u[k,j,i-1]=work_dtype(u[k,j,i-1]-work_dtype(.5)*ut)
+                        if i+1<u.shape[2]: u[k,j,i+1]=work_dtype(u[k,j,i+1]+work_dtype(.5)*ut)
+                        if j>0: v[k,j-1,i]=work_dtype(v[k,j-1,i]-work_dtype(.5)*vt)
+                        if j+1<u.shape[1]: v[k,j+1,i]=work_dtype(v[k,j+1,i]+work_dtype(.5)*vt)
                 west[k]=u[k,:,0]; east[k]=u[k,:,-1]
                 south[k]=v[k,0,:]; north[k]=v[k,-1,:]
                 divergence[k]=layer_divergence(k)
             iterations[k]=iteration
             if np.max(np.abs(divergence[k]))<=limit: break
-    return u,v,divergence,iterations
+    return (_model_array(u),_model_array(v),_model_array(divergence),iterations)
 
 def heat_flux(solar_sine_field,cloud_fraction_field,temperature_k,landuse,albedo,
               bowen,soil_heat_flux,anthropogenic_heat,water_range=(50,55),*,
@@ -1726,54 +1689,54 @@ def heat_flux(solar_sine_field,cloud_fraction_field,temperature_k,landuse,albedo
               net_radiation_coefficient_1=5.31e-13,
               net_radiation_coefficient_2=60.,net_radiation_coefficient_3=.12):
     """HEATFX short-wave radiation and land sensible heat flux."""
-    sun=np.asarray(solar_sine_field,dtype=np.float64)
-    cloud=np.asarray(cloud_fraction_field,dtype=np.float64)
-    temp=np.asarray(temperature_k,dtype=np.float64)
-    albedo=np.asarray(albedo,dtype=np.float64); bowen=np.asarray(bowen,dtype=np.float64)
-    soil=np.asarray(soil_heat_flux,dtype=np.float64)
-    anthropogenic=np.asarray(anthropogenic_heat,dtype=np.float64)
-    ha1=np.float64(turbidity_coefficient_1); ha2=np.float64(turbidity_coefficient_2)
-    hb1=np.float64(cloudiness_coefficient_1); hb2=np.float64(cloudiness_coefficient_2)
-    hc1=np.float64(net_radiation_coefficient_1)
-    hc2=np.float64(net_radiation_coefficient_2)
-    hc3=np.float64(net_radiation_coefficient_3)
-    cloud_power=np.asarray(np.power(cloud,hb2),dtype=np.float64)
-    qsw=np.maximum((ha1*sun+ha2)*
-        (np.float64(1.)+hb1*cloud_power),np.float64(0.))
-    temp2=np.asarray(temp*temp,dtype=np.float64)
-    temp3=np.asarray(temp2*temp,dtype=np.float64)
-    temp4=np.asarray(temp2*temp2,dtype=np.float64)
-    temp6=np.asarray(temp3*temp3,dtype=np.float64)
-    qstar=np.asarray(((np.float64(1.)-albedo)*qsw+
-        hc1*temp6-
-        np.float64(5.67e-8)*temp4+hc2*cloud)/
-        np.asarray(hc3+np.float64(1.),dtype=np.float64),dtype=np.float64)
-    qh=np.asarray(bowen*(qstar*(np.float64(1.)-soil)+anthropogenic)/
-                  (np.float64(1.)+bowen),dtype=np.float64)
-    qh=np.where(sun<=0.,np.float64(-.1),qh).astype(np.float64)
+    sun=np.asarray(solar_sine_field,dtype=MODEL_DTYPE)
+    cloud=np.asarray(cloud_fraction_field,dtype=MODEL_DTYPE)
+    temp=np.asarray(temperature_k,dtype=MODEL_DTYPE)
+    albedo=np.asarray(albedo,dtype=MODEL_DTYPE); bowen=np.asarray(bowen,dtype=MODEL_DTYPE)
+    soil=np.asarray(soil_heat_flux,dtype=MODEL_DTYPE)
+    anthropogenic=np.asarray(anthropogenic_heat,dtype=MODEL_DTYPE)
+    cloud_power=np.power(cloud,cloudiness_coefficient_2)
+    qsw=np.maximum(
+        (turbidity_coefficient_1*sun+turbidity_coefficient_2)*
+        (1.+cloudiness_coefficient_1*cloud_power),0.)
+    temp2=temp*temp
+    temp3=temp2*temp
+    temp4=temp2*temp2
+    temp6=temp3*temp3
+    qstar=((1.-albedo)*qsw+
+        net_radiation_coefficient_1*temp6-
+        5.67e-8*temp4+net_radiation_coefficient_2*cloud)/(
+        net_radiation_coefficient_3+1.)
+    qh=bowen*(qstar*(1.-soil)+anthropogenic)/(1.+bowen)
+    qh=np.where(sun<=0.,-.1,qh)
     water=(np.asarray(landuse)>=water_range[0])&(np.asarray(landuse)<=water_range[1])
-    return np.where(water,0.,qh),qsw
+    return _model_array(np.where(water,0.,qh)),_model_array(qsw)
 
-def psi_momentum_dyer(z_over_l):
-    """PSIUD CALMET/COARE momentum stability correction."""
-    zl=np.asarray(z_over_l,dtype=float); result=np.empty_like(zl); unstable=zl<0.
-    one=np.float64(np.float64(1.)); two=np.float64(np.float64(2.))
+def psi_momentum_dyer(z_over_l,*,dtype=MODEL_DTYPE):
+    """Return the Dyer momentum stability correction.
+
+    Model calls default to single precision.  Nonlinear convergence routines
+    can request double precision without changing the returned model fields.
+    """
+    work_dtype=np.dtype(dtype).type
+    zl=np.asarray(z_over_l,dtype=work_dtype)
+    result=np.empty_like(zl,dtype=work_dtype)
+    unstable=zl<0.
     zu=zl[unstable]
-    x=(one-np.float64(np.float64(16.))*zu)**np.float64(np.float64(.25))
-    atan_one=np.float64(np.arctan(np.float64(1.)))
-    two_atan_one=np.float64(np.float64(np.float64(2.)*atan_one))
-    psik=two*np.log((one+x)/two)+np.log((one+x*x)/two)-two*np.arctan(x)+two_atan_one
-    y=(one-np.float64(np.float64(10.15))*zu)**np.float64(np.float64(.3333))
-    sqrt_three=np.float64(np.sqrt(np.float64(3.)))
-    four_atan_over_sqrt=np.float64(np.float64(
-        np.float64(np.float64(4.)*atan_one)/sqrt_three))
-    psic=np.float64(np.float64(1.5))*np.log((one+y+y*y)/np.float64(np.float64(3.)))-np.float64(sqrt_three)*np.arctan(
-        (one+two*y)/np.float64(sqrt_three))+four_atan_over_sqrt
-    f=zu*zu/(one+zu*zu); result[unstable]=(one-f)*psik+f*psic
+    x=np.power(1.-16.*zu,.25)
+    half_pi=work_dtype(np.pi/2.)
+    psik=2.*np.log((1.+x)/2.)+np.log((1.+x*x)/2.)-2.*np.arctan(x)+half_pi
+    y=np.cbrt(1.-10.15*zu)
+    sqrt_three=work_dtype(np.sqrt(3.))
+    pi_over_sqrt=work_dtype(np.pi)/sqrt_three
+    psic=(1.5*np.log((1.+y+y*y)/3.)-
+          sqrt_three*np.arctan((1.+2.*y)/sqrt_three)+
+          pi_over_sqrt)
+    f=zu*zu/(1.+zu*zu); result[unstable]=(1.-f)*psik+f*psic
     stable=~unstable
-    c=np.minimum(np.float64(50.),np.float64(np.float64(.35))*zl[stable])
-    result[stable]=-((one+zl[stable])+np.float64(np.float64(.6667))*(
-        zl[stable]-np.float64(np.float64(14.28)))/np.exp(c)+np.float64(np.float64(8.525)))
+    c=np.minimum(50.,.35*zl[stable])
+    result[stable]=-((1.+zl[stable])+(2./3.)*(
+        zl[stable]-14.28)/np.exp(c)+8.525)
     return result
 
 def surface_similarity(u,v,roughness_m,height_m,density,temperature_k,
@@ -1800,18 +1763,18 @@ def surface_similarity(u,v,roughness_m,height_m,density,temperature_k,
     active=daytime&(qh!=0.)
     for _ in range(5):
         old=xl
-        trial_cubed=np.asarray(np.asarray(trial*trial,dtype=np.float64)*trial,
-                               dtype=np.float64)
+        trial_cubed=trial*trial*trial
         new=np.where(active,np.asarray(-np.float64(253.8226)*rho*temp*
             trial_cubed/np.where(qh==0.,np.float64(1.),qh),dtype=np.float64),xl)
         if ipsifcn==0:
-            psizl=np.asarray(psi_momentum_dyer(
-                np.asarray(measurement/new,dtype=np.float64).astype(np.float64)),dtype=np.float64)
-            psiz0l=np.asarray(psi_momentum_dyer(
-                np.asarray(z0/new,dtype=np.float64).astype(np.float64)),dtype=np.float64)
+            psizl=psi_momentum_dyer(
+                measurement/new,dtype=ACCUMULATION_DTYPE)
+            psiz0l=psi_momentum_dyer(
+                z0/new,dtype=ACCUMULATION_DTYPE)
         else:
-            psizl=_psiuc(measurement,new,15)
-            psiz0l=_psiuc(z0,new,15)
+            psizl=_psiuc(
+                measurement,new,15,dtype=ACCUMULATION_DTYPE)
+            psiz0l=_psiuc(z0,new,15,dtype=ACCUMULATION_DTYPE)
         denominator=np.asarray(logz-psizl+psiz0l,dtype=np.float64)
         refined=np.maximum(np.asarray(np.float64(.4)*speed/denominator,dtype=np.float64),
                            np.float64(.05))
@@ -1849,13 +1812,13 @@ def surface_similarity(u,v,roughness_m,height_m,density,temperature_k,
         stable_u=np.where(adjust,updated,stable_u).astype(np.float64)
         adjust &= (stable_u*theta)>tolerance
     stable_qh=np.asarray(-np.float64(996.)*rho*stable_u*theta,dtype=np.float64)
-    stable_u_cubed=np.asarray(np.asarray(stable_u*stable_u,dtype=np.float64)*stable_u,
-                              dtype=np.float64)
+    stable_u_cubed=stable_u*stable_u*stable_u
     stable_l=np.asarray(-np.float64(253.8226)*rho*temp*stable_u_cubed/stable_qh,
                         dtype=np.float64)
     ustar=np.where(night,stable_u,ustar); qh=np.where(night,stable_qh,qh); length=np.where(night,stable_l,length)
     water=(np.asarray(landuse)>=water_range[0])&(np.asarray(landuse)<=water_range[1])
-    return np.where(water,0.,ustar),np.where(water,0.,length),np.where(water,0.,qh)
+    return tuple(_model_array(value) for value in (
+        np.where(water,0.,ustar),np.where(water,0.,length),np.where(water,0.,qh)))
 
 
 def land_station_surface_similarity(u,v,roughness_m,anemometer_height_m,
@@ -1873,11 +1836,11 @@ def land_station_mixing_height(temperature_profile_k,profile_height_m,
         monin_obukhov_m,sensible_heat_flux,density,coriolis,*,mixing_method=1,
         surface_temperature_k=None,**options):
     """MIXHT2ST over prognostic columns for a vector of land stations."""
-    temperature=np.asarray(temperature_profile_k,dtype=np.float64)
-    height=np.asarray(profile_height_m,dtype=np.float64)
+    temperature=np.asarray(temperature_profile_k,dtype=MODEL_DTYPE)
+    height=np.asarray(profile_height_m,dtype=MODEL_DTYPE)
     if temperature.ndim!=2 or height.shape!=temperature.shape:
         raise ValueError('station temperature profiles must have shape (level, station)')
-    shaped=lambda value: np.asarray(value,dtype=np.float64).reshape(1,-1)
+    shaped=lambda value: np.asarray(value,dtype=MODEL_DTYPE).reshape(1,-1)
     arguments=(temperature[:,None,:],height[:,None,:],
         shaped(previous_convective_height_m),shaped(temperature_jump_k),
         shaped(friction_velocity),shaped(monin_obukhov_m),
@@ -1891,7 +1854,7 @@ def land_station_mixing_height(temperature_profile_k,profile_height_m,
             *arguments,surface_temperature_k=shaped(surface_temperature_k),**options)
     else:
         raise ValueError('mixing_method must be one of -2, -1, 1, or 2')
-    return tuple(np.asarray(value[0],dtype=np.float64) for value in result)
+    return tuple(_model_array(value[0]) for value in result)
 
 
 def land_station_similarity_theory(u,v,roughness_m,anemometer_height_m,
@@ -1905,31 +1868,29 @@ def land_station_similarity_theory(u,v,roughness_m,anemometer_height_m,
     Missing and calm station winds retain their first-level observation and
     remain missing aloft, matching ELUSTR2's early return before SIMILT.
     """
-    f32=np.float64
-    u=np.asarray(u,dtype=f32); v=np.asarray(v,dtype=f32)
+    u=np.asarray(u,dtype=MODEL_DTYPE); v=np.asarray(v,dtype=MODEL_DTYPE)
     if u.ndim!=1 or v.shape!=u.shape:
         raise ValueError('STHEOR station winds must be matching one-dimensional arrays')
     station_values=(roughness_m,anemometer_height_m,density,temperature_k,
                     cloud_fraction,sensible_heat_flux,
                     previous_convective_height_m,temperature_jump_k,coriolis,
                     station_latitude)
-    converted=tuple(np.asarray(value,dtype=f32) for value in station_values)
+    converted=tuple(np.asarray(value,dtype=MODEL_DTYPE) for value in station_values)
     if any(value.shape!=u.shape for value in converted):
         raise ValueError('STHEOR station inputs must have identical shapes')
     (roughness,anemometer,rho,temperature,cloud,heat,previous,jump,
      coriolis_value,latitude)=converted
-    profile_temperature=np.asarray(temperature_profile_k,dtype=f32)
-    profile_height=np.asarray(profile_height_m,dtype=f32)
+    profile_temperature=np.asarray(temperature_profile_k,dtype=MODEL_DTYPE)
+    profile_height=np.asarray(profile_height_m,dtype=MODEL_DTYPE)
     if profile_temperature.shape!=profile_height.shape or profile_temperature.shape[1:]!=u.shape:
         raise ValueError('STHEOR temperature profiles must have shape (level, station)')
-    centers=np.asarray(z_centers_m,dtype=f32)
-    output_u=np.full((centers.size,u.size),f32(9999.),dtype=f32)
-    output_v=np.full_like(output_u,f32(9999.))
+    centers=np.asarray(z_centers_m,dtype=MODEL_DTYPE)
+    output_u=np.full((centers.size,u.size),9999.,dtype=MODEL_DTYPE)
+    output_v=np.full_like(output_u,9999.)
     output_u[0]=u; output_v[0]=v
-    state=[np.full(u.shape,np.nan,dtype=f32) for _ in range(6)]
-    speed=np.sqrt(np.asarray(
-        np.asarray(u*u,dtype=f32)+np.asarray(v*v,dtype=f32),dtype=f32))
-    active=(u<=f32(990.))&(v<=f32(990.))&(speed>=f32(.001))
+    state=[np.full(u.shape,np.nan,dtype=MODEL_DTYPE) for _ in range(6)]
+    speed=np.sqrt(u*u+v*v)
+    active=(u<=990.)&(v<=990.)&(speed>=.001)
     if not active.any():
         return (output_u,output_v,*state)
     ustar,length,station_heat=land_station_surface_similarity(
@@ -1961,9 +1922,9 @@ def objective_analysis_component(station_values,station_xy,first_guess,landuse,d
                                  water_range=(50,55),barriers=(),barrier_top_level=0,
                                  background_weight=None,block_size=32768):
     """Vectorized no-barrier INTER2 component analysis for IPROG 0/2/4/14."""
-    f32=np.float64
-    values=np.asarray(station_values,dtype=f32); points=np.asarray(station_xy,dtype=f32)
-    guess=np.asarray(first_guess,dtype=f32); lu=np.asarray(landuse)
+    work_dtype=ACCUMULATION_DTYPE
+    values=np.asarray(station_values,dtype=work_dtype); points=np.asarray(station_xy,dtype=work_dtype)
+    guess=np.asarray(first_guess,dtype=work_dtype); lu=np.asarray(landuse)
     if values.ndim!=2 or points.shape!=(values.shape[1],2):
         raise ValueError('station values must be (level,station) with matching XY coordinates')
     if guess.ndim!=3 or lu.shape!=guess.shape[1:]: raise ValueError('first guess and landuse shapes do not match')
@@ -1971,15 +1932,15 @@ def objective_analysis_component(station_values,station_xy,first_guess,landuse,d
     nz,ny,nx=guess.shape
     counts=np.broadcast_to(np.asarray(stations_per_level,dtype=int),(nz,))
     if np.any(counts<1): raise ValueError('stations_per_level/NINTRP must be positive')
-    wo=np.broadcast_to(np.asarray(observation_weight,dtype=f32),guess.shape)
+    wo=np.broadcast_to(np.asarray(observation_weight,dtype=work_dtype),guess.shape)
     background_grid=(None if background_weight is None else
-                     np.broadcast_to(np.asarray(background_weight,dtype=f32),guess.shape))
-    x=np.asarray((np.arange(nx,dtype=f32)+f32(.5))*f32(dx_km),dtype=f32)
-    y=np.asarray((np.arange(ny,dtype=f32)+f32(.5))*f32(dy_km),dtype=f32)
+                     np.broadcast_to(np.asarray(background_weight,dtype=work_dtype),guess.shape))
+    x=np.asarray((np.arange(nx,dtype=work_dtype)+work_dtype(.5))*work_dtype(dx_km),dtype=work_dtype)
+    y=np.asarray((np.arange(ny,dtype=work_dtype)+work_dtype(.5))*work_dtype(dy_km),dtype=work_dtype)
     xx,yy=np.meshgrid(x,y); targets=np.column_stack((xx.ravel(),yy.ravel()))
     water=((lu>=water_range[0])&(lu<=water_range[1])).ravel(); output=np.empty_like(guess)
     # INTER2 tests STDAT1 .LT. EDITL; COMP defines EDITL as 900.
-    valid=values<f32(900.)
+    valid=values<work_dtype(900.)
     barrier_array=np.asarray(barriers,dtype=float)
     if barrier_array.size==0: barrier_array=np.empty((0,4))
     if barrier_array.ndim!=2 or barrier_array.shape[1]!=4:
@@ -1988,16 +1949,16 @@ def objective_analysis_component(station_values,station_xy,first_guess,landuse,d
         raise ValueError('INTER2 has a level with no valid station data')
     for start in range(0,targets.shape[0],block_size):
         stop=min(start+block_size,targets.shape[0])
-        delta=np.asarray(targets[start:stop,None,:]-points[None,:,:],dtype=f32)
-        distance=np.sqrt(np.asarray(delta[:,:,0]**2+delta[:,:,1]**2,dtype=f32))
-        safe=np.maximum(distance,f32(rmin_km))
+        delta=np.asarray(targets[start:stop,None,:]-points[None,:,:],dtype=work_dtype)
+        distance=np.sqrt(np.asarray(delta[:,:,0]**2+delta[:,:,1]**2,dtype=work_dtype))
+        safe=np.maximum(distance,work_dtype(rmin_km))
         blocked=_barrier_blocked(targets[start:stop],points,barrier_array)
         for level in range(nz):
             if not valid[level].any() and background_grid is not None:
                 output[level].ravel()[start:stop]=guess[level].ravel()[start:stop]
                 continue
-            radius=np.where(water[start:stop],f32(rmax_water_km),
-                            f32(rmax_surface_km if level==0 else rmax_upper_km))
+            radius=np.where(water[start:stop],work_dtype(rmax_water_km),
+                            work_dtype(rmax_surface_km if level==0 else rmax_upper_km))
             eligible=valid[level][None,:]&(distance<=radius[:,None])
             if level<barrier_top_level: eligible &= ~blocked
             order=np.argsort(np.where(eligible,distance,np.inf),axis=1,kind='stable')[:,:counts[level]]
@@ -2015,20 +1976,19 @@ def objective_analysis_component(station_values,station_xy,first_guess,landuse,d
             selected_distance=np.take_along_axis(safe,order,axis=1)
             selected_values=values[level,order]
             obs_factor=np.asarray(wo[level].ravel()[start:stop,None]/
-                                  np.asarray(selected_distance**2,dtype=f32),dtype=f32)
-            obs_factor=np.where(selected,obs_factor,f32(0.)).astype(f32)
-            numerator=np.zeros(stop-start,dtype=f32)
-            denominator=np.zeros(stop-start,dtype=f32)
-            for station in range(order.shape[1]):
-                numerator=np.asarray(numerator+selected_values[:,station]*obs_factor[:,station],dtype=f32)
-                denominator=np.asarray(denominator+obs_factor[:,station],dtype=f32)
-            scale=f32(surface_scale_km if level==0 else upper_scale_km)
-            background=(f32(f32(1.)/f32(scale*scale)) if background_grid is None else
+                                  np.asarray(selected_distance**2,dtype=work_dtype),dtype=work_dtype)
+            obs_factor=np.where(selected,obs_factor,work_dtype(0.)).astype(work_dtype)
+            numerator=np.sum(
+                selected_values*obs_factor,axis=1,dtype=ACCUMULATION_DTYPE)
+            denominator=np.sum(
+                obs_factor,axis=1,dtype=ACCUMULATION_DTYPE)
+            scale=work_dtype(surface_scale_km if level==0 else upper_scale_km)
+            background=(work_dtype(1.)/(scale*scale) if background_grid is None else
                         background_grid[level].ravel()[start:stop])
             output[level].ravel()[start:stop]=np.asarray(
                 (numerator+guess[level].ravel()[start:stop]*background)/
-                (denominator+background),dtype=f32)
-    return output
+                (denominator+background),dtype=work_dtype)
+    return _model_array(output)
 
 
 def wind1_initial_guess(station_u,station_v,station_xy,surface_station_count,
@@ -2037,136 +1997,125 @@ def wind1_initial_guess(station_u,station_v,station_xy,surface_station_count,
     """Vectorized WIND1 all-station first-guess interpolation.
 
     Surface (including SEA) profiles precede upper-air profiles. Distances use
-    the legacy one-grid-cell floor before vertically varying group bias and
+    a one-grid-cell floor before vertically varying group bias and
     per-level missing/calm/barrier removal.
     """
-    f32=np.float64
-    u=np.asarray(station_u,dtype=f32); v=np.asarray(station_v,dtype=f32)
-    points=np.asarray(station_xy,dtype=f32)
+    work_dtype=ACCUMULATION_DTYPE
+    u=np.asarray(station_u,dtype=work_dtype); v=np.asarray(station_v,dtype=work_dtype)
+    points=np.asarray(station_xy,dtype=work_dtype)
     if u.ndim!=2 or v.shape!=u.shape or points.shape!=(u.shape[1],2):
         raise ValueError('WIND1 station profiles and coordinates are inconsistent')
     nz,nstation=u.shape; nsurface=int(surface_station_count)
     if not 0<=nsurface<=nstation: raise ValueError('invalid WIND1 surface-station count')
-    if dx_km!=dy_km: raise ValueError('WIND1 requires CALMET square grid cells')
-    layer_bias=np.broadcast_to(np.asarray(bias,dtype=f32),(nz,))
-    if np.any((layer_bias < f32(-1.))|(layer_bias > f32(1.))):
+    if (not np.isfinite(dx_km) or not np.isfinite(dy_km) or
+            dx_km<=0. or dy_km<=0.):
+        raise ValueError('WIND1 grid spacing must be finite and positive')
+    layer_bias=np.broadcast_to(np.asarray(bias,dtype=work_dtype),(nz,))
+    if np.any((layer_bias < work_dtype(-1.))|(layer_bias > work_dtype(1.))):
         raise ValueError('WIND1 BIAS must lie in [-1,1]')
     barrier_array=np.asarray(barriers,dtype=float)
     if barrier_array.size==0: barrier_array=np.empty((0,4))
     if barrier_array.ndim!=2 or barrier_array.shape[1]!=4:
         raise ValueError('barriers must contain (x_begin,y_begin,x_end,y_end) rows')
-    cell_x=np.asarray(np.arange(nx,dtype=f32)+f32(.5),dtype=f32)
-    cell_y=np.asarray(np.arange(ny,dtype=f32)+f32(.5),dtype=f32)
+    cell_x=np.asarray(np.arange(nx,dtype=work_dtype)+work_dtype(.5),dtype=work_dtype)
+    cell_y=np.asarray(np.arange(ny,dtype=work_dtype)+work_dtype(.5),dtype=work_dtype)
     grid_x,grid_y=np.meshgrid(cell_x,cell_y)
     grid_targets=np.column_stack((grid_x.ravel(),grid_y.ravel()))
-    x=np.asarray(cell_x*f32(dx_km),dtype=f32)
-    y=np.asarray(cell_y*f32(dy_km),dtype=f32)
+    x=np.asarray(cell_x*work_dtype(dx_km),dtype=work_dtype)
+    y=np.asarray(cell_y*work_dtype(dy_km),dtype=work_dtype)
     xx,yy=np.meshgrid(x,y); targets=np.column_stack((xx.ravel(),yy.ravel()))
-    # WIND1 stores station coordinates and DGRID in metres, forms DGRIDI
-    # first, and only then converts each coordinate to grid-cell units.
-    points_m=np.asarray(points*f32(1000.),dtype=f32)
-    dgrid_m=np.asarray(f32(dx_km)*f32(1000.),dtype=f32)
-    dgridi=np.asarray(f32(1.)/dgrid_m,dtype=f32)
-    normalized_points=np.asarray(points_m*dgridi,dtype=f32)
-    output_u=np.empty((nz,ny*nx),dtype=f32); output_v=np.empty_like(output_u)
+    # Interpolation distance is expressed in grid-cell units, so a station
+    # one column or one row away receives the same base weight even when the
+    # cells are rectangular.  Barrier intersections continue to use the
+    # physical kilometre coordinates in ``points`` and ``targets`` below.
+    normalized_points=np.column_stack((
+        points[:,0]/work_dtype(dx_km),
+        points[:,1]/work_dtype(dy_km),
+    ))
+    output_u=np.empty((nz,ny*nx),dtype=work_dtype); output_v=np.empty_like(output_u)
     # WIND1 operates on internal US/VS arrays: COMP sets EDITL=900 and
     # every source check uses .GT. EDITL, not the external 9998/9999 code.
-    surface_valid=(u[0,:nsurface]<=f32(900.))&(v[0,:nsurface]<=f32(900.))
-    valid=(u<=f32(900.))&(v<=f32(900.))
-    calm=np.sqrt(np.asarray(u[0,:nsurface]**2+v[0,:nsurface]**2,dtype=f32))<f32(1.e-4)
-    def ordered_sum(items):
-        total=np.zeros(items.shape[0],dtype=f32)
-        for station in range(items.shape[1]):
-            total=np.asarray(total+items[:,station],dtype=f32)
-        return total
-    def discard_in_station_order(weights,remove):
-        """Apply WIND1's order-dependent w/(1-w_removed) updates."""
-        for station in range(nstation):
-            rows=remove[:,station]&(weights[:,station]!=f32(0.))
-            if not rows.any(): continue
-            removed_weight=weights[rows,station].copy()
-            if np.any(removed_weight==f32(1.)):
-                raise ValueError('WIND1 has no valid unblocked observation')
-            denominator=np.asarray(f32(1.)-removed_weight,dtype=f32)
-            weights[rows]=np.asarray(weights[rows]/denominator[:,None],dtype=f32)
-            weights[rows,station]=f32(0.)
+    surface_valid=(u[0,:nsurface]<=work_dtype(900.))&(v[0,:nsurface]<=work_dtype(900.))
+    valid=(u<=work_dtype(900.))&(v<=work_dtype(900.))
+    calm=np.sqrt(np.asarray(u[0,:nsurface]**2+v[0,:nsurface]**2,dtype=work_dtype))<work_dtype(1.e-4)
+    def stable_sum(items):
+        return np.sum(items,axis=1,dtype=ACCUMULATION_DTYPE)
+    def discard_weights(weights,remove):
+        """Remove unavailable observations and normalize the remaining weights."""
+        affected=np.any(remove,axis=1)
+        if not affected.any():
+            return
+        weights[remove]=work_dtype(0.)
+        denominator=stable_sum(weights)
+        if np.any(denominator[affected]<=work_dtype(0.)):
+            raise ValueError('WIND1 has no valid unblocked observation')
+        weights[affected]/=denominator[affected,None]
     for start in range(0,targets.shape[0],block_size):
         stop=min(start+block_size,targets.shape[0]); local=targets[start:stop]
         normalized_local=grid_targets[start:stop]
-        delta=np.asarray(normalized_points[None,:,:]-normalized_local[:,None,:],dtype=f32)
-        distance2=np.asarray(delta[:,:,0]**2+delta[:,:,1]**2,dtype=f32)
-        base=np.asarray(f32(1.)/np.maximum(distance2,f32(1.)),dtype=f32)
+        delta=np.asarray(normalized_points[None,:,:]-normalized_local[:,None,:],dtype=work_dtype)
+        distance2=np.asarray(delta[:,:,0]**2+delta[:,:,1]**2,dtype=work_dtype)
+        base=np.asarray(work_dtype(1.)/np.maximum(distance2,work_dtype(1.)),dtype=work_dtype)
         base[:,:nsurface]*=surface_valid[None,:]
-        total=ordered_sum(base)[:,None]
+        total=stable_sum(base)[:,None]
         if np.any(total<=0.): raise ValueError('WIND1 has no station with valid surface wind')
-        base=np.asarray(base/total,dtype=f32)
-        surface_sum=ordered_sum(base[:,:nsurface])
-        upper_sum=ordered_sum(base[:,nsurface:])
+        base=np.asarray(base/total,dtype=work_dtype)
+        surface_sum=stable_sum(base[:,:nsurface])
+        upper_sum=stable_sum(base[:,nsurface:])
         blocked=_barrier_blocked(local,points,barrier_array)
         for level in range(nz):
             weights=base.copy(); value=layer_bias[level]
             if value>=0.:
-                weights[:,:nsurface]*=f32(1.)-value
-                desired=np.asarray(value+(f32(1.)-value)*upper_sum,dtype=f32)
+                weights[:,:nsurface]*=work_dtype(1.)-value
+                desired=np.asarray(value+(work_dtype(1.)-value)*upper_sum,dtype=work_dtype)
                 if nsurface<nstation:
                     weights[:,nsurface:]*=np.divide(desired,upper_sum,
                         out=np.zeros_like(desired),where=upper_sum>0.)[:,None]
                 elif value>0.: raise ValueError('positive WIND1 BIAS requires upper-air stations')
             else:
-                desired=np.asarray(-value+(f32(1.)+value)*surface_sum,dtype=f32)
+                desired=np.asarray(-value+(work_dtype(1.)+value)*surface_sum,dtype=work_dtype)
                 if nsurface:
                     weights[:,:nsurface]*=np.divide(desired,surface_sum,
                         out=np.zeros_like(desired),where=surface_sum>0.)[:,None]
-                weights[:,nsurface:]*=f32(1.)+value
+                weights[:,nsurface:]*=work_dtype(1.)+value
             if not extrapolate_calm and level>0 and nsurface:
                 calm_remove=np.zeros_like(weights,dtype=bool)
                 calm_remove[:,:nsurface]=calm[None,:]&surface_valid[None,:]
-                # Preserve WIND1's special near-unit calm branch, which
-                # rebuilds only upper-air weights from RSQWT.
-                for station in range(nsurface):
-                    rows=calm_remove[:,station]&(weights[:,station]>=f32(.9999))
-                    if rows.any():
-                        denominator=np.asarray(f32(1.)-base[rows,station],dtype=f32)
-                        if np.any(denominator==f32(0.)):
-                            raise ValueError('WIND1 calm station leaves no upper-air observation')
-                        weights[rows,nsurface:]=np.asarray(
-                            base[rows,nsurface:]/denominator[:,None],dtype=f32)
-                        weights[rows,station]=f32(0.)
-                        calm_remove[rows,station]=False
-                discard_in_station_order(weights,calm_remove)
-            if nsurface<nstation and value>f32(-.9999):
+                discard_weights(weights,calm_remove)
+            if nsurface<nstation and value>work_dtype(-.9999):
                 missing=np.zeros_like(weights,dtype=bool)
                 missing[:,nsurface:]=~valid[level,nsurface:][None,:]
-                discard_in_station_order(weights,missing)
+                discard_weights(weights,missing)
             if level<barrier_top_level:
-                discard_in_station_order(weights,blocked)
-            output_u[level,start:stop]=ordered_sum(
-                np.asarray(weights*u[level][None,:],dtype=f32))
-            output_v[level,start:stop]=ordered_sum(
-                np.asarray(weights*v[level][None,:],dtype=f32))
-    return output_u.reshape(nz,ny,nx),output_v.reshape(nz,ny,nx)
+                discard_weights(weights,blocked)
+            output_u[level,start:stop]=stable_sum(
+                np.asarray(weights*u[level][None,:],dtype=work_dtype))
+            output_v[level,start:stop]=stable_sum(
+                np.asarray(weights*v[level][None,:],dtype=work_dtype))
+    return (_model_array(output_u.reshape(nz,ny,nx)),
+            _model_array(output_v.reshape(nz,ny,nx)))
 
 
 def _barrier_blocked(targets,stations,barriers):
     """Vectorized BARIER result for target × station pairs."""
-    f32=np.float64
-    target=np.asarray(targets,dtype=f32); station=np.asarray(stations,dtype=f32)
+    work_dtype=ACCUMULATION_DTYPE
+    target=np.asarray(targets,dtype=work_dtype); station=np.asarray(stations,dtype=work_dtype)
     blocked=np.zeros((target.shape[0],station.shape[0]),dtype=bool)
-    for xb,yb,xe,ye in np.asarray(barriers,dtype=f32):
-        dx=f32(xb-xe); slope=f32(9.9e9) if dx==f32(0.) else f32(f32(yb-ye)/dx)
-        intercept=f32(yb-f32(slope*xb))
-        d_station=np.asarray(station[:,1]-slope*station[:,0]-intercept,dtype=f32)
-        d_target=np.asarray(target[:,1]-slope*target[:,0]-intercept,dtype=f32)
-        opposite=np.asarray(d_target[:,None]*d_station[None,:],dtype=f32)<f32(0.)
-        a=np.column_stack((np.full(target.shape[0],xb,dtype=f32)-target[:,0],np.full(target.shape[0],yb,dtype=f32)-target[:,1]))
-        b=np.column_stack((np.full(target.shape[0],xe,dtype=f32)-target[:,0],np.full(target.shape[0],ye,dtype=f32)-target[:,1]))
+    for xb,yb,xe,ye in np.asarray(barriers,dtype=work_dtype):
+        dx=xb-xe; slope=9.9e9 if dx==0. else (yb-ye)/dx
+        intercept=yb-slope*xb
+        d_station=np.asarray(station[:,1]-slope*station[:,0]-intercept,dtype=work_dtype)
+        d_target=np.asarray(target[:,1]-slope*target[:,0]-intercept,dtype=work_dtype)
+        opposite=np.asarray(d_target[:,None]*d_station[None,:],dtype=work_dtype)<work_dtype(0.)
+        a=np.column_stack((np.full(target.shape[0],xb,dtype=work_dtype)-target[:,0],np.full(target.shape[0],yb,dtype=work_dtype)-target[:,1]))
+        b=np.column_stack((np.full(target.shape[0],xe,dtype=work_dtype)-target[:,0],np.full(target.shape[0],ye,dtype=work_dtype)-target[:,1]))
         c=station[None,:,:]-target[:,None,:]
         def cosine(left,right):
-            numerator=np.asarray(left[...,0]*right[...,0]+left[...,1]*right[...,1],dtype=f32)
-            left2=np.asarray(left[...,0]**2+left[...,1]**2,dtype=f32)
-            right2=np.asarray(right[...,0]**2+right[...,1]**2,dtype=f32)
-            denominator=np.sqrt(np.asarray(left2*right2,dtype=f32))
-            return np.divide(numerator,denominator,out=np.zeros_like(numerator),where=denominator!=f32(0.))
+            numerator=np.asarray(left[...,0]*right[...,0]+left[...,1]*right[...,1],dtype=work_dtype)
+            left2=np.asarray(left[...,0]**2+left[...,1]**2,dtype=work_dtype)
+            right2=np.asarray(right[...,0]**2+right[...,1]**2,dtype=work_dtype)
+            denominator=np.sqrt(np.asarray(left2*right2,dtype=work_dtype))
+            return np.divide(numerator,denominator,out=np.zeros_like(numerator),where=denominator!=work_dtype(0.))
         cos_ab=cosine(a,b)
         cos_ac=cosine(a[:,None,:],c)
         cos_bc=cosine(b[:,None,:],c)
@@ -2181,30 +2130,30 @@ def barrier_blocked_pairs(targets, stations, barriers):
     used by CALMET's four prognostic neighbours and avoids constructing the
     prohibitively large target-by-full-prognostic-grid matrix.
     """
-    f32=np.float64
-    target=np.asarray(targets,dtype=f32); station=np.asarray(stations,dtype=f32)
+    work_dtype=ACCUMULATION_DTYPE
+    target=np.asarray(targets,dtype=work_dtype); station=np.asarray(stations,dtype=work_dtype)
     if target.ndim!=2 or target.shape[1]!=2:
         raise ValueError('targets must have shape (target, 2)')
     if station.ndim!=3 or station.shape[0]!=target.shape[0] or station.shape[2]!=2:
         raise ValueError('stations must have shape (target, candidate, 2)')
     blocked=np.zeros(station.shape[:2],dtype=bool)
-    for xb,yb,xe,ye in np.asarray(barriers,dtype=f32):
-        dx=f32(xb-xe); slope=f32(9.9e9) if dx==f32(0.) else f32(f32(yb-ye)/dx)
-        intercept=f32(yb-f32(slope*xb))
-        d_station=np.asarray(station[...,1]-slope*station[...,0]-intercept,dtype=f32)
-        d_target=np.asarray(target[:,1]-slope*target[:,0]-intercept,dtype=f32)
-        opposite=np.asarray(d_target[:,None]*d_station,dtype=f32)<f32(0.)
-        a=np.column_stack((np.full(target.shape[0],xb,dtype=f32)-target[:,0],
-                           np.full(target.shape[0],yb,dtype=f32)-target[:,1]))
-        b=np.column_stack((np.full(target.shape[0],xe,dtype=f32)-target[:,0],
-                           np.full(target.shape[0],ye,dtype=f32)-target[:,1]))
+    for xb,yb,xe,ye in np.asarray(barriers,dtype=work_dtype):
+        dx=xb-xe; slope=9.9e9 if dx==0. else (yb-ye)/dx
+        intercept=yb-slope*xb
+        d_station=np.asarray(station[...,1]-slope*station[...,0]-intercept,dtype=work_dtype)
+        d_target=np.asarray(target[:,1]-slope*target[:,0]-intercept,dtype=work_dtype)
+        opposite=np.asarray(d_target[:,None]*d_station,dtype=work_dtype)<work_dtype(0.)
+        a=np.column_stack((np.full(target.shape[0],xb,dtype=work_dtype)-target[:,0],
+                           np.full(target.shape[0],yb,dtype=work_dtype)-target[:,1]))
+        b=np.column_stack((np.full(target.shape[0],xe,dtype=work_dtype)-target[:,0],
+                           np.full(target.shape[0],ye,dtype=work_dtype)-target[:,1]))
         c=station-target[:,None,:]
         def cosine(left,right):
-            numerator=np.asarray(left[...,0]*right[...,0]+left[...,1]*right[...,1],dtype=f32)
-            left2=np.asarray(left[...,0]**2+left[...,1]**2,dtype=f32)
-            right2=np.asarray(right[...,0]**2+right[...,1]**2,dtype=f32)
-            denominator=np.sqrt(np.asarray(left2*right2,dtype=f32))
-            return np.divide(numerator,denominator,out=np.zeros_like(numerator),where=denominator!=f32(0.))
+            numerator=np.asarray(left[...,0]*right[...,0]+left[...,1]*right[...,1],dtype=work_dtype)
+            left2=np.asarray(left[...,0]**2+left[...,1]**2,dtype=work_dtype)
+            right2=np.asarray(right[...,0]**2+right[...,1]**2,dtype=work_dtype)
+            denominator=np.sqrt(np.asarray(left2*right2,dtype=work_dtype))
+            return np.divide(numerator,denominator,out=np.zeros_like(numerator),where=denominator!=work_dtype(0.))
         cos_ab=cosine(a,b)
         cos_ac=cosine(a[:,None,:],c)
         cos_bc=cosine(b[:,None,:],c)

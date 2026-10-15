@@ -11,72 +11,50 @@ from netCDF4 import Dataset
 from .config import MakegeoConfig
 from ._ctgproc import USGS38
 from .datums import NIMA_DATABASE_DATE,normalize_datum
+from .datetime_utils import parse_date
 from .legacy_text import gfortran_real_pair
 
 OUTCAT=np.array([10,20,-20,30,40,51,54,55,60,61,62,70,80,90],dtype=np.int16)
 MAPCAT=np.array([10]*7+[20]*4+[30]*3+[40]*3+[51]*3+[54,55,61,62]+[70]*7+[80]*5+[90]*2,dtype=np.int16)
-Z0=np.array([.5]+[1.]*6+[.25]*4+[.05]*3+[1.]*3+[.001]*5+[1.,.2]+[.05]*7+[.2]*5+[.05]*2)
-ALBEDO=np.array([.18]*7+[.15]*4+[.25]*3+[.1]*3+[.1]*5+[.1,.1]+[.3]*7+[.3]*5+[.7]*2)
-BOWEN=np.array([1.]+[1.5]*6+[1.]*4+[1.]*3+[1.]*3+[0.]*5+[.5,.1]+[1.]*7+[.5]*5+[.5]*2)
-SOIL=np.array([.2]+[.25]*6+[.15]*4+[.15]*3+[.15]*3+[1.]*5+[.25,.25]+[.15]*7+[.15]*5+[.15]*2)
-LAI=np.array([1.]+[.2]*6+[3.]*4+[.5]*3+[7.]*3+[0.]*5+[2.,1.]+[.05]*7+[0.]*5+[0.]*2)
+MODEL_DTYPE=np.float32
+ACCUM_DTYPE=np.float64
+
+Z0=np.array([.5]+[1.]*6+[.25]*4+[.05]*3+[1.]*3+[.001]*5+[1.,.2]+[.05]*7+[.2]*5+[.05]*2,dtype=MODEL_DTYPE)
+ALBEDO=np.array([.18]*7+[.15]*4+[.25]*3+[.1]*3+[.1]*5+[.1,.1]+[.3]*7+[.3]*5+[.7]*2,dtype=MODEL_DTYPE)
+BOWEN=np.array([1.]+[1.5]*6+[1.]*4+[1.]*3+[1.]*3+[0.]*5+[.5,.1]+[1.]*7+[.5]*5+[.5]*2,dtype=MODEL_DTYPE)
+SOIL=np.array([.2]+[.25]*6+[.15]*4+[.15]*3+[.15]*3+[1.]*5+[.25,.25]+[.15]*7+[.15]*5+[.15]*2,dtype=MODEL_DTYPE)
+LAI=np.array([1.]+[.2]*6+[3.]*4+[.5]*3+[7.]*3+[0.]*5+[2.,1.]+[.05]*7+[0.]*5+[0.]*2,dtype=MODEL_DTYPE)
 STANDARD_PROPERTIES={int(category):(float(Z0[i]),float(ALBEDO[i]),float(BOWEN[i]),
     float(SOIL[i]),0.,float(LAI[i]),int(MAPCAT[i])) for i,category in enumerate(USGS38)}
 
 
 def _category_sum(values, mask=None):
-    """Sum categories in MAKEGEO's K order while vectorizing grid cells."""
-    data=np.asarray(values,dtype=np.float64)
+    """Sum category fractions with extra precision for the reduction."""
+    data=np.asarray(values,dtype=MODEL_DTYPE)
     selected=(np.ones(data.shape[0],dtype=bool) if mask is None else
               np.asarray(mask,dtype=bool))
-    total=np.zeros(data.shape[1:],dtype=np.float64)
-    for category in np.flatnonzero(selected):
-        total=np.asarray(total+data[category],dtype=np.float64)
-    return total
+    return np.sum(data[selected],axis=0,dtype=ACCUM_DTYPE)
 
 
 def _water_sum(fractions, categories, water_categories):
-    """Accumulate water fractions in MAKEGEO's IWAT control-file order."""
-    data=np.asarray(fractions,dtype=np.float64)
+    """Sum fractions assigned to configured water categories."""
+    data=np.asarray(fractions,dtype=MODEL_DTYPE)
     categories=np.asarray(categories)
-    total=np.zeros(data.shape[1:],dtype=np.float64)
-    for category in water_categories:
-        found=np.flatnonzero(categories==int(category))
-        if found.size:
-            total=np.asarray(total+data[int(found[0])],dtype=np.float64)
-    return total
-
-
-def _fortran_log(values):
-    """GNU floating-point ALOG rounding for vector inputs."""
-    data=np.asarray(values,dtype=np.float64)
-    return np.asarray(np.log(data.astype(np.float64)),dtype=np.float64)
-
-
-def _fortran_exp(values):
-    """GNU floating-point EXP rounding for vector inputs."""
-    data=np.asarray(values,dtype=np.float64)
-    return np.asarray(np.exp(data.astype(np.float64)),dtype=np.float64)
+    return np.sum(data[np.isin(categories,water_categories)],axis=0,
+                  dtype=ACCUM_DTYPE)
 
 
 def _snow_albedo_values(normal, snowy, reduction, maximum_age, age):
     """Evaluate WTSWALB's snow-age branch at floating-point boundaries."""
-    f32=np.float64
-    normal=np.asarray(normal,dtype=f32); snowy=np.asarray(snowy,dtype=f32)
-    reduction=np.asarray(reduction,dtype=f32)
+    normal=np.asarray(normal,dtype=MODEL_DTYPE)
+    snowy=np.asarray(snowy,dtype=MODEL_DTYPE)
+    reduction=np.asarray(reduction,dtype=MODEL_DTYPE)
     maximum_age=np.asarray(maximum_age,dtype=np.int32)
     age=np.asarray(age,dtype=np.int64)
-    difference=np.asarray(snowy-normal,dtype=f32)
-    decay=np.asarray(difference*reduction,dtype=f32)
-    clipped=np.minimum(age,maximum_age)
-    ratio=np.asarray(clipped.astype(f32)/maximum_age.astype(f32),dtype=f32)
-    multiplier=np.asarray(f32(1.)-np.asarray(decay*ratio,dtype=f32),dtype=f32)
-    return np.asarray(snowy*multiplier,dtype=f32)
-
-def _legacy_round(values,digits):
-    """Positive-field decimal rounding used by formatted Fortran output."""
-    scale=10.**digits; data=np.asarray(values,dtype=float)
-    return np.copysign(np.floor(np.abs(data)*scale+.500001)/scale,data)
+    clipped=np.minimum(age,maximum_age).astype(MODEL_DTYPE)
+    ratio=clipped/maximum_age.astype(MODEL_DTYPE)
+    result=snowy*(1.-(snowy-normal)*reduction*ratio)
+    return np.asarray(result,dtype=MODEL_DTYPE)
 
 @dataclass(frozen=True,slots=True)
 class GeophysicalResult:
@@ -168,9 +146,9 @@ def _expand_packed_snow(packed,minimum,missing,scale,size):
         target+=count
     if target!=output.size:
         raise ValueError('packed snow stream does not fill its grid')
-    f32=np.float64
-    result=np.asarray(np.asarray(output,dtype=f32)+f32(minimum),dtype=f32)
-    result=np.asarray(result/f32(scale),dtype=f32)
+    result=np.asarray(output,dtype=MODEL_DTYPE)
+    result=(result+minimum)/scale
+    result=np.asarray(result,dtype=MODEL_DTYPE)
     result[output==missing]=np.nan
     return result
 
@@ -211,13 +189,36 @@ def _read_formatted_snow_header(stream):
         raw_nx,raw_ny,raw_dx,raw_dy,*window)
 
 
+def _formatted_snow_timestamp(line,offset,label):
+    """Parse one fixed-width ``YYYY MM DD HH SSSS`` timestamp."""
+    try:
+        fields=(int(line[offset:offset+4]),int(line[offset+4:offset+7]),
+                int(line[offset+7:offset+10]),int(line[offset+10:offset+13]),
+                int(line[offset+14:offset+18]))
+    except ValueError as error:
+        raise ValueError(f'SNOW.DAT variable {label} timestamp is invalid') from error
+    year,month,day,hour,seconds=fields
+    if not 0<=seconds<=3600:
+        raise ValueError(f'SNOW.DAT variable {label} timestamp is invalid')
+    try:
+        timestamp=datetime(year,month,day,hour)+timedelta(seconds=seconds)
+    except ValueError as error:
+        raise ValueError(f'SNOW.DAT variable {label} timestamp is invalid') from error
+    return timestamp,fields
+
+
 def _read_formatted_snow_variable(stream,header):
     line=stream.readline()
     if not line:
         return None
     line=line.rstrip('\n').ljust(86)
+    timestamp,first_fields=_formatted_snow_timestamp(line,0,'first')
+    _,second_fields=_formatted_snow_timestamp(line,19,'second')
+    if second_fields!=first_fields:
+        raise ValueError('SNOW.DAT variable header timestamps do not match')
+    if first_fields[3]!=0 or first_fields[4]!=0:
+        raise ValueError('SNOW.DAT daily variable timestamp must be midnight')
     try:
-        year=int(line[0:4]); month=int(line[4:7]); day=int(line[7:10]); hour=int(line[10:13])
         name=line[38:46].strip()
         minimum=int(line[47:54]); maximum=int(line[54:61]); missing=int(line[61:68])
         scale=float(line[68:76]); packed_count=int(line[76:86])
@@ -238,20 +239,19 @@ def _read_formatted_snow_variable(stream,header):
     if len(packed)!=packed_count:
         raise ValueError('SNOW.DAT packed record contains extra integers')
     values=_expand_packed_snow(packed,minimum,missing,scale,header.nx*header.ny)
-    return SnowVariable(datetime(year,month,day,hour),name,
-                        values.reshape(header.ny,header.nx))
+    return SnowVariable(timestamp,name,values.reshape(header.ny,header.nx))
 
 
 def _fill_snow_spatial(values,radius=2):
     """Vectorized FILLS square-window search using the original snapshot."""
-    source=np.asarray(values,dtype=np.float64)
+    source=np.asarray(values,dtype=MODEL_DTYPE)
     if source.ndim!=2 or radius<0:
         raise ValueError('spatial snow fill requires a 2-D field and non-negative radius')
     result=source.copy(); missing=np.isnan(source)
     valid=np.isfinite(source)
     ny,nx=source.shape
     for distance in range(1,radius+1):
-        sums=np.zeros(source.shape,dtype=np.float64)
+        sums=np.zeros(source.shape,dtype=ACCUM_DTYPE)
         counts=np.zeros(source.shape,dtype=np.int32)
         # FILLS scans JJ outside II.  Each offset still updates the whole
         # target grid at once; only the order-dependent 5x5 window is looped.
@@ -263,41 +263,37 @@ def _fill_snow_spatial(values,radius=2):
                 source_x=slice(max(0,dx),min(nx,nx+dx))
                 good=valid[source_y,source_x]
                 region=sums[target_y,target_x]
-                region[:]=np.asarray(region+np.where(
-                    good,source[source_y,source_x],np.float64(0.)),dtype=np.float64)
+                region+=np.where(good,source[source_y,source_x],0.)
                 counts[target_y,target_x]+=good
         use=missing&np.isnan(result)&(counts>=1)
-        averaged=np.divide(sums,counts.astype(np.float64),
+        averaged=np.divide(sums,counts,
                            out=np.zeros_like(sums),where=counts>0)
-        result[use]=averaged[use]
+        result[use]=np.asarray(averaged[use],dtype=MODEL_DTYPE)
     return result
 
 
 def _fill_snow_temporal(values,current=1):
     """Vectorized FILLT: use current day, else mean all available window days."""
-    window=np.asarray(values,dtype=np.float64)
+    window=np.asarray(values,dtype=MODEL_DTYPE)
     if window.ndim!=3 or not 0<=current<window.shape[0]:
         raise ValueError('temporal snow fill requires (day,y,x) and a valid current index')
     result=window[current].copy()
     missing=np.isnan(result)
     valid=np.isfinite(window)
     counts=np.zeros(result.shape,dtype=np.int32)
-    totals=np.zeros(result.shape,dtype=np.float64)
+    totals=np.zeros(result.shape,dtype=ACCUM_DTYPE)
     for day in range(window.shape[0]):
-        totals=np.asarray(totals+np.where(
-            valid[day],window[day],np.float64(0.)),dtype=np.float64)
+        totals+=np.where(valid[day],window[day],0.)
         counts+=valid[day]
-    replacement=np.divide(totals,counts.astype(np.float64),
-                          out=np.full(result.shape,np.nan,dtype=np.float64),where=counts>0)
-    result[missing]=replacement[missing]
+    replacement=np.divide(totals,counts,
+                          out=np.full(result.shape,np.nan,dtype=ACCUM_DTYPE),where=counts>0)
+    result[missing]=np.asarray(replacement[missing],dtype=MODEL_DTYPE)
     return result
 
 
 def _snow_control_date(value):
-    try:
-        return datetime.strptime(str(int(value)),'%Y%m%d')
-    except (TypeError,ValueError) as error:
-        raise ValueError(f'invalid MAKEGEO snow date: {value!r}') from error
+    day=parse_date(value,'MAKEGEO snow date')
+    return datetime.combine(day,datetime.min.time())
 
 
 def _iter_formatted_snow_days(path,start_date,end_date):
@@ -328,10 +324,16 @@ def _iter_formatted_snow_days(path,start_date,end_date):
                 records.append(record)
             if not records:
                 break
+            for record in records:
+                timestamp=record.timestamp
+                if timestamp.tzinfo is not None or timestamp.utcoffset() is not None:
+                    raise ValueError('SNOW.DAT daily timestamps must be timezone-naive')
+                if timestamp.time()!=datetime.min.time():
+                    raise ValueError('SNOW.DAT daily timestamps must be midnight')
             timestamps={record.timestamp for record in records}
             if len(timestamps)!=1:
                 raise ValueError('SNOW.DAT variables in one group have different timestamps')
-            timestamp=records[0].timestamp.replace(hour=0,minute=0,second=0,microsecond=0)
+            timestamp=records[0].timestamp
             if timestamp<cutoff:
                 continue
             variables={record.name:record.values for record in records}
@@ -350,9 +352,9 @@ def _iter_formatted_snow_days(path,start_date,end_date):
                 depth_current=_fill_snow_temporal(
                     np.stack([item[1] for item in window]),current=1)
                 yielded.append(current)
-                # RDSN has already processed the next day's PRECIPS when it
-                # returns the middle day's snow depth; NDSNOW is not rolled.
-                yield current,depth_current,window[-1][2],header
+                # Depth and age describe the same (middle) day.  The third
+                # record exists only to fill missing depth values temporally.
+                yield current,depth_current,window[1][2],header
             if current>=end:
                 break
     expected=(end-start).days+1
@@ -373,7 +375,7 @@ def _read_snow_reference(path,g,categories):
             cell=np.asarray(dataset['snow_cell_index'][:],dtype=np.int64)-1
             land=np.asarray(dataset['snow_landuse_index'][:],dtype=np.int64)-1
             snow=np.asarray(dataset['snow_grid_index'][:],dtype=np.int64)
-            fraction=np.asarray(dataset['snow_fraction'][:],dtype=float)
+            fraction=np.asarray(dataset['snow_fraction'][:],dtype=MODEL_DTYPE)
     else:
         lines=source.read_text(encoding='ascii',errors='strict').splitlines()
         try:
@@ -418,7 +420,7 @@ def _read_snow_reference(path,g,categories):
         cell=np.asarray(cells,dtype=np.int64)
         land=np.asarray(lands,dtype=np.int64)
         snow=np.asarray(snow_grids,dtype=np.int64)
-        fraction=np.asarray(fractions,dtype=float)
+        fraction=np.asarray(fractions,dtype=MODEL_DTYPE)
     size=g.nx*g.ny
     if not (cell.shape==land.shape==snow.shape==fraction.shape):
         raise ValueError('snow-grid reference arrays have inconsistent lengths')
@@ -540,7 +542,7 @@ def _read_terrain(path,g):
     if p.suffix.lower() in {'.nc','.nc4','.cdf'}:
         with Dataset(p) as ds:
             _validate_netcdf_grid(ds,g,'terrain')
-            terrain=np.asarray(ds['terrain_height'][:]).astype(np.float64)
+            terrain=np.asarray(ds['terrain_height'][:],dtype=MODEL_DTYPE)
         if terrain.shape!=(g.ny,g.nx):
             raise ValueError(f'terrain NetCDF array shape mismatch in {p}')
         return terrain
@@ -564,7 +566,7 @@ def _read_terrain(path,g):
         raise ValueError(f'unsupported terrain record order in {p}')
     values=np.fromstring(' '.join(lines[index:]),sep=' ')
     if values.size != g.nx*g.ny: raise ValueError(f"terrain size mismatch in {p}")
-    terrain=values.reshape(g.ny,g.nx)*scales[z_unit]
+    terrain=np.asarray(values.reshape(g.ny,g.nx)*scales[z_unit],dtype=MODEL_DTYPE)
     return terrain[::-1] if order[1].upper()=='N_S' else terrain
 
 def _read_landuse(path,g,expected_categories=None):
@@ -581,7 +583,7 @@ def _read_landuse(path,g,expected_categories=None):
             raise ValueError(f'land-use NetCDF category dimension mismatch in {p}')
         if expected is not None and not np.array_equal(cats.astype(np.int64),expected):
             raise ValueError(f'land-use categories do not match MAKEGEO input categories in {p}')
-        return cats.astype(np.int64),frac.astype(np.float64)
+        return cats.astype(np.int64),frac.astype(MODEL_DTYPE)
     lines=p.read_text(encoding='ascii').splitlines()
     try:
         version=float(lines[0][16:32].strip())
@@ -610,7 +612,7 @@ def _read_landuse(path,g,expected_categories=None):
         raise ValueError(f'land-use categories do not match MAKEGEO input categories in {p}')
     record_count=g.nx*g.ny
     records=lines[index:index+record_count]
-    result=np.empty((categories.size,g.ny,g.nx),dtype=np.float64)
+    result=np.empty((categories.size,g.ny,g.nx),dtype=MODEL_DTYPE)
     if len(records)!=record_count: raise ValueError(f"land-use record count mismatch in {p}")
     tail=lines[index+record_count:]
     if tail and tail[0]!='SNOW Grid Information:':
@@ -629,7 +631,7 @@ def _read_landuse(path,g,expected_categories=None):
 def _split_categories(categories,frac,splits):
     if not splits: return categories,frac
     categories=np.asarray(categories,dtype=np.int64)
-    result=np.array(frac,dtype=np.float64,copy=True)
+    result=np.array(frac,dtype=MODEL_DTYPE,copy=True)
     lookup={int(value):index for index,value in enumerate(categories)}
     grouped={}
     for source,target,percent in splits: grouped.setdefault(int(source),[]).append((int(target),float(percent)))
@@ -637,27 +639,24 @@ def _split_categories(categories,frac,splits):
         if source not in lookup or any(target not in lookup for target,_ in targets):
             raise ValueError('split source and target categories must exist in the input category list')
         source_index=lookup[source]
-        percentage_sum=np.float64(0.)
+        percentage_sum=0.
         for target,percent in targets:
-            fraction=np.asarray(np.float64(percent)/np.float64(100.),dtype=np.float64)
-            contribution=np.asarray(fraction*result[source_index],dtype=np.float64)
+            fraction=percent/100.
+            contribution=fraction*result[source_index]
             target_index=lookup[target]
-            result[target_index]=np.asarray(
-                result[target_index]+contribution,dtype=np.float64)
-            percentage_sum=np.asarray(percentage_sum+fraction,dtype=np.float64)
-        result[source_index]=np.asarray(
-            result[source_index]-np.asarray(
-                percentage_sum*result[source_index],dtype=np.float64),dtype=np.float64)
+            result[target_index]+=contribution
+            percentage_sum+=fraction
+        result[source_index]-=percentage_sum*result[source_index]
     return categories,result
 
 def _fields(frac,config,categories=USGS38):
     categories,frac=_split_categories(categories,frac,config.category_splits)
-    frac=np.asarray(frac,dtype=np.float64)
+    frac=np.asarray(frac,dtype=MODEL_DTYPE)
     properties=config.input_properties or STANDARD_PROPERTIES
     missing_properties=[int(category) for category in categories if int(category) not in properties]
     if missing_properties: raise ValueError(f'missing MAKEGEO properties for categories: {missing_properties}')
     table=np.asarray([properties[int(category)][:6] for category in categories],
-                     dtype=np.float64)
+                     dtype=MODEL_DTYPE)
     mapped=np.asarray([properties[int(category)][6] for category in categories],dtype=np.int16)
     if any(int(value) not in set(config.output_categories) for value in mapped):
         raise ValueError('mapped land-use category is absent from output_categories')
@@ -669,26 +668,26 @@ def _fields(frac,config,categories=USGS38):
         found=np.flatnonzero(categories==config.missing_category)
         if not found.size: raise ValueError('missing_category is absent from input categories')
         k=int(found[0]); frac=frac.copy()
-        frac[k,missing]=np.asarray(frac[k,missing]+np.asarray(
-            np.float64(1.)-totals[missing],dtype=np.float64),dtype=np.float64)
+        frac[k,missing]+=1.-totals[missing]
         totals=_category_sum(frac)
     water_mask=np.isin(categories,config.water_categories)
-    water=_water_sum(frac,categories,config.water_categories)>np.float64(
-        np.float64(config.water_threshold)+np.float64(.0001))
+    water=_water_sum(frac,categories,config.water_categories)>(
+        config.water_threshold+.0001)
     eligible=np.where(water[None,:,:],water_mask[:,None,None],~water_mask[:,None,None])
     selected=np.argmax(np.where(eligible,frac,-np.inf),axis=0)
     dominant=mapped[selected]
     def weighted(values,*,logarithmic=False):
-        reference=(_fortran_log(values) if logarithmic else values)
-        numerator=np.zeros(totals.shape,dtype=np.float64)
-        denominator=np.zeros(totals.shape,dtype=np.float64)
-        for category in range(categories.size):
-            numerator=np.asarray(
-                numerator+frac[category]*reference[category],dtype=np.float64)
-            denominator=np.asarray(
-                denominator+frac[category],dtype=np.float64)
-        result=np.asarray(numerator/denominator,dtype=np.float64)
-        return _fortran_exp(result) if logarithmic else result
+        weights=np.asarray(frac,dtype=ACCUM_DTYPE)
+        reference=np.asarray(values,dtype=ACCUM_DTYPE)
+        if logarithmic:
+            reference=np.log(reference)
+        numerator=np.sum(weights*reference[:,None,None],axis=0,
+                         dtype=ACCUM_DTYPE)
+        denominator=np.sum(weights,axis=0,dtype=ACCUM_DTYPE)
+        result=numerator/denominator
+        if logarithmic:
+            result=np.exp(result)
+        return np.asarray(result,dtype=MODEL_DTYPE)
     roughness=weighted(table[:,0],logarithmic=True)
     fields=tuple(weighted(table[:,index]) for index in range(1,6))
     return dominant,roughness,*fields
@@ -704,16 +703,16 @@ def _snow_weighted_fields(frac,categories,reference,snow_depth,snow_age,config,
         raise ValueError('normal land-use properties do not cover the input categories')
     if set(int(value) for value in categories)-set(snowy):
         raise ValueError('snow land-use properties do not cover the input categories')
-    frac=np.asarray(frac,dtype=np.float64)
+    frac=np.asarray(frac,dtype=MODEL_DTYPE)
     normal_table=np.asarray([normal[int(category)][:6] for category in categories],
-                            dtype=np.float64)
+                            dtype=MODEL_DTYPE)
     snow_table=np.asarray([snowy[int(category)][:6] for category in categories],
-                          dtype=np.float64)
+                          dtype=MODEL_DTYPE)
     mapped=np.asarray([normal[int(category)][6] for category in categories],dtype=np.int16)
     if any(snowy[int(category)][6]!=mapped[index]
            for index,category in enumerate(categories)):
         raise ValueError('snow and no-snow output category maps must match')
-    depth=np.asarray(snow_depth,dtype=np.float64)
+    depth=np.asarray(snow_depth,dtype=MODEL_DTYPE)
     age=np.asarray(snow_age,dtype=np.int64)
     if depth.shape!=age.shape or depth.ndim!=2:
         raise ValueError('snow depth and age must be matching two-dimensional arrays')
@@ -728,49 +727,54 @@ def _snow_weighted_fields(frac,categories,reference,snow_depth,snow_age,config,
     if np.any(~np.isfinite(sample_depth)):
         raise ValueError('snow depth contains missing values at referenced cells')
     land=reference.category_index
-    weights=np.asarray(reference.fraction,dtype=np.float64)
+    # A target cell can contain many snow-reference fragments.  Accumulate
+    # those weights in FP64, then return the physical fields as FP32.
+    weights=np.asarray(reference.fraction,dtype=ACCUM_DTYPE)
     cell=reference.cell_index
     cell_count=config.grid.nx*config.grid.ny
-    denominator=np.zeros(cell_count,dtype=np.float64)
+    denominator=np.zeros(cell_count,dtype=ACCUM_DTYPE)
     np.add.at(denominator,cell,weights)
     if np.any(denominator<=0.):
         raise ValueError('snow-grid reference has no weight for one or more target cells')
 
-    def aggregate(values):
-        numerator=np.zeros(cell_count,dtype=np.float64)
-        np.add.at(numerator,cell,
-                  np.asarray(weights*np.asarray(values,dtype=np.float64),
-                             dtype=np.float64))
-        return np.asarray(numerator/denominator,dtype=np.float64).reshape(
-            config.grid.ny,config.grid.nx)
+    def aggregate(values,*,logarithmic=False):
+        values=np.asarray(values,dtype=ACCUM_DTYPE)
+        if logarithmic:
+            values=np.log(values)
+        numerator=np.zeros(cell_count,dtype=ACCUM_DTYPE)
+        np.add.at(numerator,cell,weights*values)
+        result=numerator/denominator
+        if logarithmic:
+            result=np.exp(result)
+        return np.asarray(result.reshape(config.grid.ny,config.grid.nx),
+                          dtype=MODEL_DTYPE)
 
     has_snow=sample_depth>0.
     if config.snow_roughness_method==1:
         if config.snow_height_scale_m<=0.:
             raise ValueError('snow_height_scale_m/HSCL must be positive')
-        scale=np.float64(config.snow_height_scale_m)
-        obstacle=np.asarray(normal_table[:,0]*scale,dtype=np.float64)
+        scale=config.snow_height_scale_m
+        obstacle=normal_table[:,0]*scale
         minimum=obstacle[-1]
         roughness=np.where(
             sample_depth<config.snow_depth_minimum_m,
             normal_table[land,0],
-            np.asarray(np.maximum(obstacle[land]-sample_depth,minimum)/scale,
-                       dtype=np.float64))
+            np.maximum(obstacle[land]-sample_depth,minimum)/scale)
     elif config.snow_roughness_method==2:
         roughness=np.where(has_snow,snow_table[land,0],normal_table[land,0])
     else:
         raise ValueError('snow_roughness_method/MSRL must be 1 or 2')
-    roughness=_fortran_exp(aggregate(_fortran_log(roughness)))
+    roughness=aggregate(roughness,logarithmic=True)
 
     if config.snow_albedo_method==1:
         parameters=config.snow_age_parameters
         if set(int(value) for value in categories)-set(parameters):
             raise ValueError('snow age parameters do not cover the input categories')
         raw_times=np.asarray([parameters[int(category)][0] for category in categories],
-                             dtype=np.float64)
+                             dtype=ACCUM_DTYPE)
         reductions=np.asarray([parameters[int(category)][1] for category in categories],
-                              dtype=np.float64)
-        times=np.floor(np.asarray(raw_times+np.float64(.5),dtype=np.float64)).astype(np.int32)
+                              dtype=MODEL_DTYPE)
+        times=np.rint(raw_times).astype(np.int32)
         if np.any(times<=0):
             raise ValueError('snow albedo age time scales must be positive')
         snow_albedo=_snow_albedo_values(
@@ -779,10 +783,7 @@ def _snow_weighted_fields(frac,categories,reference,snow_depth,snow_age,config,
         albedo=np.where(sample_depth<config.snow_depth_minimum_m,
                         normal_table[land,1],snow_albedo)
     elif config.snow_albedo_method==2:
-        # MAKEGEO 3.2 passes integer NDSNOW where WTSW declares real XSNOWC.
-        # With its implicit Fortran interface, zero remains zero and positive
-        # ages become positive subnormal reals.  Preserve that effective test.
-        albedo=np.where(sample_age>0,snow_table[land,1],normal_table[land,1])
+        albedo=np.where(has_snow,snow_table[land,1],normal_table[land,1])
     else:
         raise ValueError('snow_albedo_method/MSAL must be 1 or 2')
     fields=[aggregate(albedo)]
@@ -795,17 +796,16 @@ def _snow_weighted_fields(frac,categories,reference,snow_depth,snow_age,config,
 
 def _merge_landuse(primary,secondary):
     """LLU2 replacement: supplement only cells missing from the primary."""
-    primary=np.asarray(primary,dtype=np.float64); secondary=np.asarray(secondary,dtype=np.float64)
+    primary=np.asarray(primary,dtype=MODEL_DTYPE)
+    secondary=np.asarray(secondary,dtype=MODEL_DTYPE)
     if primary.shape!=secondary.shape: raise ValueError('primary and secondary land-use grids do not match')
-    missing=_category_sum(primary)<=np.float64(.001)
+    missing=_category_sum(primary)<=.001
     return np.where(missing[None,:,:],secondary,primary)
 
 def _write_netcdf(path,terrain,fields,g,config):
     names=('dominant_landuse','roughness_length','albedo','bowen_ratio','soil_heat_flux_parameter','anthropogenic_heat_flux','leaf_area_index')
-    # GEO.DAT is the numerical interface used by legacy CALMET.  Keep its
-    # F7.2/F7.4 quantisation in NetCDF so bypassing text I/O changes no values.
-    terrain=_legacy_round(terrain,2)
-    fields=(fields[0],_legacy_round(fields[1],4),*(_legacy_round(value,2) for value in fields[2:]))
+    terrain=np.asarray(terrain,dtype=MODEL_DTYPE)
+    fields=(fields[0],*(np.asarray(value,dtype=MODEL_DTYPE) for value in fields[1:]))
     with Dataset(path,'w',format='NETCDF4') as ds:
         ds.createDimension('y',g.ny); ds.createDimension('x',g.nx); ds.Conventions='CF-1.8'; ds.source='PyCALMET MAKEGEO NumPy port'
         ds.projection=g.projection; ds.datum=g.datum; ds.false_easting_km=g.false_easting_km; ds.false_northing_km=g.false_northing_km
@@ -926,7 +926,7 @@ def _write_qa_grids(terrain,dominant,g,config):
 
 def run(config: MakegeoConfig) -> GeophysicalResult:
     terrain=(_read_terrain(config.terrain,config.grid) if config.use_terrain else
-             np.zeros((config.grid.ny,config.grid.nx),dtype=float))
+             np.zeros((config.grid.ny,config.grid.nx),dtype=MODEL_DTYPE))
     expected_categories=tuple((config.input_properties or STANDARD_PROPERTIES).keys())
     categories,frac=_read_landuse(config.landuse,config.grid,expected_categories)
     if config.secondary_landuse is not None:

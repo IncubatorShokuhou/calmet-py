@@ -10,17 +10,14 @@ configure_proj_data()
 from pyproj import CRS,Proj,Transformer
 
 from .config import GridConfig
-from .datums import datum_definition,datum_shift,normalize_datum
+from .datums import (datum_definition,datum_proj4_parameters,datum_shift,
+                     normalize_datum)
 
 
 def _earth(datum: str) -> str:
     normalized=normalize_datum(datum)
     # ESR-R is the historical CALPUFF spelling for the ESR-S sphere.
-    definition=datum_definition('ESR-S' if normalized=='ESR-R' else normalized)
-    if definition.inv_f>=1.e20:
-        return f'+R={definition.radius:.15g}'
-    return (f'+a={definition.radius:.15g} +rf={definition.inv_f:.15g} '
-            f'+towgs84={definition.dx:g},{definition.dy:g},{definition.dz:g}')
+    return datum_proj4_parameters('ESR-S' if normalized=='ESR-R' else normalized)
 
 
 def geographic_crs(datum: str) -> CRS:

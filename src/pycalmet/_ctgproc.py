@@ -1,4 +1,4 @@
-"""NumPy CTGPROC implementation for USGS Global LAZA rasters."""
+"""Land-use preprocessing for standard rasters and CALMET source formats."""
 from __future__ import annotations
 
 from dataclasses import dataclass,replace
@@ -7,13 +7,17 @@ import re
 import tempfile
 import numpy as np
 from netCDF4 import Dataset
+import rasterio
+from rasterio.enums import ColorInterp
+from rasterio.errors import RasterioIOError
+from shapely import contains_xy,intersects_xy,make_valid
+from shapely.geometry import Polygon
 
 from ._proj_data import configure_proj_data
 
 configure_proj_data()
 
 from pyproj import CRS, Transformer
-import tifffile
 from .config import CtgprocConfig,CtgprocSource,GridConfig
 from .ctg_data import MODIS_SPEC,NLCD92_SPECS,ModisSpec,Nlcd92Spec
 from .datums import NIMA_DATABASE_DATE,normalize_datum
@@ -26,9 +30,6 @@ from .projections import (geographic_crs,grid_crs,project_geographic,
 USGS38 = np.array([11,12,13,14,15,16,17,21,22,23,24,31,32,33,41,42,43,51,52,53,54,55,61,62,71,72,73,74,75,76,77,81,82,83,84,85,91,92], dtype=np.int16)
 GLOBAL_MERGE_TYPES={'GLAZNA','GLAZSA','GLAZEU','GLAZAS','GLAZAF','GLAZAP',
                     'GLC2K','UMDGLC','MODIS'}
-PROCESS_ORDER={'GLC2K':0,'UMDGLC':1,'CTG':2,'NZGEN':3,
-               'GLAZNA':4,'GLAZSA':4,'GLAZEU':4,'GLAZAS':4,'GLAZAF':4,'GLAZAP':4,
-               'NLCDTF':5,'NLCD92':6,'NLCD01':7,'CORINE':8,'MODIS':9,'GEN':10}
 GLAZ_LIMITS={
     'GLAZNA':(90.,8.5,-20.,-180.),'GLAZSA':(13.,-60.,-32.,-100.),
     'GLAZEU':(90.,8.8,60.,-25.),'GLAZAS':(90.,-6.,200.,60.),
@@ -51,6 +52,8 @@ GLC2K_TO_USGS=np.array([0,42,41,41,42,41,43,61,61,43,33,32,32,21,31,
                          62,21,22,22,77,55,91,11,55,0],dtype=np.int16)
 UMDGLC_TO_USGS=np.array([55,42,42,41,41,43,32,33,32,32,31,21,21,16,77],
                          dtype=np.int16)
+MODIS_TO_USGS=np.array([0,52,42,42,41,41,43,43,33,43,32,31,62,21,16,21,
+                        91,77,52],dtype=np.int16)
 CORINE_TO_USGS=np.array([0,16,16,13,14,14,14,75,75,75,22,22,24,24,21,22,
     22,22,21,21,21,21,43,41,42,43,31,82,32,81,72,74,83,74,91,61,61,62,
     62,72,51,52,54,54,55],dtype=np.int16)
@@ -67,6 +70,9 @@ CORINE_RGB=np.array([230000077,255000000,204077242,204000000,230204204,
 QA_FILENAMES=('qamesh.dat','qactg.dat','qaglaz.dat','qanzgen.dat',
               'qanlcd.dat','qacorine.dat','qagcl2k.dat','qaumdglc.dat','qamodis.dat',
               'qageneric.dat')
+
+COMPUTE_DTYPE=np.float32
+COORD_DTYPE=np.float64
 
 @dataclass(frozen=True,slots=True)
 class GlazSpec:
@@ -105,17 +111,12 @@ class CoastPolygon:
 
 
 def _grid_indices(x, y, grid):
-    """Vectorized LUGRID indices with floating-point subtraction/division."""
-    f32=np.float64
-    x=np.asarray(x,dtype=f32); y=np.asarray(y,dtype=f32)
-    delx=np.asarray(x-f32(grid.x_origin_km),dtype=f32)
-    dely=np.asarray(y-f32(grid.y_origin_km),dtype=f32)
-    qx=np.asarray(delx/f32(grid.dx_km),dtype=f32)
-    qy=np.asarray(dely/f32(grid.dy_km),dtype=f32)
-    # Fortran first forms one-based I/J with truncation toward zero and only
-    # adds one on the non-negative side.  Return Python zero-based indices.
-    ix=np.trunc(qx).astype(np.int64)+(delx>=f32(0.)).astype(np.int64)-1
-    iy=np.trunc(qy).astype(np.int64)+(dely>=f32(0.)).astype(np.int64)-1
+    """Return zero-based grid indices for projected coordinates."""
+    x=np.asarray(x,dtype=COORD_DTYPE); y=np.asarray(y,dtype=COORD_DTYPE)
+    delx=x-float(grid.x_origin_km); dely=y-float(grid.y_origin_km)
+    qx=delx/float(grid.dx_km); qy=dely/float(grid.dy_km)
+    ix=np.floor(qx).astype(np.int64)
+    iy=np.floor(qy).astype(np.int64)
     return ix,iy
 
 
@@ -125,26 +126,19 @@ def _inside_grid(x, y, grid):
 
 
 def _grid_centers_1d(origin, spacing, count):
-    """Construct CTGPROC cell centers in its left-associated REAL arithmetic."""
-    f32=np.float64
-    index=np.arange(1,int(count)+1,dtype=np.float64)
-    offset=np.asarray(index-f32(.5),dtype=f32)
-    distance=np.asarray(f32(spacing)*offset,dtype=f32)
-    return np.asarray(f32(origin)+distance,dtype=f32)
+    """Construct grid-cell centre coordinates."""
+    index=np.arange(int(count),dtype=COORD_DTYPE)+.5
+    return float(origin)+float(spacing)*index
 
 
 def _snow_grid_indices(longitude, latitude):
-    """Map GLOBE's REAL coordinates to CTGPROC's fixed SNODAS grid."""
-    f32=np.float64
-    longitude=np.asarray(longitude,dtype=f32); latitude=np.asarray(latitude,dtype=f32)
-    lon_delta=np.asarray(longitude-f32(-124.729584),dtype=f32)
-    lat_delta=np.asarray(latitude-f32(52.8704185),dtype=f32)
-    lon_ratio=np.asarray(lon_delta/f32(8.33333377e-3),dtype=f32)
-    lat_ratio=np.asarray(lat_delta/f32(-8.33333377e-3),dtype=f32)
-    # The fixed SNODAS extent makes both ratios non-negative, so NINT is
-    # floor(x + .5), with the addition itself rounded to default REAL.
-    isn=np.floor(np.asarray(lon_ratio+f32(.5),dtype=f32)).astype(np.int64)+1
-    jsn=np.floor(np.asarray(lat_ratio+f32(.5),dtype=f32)).astype(np.int64)+1
+    """Map geographic coordinates to CTGPROC's fixed SNODAS grid."""
+    longitude=np.asarray(longitude,dtype=COORD_DTYPE)
+    latitude=np.asarray(latitude,dtype=COORD_DTYPE)
+    lon_ratio=(longitude+124.729584)/8.33333377e-3
+    lat_ratio=(latitude-52.8704185)/-8.33333377e-3
+    isn=np.floor(lon_ratio+.5).astype(np.int64)+1
+    jsn=np.floor(lat_ratio+.5).astype(np.int64)+1
     return isn,jsn
 
 
@@ -160,6 +154,32 @@ class SnowGridInfo:
     def create(cls, grid):
         return cls(grid, {}, {})
 
+    def add_hits(self, cell, category, snow_grid, count=1):
+        """Accumulate one sparse snow-grid record without fixed array limits."""
+        group=(int(cell),int(category)); snow_grid=int(snow_grid)
+        grids=self.order.setdefault(group,[])
+        if snow_grid not in grids:
+            grids.append(snow_grid)
+        key=(group[0],group[1],snow_grid)
+        self.hits[key]=self.hits.get(key,0)+int(count)
+
+    def merge(self, other):
+        """Merge sparse records from a previous modern continuation file."""
+        for (cell,category),grids in other.order.items():
+            for snow_grid in grids:
+                self.add_hits(cell,category,snow_grid,
+                              other.hits[cell,category,snow_grid])
+
+    def remap(self, mapping):
+        """Return snow records with land-use categories mapped like the grid."""
+        remapped=type(self).create(self.grid)
+        for (cell,category),grids in self.order.items():
+            target=mapping.get(category,category)
+            for snow_grid in grids:
+                remapped.add_hits(cell,target,snow_grid,
+                                  self.hits[cell,category,snow_grid])
+        return remapped
+
     def add(self, x, y, categories, good):
         selected=np.flatnonzero(good)
         if selected.size==0:
@@ -171,22 +191,9 @@ class SnowGridInfo:
         lon,lat=unproject_geographic(x,y,self.grid,'WGS-84',units='km')
         isn,jsn=_snow_grid_indices(lon,lat)
         snow=(jsn-1)*6935+isn
-        # SETSNOW is record-order dependent and contains a historical JP/K
-        # indexing bug: a repeat of any prior snow grid increments the last
-        # grid added for that cell/land pair.  This short loop is therefore
-        # intentionally not replaced by an unordered group-by reduction.
+        # Preserve first-seen order so serialized records are deterministic.
         for raw_cell,raw_category,raw_snow in zip(cell,category,snow,strict=True):
-            group=(int(raw_cell),int(raw_category)); snow_grid=int(raw_snow)
-            grids=self.order.setdefault(group,[])
-            if snow_grid not in grids:
-                if len(grids)>=10:
-                    raise ValueError('legacy CTGPROC permits at most 10 snow grids per land-use type')
-                grids.append(snow_grid)
-                target=snow_grid
-            else:
-                target=grids[-1]
-            key=(group[0],group[1],target)
-            self.hits[key]=self.hits.get(key,0)+1
+            self.add_hits(raw_cell,raw_category,raw_snow)
 
     def records(self, categories):
         lookup={int(value):index+1 for index,value in enumerate(categories)}
@@ -285,39 +292,16 @@ def _read_coastline_bln(path,grid,*,allow_empty=False):
 
 
 def _polygon_membership(px,py,polygon):
-    """Vectorized PNPOLY result: -1 outside, 0 edge, 1 inside."""
-    f32=np.float64
-    px=np.asarray(px,dtype=f32); py=np.asarray(py,dtype=f32)
-    x=np.asarray(polygon.x,dtype=f32); y=np.asarray(polygon.y,dtype=f32)
-    x2=np.roll(x,-1); y2=np.roll(y,-1)
-    result=np.empty(px.shape,dtype=np.int8)
-    # Bound each broadcast to roughly two million point-edge pairs.  GSHHS
-    # shorelines can contain many thousands of vertices.
-    chunk=max(1,2_000_000//max(1,x.size))
-    for begin in range(0,px.size,chunk):
-        end=min(begin+chunk,px.size)
-        local_x=px[begin:end,None]; local_y=py[begin:end,None]
-        xi=np.asarray(x-local_x,dtype=f32); yi=np.asarray(y-local_y,dtype=f32)
-        xj=np.asarray(x2-local_x,dtype=f32); yj=np.asarray(y2-local_y,dtype=f32)
-        ix=xi>=f32(0.); iy=yi>=f32(0.); jx=xj>=f32(0.); jy=yj>=f32(0.)
-        xor_x=ix!=jx; xor_y=iy!=jy
-        vertex=(xi==f32(0.))&(yi==f32(0.))
-        zero_length=(xi==xj)&(yi==yj)
-        vertical=(xi==f32(0.))&(xj==f32(0.))&xor_y
-        horizontal=(yi==f32(0.))&(yj==f32(0.))&xor_x
-        eligible=(iy|jy)&xor_x&~zero_length
-        obvious=eligible&iy&jy
-        remaining=eligible&~obvious
-        numerator=np.asarray(np.asarray(yi*xj,dtype=f32)-
-                             np.asarray(xi*yj,dtype=f32),dtype=f32)
-        denominator=np.asarray(xj-xi,dtype=f32)
-        quotient=np.divide(numerator,denominator,out=np.zeros_like(numerator),
-                           where=remaining)
-        edge=np.any(vertex|vertical|horizontal|(remaining&(quotient==f32(0.))),axis=1)
-        toggles=np.count_nonzero(obvious|(remaining&(quotient>f32(0.))),axis=1)
-        inside=toggles%2==1
-        result[begin:end]=np.where(edge,0,np.where(inside,1,-1))
-    return result
+    """Return Shapely's standard outside, boundary, and inside states."""
+    px=np.asarray(px,dtype=COORD_DTYPE); py=np.asarray(py,dtype=COORD_DTYPE)
+    coordinates=np.column_stack((np.asarray(polygon.x,dtype=COORD_DTYPE),
+                                 np.asarray(polygon.y,dtype=COORD_DTYPE)))
+    geometry=Polygon(coordinates)
+    if not geometry.is_valid:
+        geometry=make_valid(geometry)
+    inside=contains_xy(geometry,px,py)
+    intersects=intersects_xy(geometry,px,py)
+    return np.where(inside,1,np.where(intersects,0,-1)).astype(np.int8,copy=False)
 
 
 def _coastline_types(x,y,polygons):
@@ -340,8 +324,6 @@ def _coastline_types(x,y,polygons):
 def _fill_empty_ocean(counts,categories,config):
     if config.coastline_file is None:
         raise ValueError('fill_empty_ocean requires coastline_file/COASTBLN')
-    if config.input_type.upper()=='GEN':
-        raise ValueError('legacy CTGPROC does not support coastline processing for GENERIC data')
     matches=np.flatnonzero(np.asarray(categories)==config.ocean_category)
     if matches.size!=1:
         raise ValueError('ocean_category/IOCEAN must be in the USGS-38 category table')
@@ -360,10 +342,6 @@ def _coastline_polygons(config):
         return ()
     if config.coastline_file is None:
         raise ValueError('coastline_swap/LMARSWAP requires coastline_file/COASTBLN')
-    if config.input_type.upper()=='GEN':
-        raise ValueError('legacy CTGPROC does not support coastline processing for GENERIC data')
-    if config.ocean_category not in USGS38:
-        raise ValueError('ocean_category/IOCEAN must be in the USGS-38 category table')
     return _read_coastline_bln(config.coastline_file,config.grid,
                                allow_empty=config.gshhs_file is not None)
 
@@ -412,19 +390,18 @@ def _merge_global_counts(accumulated,current,categories,excluded_water=52):
 def _select_glaz_markers(center_lon,center_lat,left_lon,right_lon,
                          lower_lat,upper_lat):
     """GSELECT overlap tests after its longitude-branch normalization."""
-    f32=np.float64
-    center_lon=f32(center_lon); center_lat=f32(center_lat)
-    left_lon=f32(left_lon); right_lon=f32(right_lon)
-    lower_lat=f32(lower_lat); upper_lat=f32(upper_lat)
+    center_lon=float(center_lon); center_lat=float(center_lat)
+    left_lon=float(left_lon); right_lon=float(right_lon)
+    lower_lat=float(lower_lat); upper_lat=float(upper_lat)
     keep=set()
     for kind,limits in GLAZ_LIMITS.items():
-        north,south,east,west=(f32(value) for value in limits)
+        north,south,east,west=map(float,limits)
         center_hits=int(south<=center_lat<=north)+int(west<=center_lon<=east)
         corner_hits=(int(south<=upper_lat<=north)+int(south<=lower_lat<=north)+
                      int(west<left_lon<=east)+int(west<right_lon<=east))
-        for shift in (f32(360.),f32(-360.)):
-            shifted_left=np.asarray(left_lon+shift,dtype=f32)
-            shifted_right=np.asarray(right_lon+shift,dtype=f32)
+        for shift in (360.,-360.):
+            shifted_left=left_lon+shift
+            shifted_right=right_lon+shift
             corner_hits+=int(west<shifted_left<=east)
             corner_hits+=int(west<shifted_right<=east)
         if (center_hits==2 and corner_hits==4) or center_hits==2 or corner_hits==3:
@@ -435,31 +412,29 @@ def _select_glaz_markers(center_lon,center_lat,left_lon,right_lon,
 
 def _select_glaz_regions(grid):
     """Transform target markers and reproduce GSELECT's regional screen."""
-    f32=np.float64
-    x0=f32(grid.x_origin_km); y0=f32(grid.y_origin_km)
-    x_width=np.asarray(f32(grid.nx)*f32(grid.dx_km),dtype=f32)
-    y_width=np.asarray(f32(grid.ny)*f32(grid.dy_km),dtype=f32)
-    x1=np.asarray(x0+x_width,dtype=f32); y1=np.asarray(y0+y_width,dtype=f32)
-    xc=np.asarray(f32(.5)*np.asarray(x0+x1,dtype=f32),dtype=f32)
-    yc=np.asarray(f32(.5)*np.asarray(y1+y0,dtype=f32),dtype=f32)
-    x=np.array([xc,x0,x0,x1,x1],dtype=f32)
-    y=np.array([yc,y0,y1,y1,y0],dtype=f32)
+    x0=float(grid.x_origin_km); y0=float(grid.y_origin_km)
+    x1=x0+grid.nx*float(grid.dx_km)
+    y1=y0+grid.ny*float(grid.dy_km)
+    xc=.5*(x0+x1); yc=.5*(y0+y1)
+    x=np.array([xc,x0,x0,x1,x1],dtype=COORD_DTYPE)
+    y=np.array([yc,y0,y1,y1,y0],dtype=COORD_DTYPE)
     transform=Transformer.from_crs(_lcc(grid),geographic_crs(grid.datum),always_xy=True)
     longitude,latitude=transform.transform(x,y)
-    longitude=np.asarray(longitude,dtype=f32); latitude=np.asarray(latitude,dtype=f32)
+    longitude=np.asarray(longitude,dtype=COORD_DTYPE)
+    latitude=np.asarray(latitude,dtype=COORD_DTYPE)
     center=longitude[0]; corners=longitude[1:].copy()
-    if np.asarray(center-corners[0],dtype=f32)<f32(0.): corners[0]=f32(corners[0]-f32(360.))
-    if np.asarray(center-corners[1],dtype=f32)<f32(0.): corners[1]=f32(corners[1]-f32(360.))
-    if np.asarray(corners[2]-center,dtype=f32)<f32(0.): corners[2]=f32(corners[2]+f32(360.))
-    if np.asarray(corners[3]-center,dtype=f32)<f32(0.): corners[3]=f32(corners[3]+f32(360.))
+    if center<corners[0]: corners[0]-=360.
+    if center<corners[1]: corners[1]-=360.
+    if corners[2]<center: corners[2]+=360.
+    if corners[3]<center: corners[3]+=360.
     left=min(corners[0],corners[1]); right=max(corners[2],corners[3])
-    if left<f32(-180.): left=f32(left+f32(360.))
-    if left>f32(180.): left=f32(left-f32(360.))
-    if right<f32(-180.): right=f32(right+f32(360.))
-    if right>f32(180.): right=f32(right-f32(360.))
+    if left< -180.: left+=360.
+    if left>180.: left-=360.
+    if right< -180.: right+=360.
+    if right>180.: right-=360.
     lower=min(latitude[1],latitude[4]); upper=max(latitude[2],latitude[3])
-    if center<f32(-180.): center=f32(center+f32(360.))
-    if center>f32(180.): center=f32(center-f32(360.))
+    if center< -180.: center+=360.
+    if center>180.: center-=360.
     return _select_glaz_markers(center,latitude[0],left,right,lower,upper)
 
 def _lcc(g: GridConfig) -> CRS:
@@ -469,86 +444,99 @@ def _glaz_crs(spec: GlazSpec) -> CRS:
     return CRS.from_proj4(f"+proj=laea +lat_0={spec.latitude_origin:g} +lon_0={spec.longitude_origin:g} +R=6370997 +units=km +no_defs")
 
 def _window(g, reverse, spec):
-    f32=np.float64
-    x0=f32(g.x_origin_km); y0=f32(g.y_origin_km)
-    x_width=np.asarray(f32(g.nx)*f32(g.dx_km),dtype=f32)
-    y_width=np.asarray(f32(g.ny)*f32(g.dy_km),dtype=f32)
-    x1=np.asarray(x0+x_width,dtype=f32); y1=np.asarray(y0+y_width,dtype=f32)
-    x=np.array([x0,x1,x1,x0],dtype=f32)
-    y=np.array([y0,y0,y1,y1],dtype=f32)
+    x0=float(g.x_origin_km); y0=float(g.y_origin_km)
+    x1=x0+g.nx*float(g.dx_km); y1=y0+g.ny*float(g.dy_km)
+    x=np.array([x0,x1,x1,x0],dtype=COORD_DTYPE)
+    y=np.array([y0,y0,y1,y1],dtype=COORD_DTYPE)
     px,py=reverse(x,y)
-    px=np.asarray(px,dtype=f32); py=np.asarray(py,dtype=f32)
-    x_delta=np.asarray(px-f32(spec.x_origin_km),dtype=f32)
-    y_delta=np.asarray(py-f32(spec.y_origin_km),dtype=f32)
-    ix0,ix1=int(np.min(x_delta)),int(np.max(x_delta))
-    iy0,iy1=int(np.min(y_delta)),int(np.max(y_delta))
+    px=np.asarray(px,dtype=COORD_DTYPE); py=np.asarray(py,dtype=COORD_DTYPE)
+    x_delta=px-float(spec.x_origin_km); y_delta=py-float(spec.y_origin_km)
+    ix0,ix1=int(np.floor(np.min(x_delta))),int(np.ceil(np.max(x_delta)))
+    iy0,iy1=int(np.floor(np.min(y_delta))),int(np.ceil(np.max(y_delta)))
     buf=max((ix1-ix0)//10+1,(iy1-iy0)//10+1)
     return range(max(0,ix0-buf),min(spec.nx,ix1+buf+1)),range(max(0,iy0-buf),min(spec.ny,iy1+buf+1))
 
 
 def _mesh_offsets(mesh,cell_size=1.):
-    """Return LOADOTHER's REAL mesh offsets in IMESH order."""
-    f32=np.float64
-    step=np.asarray(f32(cell_size)/f32(mesh),dtype=f32)
-    half=np.asarray(f32(cell_size)/f32(2.),dtype=f32)
-    index=np.arange(1,int(mesh)+1,dtype=f32)
-    centered=np.asarray(index-f32(.5),dtype=f32)
-    return np.asarray(np.asarray(centered*step,dtype=f32)-half,dtype=f32)
+    """Return evenly spaced subpixel offsets in source-coordinate units."""
+    step=float(cell_size)/int(mesh)
+    return (np.arange(int(mesh),dtype=COORD_DTYPE)+.5)*step-float(cell_size)/2.
 
 
 def _mesh_coordinates(centers,mesh,cell_size=1.):
-    """Vectorize Fortran ``(center-half)+(index-.5)*step`` arithmetic."""
-    f32=np.float64
-    center=np.asarray(centers,dtype=f32)
-    step=np.asarray(f32(cell_size)/f32(mesh),dtype=f32)
-    half=np.asarray(f32(cell_size)/f32(2.),dtype=f32)
-    index=np.arange(1,int(mesh)+1,dtype=f32)
-    delta=np.asarray(np.asarray(index-f32(.5),dtype=f32)*step,dtype=f32)
-    lower=np.asarray(center-half,dtype=f32)
-    return np.asarray(lower[...,None]+delta,dtype=f32)
+    """Return evenly spaced subpixel coordinates around each centre."""
+    center=np.asarray(centers,dtype=COORD_DTYPE)
+    return center[...,None]+_mesh_offsets(mesh,cell_size)
 
 
 def _source_centers(origin,spacing,indices):
-    """Evaluate Fortran ``origin+spacing*(index-1)`` in default REAL."""
-    f32=np.float64
-    index=np.asarray(indices,dtype=f32)
-    product=np.asarray(f32(spacing)*index,dtype=f32)
-    return np.asarray(f32(origin)+product,dtype=f32)
+    """Return source-pixel centre coordinates for zero-based indices."""
+    return float(origin)+float(spacing)*np.asarray(indices,dtype=COORD_DTYPE)
 
 
 def _geotiff_geometry(scale,tie,raster_type,crs,*,orientation=1,
                       extra_half_pixel=False):
-    """Decode GET_IFD's origin and spacing in its REAL working units."""
-    f32=np.float64
+    """Decode legacy GeoTIFF tags for callers that supply raw metadata."""
     source_crs=CRS.from_user_input(crs)
     if source_crs.is_geographic:
-        unit_scale=f32(1.)
+        unit_scale=1.
         native_per_work=1.
     else:
         axes=source_crs.axis_info
         metres_per_native=float(axes[0].unit_conversion_factor) if axes else 1.
-        unit_scale=f32(metres_per_native/1000.)
+        unit_scale=metres_per_native/1000.
         native_per_work=1000./metres_per_native
-    dx=np.asarray(f32(scale[0])*unit_scale,dtype=f32)
-    dy=np.asarray(f32(scale[1])*unit_scale,dtype=f32)
+    dx=float(scale[0])*unit_scale; dy=float(scale[1])*unit_scale
     if dx<=0. or dy<=0.:
         raise ValueError('GeoTIFF pixel scale must be positive')
     if orientation not in {1,4}:
         raise ValueError(f'unsupported GeoTIFF orientation {orientation}')
-    if orientation==1: dy=np.asarray(-dy,dtype=f32)
-    x0=np.asarray(f32(tie[3])*unit_scale,dtype=f32)
-    y0=np.asarray(f32(tie[4])*unit_scale,dtype=f32)
+    if orientation==1: dy=-dy
+    x0=float(tie[3])*unit_scale; y0=float(tie[4])*unit_scale
     if int(raster_type)==1:
-        x0=np.asarray(x0+np.asarray(dx/f32(2.),dtype=f32),dtype=f32)
-        y0=np.asarray(y0+np.asarray(dy/f32(2.),dtype=f32),dtype=f32)
+        x0+=dx/2.; y0+=dy/2.
     ix=int(float(tie[0])); iy=int(float(tie[1]))
     if ix or iy:
-        x0=np.asarray(x0-np.asarray(dx*f32(ix),dtype=f32),dtype=f32)
-        y0=np.asarray(y0-np.asarray(dy*f32(iy),dtype=f32),dtype=f32)
+        x0-=dx*ix; y0-=dy*iy
     if extra_half_pixel:
-        x0=np.asarray(x0+np.asarray(dx/f32(2.),dtype=f32),dtype=f32)
-        y0=np.asarray(y0+np.asarray(dy/f32(2.),dtype=f32),dtype=f32)
+        x0+=dx/2.; y0+=dy/2.
     return x0,y0,dx,dy,native_per_work
+
+
+def _read_categorical_raster(path, *, fallback_crs=None):
+    """Read categorical pixels, validity, and centre coordinates with Rasterio."""
+    path=Path(path)
+    try:
+        with rasterio.open(path) as source:
+            source_crs=(CRS.from_user_input(source.crs) if source.crs is not None
+                        else (None if fallback_crs is None
+                              else CRS.from_user_input(fallback_crs)))
+            if source_crs is None:
+                raise ValueError(f'categorical GeoTIFF has no CRS: {path}')
+            transform=source.transform
+            if not np.isclose(transform.b,0.) or not np.isclose(transform.d,0.):
+                raise ValueError('rotated categorical GeoTIFF grids are not supported')
+            if transform.a<=0. or transform.e==0.:
+                raise ValueError('categorical GeoTIFF has invalid pixel spacing')
+            x0,y0=transform@(.5,.5)
+            dx,dy=float(transform.a),float(transform.e)
+            if source.count==1:
+                data=source.read(1)
+                valid=source.read_masks(1)!=0
+                photometric=(3 if source.colorinterp and
+                             source.colorinterp[0]==ColorInterp.palette else 1)
+            elif source.count in {3,4} and tuple(source.colorinterp[:3])==(
+                    ColorInterp.red,ColorInterp.green,ColorInterp.blue):
+                data=source.read()
+                valid=np.all(source.read_masks()!=0,axis=0)
+                photometric=2
+            else:
+                data=source.read()
+                valid=np.all(source.read_masks()!=0,axis=0)
+                photometric=0
+    except RasterioIOError as error:
+        raise ValueError(f'unable to read categorical GeoTIFF: {path}') from error
+    return source_crs,float(x0),float(y0),dx,dy,data,photometric,valid
 
 
 def _accumulate_glazas(path, config, snow=None):
@@ -566,7 +554,7 @@ def _accumulate_glazas(path, config, snow=None):
     def reverse(x,y):
         return unproject_to_crs(x,y,g,source_crs,config.input_datum,units='km')
     irange,jrange=_window(g,reverse,spec)
-    counts=np.zeros((USGS38.size,g.ny*g.nx),dtype=np.int32)
+    counts=np.zeros((USGS38.size,g.ny*g.nx),dtype=np.int64)
     columns={int(v):i for i,v in enumerate(USGS38)}
     polygons=_coastline_polygons(config)
     read=inside=0
@@ -580,8 +568,6 @@ def _accumulate_glazas(path, config, snow=None):
         source_y=np.asarray(np.float64(spec.y_origin_km)+np.float64(j),dtype=np.float64)
         mesh_x=_mesh_coordinates(base_x,mesh)
         mesh_y=_mesh_coordinates(source_y,mesh)
-        # Fortran loops IMESH outside JMESH, which matters to SETSNOW's
-        # historical JP/K state.
         sx=np.broadcast_to(mesh_x[:,:,None],(base_x.size,mesh,mesh)).ravel()
         sy=np.broadcast_to(mesh_y[None,None,:],(base_x.size,mesh,mesh)).ravel()
         gx,gy=project_glaz_to_lcc(sx,sy,source_grid,g,units='km')
@@ -663,7 +649,7 @@ def _accumulate_ctg(path,config,snow=None):
         inside+=int(good.sum())
     return counts.reshape(USGS38.size,config.grid.ny,config.grid.nx),read,inside
 
-def _read_generic(path,config):
+def _read_generic(path,config,snow=None):
     """Read CTGPROC ``GENERIC.LANDUSE`` point records and bin them by cell."""
     lines=path.read_text(encoding='ascii',errors='strict').splitlines()
     if not lines or lines[0][:16].strip().upper()!='GENERIC.LANDUSE':
@@ -703,10 +689,17 @@ def _read_generic(path,config):
                            config.grid,datum,units='km')
     x=np.asarray(x,dtype=float); y=np.asarray(y,dtype=float)
     _qa_write(config,'qageneric.dat',x,y,values[:,0])
-    ix,iy,good=_inside_grid(x,y,config.grid)
+    ix,iy,in_grid=_inside_grid(x,y,config.grid)
+    polygons=_coastline_polygons(config)
+    sample_categories,coastal=_swap_coastline_categories(
+        values[:,0],x,y,config,polygons)
+    if config.coastline_swap and config.ocean_category not in categories:
+        raise ValueError(
+            'ocean_category/IOCEAN must be declared by GENERIC data when coastline_swap is enabled')
+    good=coastal&in_grid
     lookup={category:i for i,category in enumerate(categories)}
-    rows=np.fromiter((lookup[int(value)] for value in values[:,0]),dtype=np.int64,count=len(records))
-    np.add.at(counts,(rows[good],iy[good],ix[good]),1)
+    _bin_samples(counts.reshape(count,-1),lookup,x,y,sample_categories,good,
+                 config,snow)
     return np.asarray(categories,dtype=np.int16),counts,len(records),int(good.sum())
 
 
@@ -789,49 +782,37 @@ def _accumulate_nlcd92(path,config,spec: Nlcd92Spec | None=None,snow=None):
 
 def _accumulate_nlcd_geotiff(path,config,translation,snow=None):
     """Read an NLCD GeoTIFF using its standard CRS and affine tags."""
-    with tifffile.TiffFile(path) as source:
-        metadata=source.geotiff_metadata
-        if metadata is None: raise ValueError(f'NLCD file has no GeoTIFF metadata: {path}')
-        epsg=metadata.get('ProjectedCSTypeGeoKey') or metadata.get('GeographicTypeGeoKey')
-        if epsg is None: raise NotImplementedError('NLCD GeoTIFF requires an EPSG CRS key')
-        scale=metadata.get('ModelPixelScale'); tie=metadata.get('ModelTiepoint')
-        if scale is None or tie is None or len(scale)<2 or len(tie)<6:
-            raise ValueError(f'NLCD GeoTIFF lacks pixel scale or tiepoint: {path}')
-        data=np.asarray(source.asarray())
-        raster_type=int(metadata.get('GTRasterTypeGeoKey',1))
-        orientation=int(source.pages[0].tags[274].value) if 274 in source.pages[0].tags else 1
+    source_crs,x0,y0,dx,dy,data,_,valid_data=_read_categorical_raster(path)
     if data.ndim!=2: raise ValueError('NLCD GeoTIFF must contain one two-dimensional band')
     if data.dtype.kind not in {'u','i'}: raise ValueError('NLCD GeoTIFF categories must be integers')
-    source_crs=CRS.from_epsg(int(epsg))
-    x0,y0,dx,dy,native_per_work=_geotiff_geometry(
-        scale,tie,raster_type,source_crs,orientation=orientation)
     transformer=Transformer.from_crs(source_crs,_lcc(config.grid),always_xy=True)
     counts=np.zeros((USGS38.size,config.grid.ny*config.grid.nx),dtype=np.int64)
     columns={int(value):index for index,value in enumerate(USGS38)}
     polygons=_coastline_polygons(config)
     x=_source_centers(x0,dx,np.arange(data.shape[1])); read=inside=0
     for row,raw in enumerate(data):
-        if np.any((raw<0)|(raw>=len(translation))):
+        valid=valid_data[row]
+        if np.any(valid&((raw<0)|(raw>=len(translation)))):
             raise ValueError(f'NLCD GeoTIFF category is outside the byte lookup table: {path}')
-        translated=translation[raw.astype(np.int64,copy=False)]
-        invalid=(raw!=0)&(translated==0)
+        translated=np.zeros(raw.shape,dtype=np.int16)
+        translated[valid]=translation[raw[valid].astype(np.int64,copy=False)]
+        invalid=valid&(raw!=0)&(translated==0)
         if invalid.any(): raise ValueError(f'unmapped NLCD category {int(raw[invalid][0])} in {path}')
-        nonstandard=~np.isin(translated,[0,*columns])
+        nonstandard=valid&~np.isin(translated,[0,*columns])
         if nonstandard.any():
             raise ValueError(f'NLCD category maps outside the USGS-38 table: {int(translated[nonstandard][0])}')
         y=_source_centers(y0,dy,row)
-        gx,gy=transformer.transform(
-            x*native_per_work,np.full(x.size,y,dtype=np.float64)*native_per_work)
+        gx,gy=transformer.transform(x,np.full(x.size,y,dtype=COORD_DTYPE))
         _qa_write(config,'qanlcd.dat',gx,gy)
         ix,iy,in_grid=_inside_grid(gx,gy,config.grid)
         translated,coastal=_swap_coastline_categories(translated,gx,gy,config,polygons)
-        good=(translated>0)&coastal&in_grid
+        good=valid&(translated>0)&coastal&in_grid
         _bin_samples(counts,columns,gx,gy,translated,good,config,snow)
         read+=raw.size; inside+=int(good.sum())
     return counts.reshape(USGS38.size,config.grid.ny,config.grid.nx),read,inside
 
 
-def _corine_indices(data,photometric,path):
+def _corine_indices(data,photometric,path,valid=None):
     """Return one-based CORINE classes for index, class-code, or RGB TIFFs."""
     raw=np.asarray(data)
     if photometric==2:
@@ -860,31 +841,23 @@ def _corine_indices(data,photometric,path):
             indices=np.zeros(values.shape,dtype=np.int16)
             indices[found]=order[positions[found]]+1
             invalid=(values!=0)&~found
+    valid_mask=(np.ones(indices.shape,dtype=bool) if valid is None
+                else np.asarray(valid,dtype=bool))
+    if valid_mask.shape!=indices.shape:
+        raise ValueError(f'CORINE validity mask has the wrong shape: {path}')
+    invalid &= valid_mask
     if np.any(invalid):
         value=(values[invalid][0] if values.ndim==2 else values.reshape(-1)[0])
         raise ValueError(f'unmapped CORINE category {value!r} in {path}')
+    indices=np.asarray(indices,dtype=np.int16).copy()
+    indices[~valid_mask]=0
     return indices
 
 
 def _accumulate_corine(path,config,snow=None):
     """Mesh-sample all three CORINE GeoTIFF category encodings."""
-    with tifffile.TiffFile(path) as source:
-        metadata=source.geotiff_metadata or {}
-        epsg=metadata.get('ProjectedCSTypeGeoKey') or metadata.get('GeographicTypeGeoKey')
-        page=source.pages[0]
-        scale=(metadata.get('ModelPixelScale') or
-               (page.tags.get(33550).value if page.tags.get(33550) else None))
-        tie=(metadata.get('ModelTiepoint') or
-             (page.tags.get(33922).value if page.tags.get(33922) else None))
-        if epsg is None or scale is None or tie is None:
-            raise ValueError(f'CORINE GeoTIFF has incomplete georeferencing: {path}')
-        photometric=int(page.photometric)
-        indices=_corine_indices(source.asarray(),photometric,path)
-        raster_type=int(metadata.get('GTRasterTypeGeoKey',1))
-        orientation=int(page.tags[274].value) if 274 in page.tags else 1
-    source_crs=CRS.from_epsg(int(epsg))
-    x0,y0,dx,dy,native_per_work=_geotiff_geometry(
-        scale,tie,raster_type,source_crs,orientation=orientation)
+    source_crs,x0,y0,dx,dy,data,photometric,valid_data=_read_categorical_raster(path)
+    indices=_corine_indices(data,photometric,path,valid_data)
     transformer=Transformer.from_crs(source_crs,_lcc(config.grid),always_xy=True)
     mesh=config.mesh_density
     if mesh<1: raise ValueError('mesh_density must be positive')
@@ -893,50 +866,35 @@ def _accumulate_corine(path,config,snow=None):
     polygons=_coastline_polygons(config); read=inside=0
     centers=_source_centers(x0,dx,np.arange(indices.shape[1]))
     for row,source_indices in enumerate(indices):
+        source_valid=valid_data[row]
         translated=CORINE_TO_USGS[source_indices]
         center_y=_source_centers(y0,dy,row)
         mesh_x=_mesh_coordinates(centers,mesh,dx)
         mesh_y=_mesh_coordinates(center_y,mesh,dy)
         sx=np.broadcast_to(mesh_x[:,:,None],(centers.size,mesh,mesh)).ravel()
         sy=np.broadcast_to(mesh_y[None,None,:],(centers.size,mesh,mesh)).ravel()
-        gx,gy=transformer.transform(sx*native_per_work,sy*native_per_work)
+        gx,gy=transformer.transform(sx,sy)
         qa_x,qa_y=transformer.transform(
-            centers*native_per_work,
-            np.full(centers.size,center_y,dtype=np.float64)*native_per_work)
+            centers,np.full(centers.size,center_y,dtype=COORD_DTYPE))
         _qa_write(config,'qacorine.dat',qa_x,qa_y)
         _qa_write(config,'qamesh.dat',gx,gy)
         ix,iy,in_grid=_inside_grid(gx,gy,config.grid)
         repeated=np.repeat(translated,mesh*mesh)
+        repeated_valid=np.repeat(source_valid,mesh*mesh)
         repeated,coastal=_swap_coastline_categories(repeated,gx,gy,config,polygons)
-        good=(repeated>0)&coastal&in_grid
+        good=repeated_valid&(repeated>0)&coastal&in_grid
         _bin_samples(counts,columns,gx,gy,repeated,good,config,snow)
         read+=source_indices.size; inside+=int(good.sum())
     return counts.reshape(USGS38.size,config.grid.ny,config.grid.nx),read,inside
 
 
 def _accumulate_global_geotiff(path,config,translation,*,offset=0,missing=(),
-                               glc_shift=False,fallback_epsg=None,snow=None):
+                               fallback_epsg=None,snow=None):
     """Mesh-sample a global categorical GeoTIFF as CTGPROC does."""
-    with tifffile.TiffFile(path) as source:
-        metadata=source.geotiff_metadata or {}
-        epsg=(metadata.get('ProjectedCSTypeGeoKey') or
-              metadata.get('GeographicTypeGeoKey') or fallback_epsg)
-        page=source.pages[0]
-        scale=(metadata.get('ModelPixelScale') or
-               (page.tags.get(33550).value if page.tags.get(33550) else None))
-        tie=(metadata.get('ModelTiepoint') or
-             (page.tags.get(33922).value if page.tags.get(33922) else None))
-        if epsg is None or scale is None or tie is None:
-            raise ValueError(f'global land-use GeoTIFF has incomplete georeferencing: {path}')
-        data=np.asarray(source.asarray())
-        raster_type=int(metadata.get('GTRasterTypeGeoKey',2 if glc_shift else 1))
-        orientation=int(page.tags[274].value) if 274 in page.tags else 1
+    source_crs,x0,y0,dx,dy,data,_,valid_data=_read_categorical_raster(
+        path,fallback_crs=(None if fallback_epsg is None else CRS.from_epsg(fallback_epsg)))
     if data.ndim!=2 or data.dtype.kind not in {'u','i'}:
         raise ValueError('global land-use GeoTIFF must be one integer band')
-    source_crs=CRS.from_epsg(int(epsg))
-    x0,y0,dx,dy,native_per_work=_geotiff_geometry(
-        scale,tie,raster_type,source_crs,orientation=orientation,
-        extra_half_pixel=glc_shift)
     transformer=Transformer.from_crs(source_crs,_lcc(config.grid),always_xy=True)
     mesh=config.mesh_density
     if mesh<1: raise ValueError('mesh_density must be positive')
@@ -945,8 +903,9 @@ def _accumulate_global_geotiff(path,config,translation,*,offset=0,missing=(),
     polygons=_coastline_polygons(config)
     read=inside=0
     for row,raw in enumerate(data):
+        raster_valid=valid_data[row]
         raw=np.asarray(raw,dtype=np.int64); source_category=raw+offset
-        absent=np.isin(raw,tuple(missing))
+        absent=~raster_valid|np.isin(raw,tuple(missing))
         invalid=(source_category<0)|(source_category>=len(translation))
         if np.any(invalid&~absent):
             raise ValueError(f'global land-use category is outside its lookup table: {path}')
@@ -960,17 +919,17 @@ def _accumulate_global_geotiff(path,config,translation,*,offset=0,missing=(),
         mesh_y=_mesh_coordinates(center_y,mesh,dy)
         sx=np.broadcast_to(mesh_x[:,:,None],(centers.size,mesh,mesh)).ravel()
         sy=np.broadcast_to(mesh_y[None,None,:],(centers.size,mesh,mesh)).ravel()
-        gx,gy=transformer.transform(sx*native_per_work,sy*native_per_work)
+        gx,gy=transformer.transform(sx,sy)
         center_x,center_y=transformer.transform(
-            centers*native_per_work,
-            np.full(centers.size,center_y,dtype=np.float64)*native_per_work)
+            centers,np.full(centers.size,center_y,dtype=COORD_DTYPE))
         qa_name='qagcl2k.dat' if config.input_type.upper()=='GLC2K' else 'qaumdglc.dat'
         _qa_write(config,qa_name,center_x,center_y)
         _qa_write(config,'qamesh.dat',gx,gy)
         ix,iy,in_grid=_inside_grid(gx,gy,config.grid)
         repeated=np.repeat(translated,mesh*mesh)
+        repeated_valid=np.repeat(raster_valid,mesh*mesh)
         repeated,coastal=_swap_coastline_categories(repeated,gx,gy,config,polygons)
-        good=(repeated>0)&coastal&in_grid
+        good=repeated_valid&(repeated>0)&coastal&in_grid
         _bin_samples(counts,columns,gx,gy,repeated,good,config,snow)
         read+=raw.size; inside+=int(good.sum())
     return counts.reshape(USGS38.size,config.grid.ny,config.grid.nx),read,inside
@@ -1005,7 +964,8 @@ def _accumulate_modis(path,config,spec: ModisSpec | None=None,snow=None):
                             np.arange(ix0,ix1+1)); read=inside=0
     for row in range(iy0,iy1+1):
         raw=np.asarray(source[row,ix0:ix1+1]); valid=(raw>=1)&(raw<=18)
-        translated=np.zeros(raw.shape,dtype=np.int16); translated[valid]=GLAZ_TO_USGS[raw[valid]]
+        translated=np.zeros(raw.shape,dtype=np.int16)
+        translated[valid]=MODIS_TO_USGS[raw[valid]]
         mesh_x=_mesh_coordinates(centers,mesh,np.float64(spec.spacing))
         center_y=_source_centers(spec.y_origin,-spec.spacing,row)
         mesh_y=_mesh_coordinates(center_y,mesh,np.float64(-spec.spacing))
@@ -1015,9 +975,7 @@ def _accumulate_modis(path,config,spec: ModisSpec | None=None,snow=None):
         center_x,center_y=project_geographic(
             centers,np.full(centers.size,center_y,dtype=np.float64),
             config.grid,config.input_datum,units='km')
-        # CTGPROC 7.0 writes MODIS centers to unit 42 (qaglaz.dat), while
-        # qamodis.dat is opened but remains empty.
-        _qa_write(config,'qaglaz.dat',center_x,center_y)
+        _qa_write(config,'qamodis.dat',center_x,center_y)
         _qa_write(config,'qamesh.dat',gx,gy)
         ix,iy,in_grid=_inside_grid(gx,gy,config.grid)
         repeated=np.repeat(translated,mesh*mesh)
@@ -1028,7 +986,7 @@ def _accumulate_modis(path,config,spec: ModisSpec | None=None,snow=None):
     return counts.reshape(USGS38.size,config.grid.ny,config.grid.nx),read,inside
 
 def _read_previous_landuse(path,grid):
-    """Read RDGRID continuation counts from NetCDF or legacy LU.DAT."""
+    """Read continuation counts and optional sparse snow records."""
     source=Path(path)
     if source.suffix.lower() in {'.nc','.nc4','.cdf'}:
         with Dataset(source) as dataset:
@@ -1055,7 +1013,36 @@ def _read_previous_landuse(path,grid):
                     normalize_datum(str(dataset.datum))!=normalize_datum(grid.datum)):
                 raise ValueError('previous land-use datum does not match')
             if np.any(counts<0): raise ValueError('previous land-use counts must be non-negative')
-        return categories,counts
+            snow_names={'snow_cell_index','snow_landuse_index','snow_grid_index',
+                        'snow_fraction'}
+            present=snow_names&set(dataset.variables)
+            if present and present!=snow_names:
+                raise ValueError('previous land-use snow metadata is incomplete')
+            snow=SnowGridInfo.create(grid) if present else None
+            if snow is not None:
+                cell=np.asarray(dataset['snow_cell_index'][:],dtype=np.int64)-1
+                land=np.asarray(dataset['snow_landuse_index'][:],dtype=np.int64)-1
+                snow_grid=np.asarray(dataset['snow_grid_index'][:],dtype=np.int64)
+                fraction=np.asarray(dataset['snow_fraction'][:],dtype=np.float64)
+                if not (cell.shape==land.shape==snow_grid.shape==fraction.shape):
+                    raise ValueError('previous land-use snow arrays do not match')
+                if (np.any((cell<0)|(cell>=grid.nx*grid.ny)) or
+                        np.any((land<0)|(land>=categories.size)) or
+                        np.any(~np.isfinite(fraction)|(fraction<0.))):
+                    raise ValueError('previous land-use snow metadata is invalid')
+                if 'snow_sample_count' in dataset.variables:
+                    snow_count=np.asarray(dataset['snow_sample_count'][:],dtype=np.int64)
+                    if snow_count.shape!=cell.shape or np.any(snow_count<0):
+                        raise ValueError('previous land-use snow counts are invalid')
+                else:
+                    totals=counts.sum(axis=0,dtype=np.int64).ravel()
+                    snow_count=np.rint(fraction*totals[cell]).astype(np.int64)
+                for cell_index,land_index,snow_index,hit_count in zip(
+                        cell,land,snow_grid,snow_count,strict=True):
+                    if hit_count:
+                        snow.add_hits(cell_index,categories[land_index],snow_index,
+                                      hit_count)
+        return categories,counts,snow
     lines=source.read_text(encoding='ascii',errors='strict').splitlines()
     if len(lines)<6 or not lines[0][:16].strip().upper().startswith('LU.DAT'):
         raise ValueError(f'previous CTGPROC file has an invalid header: {source}')
@@ -1085,7 +1072,11 @@ def _read_previous_landuse(path,grid):
     if categories.size!=category_count: raise ValueError('previous land-use category list is incomplete')
     counts=np.zeros((category_count,grid.ny,grid.nx),dtype=np.int64)
     seen=np.zeros((grid.ny,grid.nx),dtype=bool)
-    for number,line in enumerate(lines[index:],start=index+1):
+    record_count=grid.nx*grid.ny
+    records=lines[index:index+record_count]
+    if len(records)!=record_count:
+        raise ValueError('previous land-use file does not contain every grid cell')
+    for number,line in enumerate(records,start=index+1):
         values=np.fromstring(line[:10+5*category_count],sep=' ',dtype=np.int64)
         if values.size<2+category_count:
             raise ValueError(f'invalid previous land-use record at {source}:{number}')
@@ -1095,7 +1086,36 @@ def _read_previous_landuse(path,grid):
         counts[:,j,i]=values[2:2+category_count]; seen[j,i]=True
     if not seen.all(): raise ValueError('previous land-use file does not contain every grid cell')
     if np.any(counts<0): raise ValueError('previous land-use counts must be non-negative')
-    return categories,counts
+    index+=record_count
+    snow=None
+    if index<len(lines) and lines[index].strip()=='SNOW Grid Information:':
+        snow=SnowGridInfo.create(grid); index+=1
+        snow_records=lines[index:index+record_count]
+        if len(snow_records)!=record_count:
+            raise ValueError('previous land-use snow section is incomplete')
+        for number,line in enumerate(snow_records,start=index+1):
+            fields=line.split()
+            try:
+                i=int(fields[0])-1; j=int(fields[1])-1; land_count=int(fields[2])
+                if not (0<=i<grid.nx and 0<=j<grid.ny) or land_count<0:
+                    raise ValueError
+                cursor=3; cell=j*grid.nx+i
+                total=int(counts[:,j,i].sum(dtype=np.int64))
+                for _ in range(land_count):
+                    land=int(fields[cursor])-1; item_count=int(fields[cursor+1]); cursor+=2
+                    if not 0<=land<categories.size or item_count<0:
+                        raise ValueError
+                    for _ in range(item_count):
+                        snow_grid=int(fields[cursor]); fraction=float(fields[cursor+1]); cursor+=2
+                        hit_count=int(np.rint(fraction*total))
+                        if hit_count:
+                            snow.add_hits(cell,categories[land],snow_grid,hit_count)
+                if cursor!=len(fields):
+                    raise ValueError
+            except (IndexError,ValueError) as error:
+                raise ValueError(
+                    f'invalid previous land-use snow record at {source}:{number}') from error
+    return categories,counts,snow
 
 
 def _snow_rows(snow,categories):
@@ -1105,8 +1125,8 @@ def _snow_rows(snow,categories):
     rows=[]
     for (cell,land),items in sorted(grouped.items()):
         for snow_grid,count in items:
-            fraction=np.asarray(np.float64(count)/np.float64(totals[cell]),dtype=np.float64)
-            rows.append((cell,land,snow_grid,fraction))
+            fraction=COMPUTE_DTYPE(np.float64(count)/np.float64(totals[cell]))
+            rows.append((cell,land,snow_grid,fraction,count))
     return rows,totals
 
 
@@ -1121,8 +1141,10 @@ def _write_netcdf(path,fractions,counts,g,categories=USGS38,*,final_output=True,
         ds.false_easting_km=g.false_easting_km; ds.false_northing_km=g.false_northing_km
         ds.ttm_scale=g.ttm_scale
         ds.createVariable("landuse_category","i2",("category",))[:]=categories
-        ds.createVariable("landuse_fraction","f4",("category","y","x"),zlib=True)[:]=fractions
-        ds.createVariable("sample_count","i4",("category","y","x"),zlib=True)[:]=counts
+        ds.createVariable("landuse_fraction","f4",("category","y","x"),zlib=True)[:]=(
+            np.asarray(fractions,dtype=COMPUTE_DTYPE).reshape(len(categories),g.ny,g.nx))
+        ds.createVariable("sample_count","i4",("category","y","x"),zlib=True)[:]=(
+            np.asarray(counts,dtype=np.int32).reshape(len(categories),g.ny,g.nx))
         if qa_statistics is not None:
             average,threshold,low=qa_statistics
             ds.average_landuse_hits=int(average)
@@ -1132,11 +1154,12 @@ def _write_netcdf(path,fractions,counts,g,categories=USGS38,*,final_output=True,
         if snow is not None:
             ds.createDimension('snow_record',len(rows))
             ds.snow_grid_information='CTGPROC sparse SNODAS mapping'
-            values=np.asarray(rows,dtype=float).reshape((-1,4))
+            values=np.asarray(rows,dtype=float).reshape((-1,5))
             ds.createVariable('snow_cell_index','i4',('snow_record',))[:]=values[:,0].astype(np.int32)+1
             ds.createVariable('snow_landuse_index','i2',('snow_record',))[:]=values[:,1].astype(np.int16)
             ds.createVariable('snow_grid_index','i4',('snow_record',))[:]=values[:,2].astype(np.int32)
             ds.createVariable('snow_fraction','f4',('snow_record',))[:]=values[:,3]
+            ds.createVariable('snow_sample_count','i4',('snow_record',))[:]=values[:,4].astype(np.int32)
 
 def _write_legacy(path,fractions,counts,g,categories=USGS38,*,final_output=True,
                   snow=None):
@@ -1189,22 +1212,20 @@ def _write_legacy(path,fractions,counts,g,categories=USGS38,*,final_output=True,
 
 
 def _fractions_from_counts(counts):
-    """Reproduce CTGPROC's NGRID/FLOAT(ISUM) floating-point division."""
+    """Convert integer category hits to the model's FP32 fractions."""
     hits=np.asarray(counts,dtype=np.int64)
     totals=hits.sum(axis=0,dtype=np.int64)
     numerator=np.asarray(hits,dtype=np.float64)
     denominator=np.asarray(totals,dtype=np.float64)
     fractions=np.zeros(hits.shape,dtype=np.float64)
     np.divide(numerator,denominator,out=fractions,where=totals>0)
-    return totals,fractions
+    return totals,fractions.astype(COMPUTE_DTYPE)
 
 
 def _low_hit_threshold(average_hits,threshold_percent):
-    """Reproduce ``MAX(1,INT(REAL(IAVG*ITHRESH)/100.))``."""
+    """Return the integer hit-count threshold for QA reporting."""
     product=int(average_hits)*int(threshold_percent)
-    fraction=np.asarray(
-        np.float64(product)/np.float64(100.),dtype=np.float64)
-    return max(1,int(fraction))
+    return max(1,product//100)
 
 
 def run(config: CtgprocConfig) -> LanduseResult:
@@ -1213,10 +1234,6 @@ def run(config: CtgprocConfig) -> LanduseResult:
     output_format=config.output_format.lower()
     if output_format not in {'auto','legacy','netcdf'}:
         raise ValueError("output_format must be 'auto', 'legacy', or 'netcdf'")
-    if config.snow_processing and not config.final_output:
-        raise ValueError('legacy CTGPROC permits LSNOW only in the final run')
-    if config.snow_processing and config.category_map:
-        raise ValueError('snow processing cannot be combined with category_map')
     if config.qa_cell_output:
         directory=_qa_directory(config)
         directory.mkdir(parents=True,exist_ok=True)
@@ -1238,9 +1255,7 @@ def run(config: CtgprocConfig) -> LanduseResult:
                                     config.mesh_density)
                       for path in config.landuse_files)
     if not sources: raise ValueError('CTGPROC requires at least one land-use data file')
-    sources=tuple(sorted(enumerate(sources),key=lambda item:
-        (PROCESS_ORDER.get(item[1].input_type.upper(),999),item[0])))
-    sources=tuple(item[1] for item in sources)
+    sources=tuple(sources)
     kinds={source.input_type.upper() for source in sources}
     unknown=sorted(kinds-supported)
     if unknown: raise NotImplementedError(f'unsupported CTGPROC input types: {unknown}')
@@ -1250,17 +1265,10 @@ def run(config: CtgprocConfig) -> LanduseResult:
         sources=tuple(source for source in sources
                       if source.input_type.upper() not in GLAZ_SPECS or
                       source.input_type.upper() in selected)
-    if 'GEN' in kinds and (config.coastline_swap or config.fill_empty_ocean):
-        raise ValueError('legacy CTGPROC does not support coastline processing for GENERIC data')
-    if config.snow_processing and 'GEN' in kinds:
-        raise ValueError('legacy CTGPROC does not support snow processing for GENERIC data')
-    if config.previous_landuse is not None and kinds&({*GLOBAL_MERGE_TYPES,'GEN'}):
-        raise ValueError('legacy CTGPROC requires global and GENERIC data in the first continuation run')
-    if config.coastline_file is not None and not config.fill_empty_ocean:
-        if not config.coastline_swap:
-            raise ValueError('coastline processing requires LMARFILL or LMARSWAP')
+    previous_snow=None
     if config.previous_landuse is not None:
-        categories,counts=_read_previous_landuse(config.previous_landuse,config.grid)
+        categories,counts,previous_snow=_read_previous_landuse(
+            config.previous_landuse,config.grid)
     else:
         categories=counts=None
     if not sources and categories is None:
@@ -1268,12 +1276,15 @@ def run(config: CtgprocConfig) -> LanduseResult:
         counts=np.zeros((USGS38.size,config.grid.ny,config.grid.nx),dtype=np.int64)
     read=inside=0
     snow=SnowGridInfo.create(config.grid) if config.snow_processing else None
+    if snow is not None and previous_snow is not None:
+        snow.merge(previous_snow)
     for source in sources:
         kind=source.input_type.upper(); item=Path(source.path)
         active=replace(config,input_type=kind,input_datum=source.input_datum,
                        mesh_density=source.mesh_density,landuse_sources=())
         if kind=='GEN':
-            file_categories,partial,file_read,file_inside=_read_generic(item,active)
+            file_categories,partial,file_read,file_inside=_read_with_optional_snow(
+                _read_generic,item,active,snow=snow)
             if categories is None: categories=file_categories; counts=np.zeros_like(partial)
             elif not np.array_equal(categories,file_categories): raise ValueError('generic files must declare identical category lists')
         elif kind=='NZGEN':
@@ -1309,7 +1320,7 @@ def run(config: CtgprocConfig) -> LanduseResult:
             if kind=='GLC2K':
                     partial,file_read,file_inside=_read_with_optional_snow(
                         _accumulate_global_geotiff,item,active,GLC2K_TO_USGS,
-                        missing=(24,),glc_shift=True,fallback_epsg=4326,snow=snow)
+                        missing=(24,),fallback_epsg=4326,snow=snow)
             else:
                     partial,file_read,file_inside=_read_with_optional_snow(
                         _accumulate_global_geotiff,item,active,UMDGLC_TO_USGS,snow=snow)
@@ -1342,10 +1353,12 @@ def run(config: CtgprocConfig) -> LanduseResult:
     low_hit_threshold=_low_hit_threshold(
         average_hits,config.qa_hit_threshold_percent)
     low_hit_cells=int(np.count_nonzero(raw_totals<low_hit_threshold))
-    if config.fill_empty_ocean and config.final_output:
+    if config.fill_empty_ocean:
         _fill_empty_ocean(counts,categories,config)
     if config.category_map:
         categories,counts=_remap_categories(categories,counts,config.category_map)
+        if snow is not None:
+            snow=snow.remap(config.category_map)
     totals,fractions=_fractions_from_counts(counts)
     output=Path(config.output); output.parent.mkdir(parents=True,exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=output.parent,prefix=output.name+".",delete=False) as tmp: temporary=Path(tmp.name)

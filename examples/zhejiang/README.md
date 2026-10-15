@@ -5,8 +5,9 @@ control files. It does not use a prepared geophysical grid.
 
 ## Bundled inputs
 
-- Three WRF records for 2018-03-18 00:00, 01:00, and 02:00 UTC. The last
-  record is the following-hour boundary needed for a 00:00–01:00 CALMET run.
+- Three WRF records for 2018-03-18 00:00, 01:00, and 02:00 UTC. The configured
+  00:00–01:00 CALMET period uses the first two; the final record supports
+  extending the example through the next interval.
 - 42 original SRTM3 tiles under `terrain/srtm3/`, covering N26–N31 and
   E117–E123. Each `.hgt` file is a 1201 × 1201 signed 16-bit elevation grid.
 - `landuse/zhejiang_generic.landuse`, a WGS-84 categorical point dataset with
@@ -56,4 +57,5 @@ calmet.nc       final one-hour CALMET result
 The complete run writes about 190 MB. CALWRF passes its canonical NetCDF file
 directly to CALMET, so the example does not create an M3D intermediate. The WRF
 subsets retain every variable read by CALWRF and use lossless NetCDF4
-compression.
+compression. PyCALMET reads and writes these files through `netCDF4`; it does
+not require xarray.

@@ -1,17 +1,22 @@
 from types import SimpleNamespace
+from datetime import datetime
 from pathlib import Path
 
 import netCDF4 as nc
 import numpy as np
 import pytest
 import pycalmet
-import xarray as xr
 from pycalmet.config import CalwrfConfig
 from pycalmet.legacy import CalwrfConfig as LegacyCalwrfConfig
 from pycalmet._calwrf import run as run_calwrf
 from pycalmet.legacy._compat._calwrf import run as run_legacy_calwrf
-from pycalmet._calwrf import (_cone,_create_output,_geopotential_height,_horizontal_range_check,_mass_coordinate,_pressure_temperature,_rain_increment,_rain_increments,_requested_interval,_reset_total_rain_at_file_boundary,_select_wrf_times,
-                              _selection,_stamp,_surface_variable,_surface_wind,
+from pycalmet.legacy._compat._calwrf import (
+    _horizontal_range_check as _legacy_horizontal_range_check,
+    _rain_increments as _legacy_rain_increments,
+    _reset_total_rain_at_file_boundary as _legacy_reset_total_rain_at_file_boundary,
+)
+from pycalmet._calwrf import (_cone,_create_output,_geopotential_height,_horizontal_range_check,_mass_coordinate,_pressure_temperature,_rain_increment,_rain_increments,_select_wrf_times,
+                              _selection,_wrf_timestamp,_surface_variable,_surface_wind,
                               _var,_vertical_range_check,_volume_variable,
                               _write_time_text,destagger_x,
                               destagger_y,destagger_z,earth_wind,rotation_angle,
@@ -315,7 +320,7 @@ def test_public_calwrf_rejects_case_duplicate_parameters(monkeypatch,tmp_path):
 
 
 def test_calwrf_accepts_legacy_and_iso_timestamps():
-    assert _stamp('2018031800')==_stamp('2018-03-18_00:00:00')
+    assert _wrf_timestamp('2018031800')==_wrf_timestamp('2018-03-18_00:00:00')
 
 
 def test_calwrf_inclusive_one_based_subdomain_selection():
@@ -352,11 +357,10 @@ def test_canonical_output_always_contains_embedded_surface_fields(tmp_path):
         for name in ('surface_pressure','precipitation','snow_cover','temperature_2m',
                      'wind_speed_10m','sst','pbl_height'):
             assert name in output.variables
-    with xr.open_dataset(output_path) as output:
-        assert {name:output.sizes[name] for name in ('time','level','y','x')} == {
+        assert {name:len(output.dimensions[name]) for name in ('time','level','y','x')} == {
             'time':1, 'level':1, 'y':1, 'x':1,
         }
-        assert output['surface_pressure'].dims == ('time','y','x')
+        assert output['surface_pressure'].dimensions == ('time','y','x')
 
 
 def test_time_text_writes_real_netcdf_character_variable(tmp_path):
@@ -387,7 +391,7 @@ def test_rain_increment_uses_full_first_accumulation_without_prior_time():
     np.testing.assert_array_equal(_rain_increment(current,None),current)
     np.testing.assert_array_equal(_rain_increment(current,np.array([[5.,7.]],dtype='f4')),
                                   [[7.,13.]])
-    np.testing.assert_array_equal(_rain_increment([[1.]],[[5.]]),[[-4.]])
+    np.testing.assert_array_equal(_rain_increment([[1.]],[[5.]]),[[1.]])
 
 
 def test_rain_increments_continue_across_wrf_file_boundaries_by_default():
@@ -401,25 +405,31 @@ def test_rain_increments_continue_across_wrf_file_boundaries_by_default():
     np.testing.assert_array_equal(convective,[[.25,.5]])
 
 
-def test_legacy_file_rain_reset_only_resets_total_accumulation():
+def test_rain_increments_detect_component_counter_resets():
     previous=(np.array([[12.,20.]],dtype='f4'),
               np.array([[1.,2.]],dtype='f4'))
-    rainnc=np.array([[14.5,20.25]],dtype='f4')
-    rainc=np.array([[1.25,2.5]],dtype='f4')
-    total,grid,convective=_rain_increments(
-        rainnc,rainc,previous,reset_total=True)
-    np.testing.assert_array_equal(total,[[15.75,22.75]])
+    rainnc=np.array([[2.5,20.25]],dtype='f4')
+    rainc=np.array([[1.25,.5]],dtype='f4')
+    total,grid,convective=_rain_increments(rainnc,rainc,previous)
+    np.testing.assert_array_equal(total,[[2.75,.75]])
     np.testing.assert_array_equal(grid,[[2.5,.25]])
     np.testing.assert_array_equal(convective,[[.25,.5]])
 
 
-def test_legacy_total_rain_reset_requires_an_actual_file_boundary():
+def test_legacy_total_rain_reset_remains_available_in_legacy_namespace():
     previous=(np.array([[1.]],dtype='f4'),np.array([[0.]],dtype='f4'))
     first=Path('first.nc'); second=Path('second.nc')
-    assert not _reset_total_rain_at_file_boundary(False,previous,first,second)
-    assert not _reset_total_rain_at_file_boundary(True,None,first,second)
-    assert not _reset_total_rain_at_file_boundary(True,previous,first,first)
-    assert _reset_total_rain_at_file_boundary(True,previous,first,second)
+    assert not _legacy_reset_total_rain_at_file_boundary(False,previous,first,second)
+    assert not _legacy_reset_total_rain_at_file_boundary(True,None,first,second)
+    assert not _legacy_reset_total_rain_at_file_boundary(True,previous,first,first)
+    assert _legacy_reset_total_rain_at_file_boundary(True,previous,first,second)
+    total,grid,convective=_legacy_rain_increments(
+        np.array([[2.]],dtype='f4'),np.array([[.5]],dtype='f4'),previous,
+        reset_total=True,
+    )
+    np.testing.assert_array_equal(total,[[2.5]])
+    np.testing.assert_array_equal(grid,[[1.]])
+    np.testing.assert_array_equal(convective,[[.5]])
 
 
 def test_optional_calwrf_surface_variable_is_zero_but_required_one_fails(tmp_path):
@@ -466,24 +476,34 @@ def test_calwrf_selects_preceding_hour_as_rain_baseline(tmp_path):
             dataset.createDimension('Time',len(times)); dataset.createDimension('DateStrLen',19)
             variable=dataset.createVariable('Times','S1',('Time','DateStrLen'))
             variable[:]=np.asarray([list(value) for value in times],dtype='S1')
-    begin=_stamp('2018-03-18_00:00:00'); end=_stamp('2018-03-18_01:00:00')
+    begin=_wrf_timestamp('2018-03-18_00:00:00')
+    end=_wrf_timestamp('2018-03-18_01:00:00')
     selected,baseline=_select_wrf_times(paths,begin,end)
     assert baseline==(paths[0],0,'2018-03-17_23:00:00')
     assert [(path,index) for path,index,_ in selected]==[(paths[0],1),(paths[1],0)]
 
 
-def test_calwrf_negative_date_sentinel_selects_all_available_times(tmp_path):
+def test_calwrf_times_are_deduplicated_and_sorted_as_datetimes(tmp_path):
     paths=[]
-    for number,times in enumerate((('2018-01-01_01:00:00','2018-01-01_02:00:00'),
-                                   ('2018-01-01_03:00:00','2018-01-01_04:00:00'))):
+    for number,times in enumerate((
+            ('2018-01-01 01:00:00','2018-01-01_02:00:00','2018010100'),
+            ('2018-01-01_01:00:00',))):
         path=tmp_path/f'wrf-{number}.nc'; paths.append(path)
         with nc.Dataset(path,'w') as dataset:
-            dataset.createDimension('Time',len(times)); dataset.createDimension('DateStrLen',19)
+            dataset.createDimension('Time',len(times))
+            dataset.createDimension('DateStrLen',19)
             variable=dataset.createVariable('Times','S1',('Time','DateStrLen'))
-            variable[:]=np.asarray([list(value) for value in times],dtype='S1')
-    begin,end=_requested_interval(paths,'-2018010100','-2018010200')
-    assert begin==_stamp('2018-01-01_01:00:00')
-    assert end==_stamp('2018-01-01_04:00:00')
+            variable[:]=np.asarray([list(value.ljust(19)) for value in times],dtype='S1')
+
+    begin=datetime(2018,1,1); end=datetime(2018,1,1,2)
+    selected,baseline=_select_wrf_times(paths,begin,end)
+
+    assert baseline is None
+    assert selected==[
+        (paths[0],2,'2018-01-01_00:00:00'),
+        (paths[0],0,'2018-01-01_01:00:00'),
+        (paths[0],1,'2018-01-01_02:00:00'),
+    ]
 
 
 def test_destagger_is_vectorized_midpoint():
@@ -539,6 +559,21 @@ def test_calwrf_horizontal_range_check_falls_back_to_violated_limit():
     values[2,2]=-3.
     checked=_horizontal_range_check(values,0.,20.,slice(0,5),slice(0,5))
     assert checked[2,2]==0.
+
+
+def test_calwrf_horizontal_range_check_uses_each_axis_bounds():
+    values=np.zeros((3,5),dtype=np.float32)
+    values[1,3]=100.
+    values[1,2]=2.
+    values[1,4]=10.
+    values[0,3]=4.
+    values[2,3]=6.
+
+    checked=_horizontal_range_check(values,0.,20.,slice(0,3),slice(0,5))
+    legacy=_legacy_horizontal_range_check(values,0.,20.,slice(0,3),slice(0,5))
+
+    assert checked[1,3] == np.float32(5.5)
+    assert legacy[1,3] == np.float32(3.5)
 
 
 def test_calwrf_hydrometeor_range_check_uses_vertical_neighbours():

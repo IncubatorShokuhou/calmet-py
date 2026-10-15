@@ -11,6 +11,8 @@ from typing import Any
 
 from .config import (CalmetConfig,CalwrfConfig,CtgprocConfig,CtgprocSource,
                      GridConfig,MakegeoConfig,TerrelConfig,TerrelSource)
+from .datetime_utils import (exact_integer,format_timezone_label,parse_calendar,
+                             parse_date,parse_timestamp,parse_timezone_label)
 
 _ASSIGNMENT = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$")
 
@@ -82,6 +84,11 @@ def _one(values: dict[str,list[str]], name: str, default: Any=None):
 def _number(value: str) -> int | float:
     token=value.strip().replace("D","E").replace("d","e")
     return float(token) if any(character in token for character in ".Ee") else int(token)
+
+
+def _integer_number(value: str, label: str) -> int:
+    """Parse an integer control field without truncating a decimal value."""
+    return exact_integer(value,label)
 
 
 def _logical(value: str) -> bool:
@@ -209,7 +216,36 @@ def calwrf_config(path: str | Path, **overrides) -> CalwrfConfig:
         create_surface=int(_number(lines[7+count]))==1
         if create_surface and len(lines)>8+count:
             surface_output=_path(source.parent,lines[8+count])
-    data=dict(wrf_files=[_path(source.parent,item) for item in files],start=lines[4],end=lines[5],
+    wrf_files=[_path(source.parent,item) for item in files]
+    requested_files=overrides.get('wrf_files',wrf_files)
+    requested_files=([requested_files]
+                     if isinstance(requested_files,(str,Path)) else requested_files)
+    raw_start,raw_end=lines[4],lines[5]
+
+    def all_available(token: str) -> bool:
+        try:
+            return int(token.strip())<1
+        except ValueError:
+            return False
+
+    if all_available(raw_start) or all_available(raw_end):
+        from netCDF4 import Dataset,chartostring
+        available=[]
+        for wrf_path in requested_files:
+            with Dataset(wrf_path) as dataset:
+                if 'Times' not in dataset.variables:
+                    raise ValueError(f'WRF input has no Times variable: {wrf_path}')
+                values=chartostring(dataset.variables['Times'][:]).tolist()
+                if not isinstance(values,list): values=[values]
+                available.extend(parse_timestamp(str(value)) for value in values)
+        if not available:
+            raise ValueError('WRF inputs contain no dated records')
+        control_start,control_end=min(available),max(available)
+    else:
+        control_start=parse_timestamp(raw_start)
+        control_end=parse_timestamp(raw_end)
+
+    data=dict(wrf_files=wrf_files,start=control_start,end=control_end,
               output=canonical_output,create_surface=create_surface,
               title=title,listing_output=_path(source.parent,lines[1]),
               legacy_output=legacy_output,surface_output=(surface_output if create_surface else None),
@@ -548,9 +584,11 @@ def makegeo_config(path: str | Path, **overrides) -> MakegeoConfig:
               snow_processing=snow_processing,
               snow_data=(makegeo_path(_one(values,'SNOWDAT','SNOW.DAT'))
                          if snow_processing else None),
-              snow_start_date=(int(_number(_one(values,'IDATEBEG')))
+              snow_start_date=(parse_date(_one(values,'IDATEBEG'),
+                                          'MAKEGEO IDATEBEG')
                                if snow_processing else None),
-              snow_end_date=(int(_number(_one(values,'IDATEEND')))
+              snow_end_date=(parse_date(_one(values,'IDATEEND'),
+                                        'MAKEGEO IDATEEND')
                              if snow_processing else None),
               snow_properties=snow_properties,
               snow_age_parameters=snow_age_parameters,
@@ -571,16 +609,15 @@ def makegeo_config(path: str | Path, **overrides) -> MakegeoConfig:
 
 
 def _date(values,prefix):
-    fields=[int(_number(_one(values,prefix+suffix))) for suffix in ("YR","MO","DY","HR")]
-    seconds=int(_number(_one(values,prefix+"SEC","0")))
-    year,month,day,hour=fields
-    if not 0<=hour<=24:
-        raise ValueError(f'{prefix}HR must be between 0 and 24')
-    # READCF accepts hour 24 and advances the Gregorian date before doing
-    # its explicit-seconds normalization.  Construct midnight first so the
-    # Python parser has the same rollover semantics.
-    return (datetime(year,month,day)+timedelta(hours=hour,seconds=seconds)
-            ).strftime("%Y-%m-%d_%H:%M:%S")
+    fields=[_integer_number(_one(values,prefix+suffix),prefix+suffix)
+            for suffix in ("YR","MO","DY","HR")]
+    seconds=_integer_number(_one(values,prefix+"SEC","0"),prefix+"SEC")
+    try:
+        return parse_calendar(*fields,seconds)
+    except ValueError as error:
+        if 'invalid hour' in str(error):
+            raise ValueError(f'{prefix}HR must be between 0 and 24') from error
+        raise
 
 
 def _calmet_version(source: Path) -> str:
@@ -595,11 +632,15 @@ def _calmet_period(version: str, values: dict[str,list[str]]):
     if version in {'2.1','2.2'}:
         if _one(values,'ABTZ') is None:
             raise ValueError(f'CALMET {version} control requires explicit ABTZ')
-        timezone=''.join(str(_one(values,"ABTZ")).split()).upper()
-        match=re.fullmatch(r"UTC([+-])(\d{2})(\d{2})",timezone,re.I)
-        if not match: raise ValueError(f"unsupported CALMET timezone: {timezone!r}")
-        offset=int(match.group(2))+int(match.group(3))/60.
-        base_timezone=int(offset if match.group(1)=="-" else -offset)
+        try:
+            base_timezone,timezone=parse_timezone_label(
+                ''.join(str(_one(values,"ABTZ")).split()).upper())
+        except (TypeError,ValueError) as error:
+            if 'whole-hour' in str(error):
+                raise ValueError(
+                    'CALMET base_timezone only supports whole-hour ABTZ values') from error
+            raise ValueError(
+                f"unsupported CALMET timezone: {_one(values, 'ABTZ')!r}") from error
         return _date(values,"IB"),_date(values,"IE"),base_timezone,timezone
 
     # Before 2.1, IB* is the first hour-ending time, IRLG is the number of
@@ -608,21 +649,14 @@ def _calmet_period(version: str, values: dict[str,list[str]]):
     explicit=('IBSEC','IEYR','IEMO','IEDY','IEHR','IESEC')
     if any(name in values for name in explicit):
         raise ValueError('pre-2.1 CALMET controls cannot contain explicit beginning/ending times')
-    hour_ending=datetime(int(_number(_one(values,'IBYR'))),
-                         int(_number(_one(values,'IBMO'))),
-                         int(_number(_one(values,'IBDY'))))
-    hour=int(_number(_one(values,'IBHR')))
-    if not 0<=hour<=24: raise ValueError('IBHR must be between 0 and 24')
-    hour_ending+=timedelta(hours=hour)
-    length=int(_number(_one(values,'IRLG')))
+    hour_ending=_date(values,'IB')
+    length=_integer_number(_one(values,'IRLG'),'IRLG')
     if length<=0: raise ValueError('IRLG must be positive')
     begin=hour_ending-timedelta(hours=1)
     end=begin+timedelta(hours=length)
-    base_timezone=int(_number(_one(values,'IBTZ')))
-    sign='-' if base_timezone>=0 else '+'
-    timezone=f'UTC{sign}{abs(base_timezone):02d}00'
-    return (begin.strftime("%Y-%m-%d_%H:%M:%S"),
-            end.strftime("%Y-%m-%d_%H:%M:%S"),base_timezone,timezone)
+    base_timezone=_integer_number(_one(values,'IBTZ'),'IBTZ')
+    timezone=format_timezone_label(base_timezone)
+    return begin,end,base_timezone,timezone
 
 
 def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
@@ -738,9 +772,11 @@ def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
         cloud_output=int(legacy_cloud==1)
     output_format=int(_number(_one(values,"IFORMO","1")))
     write_coast_distance=_logical(_one(values,"LDBCST","F"))
-    prognostic_step_seconds=int(_number(_one(values,'ISTEPPGS','0')))
+    prognostic_step_seconds=_integer_number(
+        _one(values,'ISTEPPGS','0'),'ISTEPPGS')
     if prognostic_step_seconds==0:
-        prognostic_step_seconds=3600*int(_number(_one(values,'ISTEPPG','1')))
+        prognostic_step_seconds=3600*_integer_number(
+            _one(values,'ISTEPPG','1'),'ISTEPPG')
     data=dict(meteorology=(meteorology_files[0] if len(meteorology_files)==1 else meteorology_files),
               geophysical=calmet_path(_one(values,"GEODAT","GEO.DAT")),
               output=calmet_path(_one(values,"METDAT","CALMET.DAT")),
@@ -758,14 +794,15 @@ def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
                                         if write_coast_distance else None),
               listing_output=calmet_path(_one(values,"METLST","CALMET.LST")),
               print_fields=_logical(_one(values,'LPRINT','F')),
-              print_interval_hours=int(_number(_one(values,'IPRINF','1'))),
+              print_interval_hours=_integer_number(
+                  _one(values,'IPRINF','1'),'IPRINF'),
               print_uv_levels=print_uv_levels,
               print_w_levels=print_w_levels,
               print_temperature_levels=print_temperature_levels,
               print_surface_fields=print_surface_fields,
               micrometeorology_debug=_logical(_one(values,'LDB','F')),
-              debug_first_step=int(_number(_one(values,'NN1','1'))),
-              debug_last_step=int(_number(_one(values,'NN2','1'))),
+              debug_first_step=_integer_number(_one(values,'NN1','1'),'NN1'),
+              debug_last_step=_integer_number(_one(values,'NN2','1'),'NN2'),
               wind_debug_output=int(_number(_one(values,'IOUTD','0'))),
               wind_debug_levels=int(_number(_one(values,'NZPRN2','1'))),
               wind_debug_fields=wind_debug_fields,
@@ -775,7 +812,8 @@ def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
               slope_wind_debug_output=calmet_path(_one(values,'TSTSLP','TEST.SLP')),
               wind_print_output=calmet_path(_one(values,'TSTPRT','TEST.PRT')),
               test_mode=int(_number(_one(values,"ITEST","2"))),
-              timestep_seconds=int(_number(_one(values,"NSECDT","3600"))),
+              timestep_seconds=_integer_number(
+                  _one(values,"NSECDT","3600"),'NSECDT'),
               prognostic_timestep_seconds=prognostic_step_seconds,
               cloud_method=cloud_method,
               cloud_data=calmet_path(_one(values,"CLDDAT","CLOUD.DAT")),

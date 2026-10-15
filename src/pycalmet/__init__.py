@@ -7,6 +7,8 @@ mapping for an existing control or list file.
 """
 from __future__ import annotations
 
+from importlib import import_module
+
 # Load the public component modules before binding the package-level functions.
 # This keeps ``pycalmet.<stage>(...)`` callable after Python imports the
 # same-named component modules.
@@ -27,7 +29,6 @@ from .pipeline import run_pipeline
 from .readlst import readlst
 from .datums import DATUMS,DatumDefinition,datum_definition,datum_shift
 from .prog_data import ProgData,ProgRecord
-from . import legacy
 
 __all__ = [
     "calwrf", "terrel", "ctrproc", "ctgproc", "makegeo", "calmet",
@@ -39,4 +40,13 @@ __all__ = [
     "AuxiliaryData", "AuxiliaryHeader", "AuxiliaryCloudHour", "legacy",
 ]
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
+
+
+def __getattr__(name: str):
+    """Load the opt-in compatibility implementation only when requested."""
+    if name == "legacy":
+        module = import_module(".legacy", __name__)
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

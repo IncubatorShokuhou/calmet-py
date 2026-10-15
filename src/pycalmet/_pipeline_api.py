@@ -6,7 +6,7 @@ Regenerate this file with ``python tools/generate_pipeline_api.py``.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, TypeAlias
 
@@ -25,7 +25,7 @@ MakegeoSpec: TypeAlias = MakegeoConfig | StageSpec
 CalmetSpec: TypeAlias = CalmetConfig | StageSpec
 
 _STAGE_PARAMETERS = {
-    'calwrf': ('wrf_files', 'start', 'end', 'output', 'create_surface', 'compression', 'i_range', 'j_range', 'k_range', 'legacy_output', 'surface_output', 'title', 'listing_output', 'legacy_file_rain_reset'),
+    'calwrf': ('wrf_files', 'start', 'end', 'output', 'create_surface', 'compression', 'i_range', 'j_range', 'k_range', 'legacy_output', 'surface_output', 'title', 'listing_output'),
     'terrel': ('srtm_dir', 'output', 'datum', 'sampling', 'terrain_files', 'terrain_sources', 'void_fill', 'cell_radius_km', 'model', 'processing_method', 'receptor_input', 'receptor_output', 'receptor_columns', 'interpolate_receptors', 'receptor_radius_km', 'previous_save', 'save_output', 'coastline_file', 'gshhs_file', 'coastline_source_datum', 'coastline_wdbii_datum', 'noise_replacement', 'noise_minimum_m', 'missing_replacement', 'default_elevation_m', 'plot_output', 'raw_echo_output', 'qa_hit_threshold_percent', 'grid', 'nx', 'ny', 'dx_km', 'dy_km', 'projection', 'lat0', 'lon0', 'lat1', 'lat2', 'x_origin_km', 'y_origin_km', 'false_easting_km', 'false_northing_km', 'utm_zone', 'hemisphere', 'grid_type', 'ring_distances_km', 'ray_angles_deg', 'polar_processing', 'ttm_scale'),
     'ctgproc': ('landuse_files', 'output', 'category_map', 'input_type', 'mesh_density', 'input_datum', 'output_format', 'coastline_file', 'gshhs_file', 'coastline_source_datum', 'coastline_wdbii_datum', 'coastline_swap', 'fill_empty_ocean', 'ocean_category', 'previous_landuse', 'final_output', 'landuse_sources', 'snow_processing', 'qa_cell_output', 'qa_hit_threshold_percent', 'qa_output_directory', 'grid', 'nx', 'ny', 'dx_km', 'dy_km', 'projection', 'lat0', 'lon0', 'lat1', 'lat2', 'x_origin_km', 'y_origin_km', 'false_easting_km', 'false_northing_km', 'utm_zone', 'hemisphere', 'datum', 'grid_type', 'ring_distances_km', 'ray_angles_deg', 'polar_processing', 'ttm_scale'),
     'makegeo': ('terrain', 'landuse', 'output', 'water_threshold', 'missing_category', 'minimum_coverage', 'secondary_landuse', 'use_terrain', 'input_properties', 'water_categories', 'output_categories', 'output_water_min', 'output_water_max', 'category_splits', 'qa_cell', 'snow_processing', 'snow_data', 'snow_start_date', 'snow_end_date', 'snow_properties', 'snow_age_parameters', 'snow_roughness_method', 'snow_height_scale_m', 'snow_albedo_method', 'snow_depth_minimum_m', 'landuse_plot_output', 'terrain_plot_output', 'color_map_output', 'image_mode', 'title', 'grid', 'nx', 'ny', 'dx_km', 'dy_km', 'projection', 'lat0', 'lon0', 'lat1', 'lat2', 'x_origin_km', 'y_origin_km', 'false_easting_km', 'false_northing_km', 'utm_zone', 'hemisphere', 'datum', 'grid_type', 'ring_distances_km', 'ray_angles_deg', 'polar_processing', 'ttm_scale'),
@@ -51,8 +51,8 @@ def run_pipeline(
     calmet: CalmetSpec | None = None,
     output: str | Path | None = None,
     calwrf_wrf_files: Sequence[str | Path] | None = None,
-    calwrf_start: str | int | datetime | None = None,
-    calwrf_end: str | int | datetime | None = None,
+    calwrf_start: datetime | str | None = None,
+    calwrf_end: datetime | str | None = None,
     calwrf_output: str | Path | None = None,
     calwrf_create_surface: bool = True,
     calwrf_compression: int = 1,
@@ -63,7 +63,6 @@ def run_pipeline(
     calwrf_surface_output: str | Path | None = None,
     calwrf_title: str = 'Create 3D.DAT file for WRF output',
     calwrf_listing_output: str | Path | None = None,
-    calwrf_legacy_file_rain_reset: bool = False,
     terrel_srtm_dir: str | Path | None = None,
     terrel_output: str | Path | None = None,
     terrel_datum: str = 'WGS-84',
@@ -173,8 +172,8 @@ def run_pipeline(
     makegeo_qa_cell: tuple[int, int] | None = None,
     makegeo_snow_processing: bool = False,
     makegeo_snow_data: str | Path | None = None,
-    makegeo_snow_start_date: int | None = None,
-    makegeo_snow_end_date: int | None = None,
+    makegeo_snow_start_date: date | datetime | str | None = None,
+    makegeo_snow_end_date: date | datetime | str | None = None,
     makegeo_snow_properties: dict[int, tuple[float, float, float, float, float, float, int]] | None = None,
     makegeo_snow_age_parameters: dict[int, tuple[int, float]] | None = None,
     makegeo_snow_roughness_method: int = 1,
@@ -211,8 +210,8 @@ def run_pipeline(
     calmet_meteorology: str | Path | Sequence[str | Path] | None = None,
     calmet_geophysical: str | Path | None = None,
     calmet_output: str | Path | None = None,
-    calmet_start: str | datetime | None = None,
-    calmet_end: str | datetime | None = None,
+    calmet_start: datetime | str | None = None,
+    calmet_end: datetime | str | None = None,
     calmet_noobs: int = 0,
     calmet_run_type: int = 1,
     calmet_save_output: bool = True,

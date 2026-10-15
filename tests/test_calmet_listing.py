@@ -59,8 +59,8 @@ def test_no_upper_prepdi_debug_reproduces_domain_and_station_winds():
     assert 'SEA2        2       -2.50      4.75' in text
     assert 'upper air data not yet defined' in text
     step.debug_domain_temperature=None
-    with pytest.raises(ValueError,match='TINF undefined'):
-        format_no_upper_prepdi_debug(step,datetime(2018,3,18,1))
+    text=format_no_upper_prepdi_debug(step,datetime(2018,3,18,1))
+    assert 'TINF) = N/A (not available)' in text
 
 
 def test_upper_air_input_debug_reproduces_raw_and_layer_profiles():
@@ -93,6 +93,10 @@ def test_full_prepdi_debug_reproduces_domain_and_upper_station_fields():
     assert 'Upper air station: UP01' in text
     assert '          1       3.00    -2.00' in text
     assert 'Multiply all values' not in text
+    step.debug_domain_temperature=None
+    text=format_full_prepdi_debug(step,datetime(2018,3,18,1),
+                                  np.array([[-.0065]]))
+    assert 'TINF) = N/A (not available)' in text
 
 
 def test_line_printer_validates_shape_and_digits():

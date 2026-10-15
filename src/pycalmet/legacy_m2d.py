@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -15,7 +16,7 @@ class M2DHeader:
     ny: int
     nz: int
     nhours: int
-    start: int
+    start: datetime
     variables: tuple[str,...]
     source_nx: int = 0
     source_ny: int = 0
@@ -24,12 +25,41 @@ class M2DHeader:
     j_start: int = 1
     k_start: int = 1
 
+    @property
+    def wire_start(self) -> str:
+        """Ten-column timestamp stored in the formatted M2D header."""
+        return self.start.strftime('%Y%m%d%H')
+
 
 @dataclass(frozen=True,slots=True)
 class M2DRecord:
-    date: int
+    timestamp: datetime
     name: str
     values: np.ndarray
+
+    @property
+    def date(self) -> datetime:
+        """Compatibility name for the structured record timestamp."""
+        return self.timestamp
+
+    @property
+    def wire_date(self) -> str:
+        """Ten-column timestamp stored in the formatted variable record."""
+        return self.timestamp.strftime('%Y%m%d%H')
+
+
+def _timestamp(field: bytes,description: str) -> datetime:
+    """Decode one exact-width ``YYYYMMDDHH`` field at the file boundary."""
+    try:
+        text=field.decode('ascii')
+    except UnicodeDecodeError as error:
+        raise ValueError(f'invalid M2D {description} timestamp') from error
+    if len(text)!=10 or not text.isdecimal():
+        raise ValueError(f'invalid M2D {description} timestamp {text!r}')
+    try:
+        return datetime.strptime(text,'%Y%m%d%H')
+    except ValueError as error:
+        raise ValueError(f'invalid M2D {description} timestamp {text!r}') from error
 
 
 class M2DReader:
@@ -49,10 +79,14 @@ class M2DReader:
         stream.readline()
         grid=stream.readline().split(); source_nx,source_ny,source_nz=map(int,grid[8:11])
         stream.readline()
-        period=[int(value) for value in stream.readline().split()]
+        period=stream.readline().split()
         if len(period)<5:
             stream.close(); raise ValueError('M2D period record is incomplete')
-        start,nhours,nx,ny,nz=period[:5]
+        try:
+            start=_timestamp(period[0],'header')
+            nhours,nx,ny,nz=map(int,period[1:5])
+        except ValueError:
+            stream.close(); raise
         bounds=stream.readline().split()
         if len(bounds)<6:
             stream.close(); raise ValueError('M2D extraction-bounds record is incomplete')
@@ -69,7 +103,8 @@ class M2DReader:
                 for _ in range(nhours*variable_count):
                     line=stream.readline()
                     if not line: raise EOFError('M2D ended before a variable record')
-                    date=int(line[:10]); name=line[12:20].decode('ascii').strip()
+                    timestamp=_timestamp(line[:10],'variable-record')
+                    name=line[12:20].decode('ascii').strip()
                     rows=[]
                     for _row in range(ny):
                         values=[]
@@ -81,7 +116,7 @@ class M2DReader:
                                           if data[index:index+10].strip())
                         if len(values)!=nx: raise ValueError('M2D row contains extra values')
                         rows.append(values)
-                    yield M2DRecord(date,name,np.asarray(rows[::-1],dtype=np.float32))
+                    yield M2DRecord(timestamp,name,np.asarray(rows[::-1],dtype=np.float32))
             finally:
                 stream.close()
         return header,generate()

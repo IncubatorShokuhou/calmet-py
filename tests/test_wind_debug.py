@@ -77,6 +77,26 @@ def test_wind_print_writer_writes_divergence(tmp_path):
     assert text.count('DIVERGENCE AT LEVEL')==1
 
 
+def test_wind_print_writer_writes_final_speed_and_direction(tmp_path,monkeypatch):
+    u=np.array([[[0.,0.,1.,-1.]],[[3.,4.,5.,6.]]],dtype=np.float32)
+    v=np.array([[[0.,-1.,0.,0.]],[[4.,3.,12.,8.]]],dtype=np.float32)
+    wind=SimpleNamespace(u=u,v=v,w=np.zeros((3,1,4),dtype=np.float32))
+    hour=SimpleNamespace(timestamp=datetime(2018,3,18),wind=wind)
+    printed=[]
+    monkeypatch.setattr('pycalmet.wind_debug.format_wind_number_map',
+                        lambda values: printed.append(np.asarray(values).copy()) or '<map>\n')
+    path=tmp_path/'TEST.PRT'
+    with WindPrintWriter(path,(0,0,0,1,0,0,0,0,0),levels=1) as writer:
+        writer.append(hour)
+
+    text=path.read_text(encoding='ascii')
+    assert 'FINAL WIND SPEED AND DIRECTION AT TIME' in text
+    assert text.count('WIND SPEED (M/S) AT LEVEL')==1
+    assert text.count('WIND DIRECTION (DEGREES) AT LEVEL')==1
+    np.testing.assert_allclose(printed[0],[[0.,1.,1.,1.]])
+    np.testing.assert_allclose(printed[1],[[0.,360.,270.,90.]])
+
+
 def test_wind_print_writer_writes_initial_adjusted_and_smoothed_fields(tmp_path):
     u=np.ones((1,1,1),dtype=np.float32)
     v=u*2; w=np.zeros((2,1,1),dtype=np.float32)

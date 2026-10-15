@@ -6,12 +6,17 @@ from pathlib import Path
 import struct
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 from .config import GridConfig
 from .legacy_io import FortranSequentialReader
-from .datetime_utils import parse_ordinal_code
+from .datetime_utils import (format_timezone_label,parse_calendar,
+                             parse_ordinal_code,parse_timezone_label)
 from .projections import (grid_convergence,grid_crs,transform_grid,
                           unproject_geographic)
+
+
+MODEL_DTYPE=np.float32
 
 
 def _coded_time(code: int, seconds: int) -> datetime:
@@ -33,9 +38,16 @@ def _field(payload: bytes, size: int, *, mtver=1, integer=False):
     return label,begin_code,begin_seconds,end_code,end_seconds,values
 
 
-def _legacy_timezone(hours_west: int) -> str:
-    sign='-' if hours_west>=0 else '+'
-    return f'UTC{sign}{abs(hours_west):02d}00'
+def _run_control_time(year,month,day,hour,seconds=0):
+    try: return parse_calendar(year,month,day,hour,seconds)
+    except ValueError as error:
+        raise ValueError('invalid CALMET.DAT run-control timestamp') from error
+
+
+def _run_control_timezone(value):
+    try: return parse_timezone_label(value)[1]
+    except (TypeError,ValueError) as error:
+        raise ValueError('invalid CALMET.DAT run-control timezone') from error
 
 
 def _covering_record(records,when,label):
@@ -80,18 +92,19 @@ class InitialGuessCalmetData:
                     raise ValueError(f'invalid CALMET.DAT {self.version} run-control record')
                 if mtver:
                     first=struct.unpack_from('<10i',control,0)
-                    self.start=datetime(*first[:4])+timedelta(seconds=first[4])
-                    self.end=datetime(*first[5:9])+timedelta(seconds=first[9])
-                    self.timezone=control[40:48].decode('ascii').strip()
+                    self.start=_run_control_time(*first[:5])
+                    self.end=_run_control_time(*first[5:])
+                    self.timezone=_run_control_timezone(
+                        control[40:48].decode('ascii').strip())
                     hours,self.run_type,nx,ny,nz=struct.unpack_from('<5i',control,48)
                     dx_m,x_origin_m,y_origin_m=struct.unpack_from('<3f',control,68)
                     station_offset=80; projection_offset=116; false_offset=144
                 else:
                     year,month,day,hour,hours_west,hours,self.run_type,nx,ny,nz=struct.unpack_from('<10i',control,0)
                     # Pre-2.1 headers store the first hour-ending time.
-                    self.start=datetime(year,month,day,hour)-timedelta(hours=1)
+                    self.start=_run_control_time(year,month,day,hour)-timedelta(hours=1)
                     self.end=self.start+timedelta(hours=hours)
-                    self.timezone=_legacy_timezone(hours_west)
+                    self.timezone=format_timezone_label(hours_west)
                     dx_m,x_origin_m,y_origin_m=struct.unpack_from('<3f',control,40)
                     station_offset=52; projection_offset=88; false_offset=116
                 (self.iwfcod,self.surface_station_count,self.upper_station_count,
@@ -113,9 +126,9 @@ class InitialGuessCalmetData:
                 self.version=control[:8].decode('ascii').strip()
                 level=control[8:16].decode('ascii').strip()
                 year,month,day,hour,hours_west,hours,self.run_type,nx,ny,nz=struct.unpack_from('<10i',control,16)
-                self.start=datetime(year,month,day,hour)-timedelta(hours=1)
+                self.start=_run_control_time(year,month,day,hour)-timedelta(hours=1)
                 self.end=self.start+timedelta(hours=hours)
-                self.timezone=_legacy_timezone(hours_west)
+                self.timezone=format_timezone_label(hours_west)
                 dx_m,x_origin_m,y_origin_m=struct.unpack_from('<3f',control,56)
                 utm_zone=struct.unpack_from('<i',control,68)[0]
                 (self.iwfcod,self.surface_station_count,self.upper_station_count,
@@ -205,8 +218,9 @@ class InitialGuessCalmetData:
                 try: level=int(label[5:])-1
                 except ValueError as error: raise ValueError(f'invalid CALMET wind label {label!r}') from error
                 if not 0<=level<nz: raise ValueError(f'CALMET wind level is out of range: {label!r}')
-                item=partial.setdefault((begin,end),[np.full((nz,ny,nx),np.nan),
-                                                      np.full((nz,ny,nx),np.nan)])
+                item=partial.setdefault((begin,end),[
+                    np.full((nz,ny,nx),np.nan,dtype=MODEL_DTYPE),
+                    np.full((nz,ny,nx),np.nan,dtype=MODEL_DTYPE)])
                 component=0 if label.startswith('U-') else 1
                 if np.isfinite(item[component][level]).any():
                     raise ValueError(f'duplicate CALMET wind record {label} at {end}')
@@ -244,7 +258,8 @@ class InitialGuessCalmetData:
 
     @property
     def z_centers_m(self):
-        return .5*(self.z_faces_m[:-1]+self.z_faces_m[1:])
+        return np.asarray(.5*(self.z_faces_m[:-1]+self.z_faces_m[1:]),
+                          dtype=MODEL_DTYPE)
 
     def at_end(self,when):
         try: return self.records[when]
@@ -295,7 +310,8 @@ class InitialGuessCalmetSeries:
 
     @property
     def z_centers_m(self):
-        return .5*(self.z_faces_m[:-1]+self.z_faces_m[1:])
+        return np.asarray(.5*(self.z_faces_m[:-1]+self.z_faces_m[1:]),
+                          dtype=MODEL_DTYPE)
 
     def at_end(self,when):
         try: return self.records[when]
@@ -312,91 +328,77 @@ class InitialGuessCalmetSeries:
 
 
 def _r2interpi_four(source_points,target_points,values,*,block_size=32768):
-    """Vectorized target blocks with R2INTERPI's ordered floating-point sums."""
+    """Interpolate from the four nearest cells with inverse-square weights."""
     source=np.asarray(source_points,dtype=np.float64)
     targets=np.asarray(target_points,dtype=np.float64)
-    fields=np.asarray(values,dtype=np.float64)
+    fields=np.asarray(values,dtype=MODEL_DTYPE)
     if source.ndim!=2 or source.shape[1]!=2 or targets.ndim!=2 or targets.shape[1]!=2:
         raise ValueError('R2INTERPI coordinates must be (point,2) arrays')
     if fields.ndim!=2 or fields.shape[1]!=source.shape[0]:
         raise ValueError('R2INTERPI values must be (field,source point)')
     if source.shape[0]<4: raise ValueError('R2INTERPI requires at least four source cells')
-    output=np.empty((fields.shape[0],targets.shape[0]),dtype=np.float64)
+    output=np.empty((fields.shape[0],targets.shape[0]),dtype=MODEL_DTYPE)
+    tree=cKDTree(source)
     for start in range(0,targets.shape[0],block_size):
         stop=min(start+block_size,targets.shape[0])
-        delta=np.asarray(source[None,:,:]-targets[start:stop,None,:],dtype=np.float64)
-        squared=np.asarray(delta[:,:,0]*delta[:,:,0]+delta[:,:,1]*delta[:,:,1],
-                           dtype=np.float64)
-        distance=np.asarray(np.sqrt(squared),dtype=np.float64)
-        nearest=np.argsort(distance,axis=1,kind='stable')[:,:4]
-        numerator=np.zeros((stop-start,fields.shape[0]),dtype=np.float64)
-        denominator=np.zeros(stop-start,dtype=np.float64)
-        for rank in range(4):
-            index=nearest[:,rank]
-            chosen=np.take_along_axis(squared,index[:,None],axis=1)[:,0]
-            chosen=np.maximum(chosen,np.float64(.001))
-            inverse=np.asarray(np.float64(1.)/chosen,dtype=np.float64)
-            numerator=np.asarray(
-                numerator+fields[:,index].T*inverse[:,None],dtype=np.float64)
-            denominator=np.asarray(denominator+inverse,dtype=np.float64)
-        output[:,start:stop]=np.asarray(numerator/denominator[:,None],
-                                        dtype=np.float64).T
+        distances,nearest=tree.query(targets[start:stop],k=4)
+        inverse=1./np.maximum(distances**2,.001)
+        selected=fields[:,np.asarray(nearest,dtype=np.intp)]
+        numerator=np.sum(selected*inverse[None,:,:],axis=-1,dtype=np.float64)
+        denominator=np.sum(inverse,axis=-1,dtype=np.float64)
+        output[:,start:stop]=np.asarray(
+            numerator/denominator[None,:],dtype=MODEL_DTYPE)
     return output
 
 
 def _rdcalmet_vertical(values,source_centers_m,target_centers_m,roughness_m):
     """RDCALMET vertical persistence/interpolation in default floating-point."""
-    field=np.asarray(values,dtype=np.float64)
-    source=np.asarray(source_centers_m,dtype=np.float64)
-    target=np.asarray(target_centers_m,dtype=np.float64)
-    roughness=np.asarray(roughness_m,dtype=np.float64)
+    field=np.asarray(values,dtype=MODEL_DTYPE)
+    source=np.asarray(source_centers_m,dtype=MODEL_DTYPE)
+    target=np.asarray(target_centers_m,dtype=MODEL_DTYPE)
+    roughness=np.asarray(roughness_m,dtype=MODEL_DTYPE)
     if field.ndim!=3 or field.shape[0]!=source.size:
         raise ValueError('RDCALMET values must be (source level,y,x)')
     if roughness.shape!=field.shape[1:]:
         raise ValueError('RDCALMET roughness must match the horizontal grid')
-    if target.ndim!=1 or np.any(target<=np.float64(0.)):
+    if target.ndim!=1 or np.any(target<=MODEL_DTYPE(0.)):
         raise ValueError('IGFMET target layer centers must be a positive vector')
-    if source.ndim!=1 or np.any(np.diff(source)<=np.float64(0.)):
+    if source.ndim!=1 or np.any(np.diff(source)<=MODEL_DTYPE(0.)):
         raise ValueError('IGFMET source levels are not increasing')
-    if np.any(roughness<=np.float64(0.)) or np.any(roughness==source[0]):
+    if np.any(roughness<=MODEL_DTYPE(0.)) or np.any(roughness==source[0]):
         raise ValueError('IGFMET roughness is invalid for logarithmic extrapolation')
-    result=np.empty((target.size,*field.shape[1:]),dtype=np.float64)
+    result=np.empty((target.size,*field.shape[1:]),dtype=MODEL_DTYPE)
     below=target<source[0]
     if np.any(below):
-        log_z0=np.asarray(np.log(roughness),dtype=np.float64)
-        log_source=np.float64(np.log(source[0]))
+        log_z0=np.log(roughness)
+        log_source=np.log(source[0])
         for index in np.flatnonzero(below):
-            log_target=np.float64(np.log(target[index]))
-            ratio=np.asarray((log_target-log_z0)/(log_source-log_z0),dtype=np.float64)
-            result[index]=np.asarray(ratio*field[0],dtype=np.float64)
+            log_target=np.log(target[index])
+            ratio=(log_target-log_z0)/(log_source-log_z0)
+            result[index]=ratio*field[0]
     above=target>=source[-1]
     result[above]=field[-1]
     middle=~(below|above)
     for index in np.flatnonzero(middle):
         upper=int(np.searchsorted(source,target[index],side='right'))
         lower=upper-1
-        ratio=np.float64((target[index]-source[lower])/
-                         (source[upper]-source[lower]))
-        result[index]=np.asarray(
-            field[lower]+(field[upper]-field[lower])*ratio,dtype=np.float64)
+        ratio=(target[index]-source[lower])/(source[upper]-source[lower])
+        result[index]=field[lower]+(field[upper]-field[lower])*ratio
     return result
 
 
 def _rdcalmet_rotate(u,v,direction_adjustment_degrees):
-    """Apply RDCALMET's floating-point speed/direction wind rotation."""
+    """Rotate winds by a direction adjustment in degrees."""
     east,north,adjustment=np.broadcast_arrays(
-        np.asarray(u,dtype=np.float64),np.asarray(v,dtype=np.float64),
-        np.asarray(direction_adjustment_degrees,dtype=np.float64))
-    speed=np.sqrt(np.asarray(east*east+north*north,dtype=np.float64))
-    active=speed>np.float64(1.e-9)
-    direction=np.asarray(
-        np.float64(270.)-np.float64(57.295778)*np.arctan2(north,east),
-        dtype=np.float64)
-    direction=np.asarray(np.fmod(direction,np.float64(360.))+adjustment,
-                         dtype=np.float64)
-    radians=np.asarray(np.float64(.0174533)*direction,dtype=np.float64)
-    rotated_u=np.where(active,-speed*np.sin(radians),east).astype(np.float64)
-    rotated_v=np.where(active,-speed*np.cos(radians),north).astype(np.float64)
+        np.asarray(u,dtype=MODEL_DTYPE),np.asarray(v,dtype=MODEL_DTYPE),
+        np.asarray(direction_adjustment_degrees,dtype=MODEL_DTYPE))
+    speed=np.hypot(east,north)
+    active=speed>1.e-9
+    direction=np.mod(
+        270.-np.rad2deg(np.arctan2(north,east))+adjustment,360.)
+    radians=np.deg2rad(direction)
+    rotated_u=np.where(active,-speed*np.sin(radians),east).astype(MODEL_DTYPE)
+    rotated_v=np.where(active,-speed*np.cos(radians),north).astype(MODEL_DTYPE)
     return rotated_u,rotated_v
 
 
@@ -435,8 +437,8 @@ def interpolate_initial_guess(data, when: datetime,
     else:
         rotated_u=source_u; rotated_v=source_v
 
-    source_levels=np.asarray(data.z_centers_m,dtype=np.float64)
-    target_levels=np.asarray(target_centers_m,dtype=np.float64)
+    source_levels=np.asarray(data.z_centers_m,dtype=MODEL_DTYPE)
+    target_levels=np.asarray(target_centers_m,dtype=MODEL_DTYPE)
     vertical_u=_rdcalmet_vertical(rotated_u,source_levels,target_levels,
                                   data.roughness_m)
     vertical_v=_rdcalmet_vertical(rotated_v,source_levels,target_levels,

@@ -12,33 +12,36 @@ from pycalmet.igf_data import (_r2interpi_four,_rdcalmet_rotate,_rdcalmet_vertic
 from pycalmet.legacy_io import FortranSequentialWriter,fixed_string
 
 
-def _write_igf(path,*,surface_station=False,complete=False,misordered=False):
+def _write_igf(path,*,surface_station=False,complete=False,misordered=False,
+               start=None,base_timezone='UTC-0000'):
     grid=GridConfig(2,2,2.,2.,projection='LCC',lat0=30.,lon0=-120.,
                     lat1=30.,lat2=60.,x_origin_km=10.,y_origin_km=20.)
     geo={'roughness_length':np.array([[.1,.2],[.3,.4]]),
          'dominant_landuse':np.array([[20,55],[30,40]],dtype=np.int32),
          'terrain_height':np.array([[100.,200.],[300.,400.]]),
          'leaf_area_index':np.array([[1.,2.],[3.,4.]])}
-    start=datetime(2018,1,1)
+    start=datetime(2018,1,1) if start is None else start
+    end=start+timedelta(hours=1)
     writer=LegacyCalmetWriter(path,grid,[0.,20.,60.],geo,start,
-        datetime(2018,1,1,1),run_type=(1 if complete else 0),timestep_seconds=3600,
+        end,run_type=(1 if complete else 0),timestep_seconds=3600,
+        base_timezone=base_timezone,
         include_w_temperature=complete,
         surface_coordinates_km=([(10.5,20.5)] if surface_station else ()),
         nearest_surface_station=(np.ones((2,2),dtype=np.int32)
                                  if surface_station else None))
-    writer._field_record('U-LEV  1',[[1.,2.],[3.,4.]],start,start)
-    writer._field_record('V-LEV  1',[[5.,6.],[7.,8.]],start,start)
-    if complete: writer._field_record('WFACE  1',np.zeros((2,2)),start,start)
-    writer._field_record('U-LEV  2',[[9.,10.],[11.,12.]],start,start)
-    writer._field_record('V-LEV  2',[[13.,14.],[15.,16.]],start,start)
+    writer._field_record('U-LEV  1',[[1.,2.],[3.,4.]],start,end)
+    writer._field_record('V-LEV  1',[[5.,6.],[7.,8.]],start,end)
+    if complete: writer._field_record('WFACE  1',np.zeros((2,2)),start,end)
+    writer._field_record('U-LEV  2',[[9.,10.],[11.,12.]],start,end)
+    writer._field_record('V-LEV  2',[[13.,14.],[15.,16.]],start,end)
     if complete:
-        writer._field_record('WFACE  2',np.zeros((2,2)),start,start)
-        writer._field_record('T-LEV  1',np.full((2,2),290.),start,start)
-        writer._field_record('T-LEV  2',np.full((2,2),288.),start,start)
+        writer._field_record('WFACE  2',np.zeros((2,2)),start,end)
+        writer._field_record('T-LEV  1',np.full((2,2),290.),start,end)
+        writer._field_record('T-LEV  2',np.full((2,2),288.),start,end)
         labels=['IPGT','USTAR','ZI','EL','WSTAR','RMM','TEMPK','RHO','QSW','IRH','IPCODE']
         if misordered: labels[-2:]=reversed(labels[-2:])
         for label in labels:
-            writer._field_record(label,np.ones((2,2)),start,start,
+            writer._field_record(label,np.ones((2,2)),start,end,
                                  integer=label in {'IPGT','IRH','IPCODE'})
     writer.close()
     return start
@@ -120,6 +123,21 @@ def _write_pre_projection_igf(path):
         _old_body(writer)
 
 
+def _patch_fortran_record_int(path,payload_size,byte_offset,value):
+    content=bytearray(path.read_bytes())
+    position=0
+    while position<len(content):
+        size=struct.unpack_from('<i',content,position)[0]
+        payload=position+4
+        if size==payload_size:
+            assert struct.unpack_from('<i',content,payload+size)[0]==size
+            struct.pack_into('<i',content,payload+byte_offset,value)
+            path.write_bytes(content)
+            return
+        position=payload+size+4
+    raise AssertionError(f'no {payload_size}-byte Fortran record found')
+
+
 def test_initial_guess_reader_loads_modern_header_static_and_winds(tmp_path):
     path=tmp_path/'calmet.dat'; start=_write_igf(path)
     data=InitialGuessCalmetData(path)
@@ -134,6 +152,33 @@ def test_initial_guess_reader_loads_modern_header_static_and_winds(tmp_path):
     np.testing.assert_allclose(v,[[[5.,6.],[7.,8.]],[[13.,14.],[15.,16.]]])
     with pytest.raises(ValueError,match='no field record'):
         data.fields_at_end(start.replace(hour=1))
+
+
+def test_initial_guess_series_normalizes_equivalent_zero_timezone_labels(tmp_path):
+    start=datetime(2018,1,1)
+    first=tmp_path/'first.dat'; second=tmp_path/'second.dat'
+    _write_igf(first,start=start,base_timezone='UTC+0000')
+    _write_igf(second,start=start+timedelta(hours=1),
+               base_timezone='UTC-0000')
+
+    series=InitialGuessCalmetSeries((first,second))
+
+    assert series.timezone=='UTC+0000'
+    assert sorted(series.records)==[
+        start+timedelta(hours=1),start+timedelta(hours=2)]
+
+
+@pytest.mark.parametrize(('field_index','value'),[
+    (3,-1),(3,25),(4,-1),(4,3601),
+])
+def test_initial_guess_modern_run_control_rejects_invalid_clock_fields(
+        tmp_path,field_index,value):
+    path=tmp_path/'invalid-modern-time.dat'
+    _write_igf(path)
+    _patch_fortran_record_int(path,176,4*field_index,value)
+
+    with pytest.raises(ValueError,match='run-control timestamp'):
+        InitialGuessCalmetData(path)
 
 
 def test_initial_guess_hour_covers_subhourly_calmet_steps(tmp_path):
@@ -202,6 +247,32 @@ def test_initial_guess_reader_loads_pre_21_hour_ending_format(tmp_path):
     np.testing.assert_allclose(v,[[[5.,6.],[7.,8.]],[[13.,14.],[15.,16.]]])
 
 
+def test_initial_guess_pre_21_run_control_normalizes_hour_24_before_hour_ending(tmp_path):
+    path=tmp_path/'old-hour-24.dat'
+    _write_old_igf(path)
+    _patch_fortran_record_int(path,148,3*4,24)
+
+    data=InitialGuessCalmetData(path)
+
+    assert data.start==datetime(2018,1,1,23)
+    assert data.end==datetime(2018,1,2)
+
+
+@pytest.mark.parametrize(('writer','payload_size','hour_offset'),[
+    (_write_old_igf,148,3*4),
+    (_write_ancient_igf,108,16+3*4),
+])
+@pytest.mark.parametrize('hour',[-1,25])
+def test_initial_guess_pre_21_run_control_rejects_invalid_hour(
+        tmp_path,writer,payload_size,hour_offset,hour):
+    path=tmp_path/f'invalid-{writer.__name__}.dat'
+    writer(path)
+    _patch_fortran_record_int(path,payload_size,hour_offset,hour)
+
+    with pytest.raises(ValueError,match='run-control timestamp'):
+        InitialGuessCalmetData(path)
+
+
 def test_initial_guess_reader_loads_three_title_legacy_format(tmp_path):
     path=tmp_path/'ancient-calmet.dat'; _write_ancient_igf(path)
     data=InitialGuessCalmetData(path)
@@ -236,6 +307,7 @@ def test_initial_guess_interpolation_matches_vertical_and_four_point_rules(tmp_p
         raise AssertionError('identical IGFMET projections must bypass GLOBE remapping')
     monkeypatch.setattr('pycalmet.igf_data.transform_grid',unexpected_remap)
     u,v=interpolate_initial_guess(data,start.replace(hour=1),target,[5.,25.,80.])
+    assert u.dtype==v.dtype==np.float32
     # The target is at the four-source-cell centroid, so horizontal weights
     # are equal. Layer 5 m uses the per-cell logarithmic roughness profile,
     # layer 25 m is halfway between 10 and 40 m, and 80 m persists the top.
@@ -248,6 +320,35 @@ def test_initial_guess_interpolation_matches_vertical_and_four_point_rules(tmp_p
     assert v[1,0,0]==pytest.approx(np.mean((first_v+np.array([13.,15.,14.,16.]))/2.))
     assert u[2,0,0]==pytest.approx(10.5)
     assert v[2,0,0]==pytest.approx(14.5)
+
+
+def test_four_point_interpolation_uses_nearest_inverse_square_weights():
+    source=np.array([[0.,0.],[2.,0.],[0.,2.],[2.,2.],[10.,10.]])
+    target=np.array([[.5,.75]])
+    values=np.array([[1.,4.,9.,16.,100.],[2.,8.,18.,32.,200.]])
+    squared=np.sum((source[:4]-target[0])**2,axis=1)
+    weights=1./squared
+    expected=np.sum(values[:,:4]*weights,axis=1)/np.sum(weights)
+
+    result=_r2interpi_four(source,target,values)
+
+    assert result.dtype==np.float32
+    np.testing.assert_allclose(result[:,0],expected,rtol=2.e-7)
+
+
+def test_initial_guess_rotation_uses_standard_degree_conversion():
+    u=np.array([1.,0.,3.,0.])
+    v=np.array([0.,2.,4.,0.])
+    adjustment=np.array([90.,-90.,30.,45.])
+    radians=np.deg2rad(adjustment)
+    expected_u=u*np.cos(radians)+v*np.sin(radians)
+    expected_v=v*np.cos(radians)-u*np.sin(radians)
+
+    result_u,result_v=_rdcalmet_rotate(u,v,adjustment)
+
+    assert result_u.dtype==result_v.dtype==np.float32
+    np.testing.assert_allclose(result_u,expected_u,rtol=2.e-7,atol=2.e-7)
+    np.testing.assert_allclose(result_v,expected_v,rtol=2.e-7,atol=2.e-7)
 
 
 def test_initial_guess_reader_rejects_missing_wind_level(tmp_path):

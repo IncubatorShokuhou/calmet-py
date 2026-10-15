@@ -47,6 +47,16 @@ def test_sea_rejects_gaps_and_subhourly_versions(tmp_path):
     with pytest.raises(ValueError,match='earlier than 2.2'): SeaData(path)
 
 
+def test_sea_rejects_fractional_calendar_fields_in_numeric_records(tmp_path):
+    path=tmp_path/'sea.dat'
+    text=_sea_text().replace(
+        '100 200 10 4 0.6 2018 77 0 2018 77 1',
+        '100 200 10 4 0.6 2018 77.5 0 2018 77 1')
+    path.write_text(text,encoding='ascii')
+    with pytest.raises(ValueError,match='ordinal day'):
+        SeaData(path)
+
+
 def test_sea_21_uses_legacy_record_without_sensor_heights(tmp_path):
     text=_sea_text().replace('2.11','2.10').replace(
         'UTC-0000\n2018 77 0 2018 77 2\n','').replace(

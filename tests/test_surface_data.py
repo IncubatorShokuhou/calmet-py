@@ -11,6 +11,9 @@ import struct
 from types import SimpleNamespace
 from pyproj import Transformer
 from pycalmet._calmet import _noobs_step_transform,_surface_step_transform
+from pycalmet.legacy._compat._calmet import (
+    _surface_step_transform as _legacy_surface_step_transform,
+)
 from pycalmet.calmet_solver import Step1Fields,StepTransformContext
 from pycalmet.config import CalmetConfig,GridConfig
 from pycalmet.projections import geographic_crs,grid_crs
@@ -115,6 +118,12 @@ def test_surface_cloud_fields_follow_nearest_station_without_interpolation(tmp_p
     np.testing.assert_array_equal(ceiling,[[70,80],[80,70]])
 
 
+def test_nearest_station_grid_selects_spatially_closest_station():
+    points=np.array([[0.,0.],[4.,0.],[0.,4.]])
+    grid=GridConfig(2,1,2.,2.)
+    np.testing.assert_array_equal(_nearest_station_grid(points,grid),[[0,1]])
+
+
 def test_surface_scalar_interpolation_uses_radius_station_limit_and_water_groups():
     grid=GridConfig(2,1,1.,1.,x_origin_km=0.,y_origin_km=0.)
     points=np.array([[.5,.5],[1.5,.5],[3.,.5]])
@@ -127,6 +136,18 @@ def test_surface_scalar_interpolation_uses_radius_station_limit_and_water_groups
     np.testing.assert_allclose(fallback,100.)
 
 
+@pytest.mark.parametrize(('power','expected'),[(1,100./3.),(2,20.)])
+def test_surface_scalar_interpolation_uses_physical_distance_on_rectangular_grid(
+        power,expected):
+    grid=GridConfig(1,1,4.,1.,x_origin_km=0.,y_origin_km=0.)
+    # The target is (2, .5), so the stations are one and two physical km away.
+    # Using dx as an artificial distance floor would give both equal weight.
+    points=np.array([[1.,.5],[2.,2.5]])
+    got=interpolate_surface_scalar(
+        [0.,100.],points,grid,radius_km=10.,maximum_stations=2,power=power)
+    np.testing.assert_allclose(got,[[expected]],rtol=2.e-7)
+
+
 def test_calmet_decimal_packed_surface_words_are_vectorized():
     # 280.1 K, code 10, 61%; 1000.2 mb, cloud 8, 270 deg; ceiling 70, 1.25 m/s
     words=np.array([[2801*100000+10*1000+61,
@@ -136,9 +157,13 @@ def test_calmet_decimal_packed_surface_words_are_vectorized():
                      9999*100000+99*1000+999,
                      9999*10000+9999]],dtype=np.int64)
     fields=unpack_surface(words)
-    assert fields['temperature_k'][0]==280.1 and fields['precipitation_code'][0]==10
-    assert fields['pressure_mb'][0]==1000.2 and fields['cloud_tenths'][0]==8
-    assert fields['wind_direction'][0]==270 and fields['wind_speed'][0]==1.25
+    np.testing.assert_array_equal(
+        [fields['temperature_k'][0],fields['pressure_mb'][0],fields['wind_speed'][0]],
+        np.array([280.1,1000.2,1.25],dtype=np.float32),
+    )
+    assert fields['precipitation_code'][0]==10
+    assert fields['cloud_tenths'][0]==8
+    assert fields['wind_direction'][0]==270
     assert all(fields[name][1]==9999 for name in fields if name!='ceiling_hundreds_ft')
     assert fields['ceiling_hundreds_ft'][1]==9999
 
@@ -247,6 +272,16 @@ def test_surface_wind_components_and_power_extrapolation(tmp_path):
     np.testing.assert_array_equal(u[:,1],0.); np.testing.assert_array_equal(v[:,1],0.)
 
 
+def test_power_profile_computes_each_level_from_observation_height():
+    levels=np.array([3.,7.,19.,51.,137.],dtype=np.float32)
+    u,v=component_wind_profiles(
+        [.1],[0.],[2.3],levels,[.1],iextrp=2,power_exponent=.143)
+    expected=(np.float32(.1)*(levels/np.float32(2.3))**np.float32(.143))
+    np.testing.assert_array_equal(u[:,0],expected)
+    np.testing.assert_array_equal(v[:,0],np.zeros_like(levels))
+    assert u.dtype==np.float32 and v.dtype==np.float32
+
+
 
 
 def test_component_wind_profiles_do_not_apply_true_north_rotation():
@@ -342,6 +377,74 @@ def test_noobs1_transform_combines_surface_profile_with_inter2():
         level+50.,one*100.,one*10.,one*.1,one*.5,one*1000.,profile*280.,profile*100.,one*50.,one*0.,one.astype(int))
     result=transform(step,datetime(2018,1,1))
     assert result.u.item()>9. and abs(result.v.item())<3.e-5
+    assert result.observed_temperature_faces.dtype==np.float32
+    assert result.profile_height.dtype==np.float32
+    assert result.profile_temperature.dtype==np.float32
+    np.testing.assert_array_equal(
+        result.observed_temperature_faces[:,0,0],
+        np.array([280.,280.],dtype=np.float32),
+    )
+
+
+def test_upper_wind_means_accumulate_in_fp64_before_model_field_cast(monkeypatch):
+    grid=GridConfig(1,1,1.,1.,projection='EM',lat0=0.,lon0=0.,lat1=0.,lat2=0.)
+    lon,lat=Transformer.from_crs(
+        grid_crs(grid,units='km'),geographic_crs('WGS-84'),always_xy=True,
+    ).transform(.5,.5)
+    surface_station=SurfaceStation(1,'SFC',lat,lon,10.)
+    upper_station=SimpleNamespace(
+        identifier=2,name='UPR',latitude=lat,longitude=lon,elevation_m=0.,
+    )
+    upper_u=np.array([[128.],[1.e-6],[-128.]],dtype=np.float32)
+    upper_v=np.array([[64.],[2.e-6],[-64.]],dtype=np.float32)
+    diagnostic_record=SimpleNamespace(
+        initial_u_m_s=None,initial_v_m_s=None,
+        surface_temperature_k=None,lapse_rate_k_m=None,
+        surface_u_m_s=np.array([4.],dtype=np.float32),
+        surface_v_m_s=np.array([0.],dtype=np.float32),
+        upper_u_m_s=upper_u,upper_v_m_s=upper_v,
+    )
+    diagnostic=SimpleNamespace(at_begin=lambda when:diagnostic_record)
+    config=CalmetConfig(
+        'met','geo','out','2018010100','2018010101',grid,
+        noobs=0,run_type=0,iprog=0,iwfcod=1,itprog=2,irhprog=1,
+        diagnostic_data='diag',diagnostic_surface_wind=1,diagnostic_upper_wind=1,
+        initial_guess_upper_station=1,initial_guess_height_range_m=(0.,100.),
+        micrometeorology_debug=True,z_faces_m=(0.,20.,40.,60.),
+        smoothing_passes=(0,0,0),stations_per_level=(1,1,1),
+        wind_extrapolation=1,wind_extrapolation_factors=(1.,1.,1.),
+    )
+    transform,_=_surface_step_transform(
+        config,None,
+        {'roughness_length':np.array([[.1]],dtype=np.float32),
+         'dominant_landuse':np.array([[20]],dtype=np.int16)},
+        diagnostic=diagnostic,surface_stations=(surface_station,),
+        upper_stations=(upper_station,),
+    )
+    captured=[]
+    def use_background(observed,station_xy,background,*args,**kwargs):
+        captured.append(background.copy())
+        return background
+    monkeypatch.setattr('pycalmet._calmet.objective_analysis_component',use_background)
+    one=np.ones((1,1),dtype=np.float32)
+    levels=np.zeros((3,1,1),dtype=np.float32)
+    profile=np.ones((4,1,1),dtype=np.float32)
+    step=Step1Fields(
+        levels.copy(),levels.copy(),levels+280.,one*280.,one*1000.,one,
+        levels+50.,one*100.,one*10.,one*.1,one*.5,one*1000.,
+        profile*280.,profile*100.,one*50.,one*0.,one.astype(np.int32),
+    )
+
+    result=transform(step,datetime(2018,1,1))
+
+    expected_u=float(np.mean(upper_u[:,0],dtype=np.float64))
+    expected_v=float(np.mean(upper_v[:,0],dtype=np.float64))
+    assert result.debug_domain_u==expected_u
+    assert result.debug_domain_v==expected_v
+    assert expected_u!=0. and expected_v!=0.
+    assert all(field.dtype==np.float32 for field in captured)
+    np.testing.assert_array_equal(captured[0],np.full_like(levels,expected_u))
+    np.testing.assert_array_equal(captured[1],np.full_like(levels,expected_v))
 
 
 @pytest.mark.parametrize(('landuse','target','water_mode','flux_method','warm_layer','itprog'),
@@ -413,7 +516,8 @@ def test_noobs1_dispatches_iextrp4_by_station_landuse_and_temperature_mode(
     expected_calls=(['water',target] if target in {'waterp','coare'} else [target])
     assert [item[0] for item in captured]==expected_calls
     if warm_layer:
-        assert context.warm_layer_state.initialized.item()
+        assert not context.warm_layer_state.initialized.item()
+        assert not captured[-1][2]['warm_layer_state'].initialized.item()
         assert captured[-1][2]['solar_time_s'].shape==(1,)
     if target=='land':
         np.testing.assert_array_equal(captured[0][1][11],context.previous_convective_height.ravel())
@@ -423,8 +527,8 @@ def test_noobs1_dispatches_iextrp4_by_station_landuse_and_temperature_mode(
 
 
 @pytest.mark.parametrize('water_temperature_mode',[0,1,2])
-def test_water2_imixh1_preserves_shared_dptt_station_order(monkeypatch,
-                                                            water_temperature_mode):
+def test_water2_imixh1_uses_independent_temperature_jump_per_station(
+        monkeypatch,water_temperature_mode):
     grid=GridConfig(1,1,1.,1.,projection='EM',lat0=0.,lon0=0.,lat1=0.,lat2=0.)
     lon,lat=Transformer.from_crs(grid_crs(grid,units='km'),
         geographic_crs('WGS-84'),always_xy=True).transform(.5,.5)
@@ -475,17 +579,36 @@ def test_water2_imixh1_preserves_shared_dptt_station_order(monkeypatch,
     received=[]; received_keywords=[]
     def fake_water(*args,**kwargs):
         jump=np.asarray(kwargs['previous_temperature_jump_k'],dtype=np.float32)
-        received.append(float(jump[0]))
+        received.append(jump.copy())
         received_keywords.append(kwargs)
-        state=[np.zeros(1,dtype=np.float32) for _ in range(7)]
+        state=[np.zeros(jump.size,dtype=np.float32) for _ in range(7)]
         state[5]=jump+np.float32(1.)
-        return (np.array([[5.]],dtype=np.float32),np.array([[6.]],dtype=np.float32),*state)
+        return (np.full((1,jump.size),5.,dtype=np.float32),
+                np.full((1,jump.size),6.,dtype=np.float32),*state)
     monkeypatch.setattr('pycalmet._calmet.delta_temperature_water_station_profiles',fake_water)
     transform(step,datetime(2018,1,1),context)
-    np.testing.assert_allclose(received,[.2,1.2],rtol=0.,atol=1.e-7)
-    assert context.previous_temperature_jump[0,0]==pytest.approx(2.2)
+    assert len(received)==1
+    np.testing.assert_allclose(received[0],[.2,.2],rtol=0.,atol=1.e-7)
+    assert context.previous_temperature_jump[0,0]==pytest.approx(.2)
     if water_temperature_mode==2:
         assert 'temperature_measurement_height_m' in received_keywords[0]
+
+    legacy_received=[]
+    def fake_legacy_water(*args,**kwargs):
+        jump=np.asarray(kwargs['previous_temperature_jump_k'],dtype=np.float32)
+        legacy_received.append(float(jump[0]))
+        state=[np.zeros(1,dtype=np.float32) for _ in range(7)]
+        state[5]=jump+np.float32(1.)
+        return (np.array([[5.]],dtype=np.float32),
+                np.array([[6.]],dtype=np.float32),*state)
+    monkeypatch.setattr(
+        'pycalmet.legacy._compat._calmet.delta_temperature_water_station_profiles',
+        fake_legacy_water)
+    legacy_transform,_=_legacy_surface_step_transform(config,surface,geo,sea=sea)
+    legacy_context=StepTransformContext(one*.5,one*50.,one*75.,one*.2,one*1.e-4)
+    legacy_transform(step,datetime(2018,1,1),legacy_context)
+    np.testing.assert_allclose(legacy_received,[.2,1.2],rtol=0.,atol=1.e-7)
+    assert legacy_context.previous_temperature_jump[0,0]==pytest.approx(2.2)
 
 
 
@@ -517,6 +640,51 @@ def test_idiopt4_5_transform_uses_control_metadata_without_observation_files():
     result=transform(step,datetime(2018,1,1))
     assert nearest.item()==0
     assert result.u.item()>3.9 and abs(result.v.item())<1.e-6
+
+
+def test_full_run_diagnostic_winds_retain_observed_thermodynamics():
+    grid=GridConfig(1,1,1.,1.,projection='EM',lat0=0.,lon0=0.,lat1=0.,lat2=0.)
+    lon,lat=Transformer.from_crs(grid_crs(grid,units='km'),
+        geographic_crs('WGS-84'),always_xy=True).transform(.5,.5)
+    surface_station=SurfaceStation(1,'SFC',lat,lon,10.)
+    surface_record=SurfaceRecord(
+        datetime(2018,1,1),datetime(2018,1,1,1),
+        np.array([1.]),np.array([270.]),np.array([70]),np.array([5]),
+        np.array([282.]),np.array([60.]),np.array([1000.]),np.array([0]))
+    surface=SimpleNamespace(stations=(surface_station,),datum='WGS-84',
+        at_begin=lambda when:surface_record)
+    upper_station=SimpleNamespace(identifier=2,name='UPR',latitude=lat,
+                                  longitude=lon,elevation_m=0.)
+    upper=SimpleNamespace(station=upper_station,datum='WGS-84',
+        layer_wind_at=lambda *args:(np.array([1.]),np.array([0.])),
+        temperature_faces_at=lambda *args:np.array([282.,270.]))
+    diagnostic_record=SimpleNamespace(initial_u_m_s=None,initial_v_m_s=None,
+        surface_temperature_k=None,lapse_rate_k_m=None,
+        surface_u_m_s=np.array([4.]),surface_v_m_s=np.array([0.]),
+        upper_u_m_s=np.array([[8.]]),upper_v_m_s=np.array([[0.]]))
+    diagnostic=SimpleNamespace(at_begin=lambda when:diagnostic_record)
+    config=CalmetConfig('met','geo','out','2018010100','2018010101',grid,
+        noobs=0,run_type=1,iprog=14,iwfcod=1,itprog=0,irhprog=0,
+        surface_data='surf',upper_air_files=('up',),diagnostic_data='diag',
+        diagnostic_surface_wind=1,diagnostic_upper_wind=1,
+        z_faces_m=(0.,20.),smoothing_passes=(0,),stations_per_level=(2,),
+        wind_extrapolation=-1,wind_extrapolation_factors=(1.,))
+    geo={'roughness_length':np.array([[.1]]),'dominant_landuse':np.array([[20]])}
+    transform,_=_surface_step_transform(
+        config,surface,geo,upper_air=(upper,),diagnostic=diagnostic)
+    one=np.ones((1,1),dtype=np.float32)
+    level=np.full((1,1,1),30.,dtype=np.float32)
+    profile=np.full((2,1,1),310.,dtype=np.float32)
+    step=Step1Fields(level,level,level+280.,one*310.,one*1000.,one,
+        level+50.,one*100.,one*10.,one*.1,one*.5,one*1000.,profile,
+        np.array([[[0.]],[[20.]]],dtype=np.float32),one*50.,one*0.,
+        one.astype(np.int32))
+
+    result=transform(step,datetime(2018,1,1))
+
+    np.testing.assert_allclose(result.surface_temperature,282.)
+    assert not np.allclose(result.profile_temperature,step.profile_temperature)
+    assert result.u.item()>3.
 
 
 @pytest.mark.parametrize('method,expected_cloud',[(1,.5),(2,.35)])
@@ -593,13 +761,15 @@ def test_noobs_transform_applies_initial_guess_and_diagnostic_temperature(monkey
     assert result.temperature is step.temperature
     np.testing.assert_allclose(result.diagnostic_surface_temperature,285.)
     assert requested[0][1]==datetime(2018,1,1,1)
+    assert requested[0][3].dtype==np.float32
     np.testing.assert_allclose(requested[0][3],[10.])
 
 
-def test_iprog14_keeps_prognostic_wind_when_igfmet_is_enabled(monkeypatch):
+@pytest.mark.parametrize('iprog',(4,14))
+def test_direct_step1_modes_apply_explicit_igfmet_background(monkeypatch,iprog):
     grid=GridConfig(1,1,1.,1.)
     config=CalmetConfig('met','geo','out','2018010100','2018010101',grid,
-        noobs=2,iprog=14,use_initial_guess_calmet=1,
+        noobs=2,iprog=iprog,use_initial_guess_calmet=1,
         initial_guess_calmet_files=('coarse.dat',),z_faces_m=(0.,20.))
     one=np.ones((1,1)); level=np.ones((1,1,1)); profile=np.ones((2,1,1))
     step=Step1Fields(level*3.,level*4.,level*280.,one*280.,one*1000.,one,
@@ -607,10 +777,10 @@ def test_iprog14_keeps_prognostic_wind_when_igfmet_is_enabled(monkeypatch):
         one*50.,one*0.,one.astype(int))
     source=SimpleNamespace(timezone='UTC-0000')
     monkeypatch.setattr('pycalmet._calmet.interpolate_initial_guess',
-        lambda *args: (_ for _ in ()).throw(AssertionError('IGF wind used')))
+        lambda *args: (np.full_like(level,7.),np.full_like(level,8.)))
     result=_noobs_step_transform(config,source,None)(step,datetime(2018,1,1))
-    np.testing.assert_allclose(result.u,step.u)
-    np.testing.assert_allclose(result.v,step.v)
+    np.testing.assert_allclose(result.u,7.)
+    np.testing.assert_allclose(result.v,8.)
 
 
 def test_itprog1_water_temperature_uses_sea_station():

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from .datetime_utils import parse_timestamp
 from pathlib import Path
 
@@ -57,7 +56,12 @@ def _relative_humidity(qvapor,pressure_hpa,temperature_k):
 
 
 def _date_number(text):
-    return int(parse_timestamp(text).strftime('%Y%m%d%H'))
+    timestamp=parse_timestamp(text)
+    if timestamp.minute or timestamp.second or timestamp.microsecond:
+        raise ValueError(
+            'legacy CALWRF M2D/M3D output requires whole-hour canonical WRF times'
+        )
+    return int(timestamp.strftime('%Y%m%d%H'))
 
 
 def _compressed_water(values):
@@ -164,6 +168,10 @@ def write_m3d(canonical_path,m3d_path,m2d_path=None):
     m3d_path=Path(m3d_path); m3d_path.parent.mkdir(parents=True,exist_ok=True)
     with nc.Dataset(canonical_path) as dataset:
         times=[str(value) for value in nc.chartostring(dataset['time_text'][:]).tolist()]
+        # M2D/M3D timestamps have hour precision.  Validate every canonical
+        # time before opening either output so minutes or seconds are never
+        # silently discarded by the fixed-width legacy representation.
+        for text in times: _date_number(text)
         cloud_count=int(getattr(dataset,'legacy_cloud_component_count',5))
         iout=(1,1,int(cloud_count>=1),int(cloud_count>=4),int(cloud_count>=5),int(m2d_path is not None))
         with m3d_path.open('w',encoding='ascii') as stream:

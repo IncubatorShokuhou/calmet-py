@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+from datetime import datetime
 
 import pytest
 
@@ -51,7 +52,6 @@ def test_calwrf_accepts_fortran_parameter_names(monkeypatch, tmp_path):
         "FIO": tmp_path / "calwrf.m3d", "IOSRF": "F",
         "title": "A custom CALWRF conversion", "FlG": tmp_path / "calwrf.lst",
         "IB": 2, "IE": 4, "JB": 3, "JE": 5, "KB": 1, "KE": 6,
-        "LeGaCy_FiLe_RaIn_ReSeT": "T",
     })
     assert isinstance(config, CalwrfConfig)
     assert config.output == tmp_path / "calwrf.nc"
@@ -59,17 +59,16 @@ def test_calwrf_accepts_fortran_parameter_names(monkeypatch, tmp_path):
     assert config.title == "A custom CALWRF conversion"
     assert config.listing_output == tmp_path / "calwrf.lst"
     assert not config.create_surface
-    assert config.legacy_file_rain_reset
     assert (config.i_range, config.j_range, config.k_range) == ((2, 4), (3, 5), (1, 6))
 
 
-def test_calwrf_legacy_file_rain_reset_parses_false_logical(monkeypatch, tmp_path):
-    monkeypatch.setattr("pycalmet._calwrf.run", lambda config: config)
-    config=pycalmet.calwrf(
+def test_legacy_calwrf_file_rain_reset_parses_logical(monkeypatch, tmp_path):
+    monkeypatch.setattr("pycalmet.legacy._compat._calwrf.run", lambda config: config)
+    config=pycalmet.legacy.calwrf(
         WRF_FILES=[tmp_path/"wrf.nc"],START="2018010100",END="2018010100",
-        OUTPUT=tmp_path/"calwrf.nc",LEGACY_FILE_RAIN_RESET="F",
+        OUTPUT=tmp_path/"calwrf.nc",LEGACY_FILE_RAIN_RESET="T",
     )
-    assert config.legacy_file_rain_reset is False
+    assert config.legacy_file_rain_reset is True
 
 
 def test_calwrf_fio_derives_legacy_default_surface_name(monkeypatch, tmp_path):
@@ -299,12 +298,51 @@ def test_calmet_accepts_control_names_dates_and_timezone(monkeypatch, tmp_path):
     config = captured[0]
     assert output == tmp_path / "calmet.dat"
     assert isinstance(config, CalmetConfig)
-    assert config.start == "2018-03-18_00:00:00"
-    assert config.end == "2018-03-18_01:00:00"
+    assert config.start == datetime(2018,3,18)
+    assert config.end == datetime(2018,3,18,1)
     assert config.base_timezone == 8
     assert config.base_timezone_label == "UTC-0800"
     assert config.iprog == 14
     assert config.z_faces_m == (0., 20.)
+
+
+def _minimal_calmet_aliases(tmp_path):
+    return {
+        'M3DDAT':tmp_path/'met.m3d','NM3D':1,
+        'GEODAT':tmp_path/'geo.dat','METDAT':tmp_path/'calmet.dat',
+        'IBYR':2018,'IBMO':3,'IBDY':18,'IBHR':0,'IBSEC':0,
+        'IEYR':2018,'IEMO':3,'IEDY':18,'IEHR':1,'IESEC':0,
+        'ABTZ':'UTC-0000','NX':1,'NY':1,'DGRIDKM':1,
+        'PMAP':'UTM','IUTMZN':50,'XORIGKM':0,'YORIGKM':0,
+        'DATUM':'WGS-84','ZFACE':'0,20','NZ':1,
+    }
+
+
+def test_calmet_public_aliases_expand_two_digit_years(monkeypatch,tmp_path):
+    captured=[]
+    monkeypatch.setattr('pycalmet._calmet.run',lambda config:
+                        captured.append(config) or config.output)
+    values=_minimal_calmet_aliases(tmp_path)
+    values.update(IBYR=18,IEYR=18)
+    pycalmet.calmet(values)
+    assert captured[0].start==datetime(2018,3,18)
+    assert captured[0].end==datetime(2018,3,18,1)
+
+
+@pytest.mark.parametrize(('field','value'),(
+    ('IBYR',2018.5),('IBMO',3.5),('IBDY',18.5),('IBHR',.5),
+    ('IBSEC',.5),('IBSEC',3601),('NSECDT',900.5),
+    ('ISTEPPGS',900.5),('ISTEPPG',1.5),
+))
+def test_calmet_public_time_aliases_never_truncate_fractional_values(
+        monkeypatch,tmp_path,field,value):
+    monkeypatch.setattr('pycalmet._calmet.run',lambda config: config.output)
+    values=_minimal_calmet_aliases(tmp_path)
+    values[field]=value
+    if field=='ISTEPPG':
+        values['ISTEPPGS']=0
+    with pytest.raises(ValueError,match=field):
+        pycalmet.calmet(values)
 
 
 def test_calmet_accepts_legacy_radiation_and_mm4_timestep_names(monkeypatch, tmp_path):

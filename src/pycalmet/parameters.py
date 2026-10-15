@@ -13,6 +13,7 @@ from .config import (
     CalmetConfig, CalwrfConfig, CtgprocConfig, CtgprocSource, GridConfig,
     MakegeoConfig, TerrelConfig, TerrelSource,
 )
+from .datetime_utils import exact_integer,parse_calendar,parse_timezone_label
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +46,11 @@ def _number(value: Any) -> int | float:
 
 
 def _integer(value: Any) -> int:
-    return int(_number(value))
+    return exact_integer(_single(value))
+
+
+def _named_integer(label: str) -> Callable[[Any], int]:
+    return lambda value: exact_integer(_single(value),label)
 
 
 def _real(value: Any) -> float:
@@ -177,8 +182,7 @@ _add(CALWRF, _files, FLNAMES="wrf_files")
 _add(CALWRF, _identity, IDATEB="start", IDATEE="end", FIO="$fio",
      FLG="listing_output", FSRF="surface_output")
 _add(CALWRF, _text, TITLE="title")
-_add(CALWRF, _logical, IOSRF="create_surface",
-     LEGACY_FILE_RAIN_RESET="legacy_file_rain_reset")
+_add(CALWRF, _logical, IOSRF="create_surface")
 _add(CALWRF, _integer, NFILES="$nfiles", IB="$ib", IE="$ie", JB="$jb",
      JE="$je", KB="$kb", KE="$ke")
 
@@ -277,11 +281,12 @@ _add(MAKEGEO, _text, DATUM="grid.datum")
 _add(MAKEGEO, _real, CFRACT="water_threshold", FLUMIN="minimum_coverage",
      HSCL="snow_height_scale_m", SDPMIN="snow_depth_minimum_m")
 _add(MAKEGEO, _integer, IMISS="missing_category", IWAT1="output_water_min",
-     IWAT2="output_water_max", IDATEBEG="snow_start_date", IDATEEND="snow_end_date",
+     IWAT2="output_water_max",
      MSRL="snow_roughness_method", MSAL="snow_albedo_method", IMAGE="image_mode",
      IXQA="$ixqa", IYQA="$iyqa", NINCAT="$nincat", NOUTCAT="$noutcat",
      NUMWAT="$numwat", NSPLIT="$nsplit")
 MAKEGEO["IFMTGEO"] = _alias("$ifmtgeo", _integer)
+_add(MAKEGEO, _identity, IDATEBEG="snow_start_date", IDATEEND="snow_end_date")
 _add(MAKEGEO, _logical, LTERR="use_terrain", LSNOW="snow_processing",
      LCFILES="$lcfiles", LLU2="$llu2")
 _add(MAKEGEO, _integers, IWAT="water_categories")
@@ -353,6 +358,8 @@ CALMET_INT = {
  "NOWSTA":"$nowsta", "NIGF":"$nigf",
 }
 _add(CALMET, _integer, **CALMET_INT)
+for name in ("NSECDT","ISTEPPG","ISTEPPGS"):
+    CALMET[name]=_alias(CALMET_INT[name],_named_integer(name))
 CALMET_REAL = {
  "HAFANG":"half_average_angle", "CONSTB":"constb", "CONSTE":"conste", "CONSTN":"constn",
  "CONSTW":"constw", "FCORIOL":"coriolis", "DPTMIN":"minimum_lapse_rate",
@@ -376,7 +383,8 @@ CALMET_REAL = {
 _add(CALMET, _real, **CALMET_REAL)
 for prefix in ("IB", "IE"):
     for suffix in ("YR", "MO", "DY", "HR", "SEC"):
-        CALMET[prefix + suffix] = _alias("$date." + prefix + suffix, _integer)
+        name=prefix+suffix
+        CALMET[name]=_alias("$date."+name,_named_integer(name))
 
 
 ALIASES: dict[type[Any], dict[str, Alias]] = {
@@ -391,15 +399,13 @@ def _duplicate(cls: type[Any], target: str, old: str, new: str) -> TypeError:
 
 
 def _timezone(value: str) -> tuple[int, str]:
-    label = "".join(str(value).split()).upper()
-    match = re.fullmatch(r"UTC([+-])(\d{2})(\d{2})", label)
-    if not match:
-        raise ValueError(f"unsupported CALMET timezone: {value!r}")
-    minutes = int(match.group(2)) * 60 + int(match.group(3))
-    if minutes % 60:
-        raise ValueError("CALMET base_timezone only supports whole-hour ABTZ values")
-    offset = minutes // 60
-    return (offset if match.group(1) == "-" else -offset), label
+    try:
+        return parse_timezone_label("".join(str(value).split()).upper())
+    except (TypeError,ValueError) as error:
+        if "whole-hour" in str(error):
+            raise ValueError(
+                "CALMET base_timezone only supports whole-hour ABTZ values") from error
+        raise ValueError(f"unsupported CALMET timezone: {value!r}") from error
 
 
 def _date(parts: Mapping[str, Any], prefix: str) -> datetime:
@@ -407,11 +413,18 @@ def _date(parts: Mapping[str, Any], prefix: str) -> datetime:
     missing = [name for name in required if name not in parts]
     if missing:
         raise TypeError("incomplete CALMET date parameters: " + ", ".join(missing))
-    hour = parts[prefix + "HR"]
-    if not 0 <= hour <= 24:
-        raise ValueError(f"{prefix}HR must be between 0 and 24")
-    return datetime(parts[prefix + "YR"], parts[prefix + "MO"], parts[prefix + "DY"]) + timedelta(
-        hours=hour, seconds=parts.get(prefix + "SEC", 0))
+    try:
+        return parse_calendar(
+            parts[prefix + "YR"],parts[prefix + "MO"],
+            parts[prefix + "DY"],parts[prefix + "HR"],
+            parts.get(prefix + "SEC",0),
+        )
+    except ValueError as error:
+        if "invalid hour" in str(error):
+            raise ValueError(f"{prefix}HR must be between 0 and 24") from error
+        if "invalid seconds" in str(error):
+            raise ValueError(f"{prefix}SEC must be between 0 and 3600") from error
+        raise
 
 
 def _station(value: Any, count: int) -> tuple[Any, ...]:
@@ -478,8 +491,6 @@ def normalize_public_parameters(cls: type[Any], parameters: Mapping[str, Any]) -
             for target in targets: assign(target, converted, name)
         elif folded in canonical:
             target = canonical[folded]
-            if target in {"start", "end"} and isinstance(value, datetime):
-                value = value.strftime("%Y-%m-%d_%H:%M:%S")
             assign(target, value, name)
         elif folded in grid_canonical:
             assign("grid." + grid_canonical[folded], value, name)
@@ -642,8 +653,8 @@ def normalize_public_parameters(cls: type[Any], parameters: Mapping[str, Any]) -
             elif "irlg" in special:
                 begin -= timedelta(hours=1); end = begin + timedelta(hours=special["irlg"])
             else: raise TypeError("CALMET ending date fields or IRLG are required")
-            assign("start", begin.strftime("%Y-%m-%d_%H:%M:%S"), "IBYR")
-            assign("end", end.strftime("%Y-%m-%d_%H:%M:%S"), "IEYR")
+            assign("start", begin, "IBYR")
+            assign("end", end, "IEYR")
         if "abtz" in special:
             zone, label = _timezone(special["abtz"])
             assign("base_timezone", zone, claimed["$abtz"])

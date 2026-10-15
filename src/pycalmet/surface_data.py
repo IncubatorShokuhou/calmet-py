@@ -8,10 +8,15 @@ import re
 import shlex
 import struct
 import numpy as np
+from scipy.spatial import cKDTree
 
 from .projections import project_geographic
 from .legacy_io import FortranSequentialReader
 from .datetime_utils import parse_ordinal,parse_ordinal_code
+
+
+COMPUTE_DTYPE=np.float32
+SPATIAL_DTYPE=np.float64
 
 
 @dataclass(frozen=True,slots=True)
@@ -51,14 +56,18 @@ def unpack_surface(words):
     direction=word2-pressure*100000-cloud*1000
     ceiling=word3//10000
     speed=word3-ceiling*10000
+    speed_values=speed.astype(COMPUTE_DTYPE)
+    direction_values=direction.astype(COMPUTE_DTYPE)
+    temperature_values=temperature.astype(COMPUTE_DTYPE)
+    pressure_values=pressure.astype(COMPUTE_DTYPE)
     return dict(
-        wind_speed=np.where(speed==9999,9999.,speed/100.),
-        wind_direction=np.where(direction==999,9999.,direction.astype(float)),
+        wind_speed=np.where(speed==9999,9999.,speed_values/100.),
+        wind_direction=np.where(direction==999,9999.,direction_values),
         ceiling_hundreds_ft=ceiling.astype(np.int32),
         cloud_tenths=np.where(cloud==99,9999,cloud).astype(np.int32),
-        temperature_k=np.where(temperature==9999,9999.,temperature/10.),
+        temperature_k=np.where(temperature==9999,9999.,temperature_values/10.),
         relative_humidity=np.where(humidity==999,9999,humidity).astype(np.int32),
-        pressure_mb=np.where(pressure==9999,9999.,pressure/10.),
+        pressure_mb=np.where(pressure==9999,9999.,pressure_values/10.),
         precipitation_code=np.where(precipitation==99,9999,precipitation).astype(np.int32),
     )
 
@@ -159,7 +168,7 @@ class SurfaceData:
                     raise ValueError('SURF.DAT record interval must advance by at most one hour')
             else:
                 end=_instant(row[0],row[1],row[2],0); begin=end-timedelta(hours=1); value_offset=3
-            raw=np.asarray(row[value_offset:],dtype=float).reshape(count,8)
+            raw=np.asarray(row[value_offset:],dtype=COMPUTE_DTYPE).reshape(count,8)
             self.records.append(SurfaceRecord(begin,end,raw[:,0].copy(),raw[:,1].copy(),
                 raw[:,2].astype(np.int32),raw[:,3].astype(np.int32),raw[:,4].copy(),
                 raw[:,5].astype(np.int32),raw[:,6].copy(),raw[:,7].astype(np.int32)))
@@ -276,56 +285,95 @@ def station_grid_mapping(stations,grid,datum):
     """Return station map coordinates and CALMET's nearest-station grid."""
     sx,sy=project_geographic([item.longitude for item in stations],
                              [item.latitude for item in stations],grid,datum,units='km')
-    points=np.asarray(np.column_stack((sx,sy)),dtype=np.float64)
+    points=np.asarray(np.column_stack((sx,sy)),dtype=SPATIAL_DTYPE)
     return points,_nearest_station_grid(points,grid)
 
 
+def _nearest_indices(points,targets,block_size=65536):
+    """Query the nearest source point for each target."""
+    source=np.asarray(points,dtype=SPATIAL_DTYPE)
+    query=np.asarray(targets,dtype=SPATIAL_DTYPE)
+    if source.ndim!=2 or source.shape[1]!=2 or source.shape[0]<1:
+        raise ValueError('nearest-station coordinates must have shape (station, 2)')
+    if query.ndim!=2 or query.shape[1]!=2:
+        raise ValueError('nearest-station targets must have shape (target, 2)')
+    if block_size<1: raise ValueError('nearest-station block size must be positive')
+    tree=cKDTree(source)
+    selected=np.empty(query.shape[0],dtype=np.intp)
+    for start in range(0,query.shape[0],block_size):
+        stop=min(start+block_size,query.shape[0])
+        selected[start:stop]=np.asarray(
+            tree.query(query[start:stop],k=1)[1],dtype=np.intp)
+    return selected
+
+
+def _nearest_neighbors(points,targets,count,block_size=65536):
+    """Return the closest source points and their distances."""
+    source=np.asarray(points,dtype=SPATIAL_DTYPE)
+    query=np.asarray(targets,dtype=SPATIAL_DTYPE)
+    if source.ndim!=2 or source.shape[1]!=2 or source.shape[0]<1:
+        raise ValueError('nearest-station coordinates must have shape (station, 2)')
+    if query.ndim!=2 or query.shape[1]!=2:
+        raise ValueError('nearest-station targets must have shape (target, 2)')
+    if block_size<1: raise ValueError('nearest-station block size must be positive')
+    count=min(int(count),source.shape[0])
+    if count<1: raise ValueError('nearest-station count must be positive')
+    tree=cKDTree(source)
+    chosen=np.empty((query.shape[0],count),dtype=np.intp)
+    distances=np.empty((query.shape[0],count),dtype=SPATIAL_DTYPE)
+    for start in range(0,query.shape[0],block_size):
+        stop=min(start+block_size,query.shape[0])
+        block_distance,block_chosen=tree.query(query[start:stop],k=count)
+        if count==1:
+            block_distance=block_distance[:,None]
+            block_chosen=block_chosen[:,None]
+        chosen[start:stop]=np.asarray(block_chosen,dtype=np.intp)
+        distances[start:stop]=np.asarray(block_distance,dtype=SPATIAL_DTYPE)
+    return distances,chosen
+
+
 def _nearest_station_grid(points,grid,block_size=65536):
-    """SETCOM's floating-point nearest-station scan, returned as zero-based IDs."""
-    f32=np.float64
-    points=np.asarray(points,dtype=f32)
+    """Return zero-based nearest-station IDs for every grid cell."""
+    points=np.asarray(points,dtype=SPATIAL_DTYPE)
     if points.ndim!=2 or points.shape[1]!=2 or points.shape[0]<1:
         raise ValueError('nearest-station coordinates must have shape (station, 2)')
-    origin=np.array([grid.x_origin_km,grid.y_origin_km],dtype=f32)
-    relative=np.asarray(points-origin,dtype=f32)
-    x=np.asarray((np.arange(grid.nx,dtype=f32)+f32(.5))*f32(grid.dx_km),dtype=f32)
-    y=np.asarray((np.arange(grid.ny,dtype=f32)+f32(.5))*f32(grid.dy_km),dtype=f32)
+    origin=np.array([grid.x_origin_km,grid.y_origin_km],dtype=SPATIAL_DTYPE)
+    relative=points-origin
+    x=(np.arange(grid.nx,dtype=SPATIAL_DTYPE)+.5)*float(grid.dx_km)
+    y=(np.arange(grid.ny,dtype=SPATIAL_DTYPE)+.5)*float(grid.dy_km)
     xx,yy=np.meshgrid(x,y); targets=np.column_stack((xx.ravel(),yy.ravel()))
-    nearest=np.empty(targets.shape[0],dtype=np.int32)
-    for start in range(0,targets.shape[0],block_size):
-        delta=np.asarray(relative[None,:,:]-targets[start:start+block_size,None,:],dtype=f32)
-        distance=np.asarray(delta[...,0]*delta[...,0]+delta[...,1]*delta[...,1],dtype=f32)
-        # argmin retains the first station on a tie, matching strict .LT.
-        nearest[start:start+block_size]=np.argmin(distance,axis=1)
+    nearest=_nearest_indices(relative,targets,block_size).astype(np.int32,copy=False)
     return nearest.reshape(grid.ny,grid.nx)
 
 
 def fill_missing_surface(record,station_xy,*,cloud_method=1,itprog=0):
-    """Vectorized MISSFC nearest-valid-station replacement."""
-    f32=np.float64
-    coordinates=np.asarray(station_xy,dtype=f32)
+    """Fill missing values from each variable's nearest valid station."""
+    coordinates=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
     count=record.wind_speed.size
     if coordinates.shape!=(count,2): raise ValueError('surface station coordinates have wrong shape')
-    delta=np.asarray(coordinates[:,None,:]-coordinates[None,:,:],dtype=f32)
-    distance=np.asarray(delta[...,0]*delta[...,0]+delta[...,1]*delta[...,1],dtype=f32)
 
     def filled(values,required,integer=False):
-        source=np.asarray(values) if integer else np.asarray(values,dtype=f32)
-        missing=(source>=np.asarray(f32(9999.)-f32(.01),dtype=f32)
+        source=np.asarray(values,dtype=np.int32 if integer else COMPUTE_DTYPE)
+        missing=(source>=9998.99
                  if not integer else source>=9999)
         if not required or not missing.any(): return source.copy()
         valid=~missing
         if not valid.any(): raise ValueError('surface variable is missing at every station')
-        candidates=np.where(valid[None,:],distance,np.inf)
-        replacement=source[np.argmin(candidates,axis=1)]
-        return np.where(missing,replacement,source)
+        valid_indices=np.flatnonzero(valid)
+        nearest=_nearest_indices(coordinates[valid],coordinates[missing])
+        result=source.copy()
+        result[missing]=source[valid_indices[nearest]]
+        return result
 
-    return SurfaceRecord(record.begin,record.end,record.wind_speed.copy(),record.wind_direction.copy(),
+    return SurfaceRecord(record.begin,record.end,
+        np.asarray(record.wind_speed,dtype=COMPUTE_DTYPE).copy(),
+        np.asarray(record.wind_direction,dtype=COMPUTE_DTYPE).copy(),
         filled(record.ceiling_hundreds_ft,cloud_method<3,True).astype(np.int32),
         filled(record.cloud_tenths,cloud_method<3,True).astype(np.int32),
         filled(record.temperature_k,itprog!=2),
-        filled(record.relative_humidity,True,True).astype(np.int32),
-        filled(record.pressure_mb,True),record.precipitation_code.copy())
+        filled(record.relative_humidity,True),
+        filled(record.pressure_mb,True),
+        np.asarray(record.precipitation_code,dtype=np.int32).copy())
 
 
 def surface_cloud_fields(record,nearest_station,external_cloud=None):
@@ -335,18 +383,18 @@ def surface_cloud_fields(record,nearest_station,external_cloud=None):
         raise ValueError('nearest surface-station index is invalid')
     ceiling=np.asarray(record.ceiling_hundreds_ft)[nearest]
     if external_cloud is None:
-        cloud=np.float64(.1)*np.asarray(record.cloud_tenths,dtype='f4')[nearest]
+        cloud=.1*np.asarray(record.cloud_tenths,dtype=COMPUTE_DTYPE)[nearest]
     else:
-        cloud=np.asarray(external_cloud,dtype='f4')
+        cloud=np.asarray(external_cloud,dtype=COMPUTE_DTYPE)
         if cloud.shape!=nearest.shape: raise ValueError('external cloud field does not match CALMET grid')
-    return cloud.astype('f4'),ceiling.astype(np.int32)
+    return cloud.astype(COMPUTE_DTYPE,copy=False),ceiling.astype(np.int32)
 
 
 def interpolate_surface_scalar(values,station_xy,grid,*,radius_km=500.,maximum_stations=5,
                                power=1,target_water=None,station_water=None,empty_fallback=None):
-    """Vectorized SURFVAR radius/nearest interpolation for T and RH."""
-    f32=np.float64
-    values=np.asarray(values,dtype=f32); points=np.asarray(station_xy,dtype=f32)
+    """Interpolate T or RH with physical-distance IDW and land/water grouping."""
+    values=np.asarray(values,dtype=COMPUTE_DTYPE)
+    points=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
     if points.shape!=(values.size,2): raise ValueError('surface scalar station coordinates have wrong shape')
     if power not in {1,2} or radius_km<0. or maximum_stations<1:
         raise ValueError('surface scalar interpolation requires power 1/2, non-negative radius and positive station count')
@@ -354,101 +402,153 @@ def interpolate_surface_scalar(values,station_xy,grid,*,radius_km=500.,maximum_s
     if water.shape!=values.shape: raise ValueError('station water mask has wrong shape')
     target_mask=np.zeros((grid.ny,grid.nx),dtype=bool) if target_water is None else np.asarray(target_water,dtype=bool)
     if target_mask.shape!=(grid.ny,grid.nx): raise ValueError('target water mask has wrong shape')
-    x=np.asarray(f32(grid.x_origin_km)+(np.arange(grid.nx,dtype=f32)+f32(.5))*
-                 f32(grid.dx_km),dtype=f32)
-    y=np.asarray(f32(grid.y_origin_km)+(np.arange(grid.ny,dtype=f32)+f32(.5))*
-                 f32(grid.dy_km),dtype=f32)
+    x=float(grid.x_origin_km)+(np.arange(grid.nx,dtype=SPATIAL_DTYPE)+.5)*float(grid.dx_km)
+    y=float(grid.y_origin_km)+(np.arange(grid.ny,dtype=SPATIAL_DTYPE)+.5)*float(grid.dy_km)
     xx,yy=np.meshgrid(x,y); targets=np.column_stack((xx.ravel(),yy.ravel()))
-    output=np.empty(targets.shape[0],dtype=f32); flat_water=target_mask.ravel()
-    valid=values<np.asarray(f32(9999.)-f32(.01),dtype=f32)
-    normalized_radius=np.asarray(f32(radius_km)/f32(grid.dx_km),dtype=f32)
-    for start in range(0,targets.shape[0],65536):
-        stop=min(start+65536,targets.shape[0]); group=flat_water[start:stop]
-        delta=np.asarray((targets[start:stop,None,:]-points[None,:,:])/
-                         f32(grid.dx_km),dtype=f32)
-        distance=np.asarray(np.sqrt(np.asarray(
-            delta[...,0]*delta[...,0]+delta[...,1]*delta[...,1],dtype=f32)),dtype=f32)
-        eligible=valid[None,:]&(water[None,:]==group[:,None]); available=eligible.any(axis=1)
-        if np.any(~available) and empty_fallback is None:
-            raise ValueError('grid cell has no valid land/water surface temperature station')
-        if not available.any():
-            fallback=np.asarray(empty_fallback,dtype=f32)
-            output[start:stop]=np.where(group,fallback[1],fallback[0]); continue
-        # Give unavailable rows a harmless valid index; their result is replaced below.
-        eligible[~available,0]=True
-        ordered=np.argsort(np.where(eligible,distance,np.inf),axis=1,kind='stable')
-        nearest=ordered[:,0]; nearest_distance=np.take_along_axis(distance,nearest[:,None],axis=1)[:,0]
-        selected=ordered[:,:min(maximum_stations,values.size)]
-        selected_distance=np.take_along_axis(distance,selected,axis=1)
-        selected_valid=np.take_along_axis(eligible,selected,axis=1)&(selected_distance<=normalized_radius)
-        denominator=np.zeros(stop-start,dtype=f32); numerator=np.zeros_like(denominator)
-        for rank in range(selected.shape[1]):
-            metric=selected_distance[:,rank]
-            if power==2: metric=np.asarray(metric*metric,dtype=f32)
-            weight=np.where(selected_valid[:,rank],
-                np.asarray(f32(1.)/np.maximum(metric,f32(1.)),dtype=f32),f32(0.))
-            denominator=np.asarray(denominator+weight,dtype=f32)
-            numerator=np.asarray(numerator+np.asarray(
-                weight*values[selected[:,rank]],dtype=f32),dtype=f32)
-        weighted=np.divide(numerator,denominator,out=np.zeros_like(numerator),where=denominator!=0.)
-        result=np.where(nearest_distance>normalized_radius,values[nearest],weighted)
-        if np.any(~available):
-            fallback=np.asarray(empty_fallback,dtype=f32)
-            if fallback.shape!=(2,): raise ValueError('empty_fallback must contain land and water values')
-            result[~available]=np.where(group[~available],fallback[1],fallback[0])
-        output[start:stop]=result
+    output=np.empty(targets.shape[0],dtype=COMPUTE_DTYPE)
+    flat_water=target_mask.ravel()
+    valid=values<9998.99
+    radius=float(radius_km)
+    fallback=None
+    if empty_fallback is not None:
+        fallback=np.asarray(empty_fallback,dtype=COMPUTE_DTYPE)
+        if fallback.shape!=(2,): raise ValueError('empty_fallback must contain land and water values')
+    for is_water in (False,True):
+        target_indices=np.flatnonzero(flat_water==is_water)
+        if target_indices.size==0: continue
+        station_indices=np.flatnonzero(valid&(water==is_water))
+        if station_indices.size==0:
+            if fallback is None:
+                raise ValueError('grid cell has no valid land/water surface temperature station')
+            output[target_indices]=fallback[int(is_water)]
+            continue
+        distance,local_indices=_nearest_neighbors(
+            points[station_indices],targets[target_indices],maximum_stations)
+        selected=station_indices[local_indices]
+        selected_valid=distance<=radius
+        exact=selected_valid&(distance==0.)
+        metric=distance if power==1 else distance*distance
+        weights=np.zeros_like(distance,dtype=SPATIAL_DTYPE)
+        np.divide(1.,metric,out=weights,where=selected_valid&~exact)
+        # Summation in double precision keeps many-station weighted means stable;
+        # the model field itself remains FP32.
+        denominator=np.sum(weights,dtype=np.float64,axis=1)
+        numerator=np.sum(weights*values[selected],dtype=np.float64,axis=1)
+        weighted=np.divide(numerator,denominator,out=np.zeros_like(numerator),
+                           where=denominator!=0.)
+        exact_count=np.sum(exact,axis=1)
+        exact_total=np.sum(np.where(exact,values[selected],0.),dtype=np.float64,axis=1)
+        exact_value=np.divide(exact_total,exact_count,out=np.zeros_like(exact_total),
+                              where=exact_count!=0)
+        result=np.where(exact_count!=0,exact_value,weighted)
+        result=np.where(distance[:,0]>radius,values[selected[:,0]],result)
+        output[target_indices]=result.astype(COMPUTE_DTYPE)
     return output.reshape(grid.ny,grid.nx)
 
 
 def _near_upper_air(station_count,station_xy,upper_xy,upper_valid,
                     separation_cells,dx_km,dy_km):
-    """Vectorized DIAGNO RMIN2 test with legacy floating-point arithmetic."""
-    f32=np.float64
+    """Return stations within RMIN2 of a valid upper-air station."""
     skip=np.zeros(station_count,dtype=bool)
     if separation_cells<0. or upper_xy is None:
         return skip
     if dx_km<=0. or dy_km<=0.:
         raise ValueError('RMIN2 grid spacing must be positive')
-    surface_points=np.asarray(station_xy,dtype=f32)
-    upper_points=np.asarray(upper_xy,dtype=f32)
+    surface_points=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
+    upper_points=np.asarray(upper_xy,dtype=SPATIAL_DTYPE)
     available=np.asarray(upper_valid,dtype=bool)
     if surface_points.shape!=(station_count,2) or upper_points.ndim!=2 or upper_points.shape[1]!=2:
         raise ValueError('RMIN2 station coordinates are inconsistent')
     if available.shape!=(upper_points.shape[0],):
         raise ValueError('RMIN2 upper validity has wrong shape')
     if available.any():
-        delta=np.asarray(upper_points[None,:,:]-surface_points[:,None,:],dtype=f32)
-        rsx=np.asarray(delta[...,0]/f32(dx_km),dtype=f32)
-        rsy=np.asarray(delta[...,1]/f32(dy_km),dtype=f32)
-        squared=np.asarray(np.asarray(rsx*rsx,dtype=f32)+
-                           np.asarray(rsy*rsy,dtype=f32),dtype=f32)
-        distance=np.asarray(np.sqrt(squared),dtype=f32)
-        skip=np.min(distance[:,available],axis=1)<f32(separation_cells)
+        scale=np.asarray((dx_km,dy_km),dtype=SPATIAL_DTYPE)
+        tree=cKDTree(upper_points[available]/scale)
+        distance,_=tree.query(surface_points/scale,k=1)
+        skip=distance<float(separation_cells)
     return skip
 
 
 def _wind_components(wind_speed,wind_direction,grid_convergence_degrees=None):
-    """PREPDI/RDS true-north wind conversion in legacy floating-point order."""
-    f32=np.float64
-    speed=np.asarray(wind_speed,dtype=f32)
-    direction=np.asarray(wind_direction,dtype=f32)
+    """Convert meteorological wind observations to grid-oriented U/V."""
+    speed=np.asarray(wind_speed,dtype=COMPUTE_DTYPE)
+    direction=np.asarray(wind_direction,dtype=COMPUTE_DTYPE)
     if speed.shape!=direction.shape:
         raise ValueError('wind speed and direction have different shapes')
     convergence=(np.zeros_like(direction) if grid_convergence_degrees is None else
-                 np.asarray(grid_convergence_degrees,dtype=f32))
+                 np.asarray(grid_convergence_degrees,dtype=COMPUTE_DTYPE))
     if convergence.shape!=direction.shape:
         raise ValueError('grid convergence must have one value per station')
-    valid=(np.abs(speed)<f32(999.))&(np.abs(direction)<f32(999.))
-    rotated=np.asarray(direction-convergence,dtype=f32)
-    rotated=np.where(rotated<f32(0.),np.asarray(rotated+f32(360.),dtype=f32),rotated)
-    rotated=np.where(rotated>f32(360.),np.asarray(rotated-f32(360.),dtype=f32),rotated)
-    direction=np.where(valid,rotated,direction).astype(f32)
-    angle=np.asarray(f32(.0174533)*direction,dtype=f32)
-    sine=np.asarray(np.sin(angle.astype(np.float64)),dtype=f32)
-    cosine=np.asarray(np.cos(angle.astype(np.float64)),dtype=f32)
-    u=np.where(valid,np.asarray(-speed*sine,dtype=f32),f32(9999.))
-    v=np.where(valid,np.asarray(-speed*cosine,dtype=f32),f32(9999.))
-    return u.astype(f32),v.astype(f32),valid,direction
+    valid=(np.abs(speed)<999.)&(np.abs(direction)<999.)
+    rotated=np.mod(direction-convergence,360.)
+    direction=np.where(valid,rotated,direction).astype(COMPUTE_DTYPE,copy=False)
+    angle=np.deg2rad(direction)
+    u=np.where(valid,-speed*np.sin(angle),9999.).astype(COMPUTE_DTYPE,copy=False)
+    v=np.where(valid,-speed*np.cos(angle),9999.).astype(COMPUTE_DTYPE,copy=False)
+    return u,v,valid,direction
+
+
+def _apply_wind_extrapolation(u,v,valid,calm_speed,anem,levels,roughness,*,
+                              iextrp,factors,station_latitude,station_xy,
+                              upper_xy,upper_valid,upper_air_separation_cells,
+                              dx_km,dy_km,power_exponent):
+    """Apply one vertical profile directly from each surface observation."""
+    output_u=np.full((levels.size,u.size),9999.,dtype=COMPUTE_DTYPE)
+    output_v=np.full_like(output_u,9999.)
+    skip=_near_upper_air(u.size,station_xy,upper_xy,upper_valid,
+                         upper_air_separation_cells,dx_km,dy_km)
+    output_u[0,skip&valid]=u[skip&valid]
+    output_v[0,skip&valid]=v[skip&valid]
+    calm=valid&(calm_speed<1.e-4)&~skip
+    output_u[:,calm]=0.
+    output_v[:,calm]=0.
+    active=valid&~calm&~skip
+    option=abs(int(iextrp))
+    if option==1:
+        coefficient=(np.log(levels[0])-np.log(roughness))/(
+            np.log(anem)-np.log(roughness))
+        output_u[0,active]=u[active]*coefficient[active]
+        output_v[0,active]=v[active]*coefficient[active]
+    elif option==2:
+        exponent=np.broadcast_to(
+            np.asarray(power_exponent,dtype=COMPUTE_DTYPE),u.shape)
+        # Every target level is referenced directly to the observation height.
+        # This is the ordinary power-law profile and does not make one layer's
+        # result depend on rounding performed while computing the layer below.
+        coefficient=(levels[:,None]/anem[None,:])**exponent[None,:]
+        output_u[:,active]=u[None,active]*coefficient[:,active]
+        output_v[:,active]=v[None,active]*coefficient[:,active]
+    elif option==3:
+        scale=np.asarray(factors,dtype=COMPUTE_DTYPE)
+        if scale.shape!=(levels.size,):
+            raise ValueError('IEXTRP=3 requires one FEXTR2 factor per layer')
+        output_u[:,active]=u[None,active]*scale[:,None]
+        output_v[:,active]=v[None,active]*scale[:,None]
+    elif option==4:
+        latitude=np.asarray(station_latitude,dtype=COMPUTE_DTYPE)
+        if latitude.shape!=u.shape:
+            raise ValueError('IEXTRP=4 requires one latitude per station')
+        speed=np.hypot(u,v)
+        direction=np.mod(270.-np.rad2deg(np.arctan2(v,u)),360.)
+        direction=np.where(direction==0.,360.,direction)
+        denominator=np.log(anem/roughness)
+        if np.any(np.abs(denominator[active])<1.e-12):
+            raise ValueError('anemometer height must differ from roughness')
+        magnitude=(speed[None,:]*np.log(levels[:,None]/roughness[None,:])/
+                   denominator[None,:])
+        turning_scale=12.*1.58
+        at_anem=turning_scale*(1.-np.exp(-anem/200.))
+        at_level=turning_scale*(1.-np.exp(-levels/200.))
+        turning=at_level[:,None]-at_anem[None,:]
+        adjusted=np.where(latitude[None,:]>0.,
+                          direction[None,:]+turning,
+                          direction[None,:]-turning)
+        radians=np.deg2rad(np.mod(adjusted,360.))
+        output_u[:,active]=-magnitude[:,active]*np.sin(radians[:,active])
+        output_v[:,active]=-magnitude[:,active]*np.cos(radians[:,active])
+    else:
+        raise ValueError('IEXTRP must be one of +/-1, +/-2, +/-3, or +/-4')
+    return output_u,output_v
 
 
 def wind_profiles(wind_speed,wind_direction,anemometer_height_m,z_centers_m,roughness_m,
@@ -457,90 +557,21 @@ def wind_profiles(wind_speed,wind_direction,anemometer_height_m,z_centers_m,roug
                   upper_valid=None,upper_air_separation_cells=-1.,dx_km=1.,dy_km=1.,
                   power_exponent=.143):
     """Convert land/overwater wind observations and apply IEXTRP 1--4."""
-    f32=np.float64
-    speed=np.asarray(wind_speed,dtype=f32)
-    anem=np.asarray(anemometer_height_m,dtype=f32)
-    roughness=np.asarray(roughness_m,dtype=f32); levels=np.asarray(z_centers_m,dtype=f32)
-    if anem.shape!=speed.shape or roughness.shape!=speed.shape or levels.ndim!=1:
+    speed=np.asarray(wind_speed,dtype=COMPUTE_DTYPE)
+    anem=np.asarray(anemometer_height_m,dtype=COMPUTE_DTYPE)
+    roughness=np.asarray(roughness_m,dtype=COMPUTE_DTYPE)
+    levels=np.asarray(z_centers_m,dtype=COMPUTE_DTYPE)
+    if (anem.shape!=speed.shape or roughness.shape!=speed.shape or
+            levels.ndim!=1 or levels.size==0):
         raise ValueError('surface wind profile inputs have incompatible shapes')
     if np.any(anem<=0.) or np.any(roughness<=0.) or np.any(levels<=0.):
         raise ValueError('wind heights and roughness must be positive')
-    u,v,valid,direction=_wind_components(speed,wind_direction,grid_convergence_degrees)
-    output_u=np.full((levels.size,speed.size),f32(9999.),dtype=f32)
-    output_v=np.full_like(output_u,f32(9999.))
-    skip=_near_upper_air(speed.size,station_xy,upper_xy,upper_valid,
-                         upper_air_separation_cells,dx_km,dy_km)
-    output_u[0,skip&valid]=u[skip&valid]; output_v[0,skip&valid]=v[skip&valid]
-    calm=valid&(speed<1.e-4)&~skip; output_u[:,calm]=0.; output_v[:,calm]=0.
-    active=valid&~calm&~skip; option=abs(int(iextrp))
-    if option==1:
-        log_level=np.asarray(np.log(np.float64(levels[0])),dtype=f32)
-        log_roughness=np.asarray(np.log(roughness.astype(np.float64)),dtype=f32)
-        log_anemometer=np.asarray(np.log(anem.astype(np.float64)),dtype=f32)
-        numerator=np.asarray(log_level-log_roughness,dtype=f32)
-        denominator=np.asarray(log_anemometer-log_roughness,dtype=f32)
-        coefficient=np.asarray(numerator/denominator,dtype=f32)
-        output_u[0,active]=np.asarray(u[active]*coefficient[active],dtype=f32)
-        output_v[0,active]=np.asarray(v[active]*coefficient[active],dtype=f32)
-    elif option==2:
-        exponent=np.broadcast_to(np.asarray(power_exponent,dtype=f32),speed.shape)
-        # DIAGNO advances K=2..NZ from the already rounded preceding layer;
-        # only K=2 is referenced directly to the anemometer height.
-        for level in range(1,levels.size):
-            reference=anem if level==1 else np.full_like(anem,levels[level-1])
-            ratio=np.asarray(levels[level]/reference,dtype=f32)
-            coefficient=np.asarray(ratio.astype(np.float64)**exponent.astype(np.float64),dtype=f32)
-            source_u=u if level==1 else output_u[level-1]
-            source_v=v if level==1 else output_v[level-1]
-            output_u[level,active]=np.asarray(source_u[active]*coefficient[active],dtype=f32)
-            output_v[level,active]=np.asarray(source_v[active]*coefficient[active],dtype=f32)
-        ratio=np.asarray(anem/levels[0],dtype=f32)
-        coefficient=np.asarray(ratio.astype(np.float64)**exponent.astype(np.float64),dtype=f32)
-        output_u[0,active]=np.asarray(u[active]/coefficient[active],dtype=f32)
-        output_v[0,active]=np.asarray(v[active]/coefficient[active],dtype=f32)
-    elif option==3:
-        scale=np.asarray(factors,dtype=f32)
-        if scale.shape!=(levels.size,): raise ValueError('IEXTRP=3 requires one FEXTR2 factor per layer')
-        output_u[:,active]=np.asarray(u[None,active]*scale[:,None],dtype=f32)
-        output_v[:,active]=np.asarray(v[None,active]*scale[:,None],dtype=f32)
-    elif option==4:
-        latitude=np.asarray(station_latitude,dtype=f32)
-        if latitude.shape!=speed.shape: raise ValueError('IEXTRP=4 requires one latitude per station')
-        ws1=np.asarray(np.sqrt(np.asarray(
-            np.asarray(u*u,dtype=f32)+np.asarray(v*v,dtype=f32),dtype=f32)),dtype=f32)
-        factor=f32(57.2957795)
-        recovered=np.asarray(f32(270.)-np.asarray(
-            np.asarray(np.arctan2(v,u),dtype=f32)*factor,
-            dtype=f32),dtype=f32)
-        wd1=np.asarray(np.fmod(recovered,f32(360.)),dtype=f32)
-        wd1=np.where(wd1==f32(0.),f32(360.),wd1).astype(f32)
-        height_ratio=np.asarray(anem/roughness,dtype=f32)
-        denominator=np.asarray(np.log(height_ratio.astype(np.float64)),dtype=f32)
-        if np.any(np.abs(denominator[active])<f32(1.e-12)):
-            raise ValueError('anemometer height must differ from roughness')
-        level_ratio=np.asarray(levels[:,None]/roughness[None,:],dtype=f32)
-        logarithm=np.asarray(np.log(level_ratio.astype(np.float64)),dtype=f32)
-        magnitude=np.asarray(np.asarray(ws1[None,:]*logarithm,dtype=f32)/denominator[None,:],dtype=f32)
-        dh_d1=np.asarray(f32(12.)*f32(1.58),dtype=f32)
-        anem_exponent=np.asarray(np.asarray(-f32(1.)*anem,dtype=f32)/f32(200.),dtype=f32)
-        anem_decay=np.asarray(np.exp(anem_exponent.astype(np.float64)),dtype=f32)
-        at_anem=np.asarray(dh_d1*np.asarray(f32(1.)-anem_decay,dtype=f32),dtype=f32)
-        level_exponent=np.asarray(np.asarray(-f32(1.)*levels,dtype=f32)/f32(200.),dtype=f32)
-        level_decay=np.asarray(np.exp(level_exponent.astype(np.float64)),dtype=f32)
-        at_level=np.asarray(dh_d1*np.asarray(f32(1.)-level_decay,dtype=f32),dtype=f32)
-        north=np.asarray(np.asarray(wd1[None,:]+at_level[:,None],dtype=f32)-at_anem[None,:],dtype=f32)
-        north=np.where(north>f32(360.),np.asarray(north-f32(360.),dtype=f32),north)
-        south=np.asarray(np.asarray(wd1[None,:]-at_level[:,None],dtype=f32)+at_anem[None,:],dtype=f32)
-        south=np.where(south<=f32(0.),np.asarray(f32(360.)+south,dtype=f32),south)
-        adjusted_direction=np.where(latitude[None,:]>f32(0.),north,south).astype(f32)
-        radians=np.asarray(f32(.0174533)*adjusted_direction,dtype=f32)
-        profile_sine=np.asarray(np.sin(radians.astype(np.float64)),dtype=f32)
-        profile_cosine=np.asarray(np.cos(radians.astype(np.float64)),dtype=f32)
-        output_u[:,active]=np.asarray(-magnitude[:,active]*profile_sine[:,active],dtype=f32)
-        output_v[:,active]=np.asarray(-magnitude[:,active]*profile_cosine[:,active],dtype=f32)
-    else:
-        raise ValueError('IEXTRP must be one of +/-1, +/-2, +/-3, or +/-4')
-    return output_u,output_v
+    u,v,valid,_=_wind_components(speed,wind_direction,grid_convergence_degrees)
+    return _apply_wind_extrapolation(
+        u,v,valid,speed,anem,levels,roughness,iextrp=iextrp,factors=factors,
+        station_latitude=station_latitude,station_xy=station_xy,upper_xy=upper_xy,
+        upper_valid=upper_valid,upper_air_separation_cells=upper_air_separation_cells,
+        dx_km=dx_km,dy_km=dy_km,power_exponent=power_exponent)
 
 
 def surface_wind_profiles(record,anemometer_height_m,z_centers_m,roughness_m,iextrp=-1,
@@ -561,87 +592,23 @@ def component_wind_profiles(u_component,v_component,anemometer_height_m,z_center
                             upper_air_separation_cells=-1.,dx_km=1.,dy_km=1.,
                             power_exponent=.143):
     """Profile grid-oriented DIAG.DAT U/V surface observations."""
-    f32=np.float64
-    u=np.asarray(u_component,dtype=f32); v=np.asarray(v_component,dtype=f32)
+    u=np.asarray(u_component,dtype=COMPUTE_DTYPE)
+    v=np.asarray(v_component,dtype=COMPUTE_DTYPE)
     if u.shape!=v.shape: raise ValueError('surface U/V components have different shapes')
-    anem=np.asarray(anemometer_height_m,dtype=f32)
-    roughness=np.asarray(roughness_m,dtype=f32); levels=np.asarray(z_centers_m,dtype=f32)
-    if anem.shape!=u.shape or roughness.shape!=u.shape or levels.ndim!=1:
+    anem=np.asarray(anemometer_height_m,dtype=COMPUTE_DTYPE)
+    roughness=np.asarray(roughness_m,dtype=COMPUTE_DTYPE)
+    levels=np.asarray(z_centers_m,dtype=COMPUTE_DTYPE)
+    if (anem.shape!=u.shape or roughness.shape!=u.shape or
+            levels.ndim!=1 or levels.size==0):
         raise ValueError('surface component profile inputs have incompatible shapes')
     if np.any(anem<=0.) or np.any(roughness<=0.) or np.any(levels<=0.):
         raise ValueError('wind heights and roughness must be positive')
     # US/VS are initialized to EDIT=999 and DIAGNO treats values above
     # EDITL=900 as missing before vertical extrapolation.
-    valid=(u<=f32(900.))&(v<=f32(900.))
-    profiled_u=np.full((levels.size,u.size),f32(9999.),dtype=f32)
-    profiled_v=np.full_like(profiled_u,f32(9999.))
-    skip=_near_upper_air(u.size,station_xy,upper_xy,upper_valid,
-                         upper_air_separation_cells,dx_km,dy_km)
-    profiled_u[0,skip&valid]=u[skip&valid]
-    profiled_v[0,skip&valid]=v[skip&valid]
-    speed=np.asarray(np.sqrt(np.asarray(
-        np.asarray(u*u,dtype=f32)+np.asarray(v*v,dtype=f32),dtype=f32)),dtype=f32)
-    calm=valid&(speed<f32(1.e-4))&~skip
-    profiled_u[:,calm]=f32(0.); profiled_v[:,calm]=f32(0.)
-    active=valid&~calm&~skip
-    option=abs(int(iextrp))
-    if option==1:
-        log_level=np.asarray(np.log(np.float64(levels[0])),dtype=f32)
-        log_roughness=np.asarray(np.log(roughness.astype(np.float64)),dtype=f32)
-        log_anemometer=np.asarray(np.log(anem.astype(np.float64)),dtype=f32)
-        coefficient=np.asarray(np.asarray(log_level-log_roughness,dtype=f32)/
-                               np.asarray(log_anemometer-log_roughness,dtype=f32),dtype=f32)
-        profiled_u[0,active]=np.asarray(u[active]*coefficient[active],dtype=f32)
-        profiled_v[0,active]=np.asarray(v[active]*coefficient[active],dtype=f32)
-    elif option==2:
-        exponent=np.broadcast_to(np.asarray(power_exponent,dtype=f32),u.shape)
-        for level in range(1,levels.size):
-            reference=anem if level==1 else np.full_like(anem,levels[level-1])
-            ratio=np.asarray(levels[level]/reference,dtype=f32)
-            coefficient=np.asarray(ratio.astype(np.float64)**exponent.astype(np.float64),dtype=f32)
-            source_u=u if level==1 else profiled_u[level-1]
-            source_v=v if level==1 else profiled_v[level-1]
-            profiled_u[level,active]=np.asarray(source_u[active]*coefficient[active],dtype=f32)
-            profiled_v[level,active]=np.asarray(source_v[active]*coefficient[active],dtype=f32)
-        ratio=np.asarray(anem/levels[0],dtype=f32)
-        coefficient=np.asarray(ratio.astype(np.float64)**exponent.astype(np.float64),dtype=f32)
-        profiled_u[0,active]=np.asarray(u[active]/coefficient[active],dtype=f32)
-        profiled_v[0,active]=np.asarray(v[active]/coefficient[active],dtype=f32)
-    elif option==3:
-        scale=np.asarray(factors,dtype=f32)
-        if scale.shape!=(levels.size,): raise ValueError('IEXTRP=3 requires one FEXTR2 factor per layer')
-        profiled_u[:,active]=np.asarray(u[None,active]*scale[:,None],dtype=f32)
-        profiled_v[:,active]=np.asarray(v[None,active]*scale[:,None],dtype=f32)
-    elif option==4:
-        latitude=np.asarray(station_latitude,dtype=f32)
-        if latitude.shape!=u.shape: raise ValueError('IEXTRP=4 requires one latitude per station')
-        factor=f32(57.2957795)
-        recovered=np.asarray(f32(270.)-np.asarray(
-            np.asarray(np.arctan2(v,u),dtype=f32)*factor,
-            dtype=f32),dtype=f32)
-        wd1=np.asarray(np.fmod(recovered,f32(360.)),dtype=f32)
-        wd1=np.where(wd1==f32(0.),f32(360.),wd1).astype(f32)
-        denominator=np.asarray(np.log(np.asarray(anem/roughness,dtype=f32).astype(np.float64)),dtype=f32)
-        if np.any(np.abs(denominator[active])<f32(1.e-12)):
-            raise ValueError('anemometer height must differ from roughness')
-        logarithm=np.asarray(np.log(np.asarray(
-            levels[:,None]/roughness[None,:],dtype=f32).astype(np.float64)),dtype=f32)
-        magnitude=np.asarray(np.asarray(speed[None,:]*logarithm,dtype=f32)/denominator[None,:],dtype=f32)
-        dh_d1=np.asarray(f32(12.)*f32(1.58),dtype=f32)
-        anem_decay=np.asarray(np.exp(np.asarray(-anem/f32(200.),dtype=f32).astype(np.float64)),dtype=f32)
-        level_decay=np.asarray(np.exp(np.asarray(-levels/f32(200.),dtype=f32).astype(np.float64)),dtype=f32)
-        at_anem=np.asarray(dh_d1*np.asarray(f32(1.)-anem_decay,dtype=f32),dtype=f32)
-        at_level=np.asarray(dh_d1*np.asarray(f32(1.)-level_decay,dtype=f32),dtype=f32)
-        north=np.asarray(np.asarray(wd1[None,:]+at_level[:,None],dtype=f32)-at_anem[None,:],dtype=f32)
-        north=np.where(north>f32(360.),np.asarray(north-f32(360.),dtype=f32),north)
-        south=np.asarray(np.asarray(wd1[None,:]-at_level[:,None],dtype=f32)+at_anem[None,:],dtype=f32)
-        south=np.where(south<=f32(0.),np.asarray(f32(360.)+south,dtype=f32),south)
-        direction=np.where(latitude[None,:]>f32(0.),north,south).astype(f32)
-        radians=np.asarray(f32(.0174533)*direction,dtype=f32)
-        sine=np.asarray(np.sin(radians.astype(np.float64)),dtype=f32)
-        cosine=np.asarray(np.cos(radians.astype(np.float64)),dtype=f32)
-        profiled_u[:,active]=np.asarray(-magnitude[:,active]*sine[:,active],dtype=f32)
-        profiled_v[:,active]=np.asarray(-magnitude[:,active]*cosine[:,active],dtype=f32)
-    else:
-        raise ValueError('IEXTRP must be one of +/-1, +/-2, +/-3, or +/-4')
-    return profiled_u,profiled_v
+    valid=(u<=900.)&(v<=900.)
+    speed=np.hypot(u,v).astype(COMPUTE_DTYPE,copy=False)
+    return _apply_wind_extrapolation(
+        u,v,valid,speed,anem,levels,roughness,iextrp=iextrp,factors=factors,
+        station_latitude=station_latitude,station_xy=station_xy,upper_xy=upper_xy,
+        upper_valid=upper_valid,upper_air_separation_cells=upper_air_separation_cells,
+        dx_km=dx_km,dy_km=dy_km,power_exponent=power_exponent)

@@ -2,6 +2,7 @@ import numpy as np
 import netCDF4 as nc
 import pytest
 import shutil
+import struct
 import subprocess
 import textwrap
 from types import SimpleNamespace
@@ -13,9 +14,12 @@ from pycalmet.calmet_numerics import (air_density,cloud_cover_mm5,cloud_cover_te
     smooth_wind,terrain_adjust_surface_wind,topographic_vertical_velocity,vertical_interpolate,vertical_layer_average,water_mechanical_height,wind1_initial_guess,wind_speed_direction)
 from pycalmet.calmet_output import (AuxiliaryCalmetWriter,CalmetNetCDFWriter,
                                     LegacyCalmetWriter,MesopacWriter)
+from pycalmet.legacy._compat.calmet_output import (
+    MesopacWriter as LegacyMesopacWriter,
+)
 from pycalmet.aux_data import AuxiliaryData
 from pycalmet.legacy_io import FortranSequentialReader,FortranSequentialWriter,fixed_string
-from pycalmet.calmet_solver import DiagnosticWindFields,HourFields,PrognosticMapper,Step1Fields,StepTransformContext,SurfaceFields,_coare_ending_gmt_hour,_domain_mean_real4,_fortran_nearest_indices,_fortran_nint_positive,_m3d_cloud_water_g_kg,_m3d_relative_humidity,_prognostic_local_timestamp,_prognostic_record_solar,_prognostic_wind_components,_rdmm5_above_ground_profiles,_rdmm5_sst_profile,_rdmm5_surface_density,_relative_humidity,_stull_temperature,_vertical_centers,build_diagnostic_wind,build_objective_wind,build_surface_fields,dataset_timestamp,interpolate_step1_fields,iter_hours,map_prognostic_cloud,observed_temperature_3d,solar_at_step_midpoint,solve_hour,target_latitude_longitude
+from pycalmet.calmet_solver import DiagnosticWindFields,HourFields,PrognosticMapper,Step1Fields,StepTransformContext,SurfaceFields,_coare_ending_gmt_hour,_nearest_indices,_source_relative_humidity,_prognostic_local_timestamp,_prognostic_record_solar,_prognostic_wind_components,_rdmm5_above_ground_profiles,_rdmm5_sst_profile,_rdmm5_surface_density,_relative_humidity,_stull_temperature,_vertical_centers,build_diagnostic_wind,build_objective_wind,build_surface_fields,dataset_timestamp,interpolate_step1_fields,iter_hours,map_prognostic_cloud,observed_temperature_3d,solar_at_step_midpoint,solve_hour,target_latitude_longitude
 from pycalmet.config import GridConfig
 from pycalmet.coare import initial_warm_layer_state,surface_flux
 from pycalmet.sea_data import GriddedSeaData
@@ -45,7 +49,8 @@ def test_mixht2st_vectorizes_station_columns_without_changing_grid_kernel(method
         grid=mixing_height_batchvarova_gryning(
             *shaped,surface_temperature_k=np.full((1,3),290.,dtype=np.float32))
     for actual,expected in zip(station,grid,strict=True):
-        np.testing.assert_array_equal(actual.view(np.uint32),expected[0].view(np.uint32))
+        assert actual.dtype==np.float32
+        np.testing.assert_allclose(actual,expected[0],rtol=1.e-6,atol=1.e-6)
 
 
 
@@ -96,7 +101,7 @@ def test_auxiliary_calmet_writer_header_and_zero_run_compression(tmp_path):
         assert reader.read_record()[:8]==b'2D_VARS '
         assert reader.read_record()[:8]==b'3D_VARS '
         np.testing.assert_array_equal(np.frombuffer(reader.read_record(),dtype='<i4'),
-                                      [201807700,0,201807700,3600])
+                                      [201807700,0,201807701,0])
         assert np.frombuffer(reader.read_record(),dtype='<i4').item()==3
         record=reader.read_record(); assert record[:12]==b'CLDMRUP     '
         expected=np.array([-(np.float32(1.)+np.float32(.0001)),1.,
@@ -104,9 +109,13 @@ def test_auxiliary_calmet_writer_header_and_zero_run_compression(tmp_path):
         np.testing.assert_array_equal(np.frombuffer(record[12:],dtype='<f4'),expected)
     with AuxiliaryData(path) as auxiliary:
         assert (auxiliary.header.nx,auxiliary.header.ny,auxiliary.header.nz)==(2,2,2)
+        assert auxiliary.header.start==begin
+        assert auxiliary.header.end==begin+timedelta(hours=1)
+        assert auxiliary.header.wire_start==(2018,3,18,0,0)
+        assert auxiliary.header.wire_end==(2018,3,18,1,0)
         result=auxiliary.read_hour()
-        assert (result.begin_code,result.begin_seconds,result.end_code,
-                result.end_seconds)==(201807700,0,201807700,3600)
+        assert (result.begin,result.end)==(begin,begin+timedelta(hours=1))
+        assert result.wire_time_bounds==(201807700,0,201807701,0)
         np.testing.assert_array_equal(result.cloud_water_above_g_kg,field)
         np.testing.assert_array_equal(result.cloud_bottom_above_m,field*2.)
         np.testing.assert_array_equal(result.cloud_top_above_m,field*3.)
@@ -122,10 +131,68 @@ def test_auxiliary_calmet_writer_is_empty_without_source_cloud_water(tmp_path):
     assert path.read_bytes()==b''
 
 
+@pytest.mark.parametrize(('begin','expected'),(
+    (datetime(2018,3,18,23,30),(201807723,1800,201807800,1800)),
+    (datetime(2018,12,31,23,30),(201836523,1800,201900100,1800)),
+))
+def test_auxiliary_calmet_writer_normalizes_end_timestamp_across_dates(
+        tmp_path,begin,expected):
+    path=tmp_path/f'{begin:%Y%m%d}.aux'
+    field=np.zeros((1,1),dtype=np.float32)
+    step=SimpleNamespace(cloud_liquid_water_above=field,
+        cloud_liquid_water_above_bottom=field,
+        cloud_liquid_water_above_top=field,
+        cloud_liquid_water_3d=field[None])
+    hour=SimpleNamespace(timestamp=begin,step1=step)
+    end=begin+timedelta(hours=1)
+    with AuxiliaryCalmetWriter(path,GridConfig(1,1,1.,1.),[0.,20.],begin,end) as writer:
+        writer.append(hour)
+    with AuxiliaryData(path) as auxiliary:
+        result=auxiliary.read_hour()
+        assert (result.begin,result.end)==(begin,end)
+        assert result.wire_time_bounds==expected
 
-def test_coare_ending_hour_uses_west_positive_timezone_and_ignores_seconds():
-    assert _coare_ending_gmt_hour(datetime(2018,1,1,0,15,30),8)==8
-    assert _coare_ending_gmt_hour(datetime(2018,1,1,23,59,59),-8)==15
+
+@pytest.mark.parametrize('fields',(
+    (201936600,0,202000100,0),
+    (201900100,-1,201900101,0),
+    (201900100,0,201900100,0),
+    (201900101,0,201900100,0),
+))
+def test_auxiliary_reader_rejects_invalid_or_nonadvancing_timestamps(fields):
+    with pytest.raises(ValueError,match='CALMET.AUX'):
+        AuxiliaryData._decode_timestamp(struct.pack('<4i',*fields))
+
+
+
+def test_coare_ending_hour_uses_west_positive_timezone_and_full_time():
+    assert _coare_ending_gmt_hour(
+        datetime(2018,1,1,0,15,30,500000),8)==pytest.approx(
+            8.+15./60.+30.5/3600.)
+    assert _coare_ending_gmt_hour(
+        datetime(2018,1,1,23,59,59),-8)==pytest.approx(15.+59./60.+59./3600.)
+
+
+@pytest.mark.parametrize(('begin','timestep_seconds','expected_day','expected_position'),(
+    (datetime(2018,3,18,0,29,59),1.,77,
+     (29.*60.+59.5)/3600.+.5),
+    (datetime(2018,3,18,23,59,59,750000),.5,78,.5),
+    (datetime(2018,12,31,23,59,59,500000),1.,1,.5),
+))
+def test_solar_midpoint_uses_full_datetime_across_date_boundaries(
+        monkeypatch,begin,timestep_seconds,expected_day,expected_position):
+    requested_days=[]
+    def fake_solar(day,base_timezone,latitude,longitude):
+        requested_days.append(day)
+        return np.arange(26,dtype=np.float32)[:,None,None]
+    monkeypatch.setattr('pycalmet.calmet_solver.solar_sine',fake_solar)
+
+    result=solar_at_step_midpoint(
+        begin,timestep_seconds,8,np.array([[30.]]),np.array([[120.]]))
+
+    assert requested_days==[expected_day]
+    assert result.dtype==np.float32
+    np.testing.assert_allclose(result,expected_position,rtol=0.,atol=2.e-6)
 
 
 def test_irtype0_diagnostic_lapse_stops_after_wind(monkeypatch):
@@ -222,14 +289,119 @@ def test_cloud3_maps_rh_before_applying_nonlinear_teixeira_formula():
 
 
 
-def test_rdmm5_uses_stored_integer_rh_instead_of_reconstructing_it():
+def test_source_uses_stored_relative_humidity_instead_of_reconstructing_it():
     class Dataset:
         variables={'relative_humidity':np.array([[[[100.]]]])}
         def __getitem__(self,name): return self.variables[name]
-    got=_m3d_relative_humidity(
+    got=_source_relative_humidity(
         Dataset(),0,np.array([[[.0099]]]),np.array([[[900.]]]),
         np.array([[[280.]]]))
     np.testing.assert_array_equal(got,100.)
+
+
+def test_relative_humidity_uses_standard_wrf_mixing_ratio_definition():
+    qvapor=np.array([.01],dtype=np.float32)
+    pressure=np.array([1000.],dtype=np.float32)
+    temperature=np.array([300.],dtype=np.float32)
+    tc=temperature-273.15
+    vapor_pressure=6.112*np.exp(17.67*tc/(tc+243.5))
+    saturation_mixing_ratio=.622*vapor_pressure/(pressure-vapor_pressure)
+
+    result=_relative_humidity(qvapor,pressure,temperature)
+
+    assert result.dtype==np.float32
+    np.testing.assert_allclose(
+        result,100.*qvapor/saturation_mixing_ratio,rtol=2.e-6)
+
+
+def test_step_interpolation_preserves_fractional_surface_humidity():
+    shape=(1,1)
+    level=np.ones((1,*shape),dtype=np.float32)
+    profile=np.ones((2,*shape),dtype=np.float32)
+    def step(humidity):
+        return Step1Fields(
+            level,level,level*280.,np.full(shape,280.,dtype=np.float32),
+            np.full(shape,1000.,dtype=np.float32),np.ones(shape,dtype=np.float32),
+            level*50.,np.zeros(shape,dtype=np.float32),
+            np.zeros(shape,dtype=np.float32),np.full(shape,.1,dtype=np.float32),
+            np.zeros(shape,dtype=np.float32),np.zeros(shape,dtype=np.float32),
+            profile*280.,profile*100.,np.full(shape,humidity,dtype=np.float32),
+            np.zeros(shape,dtype=np.float32),np.zeros(shape,dtype=np.int32))
+
+    result=interpolate_step1_fields(step(50.25),step(50.75),.25)
+
+    assert result.surface_relative_humidity.dtype==np.float32
+    np.testing.assert_allclose(result.surface_relative_humidity,50.375)
+
+
+def test_step_interpolation_includes_profile_temperature_and_height():
+    shape=(1,1)
+    level=np.ones((1,*shape),dtype=np.float32)
+    def step(profile_temperature,profile_height):
+        profile_temperature=np.asarray(profile_temperature,dtype=np.float32)[:,None,None]
+        profile_height=np.asarray(profile_height,dtype=np.float32)[:,None,None]
+        return Step1Fields(
+            level,level,level*280.,np.full(shape,280.,dtype=np.float32),
+            np.full(shape,1000.,dtype=np.float32),np.ones(shape,dtype=np.float32),
+            level*50.,np.zeros(shape,dtype=np.float32),
+            np.zeros(shape,dtype=np.float32),np.full(shape,.1,dtype=np.float32),
+            np.zeros(shape,dtype=np.float32),np.zeros(shape,dtype=np.float32),
+            profile_temperature,profile_height,np.full(shape,50.,dtype=np.float32),
+            np.zeros(shape,dtype=np.float32),np.zeros(shape,dtype=np.int32))
+
+    left=step([280.,275.],[0.,100.])
+    right=step([284.,279.],[0.,120.])
+    quarter=interpolate_step1_fields(left,right,.25)
+    end=interpolate_step1_fields(left,right,1.)
+
+    np.testing.assert_allclose(quarter.profile_temperature[:,0,0],[281.,276.])
+    np.testing.assert_allclose(quarter.profile_height[:,0,0],[0.,105.])
+    np.testing.assert_array_equal(end.profile_temperature,right.profile_temperature)
+    np.testing.assert_array_equal(end.profile_height,right.profile_height)
+    assert quarter.profile_temperature.dtype==np.float32
+    assert quarter.profile_height.dtype==np.float32
+
+
+def test_build_step1_preserves_fractional_canonical_surface_humidity():
+    class Dataset:
+        variables={
+            'latitude':np.array([[30.]],dtype=np.float64),
+            'longitude':np.array([[120.]],dtype=np.float64),
+            'terrain':np.array([[0.]],dtype=np.float32),
+            'height':np.array([[[[10.]],[[100.]],[[500.]]]],dtype=np.float32),
+            'wind_speed':np.ones((1,3,1,1),dtype=np.float32),
+            'wind_direction':np.zeros((1,3,1,1),dtype=np.float32),
+            'temperature':np.array([[[[290.]],[[288.]],[[280.]]]],dtype=np.float32),
+            'qvapor':np.full((1,3,1,1),.005,dtype=np.float32),
+            'pressure':np.array([[[[1000.]],[[900.]],[[800.]]]],dtype=np.float32),
+            'relative_humidity':np.array(
+                [[[[50.25]],[[60.5]],[[70.75]]]],dtype=np.float32),
+            'landuse':np.array([[1]],dtype=np.int16),
+            'temperature_2m':np.array([[[290.]]],dtype=np.float32),
+            'surface_pressure':np.array([[[100000.]]],dtype=np.float32),
+            'precipitation':np.zeros((1,1,1),dtype=np.float32),
+            'pbl_height':np.full((1,1,1),100.,dtype=np.float32),
+            'sensible_heat_flux':np.zeros((1,1,1),dtype=np.float32),
+            'friction_velocity':np.full((1,1,1),.1,dtype=np.float32),
+        }
+        def __getitem__(self,name):
+            return self.variables[name]
+
+    class IdentityMapper:
+        target_shape=(1,1)
+        def interpolate(self,field,*,ignore_zero=False):
+            return np.asarray(field,dtype=np.float32)
+        def nearest(self,field):
+            return np.asarray(field,dtype=np.float32)
+        def radius_interpolate(self,field,*args,**kwargs):
+            return np.asarray(field,dtype=np.float32)
+
+    result=calmet_solver.build_step1_fields(
+        Dataset(),0,GridConfig(1,1,1.,1.),[0.,50.,200.],
+        mapper=IdentityMapper(),cloud_method=3)
+
+    assert result.surface_relative_humidity.dtype==np.float32
+    np.testing.assert_array_equal(result.surface_relative_humidity,[[50.25]])
 
 
 
@@ -315,6 +487,26 @@ def test_water2_coare_station_carries_warm_layer_between_hours():
     np.testing.assert_array_equal(mixed_result[-1].initialized,[True,False])
 
 
+def test_water_station_profiles_preserve_return_contract_when_all_inactive():
+    f32=lambda value: np.array([value],dtype=np.float32)
+    centers=np.array([10.,40.],dtype=np.float32)
+    faces=np.array([0.,20.,60.],dtype=np.float32)
+    neutral=neutral_water_station_profiles(
+        f32(0.),f32(0.),f32(10.),f32(600.),f32(1.e-4),centers,faces,f32(30.))
+    assert len(neutral)==6
+    assert all(np.isnan(field).all() for field in neutral[2:])
+
+    warm_state=initial_warm_layer_state((1,))
+    coare=coare_water_station_profiles(
+        f32(0.),f32(0.),f32(10.),f32(10.),f32(288.15),f32(-2.),f32(80.),
+        f32(9999.),f32(600.),f32(1.e-4),f32(.004),f32(.2),centers,faces,
+        f32(30.),f32(700.),f32(350.),f32(0.),mixing_method=-1,
+        warm_layer_state=warm_state)
+    assert len(coare)==10
+    assert all(np.isnan(field).all() for field in coare[2:-1])
+    assert coare[-1] is warm_state
+
+
 def test_maul_carson_threshold_relaxes_without_resetting_jump():
     heights=np.array([0.,100.,400.])[:,None,None]
     temperatures=np.array([291.,290.,287.])[:,None,None]
@@ -342,13 +534,13 @@ def test_surface_fields_combine_land_and_no_station_water():
 
 
 
-def test_psiud_convective_constant_matches_four_atan_one():
+def test_psiud_uses_exact_cube_root_and_pi_constants():
     zl=np.array([-1.])
-    x=(1.-16.*zl)**.25; y=(1.-10.15*zl)**.3333
+    x=(1.-16.*zl)**.25; y=np.cbrt(1.-10.15*zl)
     psik=2.*np.log((1.+x)/2.)+np.log((1.+x*x)/2.)-2.*np.arctan(x)+np.pi/2.
     psic=1.5*np.log((1.+y+y*y)/3.)-np.sqrt(3.)*np.arctan((1.+2.*y)/np.sqrt(3.))+np.pi/np.sqrt(3.)
     expected=.5*(psik+psic)
-    np.testing.assert_allclose(psi_momentum_dyer(zl),expected)
+    np.testing.assert_allclose(psi_momentum_dyer(zl),expected,rtol=2.e-7)
 
 
 def test_avemix_zero_wind_uses_displaced_inverse_square_local_box():
@@ -368,7 +560,7 @@ def test_avemix_wind_extends_search_upwind_beyond_minimum_box():
 
 
 
-def test_avemix_uses_legacy_fixed_one_hour_trajectory_for_subhour_runs():
+def test_avemix_uses_configured_trajectory_duration_for_subhour_runs():
     zi=np.arange(7.,dtype=np.float32)[None,:]
     u=np.full_like(zi,1.)
     zero=np.zeros_like(zi)
@@ -376,7 +568,42 @@ def test_avemix_uses_legacy_fixed_one_hour_trajectory_for_subhour_runs():
                                  timestep_s=3600.)[0]
     subhour=upwind_mixing_average(u,zero,zi,zi,1000.,minimum_radius_cells=0,
                                   timestep_s=900.)[0]
-    np.testing.assert_array_equal(subhour,hourly)
+    np.testing.assert_array_equal(subhour,zi)
+    assert not np.array_equal(subhour,hourly)
+
+
+def test_avemix_rectangular_grid_is_invariant_under_ninety_degree_rotation():
+    rng=np.random.default_rng(184)
+    shape=(5,7)
+    zi=rng.uniform(100.,1000.,shape)
+    zic=rng.uniform(0.,500.,shape)
+    u=rng.uniform(-2.,2.,shape)
+    v=rng.uniform(-2.,2.,shape)
+    averaged,averaged_convective=upwind_mixing_average(
+        u,v,zi,zic,2000.,1000.,minimum_radius_cells=1,
+        half_angle_degrees=35.,timestep_s=1800.)
+
+    # np.rot90 maps the new +x direction to old +y and new +y to old -x.
+    rotated,rotated_convective=upwind_mixing_average(
+        np.rot90(v),-np.rot90(u),np.rot90(zi),np.rot90(zic),1000.,2000.,
+        minimum_radius_cells=1,half_angle_degrees=35.,timestep_s=1800.)
+    np.testing.assert_allclose(rotated,np.rot90(averaged),rtol=0.,atol=0.)
+    np.testing.assert_allclose(
+        rotated_convective,np.rot90(averaged_convective),rtol=0.,atol=0.)
+
+
+def test_avemix_pure_north_wind_uses_southern_upwind_cells():
+    zi=np.zeros((5,1),dtype=np.float32)
+    zi[0,0]=100.
+    northward=np.ones_like(zi)
+    averaged,_=upwind_mixing_average(
+        np.zeros_like(zi),northward,zi,zi,2000.,1000.,
+        minimum_radius_cells=0,timestep_s=3600.)
+    calm,_=upwind_mixing_average(
+        np.zeros_like(zi),np.zeros_like(zi),zi,zi,2000.,1000.,
+        minimum_radius_cells=0,timestep_s=3600.)
+    assert averaged[3,0]>0.
+    assert calm[3,0]==0.
 
 
 def test_mesopac_layer_average_matches_pacave_partial_layers():
@@ -436,7 +663,7 @@ def test_canonical_dataset_timestamp_decoder():
     assert _prognostic_local_timestamp(dataset,0,5)==datetime(2018,3,17,19)
 
 
-def test_nonfinal_exact_boundary_uses_current_and_future_ceiling(monkeypatch):
+def test_exact_boundaries_use_their_adjacent_endpoint_ceilings(monkeypatch):
     text=np.array([list(value) for value in (
         '2018-03-18_00:00:00','2018-03-18_01:00:00',
         '2018-03-18_02:00:00','2018-03-18_03:00:00',
@@ -460,14 +687,10 @@ def test_nonfinal_exact_boundary_uses_current_and_future_ceiling(monkeypatch):
     monkeypatch.setattr('pycalmet.calmet_solver.build_step1_fields',fake_build)
     monkeypatch.setattr('pycalmet.calmet_solver.solve_hour',fake_solve)
     list(iter_hours({'time_text':text},GridConfig(1,1,1.,1.),[0.,20.],{}))
-    # Startup reads endpoint 1/2 even though endpoint 1 is the first ending.
-    # At ending hour three RDMM5 has shifted to endpoint 3/4 at DTINC=0, so
-    # ICEILG takes MAX(0,20), not MAX(100,0) from the stale endpoint 2/3 pair.
-    # The final hour retains endpoint 3/4 and evaluates it at DTINC=1.
-    assert received==[100.,100.,20.,20.]
+    assert received==[0.,100.,100.,20.]
     assert builds==[0,1,2,3,4]
 
-def test_single_hour_first_boundary_still_reads_future_ceiling(monkeypatch):
+def test_single_hour_boundary_does_not_read_an_unused_future_record(monkeypatch):
     text=np.array([list(value) for value in (
         '2018-03-18_00:00:00','2018-03-18_01:00:00',
         '2018-03-18_02:00:00')],dtype='S1')
@@ -488,10 +711,11 @@ def test_single_hour_first_boundary_still_reads_future_ceiling(monkeypatch):
     monkeypatch.setattr('pycalmet.calmet_solver.solve_hour',fake_solve)
     list(iter_hours({'time_text':text},GridConfig(1,1,1.,1.),[0.,20.],{},
                     time_indices=[1]))
-    assert received==[40.]
-    with pytest.raises(ValueError,match='requires a following prognostic record'):
-        list(iter_hours({'time_text':text[:2]},GridConfig(1,1,1.,1.),[0.,20.],{},
-                        time_indices=[1]))
+    assert received==[0.]
+    received.clear()
+    list(iter_hours({'time_text':text[:2]},GridConfig(1,1,1.,1.),[0.,20.],{},
+                    time_indices=[1]))
+    assert received==[0.]
 
 def test_three_hour_endpoints_pass_record_time_to_rdmm5(monkeypatch):
     text=np.array([list(value) for value in
@@ -513,12 +737,10 @@ def test_three_hour_endpoints_pass_record_time_to_rdmm5(monkeypatch):
     monkeypatch.setattr('pycalmet.calmet_solver.solve_hour',fake_solve)
     list(iter_hours({'time_text':text},GridConfig(1,1,1.,1.),[0.,20.],{},
                     time_indices=[1],prognostic_timestep_s=10800.))
-    assert builds==[(0,datetime(2018,3,18)),(1,datetime(2018,3,18,3)),
-                    (2,datetime(2018,3,18,6))]
+    assert builds==[(0,datetime(2018,3,18)),(1,datetime(2018,3,18,3))]
 
-def test_gmt_endpoints_convert_to_base_time_and_keep_comp_solar_day(monkeypatch):
-    # 04/05 UTC are 23/00 in CALMET's positive-west IBTZ=5 base time.  COMP
-    # retains the June 21 SOLAR table while RDMM5 reads the future 00 record.
+def test_gmt_endpoints_convert_each_record_to_base_time(monkeypatch):
+    # 04/05 UTC are 23/00 in CALMET's positive-west IBTZ=5 base time.
     text=np.array([list(value) for value in
         ('2018-06-22_04:00:00','2018-06-22_05:00:00',
          '2018-06-22_06:00:00')],dtype='S1')
@@ -528,7 +750,8 @@ def test_gmt_endpoints_convert_to_base_time_and_keep_comp_solar_day(monkeypatch)
         np.zeros(shape),np.ones(shape),np.zeros(shape),np.zeros(shape),
         profile,profile,np.ones(shape)*50.,np.zeros(shape),np.zeros(shape,dtype=int))
     def fake_build(dataset,index,*args,**kwargs):
-        builds.append((index,kwargs['timestamp'],kwargs['solar_day']))
+        assert 'solar_day' not in kwargs
+        builds.append((index,kwargs['timestamp']))
         return step
     def fake_solve(dataset,index,grid,z_faces,geo,timestamp,convective,jump,**options):
         calls.append(timestamp)
@@ -540,9 +763,7 @@ def test_gmt_endpoints_convert_to_base_time_and_keep_comp_solar_day(monkeypatch)
     list(iter_hours({'time_text':text},GridConfig(1,1,1.,1.),[0.,20.],{},
                     time_indices=[1],base_timezone=5))
     beginning=datetime(2018,6,21,23)
-    assert builds==[(0,beginning,beginning),
-                    (1,datetime(2018,6,22),beginning),
-                    (2,datetime(2018,6,22,1),beginning)]
+    assert builds==[(0,beginning),(1,datetime(2018,6,22))]
     assert calls==[beginning]
 
 def test_hour_iterator_injects_external_cloud_at_interval_end(monkeypatch):
@@ -591,7 +812,7 @@ def test_subhour_iterator_caches_endpoints_and_interpolates_step1(monkeypatch):
 
 
 def test_streaming_calmet_netcdf_writer(tmp_path):
-    shape=(1,1); three=np.ones((3,1,1)); step=Step1Fields(three,three,three*290.,np.full(shape,290.),np.full(shape,1000.),np.full(shape,1.2),three*50.,np.zeros(shape),np.zeros(shape),np.full(shape,.1),np.zeros(shape),np.zeros(shape),three*290.,np.array([0.,100.,300.])[:,None,None],np.full(shape,50),np.zeros(shape),np.zeros(shape,dtype=int))
+    shape=(1,1); three=np.ones((3,1,1)); step=Step1Fields(three,three,three*290.,np.full(shape,290.),np.full(shape,1000.),np.full(shape,1.2),three*50.,np.zeros(shape),np.zeros(shape),np.full(shape,.1),np.zeros(shape),np.zeros(shape),three*290.,np.array([0.,100.,300.])[:,None,None],np.full(shape,50.25,dtype=np.float32),np.zeros(shape),np.zeros(shape,dtype=int))
     wind=DiagnosticWindFields(three,three,np.ones((4,1,1)),three,np.zeros(shape),np.zeros(shape))
     surface=SurfaceFields(np.full(shape,.1),np.full(shape,1.2),np.full(shape,100.),np.full(shape,20.),np.full(shape,.2),np.full(shape,-100.),np.full(shape,500.),np.full(shape,300.),np.zeros(shape))
     hour=HourFields(datetime(2018,3,18),step,wind,surface,three*280.); geo={'terrain_height':np.zeros(shape),'dominant_landuse':np.full(shape,20)}
@@ -599,7 +820,7 @@ def test_streaming_calmet_netcdf_writer(tmp_path):
     with CalmetNetCDFWriter(path,GridConfig(1,1,1.,1.),[0.,20.,100.,300.],geo) as writer: writer.append(hour,np.full(shape,.5),geo['dominant_landuse'])
     with nc.Dataset(path) as ds:
         assert ds.dimensions['time'].size==1; np.testing.assert_allclose(ds['wind_u'][0],three)
-        np.testing.assert_array_equal(ds['surface_relative_humidity'][0],50)
+        np.testing.assert_array_equal(ds['surface_relative_humidity'][0],50.25)
         np.testing.assert_array_equal(ds['precipitation_rate'][0],0.)
         assert ds['pgt_stability_class'][0,0,0]>=1
     wind_only=tmp_path/'wind_only.nc'
@@ -698,7 +919,7 @@ def test_legacy_calmet_header_and_hour_record_layout(tmp_path):
         for _ in range(4): reader.read_record()
         first_hour=reader.read_record(); assert first_hour[:8]==b'U-LEV  1'; assert len(first_hour)==28
         np.testing.assert_array_equal(np.frombuffer(first_hour[8:24],dtype='<i4'),
-                                      [201807700,0,201807700,3600])
+                                      [201807700,0,201807701,0])
 
     no_precip=tmp_path/'calmet-no-precip.dat'
     with LegacyCalmetWriter(no_precip,GridConfig(1,1,1.,1.),[0.,20.,100.,300.],geo,
@@ -745,10 +966,13 @@ def test_legacy_calmet_subhour_record_uses_fortran_seconds_encoding(tmp_path):
     step=Step1Fields(three,three,three*290.,np.full(shape,290.),np.full(shape,1000.),np.full(shape,1.2),three*50.,np.zeros(shape),np.zeros(shape),np.full(shape,.1),np.zeros(shape),np.zeros(shape),three*290.,np.array([0.,100.,300.])[:,None,None],np.full(shape,50),np.zeros(shape),np.zeros(shape,dtype=int))
     wind=DiagnosticWindFields(three,three,np.ones((4,1,1)),three,np.zeros(shape),np.zeros(shape))
     surface=SurfaceFields(np.full(shape,.1),np.full(shape,1.2),np.full(shape,100.),np.full(shape,20.),np.full(shape,.2),np.full(shape,-100.),np.full(shape,500.),np.full(shape,300.),np.zeros(shape))
-    begin=datetime(2018,3,18,0,15); hour=HourFields(begin,step,wind,surface,three*280.)
+    run_begin=datetime(2018,3,18); begin=run_begin+timedelta(minutes=15)
+    hour=HourFields(begin,step,wind,surface,three*280.)
     geo={'terrain_height':np.zeros(shape),'dominant_landuse':np.full(shape,20),'roughness_length':np.full(shape,.1),'leaf_area_index':np.ones(shape)}
     path=tmp_path/'quarter_hour.dat'
-    with LegacyCalmetWriter(path,GridConfig(1,1,1.,1.),[0.,20.,100.,300.],geo,begin,begin+timedelta(minutes=15),run_type=0,timestep_seconds=900) as writer:
+    with LegacyCalmetWriter(path,GridConfig(1,1,1.,1.),[0.,20.,100.,300.],
+            geo,run_begin,run_begin+timedelta(hours=1),run_type=0,
+            timestep_seconds=900) as writer:
         writer.append(hour,np.full(shape,.5))
     with FortranSequentialReader(path) as reader:
         reader.read_record(); count=np.frombuffer(reader.read_record(),dtype='<i4').item()
@@ -758,6 +982,45 @@ def test_legacy_calmet_subhour_record_uses_fortran_seconds_encoding(tmp_path):
         record=reader.read_record()
         np.testing.assert_array_equal(np.frombuffer(record[8:24],dtype='<i4'),
                                       [201807700,900,201807700,1800])
+
+
+def test_legacy_calmet_field_record_honors_explicit_end_across_year(tmp_path):
+    shape=(1,1)
+    geo={'terrain_height':np.zeros(shape),'dominant_landuse':np.full(shape,20),
+         'roughness_length':np.full(shape,.1),'leaf_area_index':np.ones(shape)}
+    begin=datetime(2018,12,31,23,59,30)
+    end=datetime(2019,1,1,0,0,15)
+    path=tmp_path/'cross-year.dat'
+    run_begin=datetime(2018,12,31,23)
+    with LegacyCalmetWriter(path,GridConfig(1,1,1.,1.),[0.,20.],geo,
+            run_begin,run_begin+timedelta(hours=1),
+            run_type=0,timestep_seconds=900) as writer:
+        writer._field_record('CHECK',np.ones(shape),begin,end)
+    with FortranSequentialReader(path) as reader:
+        while (record:=reader.read_record()) is not None:
+            if record[:8]==b'CHECK   ':
+                np.testing.assert_array_equal(np.frombuffer(record[8:24],dtype='<i4'),
+                    [201836523,3570,201900100,15])
+                break
+        else:
+            pytest.fail('CHECK record was not written')
+
+
+def test_integer_hour_legacy_headers_reject_fractional_run_duration(tmp_path):
+    grid=GridConfig(1,1,1.,1.)
+    begin=datetime(2018,3,18)
+    end=begin+timedelta(minutes=15)
+    geo={'terrain_height':np.zeros((1,1)),
+         'dominant_landuse':np.full((1,1),20),
+         'roughness_length':np.full((1,1),.1),
+         'leaf_area_index':np.ones((1,1))}
+    with pytest.raises(ValueError,match='whole-hour'):
+        AuxiliaryCalmetWriter(tmp_path/'calmet.aux',grid,[0.,20.],begin,end)
+    with pytest.raises(ValueError,match='whole-hour'):
+        LegacyCalmetWriter(
+            tmp_path/'calmet.dat',grid,[0.,20.],geo,begin,end,run_type=0)
+    with pytest.raises(ValueError,match='whole-hour'):
+        MesopacWriter(tmp_path/'pacout.dat',grid,[0.,20.],geo,begin,end)
 
 
 def test_mesopac_writer_matches_outpc_record_layout(tmp_path):
@@ -803,7 +1066,7 @@ def test_mesopac_writer_matches_outpc_record_layout(tmp_path):
         assert reader.read_record() is None
 
 
-def test_mesopac_writer_is_byte_identical_to_gfortran_outpc_records(tmp_path):
+def test_legacy_mesopac_writer_is_byte_identical_to_gfortran_outpc_records(tmp_path):
     compiler=shutil.which('gfortran')
     if compiler is None: pytest.skip('gfortran is required for the binary oracle')
     source=tmp_path/'oracle.f90'
@@ -864,7 +1127,7 @@ def test_mesopac_writer_is_byte_identical_to_gfortran_outpc_records(tmp_path):
     hour=HourFields(datetime(2018,3,18,4),step,wind,surface,one*0.+280.)
     geo={'dominant_landuse':np.full(shape,55),'roughness_length':np.full(shape,.125)}
     python_output=tmp_path/'python.dat'
-    with MesopacWriter(python_output,GridConfig(2,2,1.,1.),[0.,5000.],geo,
+    with LegacyMesopacWriter(python_output,GridConfig(2,2,1.,1.),[0.,5000.],geo,
             datetime(2018,3,18),datetime(2018,3,18,1),timezone_offset=8,
             surface_coordinates_m=[(500.,500.),(1500.,1500.)],
             upper_coordinates_m=[(500.,1500.)],nearest_surface_station=[[1,1],[2,2]]) as writer:
@@ -884,17 +1147,28 @@ def test_rdmm5_ending_record_maps_to_preceding_half_hour_solar_sample():
     np.testing.assert_array_equal(got,samples[10])
     assert not np.array_equal(got,samples[11])
 
-def test_rdmm5_midnight_record_uses_current_comp_day_solar_table():
+def test_prognostic_midnight_record_uses_its_actual_date_solar_table():
     latitude=np.array([[70.]],dtype=np.float32)
     longitude=np.array([[0.]],dtype=np.float32)
-    current_day=datetime(2018,6,21,23)
     record_time=datetime(2018,6,22)
-    got=_prognostic_record_solar(
-        record_time,0,latitude,longitude,solar_day=current_day)
-    expected=solar_sine(172,0,latitude,longitude)[0]
-    next_day=solar_sine(173,0,latitude,longitude)[0]
+    got=_prognostic_record_solar(record_time,0,latitude,longitude)
+    expected=solar_sine(173,0,latitude,longitude)[0]
+    previous_day=solar_sine(172,0,latitude,longitude)[0]
     np.testing.assert_array_equal(got,expected)
-    assert not np.array_equal(got,next_day)
+    assert not np.array_equal(got,previous_day)
+
+
+@pytest.mark.parametrize('record_time,previous_julian',(
+    (datetime(2019,1,1),365),
+    (datetime(2021,1,1),366),
+))
+def test_prognostic_midnight_record_uses_new_year_date(record_time,previous_julian):
+    latitude=np.array([[70.]],dtype=np.float32)
+    longitude=np.array([[0.]],dtype=np.float32)
+    got=_prognostic_record_solar(record_time,0,latitude,longitude)
+    np.testing.assert_array_equal(got,solar_sine(1,0,latitude,longitude)[0])
+    assert not np.array_equal(
+        got,solar_sine(previous_julian,0,latitude,longitude)[0])
 
 
 
@@ -903,6 +1177,36 @@ def test_topographic_velocity_is_zero_for_flat_terrain():
     u=np.ones((2,2,3)); v=np.zeros_like(u)
     got=topographic_vertical_velocity(u,v,np.zeros((2,3)),[0.,20.,40.],np.zeros((2,3)),np.full((2,3),300.),.1,1000.,1000.)
     np.testing.assert_array_equal(got,0.)
+
+@pytest.mark.parametrize(('terrain','value_index','distance_index','expected'),[
+    (np.array([[10.,5.,5.,5.,10.,5.,5.]]),0,2,10.),
+    (np.array([[0.,5.,5.,5.,0.,5.,5.]]),1,3,0.),
+])
+def test_terrain_extrema_equal_values_use_nearest_occurrence_independent_of_scan_direction(
+        terrain,value_index,distance_index,expected):
+    result=terrain_extrema(terrain,4.,1000.,1000.)
+    reversed_result=terrain_extrema(terrain[:,::-1],4.,1000.,1000.)
+
+    for field,reversed_field in zip(result,reversed_result,strict=True):
+        assert field.dtype==np.float32
+        np.testing.assert_array_equal(reversed_field,field[:,::-1])
+    assert result[value_index][0,3]==expected
+    assert result[distance_index][0,3]==1000.
+
+
+def test_terrain_extrema_respects_physical_distance_on_rectangular_grid():
+    terrain=np.zeros((5,5))
+    terrain[2,3]=10.  # one 2 km x-cell from the centre
+    terrain[3,2]=10.  # one 1 km y-cell from the centre
+
+    result=terrain_extrema(terrain,3.,2000.,1000.)
+    transposed=terrain_extrema(terrain.T,3.,1000.,2000.)
+
+    assert result[0][2,2]==10.
+    assert result[2][2,2]==1000.
+    for field,transposed_field in zip(result,transposed,strict=True):
+        np.testing.assert_array_equal(transposed_field,field.T)
+
 
 def test_slope_flow_respects_water_and_layer_depth():
     terrain=np.array([[0.,10.,20.]])
@@ -947,7 +1251,10 @@ def test_interpqr_supports_inverse_distance_and_exponential_methods():
     np.testing.assert_allclose(mapper.radius_interpolate(field,4.,method=2),expected2)
     weights=np.exp(-np.array([1.,4.,9.])/4.)/np.array([1.,4.,9.])
     np.testing.assert_allclose(mapper.radius_interpolate(field,2.,method=3),np.sum(field.ravel()*weights)/weights.sum())
-    assert np.isfinite(mapper.radius_interpolate(field,0.,method=3)).all()
+    automatic_weights=np.exp(-np.array([1.,4.,9.])/.25)/np.array([1.,4.,9.])
+    expected_automatic=np.sum(field.ravel()*automatic_weights)/automatic_weights.sum()
+    np.testing.assert_allclose(
+        mapper.radius_interpolate(field,0.,method=3),expected_automatic,rtol=2.e-6)
 
 
 def test_interpqr_exponential_has_no_nearest_fallback_beyond_cutoff():
@@ -1015,21 +1322,21 @@ def test_prognostic_sst_uses_nearest_ocean_source_not_nearest_any_source():
         mapper.nearest_masked(field,np.zeros((1,3),dtype=bool))
 
 
-def test_prognostic_sst_nearest_ocean_tie_keeps_fortran_scan_order():
+def test_prognostic_sst_nearest_ocean_accepts_any_equidistant_source():
     mapper=PrognosticMapper((2,2),np.array([[0,1,2,3]]),np.ones((1,4))/4.,(1,1),
         np.array([[-1.,0.],[0.,-1.],[1.,0.],[0.,1.]],dtype=np.float32),
         np.array([[0.,0.]],dtype=np.float32))
     field=np.array([[10.,30.],[20.,40.]],dtype=np.float32)
-    # F-order is Fortran's I-outer/J-inner RDHD5 scan: (0,0), (1,0), ... .
-    np.testing.assert_array_equal(
-        mapper.nearest_masked(field,np.ones((2,2),dtype=bool)),[[10.]])
+    selected=mapper.nearest_masked(field,np.ones((2,2),dtype=bool)).item()
+    assert selected in field.ravel()
 
 
-def test_prognostic_four_neighbours_keep_fortran_scan_order_on_ties():
+def test_prognostic_four_neighbours_select_the_nearest_tied_points():
     source=np.array([[-1.,0.],[0.,-1.],[1.,0.],[0.,1.],
                      [-2.,0.],[0.,-2.],[2.,0.],[0.,2.]],dtype=np.float32)
-    got=_fortran_nearest_indices(source,np.array([[0.,0.]],dtype=np.float32),4)
-    np.testing.assert_array_equal(got,[[0,1,2,3]])
+    got=_nearest_indices(source,np.array([[0.,0.]],dtype=np.float32),4)
+    np.testing.assert_array_equal(np.sort(got[0]),[0,1,2,3])
+    np.testing.assert_allclose(np.linalg.norm(source[got[0]],axis=1),1.)
 
 
 
@@ -1043,6 +1350,25 @@ def test_wind1_initial_guess_removes_calm_and_barrier_by_level():
     # The upper station is blocked in layer 1, while the calm surface station
     # is removed aloft and the barrier no longer applies in layer 2.
     np.testing.assert_allclose(got_u[:,0,0],[0.,10.])
+
+
+def test_wind1_rectangular_cells_give_equal_weight_to_equal_cell_offsets():
+    # The target is at (1.0, 0.5) km.  Each station is exactly one cell away:
+    # one 2 km column east and one 1 km row north.
+    points=np.array([[3.,.5],[1.,1.5]])
+    u=np.array([[2.,6.]])
+    v=np.zeros_like(u)
+    got_u,got_v=wind1_initial_guess(u,v,points,2,1,1,2.,1.)
+    np.testing.assert_allclose(got_u,np.array([[[4.]]],dtype=np.float32))
+    np.testing.assert_array_equal(got_v,0.)
+
+
+@pytest.mark.parametrize(('dx_km','dy_km'),[
+    (0.,1.),(1.,0.),(-1.,1.),(1.,-1.),(np.inf,1.),(1.,np.nan),
+])
+def test_wind1_rejects_invalid_rectangular_grid_spacing(dx_km,dy_km):
+    with pytest.raises(ValueError,match='finite and positive'):
+        wind1_initial_guess([[1.]],[[0.]],[[.5,.5]],1,1,1,dx_km,dy_km)
 
 
 def test_wind1_uses_internal_editl_missing_threshold():

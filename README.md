@@ -16,7 +16,11 @@ numerical references are kept in separate, clearly scoped directories.
 
 - Pure Python and NumPy/SciPy execution; no Fortran compiler is required.
 - Five public processing stages plus an end-to-end pipeline exposed through one package.
-- WRF NetCDF input and CF-compatible NetCDF output.
+- WRF NetCDF input and CF-compatible NetCDF output through `netCDF4` only.
+- FP32 model fields with explicit high-precision boundaries for time, geodesy,
+  spatial searches, and sensitive reductions.
+- Rasterio-backed standard rasters, Shapely geometry, and SciPy spatial
+  indexing instead of bespoke general-purpose implementations.
 - Compatibility with legacy CALWRF, TERREL, CTGPROC, MAKEGEO, and CALMET files.
 - Streaming WRF processing for datasets larger than memory.
 - A real-data Zhejiang example with losslessly compressed WRF inputs.
@@ -225,13 +229,13 @@ Python code that consumes each value. Regenerate the tables
 with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 
 <details>
-<summary><strong>CALWRF</strong> — 14 parameters; Zhejiang control: `examples/zhejiang/config/calwrf.inp`.</summary>
+<summary><strong>CALWRF</strong> — 13 parameters; Zhejiang control: `examples/zhejiang/config/calwrf.inp`.</summary>
 
 | Parameter | Meaning | Python type | Python default | Zhejiang value |
 | --- | --- | --- | --- | --- |
 | `wrf_files` | WRF NetCDF files, in chronological order. | `Sequence[str \| Path] \| None` | `required` | `[examples/zhejiang/wrfout_d01_2018-03-18_00_00_00.nc, examples/zhejiang/wrfout_d01_2018-03-18_01_00_00.nc, … (3 items)]` |
-| `start` | First timestamp included in the run. | `str \| int \| datetime \| None` | `required` | `'2018031800'` |
-| `end` | Last timestamp included in the run. | `str \| int \| datetime \| None` | `required` | `'2018031802'` |
+| `start` | First naive, second-precision timestamp included in the run; accepts datetime or YYYYMMDDHH/ISO-like text. | `datetime \| str \| None` | `required` | `2018-03-18 00:00:00` |
+| `end` | Last naive, second-precision timestamp included in the run; accepts datetime or YYYYMMDDHH/ISO-like text. | `datetime \| str \| None` | `required` | `2018-03-18 02:00:00` |
 | `output` | Primary output file path. | `str \| Path \| None` | `required` | `output/zhejiang/calwrf.nc` |
 | `create_surface` | Create the separate legacy M2D surface file when legacy_output is also requested. | `bool` | `True` | `False` |
 | `compression` | NetCDF deflate compression level for CALWRF output (0 disables compression). | `int` | `1` | `1` |
@@ -242,7 +246,6 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 | `surface_output` | Optional traditional CALWRF two-dimensional surface/M2D path, written when create_surface is true and legacy_output is requested. | `str \| Path \| None` | `None` | `None` |
 | `title` | Descriptive title stored in CALWRF output metadata. | `str` | `'Create 3D.DAT file for WRF output'` | `'Create CALWRF data for the Zhejiang example'` |
 | `listing_output` | CALWRF processing log/listing destination. | `str \| Path \| None` | `None` | `output/zhejiang/calwrf.lst` |
-| `legacy_file_rain_reset` | Reset accumulated rain at each legacy input-file boundary. | `bool` | `False` | `False` |
 
 </details>
 
@@ -282,8 +285,8 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 | `grid` | Complete grid object; an alternative to the flattened grid parameters. | `GridConfig \| Mapping[str, Any] \| None` | `None` | `see flattened grid fields` |
 | `nx` | Number of Cartesian X/east-west cells; for a TERREL polar grid, number of rings. | `int \| None` | `required` | `610` |
 | `ny` | Number of Cartesian Y/north-south cells; for a TERREL polar grid, number of rays. | `int \| None` | `required` | `499` |
-| `dx_km` | Cartesian X grid spacing in kilometres; TERREL requires equal X/Y spacing and ignores it for polar ring positions. | `float \| None` | `required` | `1.0` |
-| `dy_km` | Cartesian Y grid spacing in kilometres; TERREL requires equal X/Y spacing and ignores it for polar ring positions. | `float \| None` | `required` | `1.0` |
+| `dx_km` | Cartesian X grid spacing in kilometres; independent of dy_km and unused for polar ring positions. | `float \| None` | `required` | `1.0` |
+| `dy_km` | Cartesian Y grid spacing in kilometres; independent of dx_km and unused for polar ray positions. | `float \| None` | `required` | `1.0` |
 | `projection` | Projection code: UTM, Transverse Mercator (TTM), Lambert conformal conic (LCC), polar stereographic (PS), equatorial Mercator (EM), or Lambert azimuthal equal-area (LAZA). | `str` | `'UTM'` | `'LCC'` |
 | `lat0` | Signed latitude of the projection origin or tangent point, in degrees (north positive); EM fixes it at zero. | `float` | `27.0` | `27.0` |
 | `lon0` | Signed central-meridian or tangent-point longitude, in degrees (east positive). | `float` | `117.5` | `117.5` |
@@ -332,8 +335,8 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 | `grid` | Complete grid object; an alternative to the flattened grid parameters. | `GridConfig \| Mapping[str, Any] \| None` | `None` | `see flattened grid fields` |
 | `nx` | Number of Cartesian X/east-west cells; for a TERREL polar grid, number of rings. | `int \| None` | `required` | `610` |
 | `ny` | Number of Cartesian Y/north-south cells; for a TERREL polar grid, number of rays. | `int \| None` | `required` | `499` |
-| `dx_km` | Cartesian X grid spacing in kilometres; TERREL requires equal X/Y spacing and ignores it for polar ring positions. | `float \| None` | `required` | `1.0` |
-| `dy_km` | Cartesian Y grid spacing in kilometres; TERREL requires equal X/Y spacing and ignores it for polar ring positions. | `float \| None` | `required` | `1.0` |
+| `dx_km` | Cartesian X grid spacing in kilometres; independent of dy_km and unused for polar ring positions. | `float \| None` | `required` | `1.0` |
+| `dy_km` | Cartesian Y grid spacing in kilometres; independent of dx_km and unused for polar ray positions. | `float \| None` | `required` | `1.0` |
 | `projection` | Projection code: UTM, Transverse Mercator (TTM), Lambert conformal conic (LCC), polar stereographic (PS), equatorial Mercator (EM), or Lambert azimuthal equal-area (LAZA). | `str` | `'UTM'` | `'LCC'` |
 | `lat0` | Signed latitude of the projection origin or tangent point, in degrees (north positive); EM fixes it at zero. | `float` | `27.0` | `27.0` |
 | `lon0` | Signed central-meridian or tangent-point longitude, in degrees (east positive). | `float` | `117.5` | `117.5` |
@@ -376,8 +379,8 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 | `qa_cell` | Optional one-based `(i, j)` cell for reporting intermediate terrain, land-use, and surface-property calculations. | `tuple[int, int] \| None` | `None` | `(20, 15)` |
 | `snow_processing` | Create one snow-adjusted GEO file per day from SNODAS depth/age data over the inclusive snow_start_date..snow_end_date range. | `bool` | `False` | `False` |
 | `snow_data` | SNODAS snow-depth/age input used to build daily snow-adjusted geophysical files. | `str \| Path \| None` | `None` | `None` |
-| `snow_start_date` | First YYYYMMDD date covered by snow processing. | `int \| None` | `None` | `None` |
-| `snow_end_date` | Last YYYYMMDD date covered by snow processing. | `int \| None` | `None` | `None` |
+| `snow_start_date` | First calendar date covered by snow processing; accepts date, midnight datetime, or YYYY-MM-DD/YYYYMMDD text. | `date \| datetime \| str \| None` | `None` | `None` |
+| `snow_end_date` | Last calendar date covered by snow processing; accepts date, midnight datetime, or YYYY-MM-DD/YYYYMMDD text. | `date \| datetime \| str \| None` | `None` | `None` |
 | `snow_properties` | Snow-covered records with the same seven fields as input_properties; the mapped output category must match the normal record. | `dict[int, tuple[float, float, float, float, float, float, int]] \| None` | `{}` | `{}` |
 | `snow_age_parameters` | Per snow class `(age_time_scale_days, albedo_reduction_factor)` used by the ageing-albedo method. | `dict[int, tuple[int, float]] \| None` | `{}` | `{}` |
 | `snow_roughness_method` | Snow roughness method: 1 reduces inferred obstacle height by snow depth; 2 uses the user snow roughness wherever snow is present. | `int` | `1` | `1` |
@@ -392,8 +395,8 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 | `grid` | Complete grid object; an alternative to the flattened grid parameters. | `GridConfig \| Mapping[str, Any] \| None` | `None` | `see flattened grid fields` |
 | `nx` | Number of Cartesian X/east-west cells; for a TERREL polar grid, number of rings. | `int \| None` | `required` | `610` |
 | `ny` | Number of Cartesian Y/north-south cells; for a TERREL polar grid, number of rays. | `int \| None` | `required` | `499` |
-| `dx_km` | Cartesian X grid spacing in kilometres; TERREL requires equal X/Y spacing and ignores it for polar ring positions. | `float \| None` | `required` | `1.0` |
-| `dy_km` | Cartesian Y grid spacing in kilometres; TERREL requires equal X/Y spacing and ignores it for polar ring positions. | `float \| None` | `required` | `1.0` |
+| `dx_km` | Cartesian X grid spacing in kilometres; independent of dy_km and unused for polar ring positions. | `float \| None` | `required` | `1.0` |
+| `dy_km` | Cartesian Y grid spacing in kilometres; independent of dx_km and unused for polar ray positions. | `float \| None` | `required` | `1.0` |
 | `projection` | Projection code: UTM, Transverse Mercator (TTM), Lambert conformal conic (LCC), polar stereographic (PS), equatorial Mercator (EM), or Lambert azimuthal equal-area (LAZA). | `str` | `'UTM'` | `'LCC'` |
 | `lat0` | Signed latitude of the projection origin or tangent point, in degrees (north positive); EM fixes it at zero. | `float` | `27.0` | `27.0` |
 | `lon0` | Signed central-meridian or tangent-point longitude, in degrees (east positive). | `float` | `117.5` | `117.5` |
@@ -422,8 +425,8 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 | `meteorology` | Gridded prognostic meteorology input; iprog selects whether it supplies a Step-1 field, initial guess, or pseudo-observations. | `str \| Path \| Sequence[str \| Path] \| None` | `required` | `output/zhejiang/calwrf.nc` |
 | `geophysical` | GEO geophysical grid containing terrain, land use, roughness, albedo, Bowen ratio, soil/anthropogenic heat parameters, and leaf-area index. | `str \| Path \| None` | `required` | `output/zhejiang/geo.nc` |
 | `output` | Primary output file path. | `str \| Path \| None` | `required` | `output/zhejiang/calmet.nc` |
-| `start` | Inclusive lower boundary of the CALMET output interval `[start, end)`; meteorological boundary times are selected with `start < t <= end`, and each output timestamp is `t - timestep_seconds`. | `str \| datetime \| None` | `required` | `'2018-03-18_00:00:00'` |
-| `end` | Exclusive upper boundary of the CALMET output interval `[start, end)`; meteorological boundary times are selected with `start < t <= end`, and each output timestamp is `t - timestep_seconds`. | `str \| datetime \| None` | `required` | `'2018-03-18_01:00:00'` |
+| `start` | Inclusive lower boundary of the CALMET output interval `[start, end)`; meteorological boundary times are selected with `start < t <= end`, and each output timestamp is `t - timestep_seconds`. | `datetime \| str \| None` | `required` | `2018-03-18 00:00:00` |
+| `end` | Exclusive upper boundary of the CALMET output interval `[start, end)`; meteorological boundary times are selected with `start < t <= end`, and each output timestamp is `t - timestep_seconds`. | `datetime \| str \| None` | `required` | `2018-03-18 01:00:00` |
 | `noobs` | Observation mode: 0 uses surface/overwater/upper-air observations; 1 replaces upper-air observations with prognostic data; 2 uses prognostic data at all levels. | `int` | `0` | `2` |
 | `run_type` | Run type: 0 computes wind fields only; 1 also computes micrometeorology and is required by CALPUFF/CALGRID. | `int` | `1` | `1` |
 | `save_output` | Write the gridded meteorological disk output selected by legacy_output_format. | `bool` | `True` | `True` |
@@ -431,26 +434,26 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 | `test_mode` | 1 stops after input setup checks; 2 continues into model computation. | `int` | `2` | `2` |
 | `regulatory_mode` | Regulatory check mode: 0 disables it; 1 enforces the USEPA-required mixing-height, overwater-flux, relaxation, and representative-temperature choices. | `int` | `0` | `0` |
 | `timestep_seconds` | CALMET computational time step; it must divide evenly into one hour. | `int` | `3600` | `3600` |
-| `prognostic_timestep_seconds` | Seconds between prognostic records: a positive multiple of timestep_seconds, no more than 12 hours; legacy IPROG<13 requires 3600 s. | `int` | `3600` | `3600` |
+| `prognostic_timestep_seconds` | Seconds between prognostic records: a positive multiple of timestep_seconds and no more than 12 hours. Traditional PROG.DAT and native MM4.DAT inputs remain hourly by file format. | `int` | `3600` | `3600` |
 | `cloud_method` | Cloud source: 1 surface observations (NOOBS 0/1), 2 existing CLOUD.DAT, 3 prognostic 850-hPa RH, or 4 prognostic RH at all levels. | `int` | `4` | `4` |
 | `cloud_data` | CLOUD.DAT path: input when cloud_method=2, or output destination when cloud_output=1. | `str \| Path \| None` | `None` | `examples/zhejiang/config/cloud.dat` |
 | `cloud_data_format` | CLOUD.DAT format: unformatted binary (1) or formatted text (2). | `int` | `2` | `2` |
 | `cloud_output` | Write the internally generated gridded cloud field as CLOUD.DAT (0=no, 1=yes); output is unavailable when cloud_method=2 reads an existing file. | `int` | `0` | `0` |
-| `surface_data` | Hourly SURF.DAT observations, used in NOOBS modes 0/1 unless corresponding fields come from DIAG.DAT. | `str \| Path \| None` | `None` | `examples/zhejiang/config/surf.dat` |
+| `surface_data` | Hourly SURF.DAT observations for NOOBS 0/1. DIAG.DAT may replace their winds; full meteorological runs still read SURF.DAT thermodynamic fields. | `str \| Path \| None` | `None` | `examples/zhejiang/config/surf.dat` |
 | `surface_data_format` | SURF.DAT format: unformatted binary (1) or formatted text (2). | `int` | `2` | `2` |
 | `surface_control_stations` | Records `(4-char name, station ID, x_km, y_km, timezone, anemometer_height_m)` in model coordinates; list land stations only when land/water interpolation is separate. | `Sequence[tuple[str, int, float, float, float, float]]` | `()` | `()` |
-| `upper_air_files` | One sounding file per upper-air station, used in NOOBS=0 unless upper winds come from DIAG.DAT. | `Sequence[str \| Path]` | `()` | `()` |
+| `upper_air_files` | One sounding file per upper-air station for NOOBS=0. DIAG.DAT may replace sounding winds; full meteorological runs still read sounding temperatures. | `Sequence[str \| Path]` | `()` | `()` |
 | `upper_control_stations` | Records `(4-char name, station ID, x_km, y_km, timezone)`, one per upper-air file. | `Sequence[tuple[str, int, float, float, float]]` | `()` | `()` |
 | `sea_files` | One file per overwater station; may contain water ΔT, lapse rate, observed mixing height, and observed waves for negative COARE wave codes. | `Sequence[str \| Path]` | `()` | `()` |
-| `diagnostic_data` | Hourly preprocessed DIAG.DAT temperatures, lapse rates, or U/V winds, required for each diagnostic_* source option set to 1. | `str \| Path \| None` | `None` | `examples/zhejiang/config/diag.dat` |
+| `diagnostic_data` | Hourly preprocessed DIAG.DAT temperatures, lapse rates, or U/V winds. A file is required only when the selected observation mode actually consumes an enabled diagnostic source. | `str \| Path \| None` | `None` | `examples/zhejiang/config/diag.dat` |
 | `diagnostic_surface_temperature` | Surface-temperature source for the diagnostic wind module: compute internally (0) or read hourly preprocessed values from DIAG.DAT (1). | `int` | `0` | `0` |
 | `diagnostic_lapse_rate` | Domain lapse-rate source for terrain circulations: compute internally from upper-air/prognostic data (0) or read hourly DIAG.DAT values (1). | `int` | `0` | `0` |
 | `diagnostic_initial_wind` | Diagnostic-module initial-guess wind source: compute from upper/prognostic data (0) or read hourly preprocessed U/V from DIAG.DAT (1). | `int` | `0` | `0` |
-| `diagnostic_surface_wind` | Surface-wind source: SURF.DAT speed/direction (0) or preprocessed DIAG.DAT U/V (1); legacy validation permits option 1 only for wind-only runs. | `int` | `0` | `0` |
-| `diagnostic_upper_wind` | Upper-wind source: sounding speed/direction (0) or preprocessed DIAG.DAT U/V (1); legacy validation permits option 1 only for wind-only runs. | `int` | `0` | `0` |
+| `diagnostic_surface_wind` | Surface-wind source: SURF.DAT speed/direction (0) or preprocessed DIAG.DAT U/V (1). In full runs, option 1 replaces only wind and retains SURF.DAT thermodynamic fields. | `int` | `0` | `0` |
+| `diagnostic_upper_wind` | Upper-wind source: sounding speed/direction (0) or preprocessed DIAG.DAT U/V (1). In full runs, option 1 replaces only wind and retains sounding temperatures. | `int` | `0` | `0` |
 | `initial_guess_upper_station` | With internally computed initial winds, 1..NUSTA selects one sounding for a uniform guess; -1 uses all soundings with 1/R² weighting for a spatially varying guess. | `int` | `-1` | `-1` |
 | `initial_guess_height_range_m` | Bottom and top heights, in metres, used to form the diagnostic module's domain-uniform initial wind. | `Sequence[float]` | `(1.0, 1000.0)` | `(1.0, 1000.0)` |
-| `use_initial_guess_calmet` | Use coarse CALMET fields as the initial guess (0=no, 1=yes), replacing any prognostic initial guess; incompatible with Step-1 IPROG 1/3/13. | `int` | `0` | `0` |
+| `use_initial_guess_calmet` | Use coarse CALMET fields as the initial wind guess (0=no, 1=yes); when enabled, it replaces the background wind for every IPROG mode. | `int` | `0` | `0` |
 | `initial_guess_calmet_files` | Coarse-grid CALMET files used as the initial wind guess when use_initial_guess_calmet=1. | `Sequence[str \| Path]` | `()` | `()` |
 | `weight_data` | WT.DAT three-dimensional observation weight Wo; the prognostic field receives complementary weight 1−Wo. | `str \| Path \| None` | `None` | `examples/zhejiang/config/wt.dat` |
 | `precipitation_station_count` | Precipitation source: positive is the number of PRECIP.DAT stations, 0 disables precipitation input, and -1 uses prognostic precipitation. | `int` | `0` | `-1` |
@@ -458,7 +461,7 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 | `precipitation_data_format` | PRECIP.DAT format: unformatted binary (1) or formatted text (2). | `int` | `2` | `2` |
 | `precipitation_control_stations` | Records `(4-char name, six-digit station code, x_km, y_km)`; the traditional code combines a two-digit state and four-digit station ID. | `Sequence[tuple[str, int, float, float]]` | `()` | `()` |
 | `iprog` | Prognostic-wind use: 0 off; 1/3/13 Step-1 field (IWFCOD=0); 2/4/14 initial guess (IWFCOD=1); 5/15 pseudo-observations. Code families select CSUMM, MM4, or MM5/3D. | `int` | `0` | `14` |
-| `irhprog` | Relative-humidity source: 0 observed SURF/SEA data (NOOBS 0/1); 1 prognostic RH (required for NOOBS=2). | `int` | `0` | `1` |
+| `irhprog` | Relative-humidity source for NOOBS 0/1: 0 observed SURF/SEA data, 1 prognostic RH. NOOBS=2 always uses prognostic RH without modifying this setting. | `int` | `0` | `1` |
 | `itprog` | Temperature source: 0 surface and upper observations (NOOBS=0); 1 surface observations plus prognostic aloft; 2 prognostic surface and aloft. | `int` | `0` | `2` |
 | `imixh` | Mixing-height method: 1 Maul–Carson land/water; -1 Maul–Carson land plus OCD water; 2 Batchvarova–Gryning land/water; -2 BG land plus OCD water. | `int` | `1` | `1` |
 | `constb` | Dimensionless B in the Venkatram neutral mechanical mixing-height relation, scaling friction velocity by Coriolis and free-atmosphere stability. | `float` | `1.41` | `1.41` |
@@ -536,7 +539,7 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 | `kinematic_alpha` | Empirical multiplier applied to the vertical gradient of terrain-induced vertical velocity in the kinematic adjustment. | `float` | `0.1` | `0.1` |
 | `z_faces_m` | Vertical cell-face heights in metres; supply NZ+1 values, and layer k is centred at `(face[k] + face[k+1]) / 2`. | `Sequence[float]` | `(0.0, 20.0, … (11 items))` | `[0.0, 20.0, … (11 items)]` |
 | `base_timezone` | Base time-zone offset in CALMET's hours-west-of-UTC convention (for example 5=EST; negative values are east). | `int` | `0` | `0` |
-| `base_timezone_label` | Modern `UTC±HHMM` label for the same offset represented by base_timezone. | `str \| None` | `None` | `'UTC-0000'` |
+| `base_timezone_label` | Modern `UTC±HHMM` label for the same offset represented by base_timezone. | `str \| None` | `None` | `'UTC+0000'` |
 | `terrain_radius_km` | Terrain-search radius, in kilometres, used to determine nearby extrema and effective obstacle height for the Froude adjustment. | `float` | `15.0` | `15.0` |
 | `half_average_angle` | Half-opening angle of the upwind spatial-averaging cone, in degrees; the full opening is twice this value. | `float` | `30.0` | `30.0` |
 | `include_w_temperature` | Store 3-D vertical-wind and temperature fields required by CALGRID and CALPUFF's subgrid complex-terrain option. | `bool` | `True` | `False` |
@@ -565,8 +568,8 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 | `grid` | Complete grid object; an alternative to the flattened grid parameters. | `GridConfig \| Mapping[str, Any] \| None` | `None` | `see flattened grid fields` |
 | `nx` | Number of Cartesian X/east-west cells; for a TERREL polar grid, number of rings. | `int \| None` | `required` | `610` |
 | `ny` | Number of Cartesian Y/north-south cells; for a TERREL polar grid, number of rays. | `int \| None` | `required` | `499` |
-| `dx_km` | Cartesian X grid spacing in kilometres; TERREL requires equal X/Y spacing and ignores it for polar ring positions. | `float \| None` | `required` | `1.0` |
-| `dy_km` | Cartesian Y grid spacing in kilometres; TERREL requires equal X/Y spacing and ignores it for polar ring positions. | `float \| None` | `required` | `1.0` |
+| `dx_km` | Cartesian X grid spacing in kilometres; independent of dy_km and unused for polar ring positions. | `float \| None` | `required` | `1.0` |
+| `dy_km` | Cartesian Y grid spacing in kilometres; independent of dx_km and unused for polar ray positions. | `float \| None` | `required` | `1.0` |
 | `projection` | Projection code: UTM, Transverse Mercator (TTM), Lambert conformal conic (LCC), polar stereographic (PS), equatorial Mercator (EM), or Lambert azimuthal equal-area (LAZA). | `str` | `'UTM'` | `'LCC'` |
 | `lat0` | Signed latitude of the projection origin or tangent point, in degrees (north positive); EM fixes it at zero. | `float` | `27.0` | `27.0` |
 | `lon0` | Signed central-meridian or tangent-point longitude, in degrees (east positive). | `float` | `117.5` | `117.5` |
@@ -601,8 +604,9 @@ pycalmet.calmet(...)
 pycalmet.readlst(...)
 ```
 
-The default API uses regular NumPy calculations, `pyproj`, `datetime`, and a
-direct NetCDF flow from CALWRF to CALMET. Workflows that specifically require
+The default API uses regular NumPy calculations, `pyproj`, `datetime`, and
+`netCDF4` for every NetCDF read and write. CALWRF passes its NetCDF output
+directly to CALMET. Workflows that specifically require
 the former single-precision operation order or M3D staging can opt in to the
 frozen compatibility implementation:
 
@@ -645,15 +649,26 @@ products are intentionally excluded from the maintained library.
 
 ## Data and output conventions
 
-Canonical outputs are NetCDF files readable by `xarray.open_dataset`. Legacy
-formatted and unformatted CALMET-family files remain available when an output
-path or compatibility option explicitly requests them. Large inputs should be
-kept outside the source tree; generated files belong under `output/`, which is
-ignored by Git.
+Canonical outputs are NetCDF files created and read with `netCDF4.Dataset`.
+The package does not depend on xarray. Legacy formatted and unformatted
+CALMET-family files remain available when an output path or compatibility
+option explicitly requests them. Large inputs should be kept outside the
+source tree; generated files belong under `output/`, which is ignored by Git.
+
+Physical fields and model-state arrays use 32-bit floating point by default.
+Time coordinates, integer categories and indices, projection coordinates, and
+selected convergence or large-reduction scalars retain the precision required
+for correct temporal, spatial, and numerical behavior.
+
+Standard SRTM HGT and GeoTIFF inputs are decoded by Rasterio, datum operations
+are delegated to PROJ through `pyproj`, coastline clipping uses Shapely, and
+nearest-neighbour searches use SciPy `cKDTree`. CALMET-specific parameterizations
+and uncommon historical input formats remain implemented in the package.
 
 The Zhejiang example uses an LCC grid with a 1 km spacing and a `610 × 499`
-domain. Its WRF records cover 2018-03-18 00:00–02:00 UTC. The final record is
-the following-hour boundary required to produce the 00:00–01:00 CALMET period.
+domain. Its WRF records cover 2018-03-18 00:00–02:00 UTC. The configured
+00:00–01:00 CALMET period uses the first two records; the 02:00 record is
+available when extending the run through the next interval.
 
 ## Validation
 

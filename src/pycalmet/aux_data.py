@@ -2,19 +2,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 import struct
 
 import numpy as np
 
 from .legacy_io import FortranSequentialReader
+from .datetime_utils import parse_calendar,parse_ordinal_code
 
 
 @dataclass(frozen=True,slots=True)
 class AuxiliaryHeader:
     comments: tuple[str,...]
-    start: tuple[int,int,int,int,int]
-    end: tuple[int,int,int,int,int]
+    start: datetime
+    end: datetime
+    wire_start: tuple[int,int,int,int,int]
+    wire_end: tuple[int,int,int,int,int]
     timezone: str
     run_hours: int
     nx: int
@@ -39,10 +43,9 @@ class AuxiliaryHeader:
 
 @dataclass(frozen=True,slots=True)
 class AuxiliaryCloudHour:
-    begin_code: int
-    begin_seconds: int
-    end_code: int
-    end_seconds: int
+    begin: datetime
+    end: datetime
+    wire_time_bounds: tuple[int,int,int,int]
     cloud_water_above_g_kg: np.ndarray
     cloud_bottom_above_m: np.ndarray
     cloud_top_above_m: np.ndarray
@@ -79,6 +82,12 @@ class AuxiliaryData:
         run=self._record('run control')
         if len(run)!=144: raise ValueError('invalid CALMET.AUX run-control record')
         dates=struct.unpack('<10i',run[:40])
+        try:
+            start=parse_calendar(*dates[:5]); end=parse_calendar(*dates[5:])
+        except ValueError as error:
+            raise ValueError('invalid CALMET.AUX run-control timestamp') from error
+        if end<start:
+            raise ValueError('CALMET.AUX run-control end precedes start')
         timezone=self._text(run[40:48])
         run_hours,nx,ny,nz=struct.unpack('<4i',run[48:64])
         spacing,x_origin,y_origin=struct.unpack('<3f',run[64:76])
@@ -103,14 +112,26 @@ class AuxiliaryData:
             raise ValueError('unsupported CALMET.AUX 2-D variable table')
         if self._record('3-D variables')!=expected_3d:
             raise ValueError('unsupported CALMET.AUX 3-D variable table')
-        return AuxiliaryHeader(comments,dates[:5],dates[5:],timezone,run_hours,nx,ny,nz,
+        return AuxiliaryHeader(comments,start,end,dates[:5],dates[5:],timezone,
+            run_hours,nx,ny,nz,
             spacing,x_origin,y_origin,projection,datum,datum_date,false_easting,
             false_northing,hemisphere,utm_zone,*angles,faces)
 
-    def _timestamp(self):
-        record=self._record('timestamp')
+    @staticmethod
+    def _decode_timestamp(record):
         if len(record)!=16: raise ValueError('invalid CALMET.AUX timestamp record')
-        return struct.unpack('<4i',record)
+        begin_code,begin_seconds,end_code,end_seconds=struct.unpack('<4i',record)
+        try:
+            begin=parse_ordinal_code(begin_code,begin_seconds)
+            end=parse_ordinal_code(end_code,end_seconds)
+        except ValueError as error:
+            raise ValueError('invalid CALMET.AUX timestamp') from error
+        if begin>=end:
+            raise ValueError('CALMET.AUX interval does not advance')
+        return begin,end,(begin_code,begin_seconds,end_code,end_seconds)
+
+    def _timestamp(self):
+        return self._decode_timestamp(self._record('timestamp'))[:2]
 
     def _compressed(self,label):
         count_record=self._record(f'{label} compressed count')
@@ -133,8 +154,8 @@ class AuxiliaryData:
     def read_hour(self):
         first=self.reader.read_record()
         if first is None: return None
-        if len(first)!=16: raise ValueError('invalid CALMET.AUX timestamp record')
-        stamp=struct.unpack('<4i',first)
+        begin,end,wire_time_bounds=self._decode_timestamp(first)
+        stamp=begin,end
         fields=[]
         for index,label in enumerate(self._fields_2d):
             if index and self._timestamp()!=stamp:
@@ -144,7 +165,7 @@ class AuxiliaryData:
             raise ValueError('CALMET.AUX 3-D timestamp is inconsistent')
         layers=np.stack([self._compressed(f'CLDMR3D {level:04d}')
                          for level in range(1,self.header.nz+1)])
-        return AuxiliaryCloudHour(*stamp,*fields,layers)
+        return AuxiliaryCloudHour(begin,end,wire_time_bounds,*fields,layers)
 
     def close(self): self.reader.close()
     def __enter__(self): return self

@@ -7,6 +7,9 @@ import struct
 from typing import BinaryIO,Iterator
 
 import numpy as np
+from shapely import box,make_valid
+from shapely.geometry import Polygon
+from shapely.geometry.polygon import orient
 
 from .config import GridConfig
 from .datums import datum_shift
@@ -80,84 +83,52 @@ def _append_corner(points,side1,side2,bounds):
 
 def clip_coast_polygon(longitude,latitude,x,y,kind,geographic_bounds,
                        projected_bounds,polygon_bounds=None):
-    """Reproduce COASTEXT's segment retention and directional corner closure.
+    """Clip one GSHHS ring to zero or more extraction-window polygons.
 
     Bounds use ``(xmin, xmax, ymin, ymax)``. Geographic coordinates determine
-    whether a vertex is retained; projected coordinates are written to BLN.
+    whether the source ring intersects the region; projected coordinates are
+    clipped and written to BLN.  Odd GSHHS levels are counter-clockwise and
+    even levels are clockwise, preserving the nesting convention consumed by
+    CTGPROC.
     """
     lon,lat,px,py=np.broadcast_arrays(*(np.asarray(value,dtype=float)
                                         for value in (longitude,latitude,x,y)))
-    if lon.ndim!=1 or lon.size==0: raise ValueError('coastline polygon must be a non-empty vector')
+    if lon.ndim!=1 or lon.size<3:
+        raise ValueError('coastline polygon must contain at least three vertices')
     gxmin,gxmax,gymin,gymax=geographic_bounds
     xmin,xmax,ymin,ymax=projected_bounds
-    inside=(lon>=gxmin)&(lon<=gxmax)&(lat>=gymin)&(lat<=gymax)
-    points=[]; sides_seen=set(); good=False; starts_inside=False; first=True
-    previous=None; start_side=end_side=exit_side=None; exit_point=None; exit_index=None
-    for index,(is_inside,xp,yp,xg,yg) in enumerate(zip(inside,px,py,lon,lat)):
-        point=(float(xp),float(yp))
-        if is_inside:
-            if index==0: starts_inside=True
-            if not good:
-                good=True
-                if first:
-                    first=False
-                    if not starts_inside and previous is not None: points.append(previous)
-                    start_side=boundary_side(xp,yp,xmax,xmin,ymax,ymin)
-                elif previous is not None:
-                    points.append(previous)
-            points.append(point)
-        elif good:
-            end_side=boundary_side(xp,yp,xmax,xmin,ymax,ymin)
-            exit_point=point; exit_index=len(points); exit_side=boundary_side(
-                xg,yg,gxmax,gxmin,gymax,gymin)
-            points.append(point); good=False
-        else:
-            previous=point
-            next_side=boundary_side(xg,yg,gxmax,gxmin,gymax,gymin)
-            if not first and next_side!=end_side:
-                _append_corner(points,next_side,end_side,projected_bounds)
-                end_side=next_side
-            else:
-                end_side=next_side
-            sides_seen.add(end_side)
-        previous=point
+    bounds=(float(np.min(lon)),float(np.max(lon)),
+            float(np.min(lat)),float(np.max(lat))) if polygon_bounds is None else polygon_bounds
+    if gxmax<bounds[0] or gxmin>bounds[1] or gymax<bounds[2] or gymin>bounds[3]:
+        return ()
 
-    if first:
-        bounds=(np.min(lon),np.max(lon),np.min(lat),np.max(lat)) if polygon_bounds is None else polygon_bounds
-        surrounds=(gxmax<=bounds[1] and gxmin>=bounds[0] and
-                   gymax<=bounds[3] and gymin>=bounds[2] and sides_seen=={1,2,3,4})
-        if not surrounds: return None
-        points=[]; direction=1 if kind%2==0 else -1
-        side=1
-        if direction<0: side=1
-        for _ in range(5):
-            next_side=((side-1+direction)%4)+1
-            _append_corner(points,side,next_side,projected_bounds)
-            side=next_side
-        return np.asarray(points,dtype=float)
+    geographic=make_valid(Polygon(np.column_stack((lon,lat))))
+    if geographic.is_empty or not geographic.intersects(box(gxmin,gymin,gxmax,gymax)):
+        return ()
+    projected=make_valid(Polygon(np.column_stack((px,py))))
+    clipped=projected.intersection(box(xmin,ymin,xmax,ymax))
+    if clipped.is_empty:
+        return ()
 
-    if not starts_inside and exit_index is not None:
-        points=points[:exit_index+1]
-        end_side=exit_side
-        difference=0.
-        if start_side==end_side:
-            if start_side==1: difference=exit_point[1]-points[0][1]
-            elif start_side==2: difference=exit_point[0]-points[0][0]
-            elif start_side==3: difference=points[0][1]-exit_point[1]
-            else: difference=points[0][0]-exit_point[0]
-        if kind in {1,3} and difference<0.:
-            next_side=4 if end_side==1 else end_side-1
-            _append_corner(points,end_side,next_side,projected_bounds); end_side=next_side
-        elif kind in {2,4} and difference>0.:
-            next_side=1 if end_side==4 else end_side+1
-            _append_corner(points,end_side,next_side,projected_bounds); end_side=next_side
-        direction=-1 if kind in {1,3} else 1
-        while start_side!=end_side:
-            next_side=((end_side-1+direction)%4)+1
-            _append_corner(points,end_side,next_side,projected_bounds)
-            end_side=next_side
-    if points and points[-1]!=points[0]: points.append(points[0])
-    return np.asarray(points,dtype=float) if len(points)>=3 else None
+    def polygon_parts(geometry):
+        if geometry.geom_type=='Polygon':
+            if not geometry.is_empty and geometry.area>0.:
+                yield geometry
+            return
+        for component in getattr(geometry,'geoms',()):
+            yield from polygon_parts(component)
+
+    parts=list(polygon_parts(clipped))
+    if not parts:
+        # A boundary-only touch has no area and does not create a BLN record.
+        return ()
+    result=[]
+    for polygon in parts:
+        polygon=orient(polygon,sign=1.0 if kind%2 else -1.0)
+        points=np.asarray(polygon.exterior.coords,dtype=np.float64)
+        if len(points)>=4:
+            result.append(points)
+    return tuple(result)
 
 
 def _packed_header(values: tuple[int,...],version: int) -> GshhsHeader:
@@ -287,18 +258,19 @@ def extract_gshhs(source: str | Path,output: str | Path,grid: GridConfig,
             continue
         px,py=project_geographic(source_lon,polygon.latitude,grid,polygon_datum,
                                  units='km')
-        points=clip_coast_polygon(output_lon,output_lat,px,py,header.level,
-                                  geographic_bounds,projected_bounds,polygon_bounds)
-        if points is None: continue
-        surrounds=(len(points)==5 and np.array_equal(points[0],points[-1]) and
-                   np.isin(points[:-1,0],projected_bounds[:2]).all() and
-                   np.isin(points[:-1,1],projected_bounds[2:]).all())
-        if surrounds and records:
-            previous=records[-1]
-            records[-1]=(header.level,*previous[1:])
-            continue
-        records.append((header.level,header.source+1,header.identifier,points))
-    if len(records)>1 and len(records[0][3])==5 and records[1][0]-records[0][0]!=1:
+        parts=clip_coast_polygon(output_lon,output_lat,px,py,header.level,
+                                 geographic_bounds,projected_bounds,polygon_bounds)
+        for points in parts:
+            surrounds=(len(points)==5 and np.array_equal(points[0],points[-1]) and
+                       np.isin(points[:-1,0],projected_bounds[:2]).all() and
+                       np.isin(points[:-1,1],projected_bounds[2:]).all())
+            if surrounds and records:
+                previous=records[-1]
+                records[-1]=(header.level,*previous[1:])
+                continue
+            records.append((header.level,header.source+1,header.identifier,points))
+    if (len(records)>1 and records[0][1:3]!=records[1][1:3] and
+            len(records[0][3])==5 and records[1][0]-records[0][0]!=1):
         first=records[0]; records[0]=(records[1][0]-1,*first[1:])
     destination=Path(output); destination.parent.mkdir(parents=True,exist_ok=True)
     with destination.open('w',encoding='ascii',newline='\n') as stream:

@@ -8,7 +8,8 @@ import re
 import tempfile
 import numpy as np
 from netCDF4 import Dataset
-from .datetime_utils import parse_timestamp
+from .datetime_utils import (exact_integer,format_timezone_label,
+                             parse_timezone_label)
 from .config import CalmetConfig,GridConfig
 from .datums import normalize_datum
 from .calmet_numerics import (coare_water_station_profiles,
@@ -20,7 +21,7 @@ from .calmet_numerics import (coare_water_station_profiles,
 from .calmet_output import (AuxiliaryCalmetWriter,CalmetNetCDFWriter,
                             LegacyCalmetWriter,MesopacWriter)
 from .calmet_listing import CalmetListingWriter
-from .calmet_solver import (PrognosticMapper,_domain_mean_real4,build_mm4_step_fields,
+from .calmet_solver import (PrognosticMapper,_domain_mean,build_mm4_step_fields,
                             _prognostic_local_timestamp,build_prog_step_fields,
                             dataset_timestamp,iter_hours,
                             solar_at_step_midpoint,target_latitude_longitude)
@@ -60,6 +61,58 @@ def _single_meteorology_dataset(path,temporary_directory):
         with Dataset(path) as dataset: yield dataset
 
 
+def _validate_mm4_static_headers(sources):
+    """Require every native MM4 file to describe the same source grid."""
+    reference=sources[0]
+    expected=reference.header
+    scalar_fields={
+        'model grid dimensions':(expected.model_nx,expected.model_ny),
+        'subdomain origin':(expected.i_start,expected.j_start),
+        'top pressure':expected.top_pressure_mb,
+    }
+    array_fields={
+        'sigma levels':expected.sigma_levels,
+        'latitude grid':expected.latitude,
+        'longitude grid':expected.longitude,
+        'terrain heights':expected.terrain_height_m,
+        'land-use categories':expected.landuse,
+    }
+    for source in sources[1:]:
+        header=source.header
+        actual_scalars={
+            'model grid dimensions':(header.model_nx,header.model_ny),
+            'subdomain origin':(header.i_start,header.j_start),
+            'top pressure':header.top_pressure_mb,
+        }
+        actual_arrays={
+            'sigma levels':header.sigma_levels,
+            'latitude grid':header.latitude,
+            'longitude grid':header.longitude,
+            'terrain heights':header.terrain_height_m,
+            'land-use categories':header.landuse,
+        }
+        differences=[name for name,expected_value in scalar_fields.items()
+                     if actual_scalars[name]!=expected_value]
+        for name,expected_values in array_fields.items():
+            actual_values=actual_arrays[name]
+            if (actual_values.shape!=expected_values.shape or
+                    not np.array_equal(actual_values,expected_values,equal_nan=True)):
+                differences.append(name)
+        if differences:
+            raise ValueError(
+                f'native MM4 static header in {source.path} is incompatible with '
+                f'{reference.path}: '+', '.join(differences))
+
+
+def _same_mm4_record(left,right):
+    """Return whether overlapping native MM4 records contain identical data."""
+    fields=('sea_level_pressure_mb','precipitation_mm_h','snow_code','pressure_mb',
+            'height_agl_m','temperature_k','relative_humidity','wind_direction_deg',
+            'wind_speed_m_s')
+    return all(np.array_equal(getattr(left,name),getattr(right,name),equal_nan=True)
+               for name in fields)
+
+
 @contextmanager
 def _meteorology_input(config,paths,temporary_directory,start,end):
     """Open canonical meteorology or adapt native MM4/PROG records."""
@@ -70,23 +123,18 @@ def _meteorology_input(config,paths,temporary_directory,start,end):
                     re.fullmatch(rb'\s*\d{8}\s*\d+\s+\d+\s+\d+\s+\d+\s*[-+0-9.]*\s*',
                                  sample.splitlines()[1]) is not None)
         if native_mm4:
+            if config.prognostic_timestep_seconds!=3600:
+                raise ValueError(
+                    'native MM4.DAT records are hourly; ISTEPPGS must be 3600')
             sources=[MM4Data(path) for path in paths]
             reference=sources[0].header
-            for source in sources[1:]:
-                header=source.header
-                if ((header.i_start,header.j_start)!=(reference.i_start,reference.j_start) or
-                    header.latitude.shape!=reference.latitude.shape or
-                    header.sigma_levels.shape!=reference.sigma_levels.shape):
-                    raise ValueError('native MM4.DAT files do not share the first-file record layout')
-            first_ending=start+timedelta(seconds=config.timestep_seconds)
-            header_start=reference.start-timedelta(hours=config.base_timezone)
-            if header_start>first_ending:
-                raise ValueError(f'MM4.DAT header begins at {header_start}, after first CALMET ending time {first_ending}')
-            native_mapper=PrognosticMapper.build(reference.latitude,reference.longitude,
-                                                  config.grid,validate_domain=True)
-            precipitation_radius=_prognostic_precipitation_radius(
-                native_mapper,config.precipitation_radius_km,
-                config.precipitation_station_count)
+            _validate_mm4_static_headers(sources)
+            for source in sources:
+                earliest=min(record.timestamp for record in source.records)
+                if source.header.start>earliest:
+                    raise ValueError(
+                        f'native MM4 header in {source.path} begins at '
+                        f'{source.header.start}, after its earliest record {earliest}')
             boundaries=[]; current=start+timedelta(seconds=config.timestep_seconds)
             while current<=end:
                 boundaries.append(current); current+=timedelta(seconds=config.timestep_seconds)
@@ -95,36 +143,34 @@ def _meteorology_input(config,paths,temporary_directory,start,end):
                 target=(boundary if boundary.minute==0 and boundary.second==0 else
                         boundary.replace(minute=0,second=0,microsecond=0)+timedelta(hours=1))
                 if not targets or target!=targets[-1]: targets.append(target)
-            # RDMM4 consumes MM4.DAT records strictly forwards.  It skips
-            # records older than the requested hour, fails as soon as the
-            # next record is newer, and opens another MM4 file only at EOF.
-            # A global timestamp index would incorrectly let a later file
-            # repair a gap inside the current one.
-            reference_source=sources[0]
-            def records_in_file_order():
-                for source in sources:
-                    terrain_delta=np.asarray(source.header.terrain_height_m-
-                                             reference.terrain_height_m,dtype=np.float32)
-                    for record in source.records:
-                        # RDMM4 skips later headers and retains all static
-                        # fields from RDHD4's first file.  The reader formed
-                        # AGL with the local header, so undo that subtraction.
-                        if source is not reference_source:
-                            record=replace(record,height_agl_m=np.asarray(
-                                record.height_agl_m+terrain_delta[None],dtype=np.float32))
-                        yield (reference_source,record,
-                               record.timestamp-timedelta(hours=config.base_timezone))
-            records=records_in_file_order()
-            selected={}
-            for target in targets:
-                for source,record,local in records:
-                    if local<target: continue
-                    if local>target:
-                        raise ValueError(f'MM4.DAT record {local} is beyond requested time {target}')
-                    selected[target]=(source,record)
-                    break
-                else:
-                    raise ValueError(f'MM4.DAT has no record for {target}')
+            # Index all files by their actual timestamps.  Overlap is common
+            # at file boundaries, so identical records are deduplicated while
+            # contradictory records are rejected explicitly.
+            record_index={}
+            record_origins={}
+            for source in sources:
+                for record in source.records:
+                    local=record.timestamp-timedelta(hours=config.base_timezone)
+                    if local in record_index:
+                        _,existing=record_index[local]
+                        if not _same_mm4_record(existing,record):
+                            raise ValueError(
+                                f'conflicting native MM4 records for {local} in '
+                                f'{record_origins[local]} and {source.path}')
+                        continue
+                    record_index[local]=(source,record)
+                    record_origins[local]=source.path
+            missing=[target for target in targets if target not in record_index]
+            if missing:
+                values=', '.join(value.isoformat(sep=' ') for value in missing)
+                raise ValueError(f'native MM4 files do not cover requested time(s): {values}')
+            selected={target:record_index[target] for target in targets}
+            target_positions={target:index for index,target in enumerate(targets)}
+            native_mapper=PrognosticMapper.build(reference.latitude,reference.longitude,
+                                                  config.grid,validate_domain=True)
+            precipitation_radius=_prognostic_precipitation_radius(
+                native_mapper,config.precipitation_radius_km,
+                config.precipitation_station_count)
             all_times=[start,*boundaries]
             text=np.array([list(value.strftime('%Y-%m-%d_%H:%M:%S'))
                            for value in all_times],dtype='S1')
@@ -133,11 +179,11 @@ def _meteorology_input(config,paths,temporary_directory,start,end):
                 nonlocal state,built
                 target=(ending if ending.minute==0 and ending.second==0 else
                         ending.replace(minute=0,second=0,microsecond=0)+timedelta(hours=1))
-                try: requested=targets.index(target)
-                except ValueError as error:
+                try: requested=target_positions[target]
+                except KeyError as error:
                     raise ValueError(f'MM4.DAT has no record for {target}') from error
-                # Thermal history is also sequential in RDMM4.  Materialize
-                # intervening hours if a caller asks for a later step first.
+                # Materialize intervening hours so the thermal state is
+                # deterministic even when callers request steps out of order.
                 while built<requested:
                     built+=1; build_target=targets[built]
                     source,record=selected[build_target]
@@ -170,23 +216,19 @@ def _meteorology_input(config,paths,temporary_directory,start,end):
     while current<=end:
         boundaries.append(current)
         current+=timedelta(seconds=config.timestep_seconds)
-    # PROGRD reads on its first call and whenever NSECE is 0 or 3600.  For
-    # sub-hourly runs this means another read at the ending-hour boundary,
-    # using the same target hour as the first substep of that hour.  Preserve
-    # that historical behavior, including its requirement for duplicate
-    # labels in a sub-hourly PROG.DAT sequence.
-    read_targets=[]
-    for index,boundary in enumerate(boundaries):
-        if index==0 or (boundary.minute==0 and boundary.second==0):
-            target=(boundary if boundary.minute==0 and boundary.second==0 else
-                    boundary.replace(minute=0,second=0,microsecond=0)+timedelta(hours=1))
-            read_targets.append(target)
-    records=iter(prog.records_for_hours([target.hour for target in read_targets]))
-    selected={}; current_record=None
-    for index,boundary in enumerate(boundaries):
-        if index==0 or (boundary.minute==0 and boundary.second==0):
-            current_record=next(records)
-        selected[boundary]=current_record
+    targets=[]
+    for boundary in boundaries:
+        target=(boundary if boundary.minute==0 and boundary.second==0 else
+                boundary.replace(minute=0,second=0,microsecond=0)+timedelta(hours=1))
+        if not targets or target!=targets[-1]:
+            targets.append(target)
+    records=prog.records_for_times(targets)
+    record_by_target=dict(zip(targets,records))
+    selected={}
+    for boundary in boundaries:
+        target=(boundary if boundary.minute==0 and boundary.second==0 else
+                boundary.replace(minute=0,second=0,microsecond=0)+timedelta(hours=1))
+        selected[boundary]=record_by_target[target]
     all_times=[start,*boundaries]
     text=np.array([list(value.strftime('%Y-%m-%d_%H:%M:%S')) for value in all_times],dtype='S1')
     dataset={'time_text':text}
@@ -306,30 +348,21 @@ def _geophysical_dataset(path,temporary_directory):
     else:
         with Dataset(path) as dataset: yield dataset
 
-def _stamp(value: str) -> datetime:
-    try: return parse_timestamp(value)
-    except ValueError as error: raise ValueError(f'invalid CALMET timestamp: {value!r}') from error
-
-def _timezone_label(offset: int) -> str:
-    """Return CALMET's eight-character UTC offset label."""
-    sign = '-' if offset >= 0 else '+'
-    return f'UTC{sign}{abs(offset):02d}00'
-
-
 def _timezone_offset(label: str) -> int:
     """Convert UTC label using CALMET's positive-west integer convention."""
-    match=re.fullmatch(r'UTC([+-])(\d{2})(\d{2})',label.strip().upper())
-    if match is None: raise ValueError(f'invalid CALMET timezone {label!r}')
-    hours=int(match.group(2))+int(match.group(3))/60.
-    return int(hours if match.group(1)=='-' else -hours)
+    try:
+        return parse_timezone_label(label)[0]
+    except (TypeError,ValueError) as error:
+        raise ValueError(f'invalid CALMET timezone {label!r}: {error}') from error
 
 
 def _validate_input_timezone(value,base_timezone: int,dataset: str):
     """Compare legacy integer or modern UTC data timezone with CALMET IBTZ."""
     try:
-        offset=_timezone_offset(value) if isinstance(value,str) else int(value)
+        offset=(_timezone_offset(value) if isinstance(value,str) else
+                exact_integer(value,f'{dataset} timezone'))
     except (TypeError,ValueError) as error:
-        raise ValueError(f'invalid {dataset} timezone {value!r}') from error
+        raise ValueError(f'invalid {dataset} timezone {value!r}: {error}') from error
     if offset!=base_timezone:
         raise ValueError(
             f'{dataset} timezone {value!r} does not match '
@@ -345,23 +378,12 @@ def _validate_input_span(data,start: datetime,end: datetime,dataset: str):
 
 
 def _validate_upper_span(data,start: datetime,end: datetime,base_timezone: int):
-    """Reproduce READHD's per-station UTC UP.DAT coverage QA."""
+    """Validate that one UTC UP.DAT station covers the requested run."""
     run_start=start+timedelta(hours=base_timezone)
     run_end=end+timedelta(hours=base_timezone)
-    start_hour=data.start.replace(minute=0,second=0,microsecond=0)
-    run_start_hour=run_start.replace(minute=0,second=0,microsecond=0)
-    start_seconds=data.start.minute*60+data.start.second
-    run_start_seconds=run_start.minute*60+run_start.second
-    if (start_hour>run_start_hour or
-            (start_hour==run_start_hour and start_seconds>run_start_seconds)):
+    if data.start>run_start:
         raise ValueError('UP.DAT declared period does not cover CALMET run beginning')
-    end_hour=data.end.replace(minute=0,second=0,microsecond=0)
-    run_end_hour=run_end.replace(minute=0,second=0,microsecond=0)
-    # READHD 6.5.0 compares IBSECU with IBSEC in its equal-ending-hour
-    # condition (rather than IESECU with IESEC). Preserve that published
-    # behavior for byte-for-byte control-flow equivalence.
-    if (end_hour<run_end_hour or
-            (end_hour==run_end_hour and start_seconds<run_start_seconds)):
+    if data.end<run_end:
         raise ValueError('UP.DAT declared period does not cover CALMET run ending')
 
 
@@ -376,9 +398,9 @@ def _validate_sea_metadata(config, stations):
             try:
                 sea_timezone=_timezone_offset(actual)
             except ValueError as error:
-                raise ValueError(f'invalid SEA.DAT timezone {data.timezone!r}')
-            # RDHDOW assigns the real offset to INTEGER, truncating fractional
-            # zones toward zero before comparing it with IBTZ.
+                raise ValueError(
+                    f'invalid SEA.DAT timezone {data.timezone!r}: {error}',
+                ) from error
             if sea_timezone!=config.base_timezone:
                 raise ValueError(
                     f'SEA.DAT timezone {data.timezone!r} does not match '
@@ -404,7 +426,7 @@ def _surface_control_metadata(config):
     """Convert Group-7 projected station rows to the LL representation."""
     rows=tuple(config.surface_control_stations)
     if not rows: return None
-    zones=np.asarray([item[4] for item in rows],dtype=float)
+    zones=np.asarray([item[4] for item in rows],dtype=np.float64)
     if np.any(zones!=config.base_timezone):
         raise ValueError('surface control-station time zone does not match CALMET base time zone')
     longitude,latitude=unproject_geographic([item[2] for item in rows],
@@ -425,7 +447,7 @@ def _precipitation_control_metadata(config):
 def _upper_control_metadata(config):
     rows=tuple(config.upper_control_stations)
     if not rows: return None
-    zones=np.asarray([item[4] for item in rows],dtype=float)
+    zones=np.asarray([item[4] for item in rows],dtype=np.float64)
     if np.any(zones!=config.base_timezone):
         raise ValueError('upper-air control-station time zone does not match CALMET base time zone')
     longitude,latitude=unproject_geographic([item[2] for item in rows],
@@ -476,19 +498,33 @@ def _validate_geophysical_grid(dataset,grid):
     if differences: raise ValueError('geophysical grid does not match CALMET control: '+', '.join(differences))
 
 def _prognostic_precipitation_radius(mapper,requested_km,station_count):
-    """Apply READHD's SIGMAP guard for gridded prognostic precipitation."""
+    """Bound gridded precipitation radius from both projected grid spacings.
+
+    The longer median cardinal spacing is the smallest useful radius.  The
+    corresponding cell diagonal, enlarged by five percent, is the automatic
+    radius used when the request falls outside the useful interval.
+    """
     if station_count!=-1 or mapper is None: return requested_km
-    # RDHD4/RDHD5 derives DXMM5 from projected (1,1) and (2,1), rather
-    # than trusting the nominal WRF grid spacing.  The projected spacing
-    # can differ by enough metres to change INTERPQR's inclusive boundary.
-    stride=mapper.source_shape[0]
-    first=np.asarray(mapper.source_coordinates[0],dtype=np.float32)
-    second=np.asarray(mapper.source_coordinates[stride],dtype=np.float32)
-    delta=np.asarray(first-second,dtype=np.float32)
-    spacing=np.sqrt(np.asarray(delta[0]*delta[0]+delta[1]*delta[1],dtype=np.float32))
-    maximum=np.float32(np.sqrt(np.float32(2.))*spacing*np.float32(1.05))
-    requested=np.float32(requested_km)
-    return float(maximum if requested<spacing or requested>maximum else requested)
+    ny,nx=mapper.source_shape
+    coordinates=np.asarray(mapper.source_coordinates,dtype=np.float64)
+    if coordinates.shape!=(ny*nx,2):
+        raise ValueError('prognostic source coordinates do not match source grid shape')
+    grid=coordinates.reshape((ny,nx,2),order='F')
+    axis_spacing=[]
+    if nx>1:
+        adjacent=np.linalg.norm(np.diff(grid,axis=1),axis=2)
+        valid=adjacent[np.isfinite(adjacent)&(adjacent>0.)]
+        if valid.size: axis_spacing.append(float(np.median(valid)))
+    if ny>1:
+        adjacent=np.linalg.norm(np.diff(grid,axis=0),axis=2)
+        valid=adjacent[np.isfinite(adjacent)&(adjacent>0.)]
+        if valid.size: axis_spacing.append(float(np.median(valid)))
+    if not axis_spacing: return requested_km
+    if len(axis_spacing)==1: axis_spacing*=2
+    minimum=max(axis_spacing)
+    maximum=float(np.hypot(*axis_spacing)*1.05)
+    requested=float(requested_km)
+    return maximum if requested<minimum or requested>maximum else requested
 
 def _output_path(config: CalmetConfig) -> Path:
     """Select OPENOT's METDAT/PACDAT target for the requested format."""
@@ -514,6 +550,22 @@ def _write_distance_to_coast_grid(
     target.write_text('\n'.join(lines)+'\n',encoding='ascii')
     return distance
 
+
+def _diagnostic_input_options(config: CalmetConfig) -> dict[str,bool]:
+    """Return only DIAG.DAT fields that the selected modern path consumes."""
+    has_surface_observations=config.noobs in {0,1}
+    has_upper_observations=config.noobs==0
+    return {
+        'surface_temperature':bool(config.diagnostic_surface_temperature and
+                                   config.surface_temperature_option!=-1),
+        'lapse_rate':bool(config.diagnostic_lapse_rate and has_upper_observations),
+        'initial_wind':bool(config.diagnostic_initial_wind and has_upper_observations),
+        'surface_wind':bool(config.diagnostic_surface_wind and
+                            has_surface_observations),
+        'upper_wind':bool(config.diagnostic_upper_wind and has_upper_observations),
+    }
+
+
 def _validate(config: CalmetConfig):
     projection=config.grid.projection.upper()
     if projection not in {'UTM','LCC','TTM','PS','EM','LAZA'}:
@@ -532,6 +584,9 @@ def _validate(config: CalmetConfig):
             raise ValueError('CALMET PS matching latitude is out of range')
     if config.grid.nx<=0 or config.grid.ny<=0:
         raise ValueError('CALMET NX and NY must be positive')
+    if (not np.isfinite(config.grid.dx_km) or not np.isfinite(config.grid.dy_km) or
+            config.grid.dx_km<=0. or config.grid.dy_km<=0.):
+        raise ValueError('CALMET DX and DY grid spacing must be finite and positive')
     if str(config.grid.datum).upper()=='UNKNOWN':
         raise ValueError('CALMET DATUM cannot be UNKNOWN')
     if not -12<=config.base_timezone<=12:
@@ -563,11 +618,6 @@ def _validate(config: CalmetConfig):
         raise ValueError('IOUTD must be zero or one')
     if config.wind_debug_levels<0 or config.wind_debug_levels>len(config.z_faces_m)-1:
         raise ValueError('NZPRN2 must be between zero and the number of CALMET layers')
-    if config.wind_debug_fields[3]:
-        raise ValueError('legacy CALMET IPR3 crashes because FORMAT 2820 cannot consume NH')
-    if (config.micrometeorology_debug and config.noobs in {0,1} and
-            config.surface_temperature_option==-1):
-        raise ValueError('LDB with NOOBS=0/1 and ISURFT=-1 prints undefined TINF in legacy CALMET')
     if config.iprog not in {0,1,2,3,4,5,13,14,15}:
         raise ValueError('IPROG must be one of 0, 1, 2, 3, 4, 5, 13, 14, or 15')
     if config.iwfcod not in {0,1}:
@@ -575,14 +625,6 @@ def _validate(config: CalmetConfig):
     if config.use_initial_guess_calmet:
         if not config.initial_guess_calmet_files:
             raise ValueError('IGFMET=1 requires at least one IGFDAT file')
-        if config.iprog in {1,3,13}:
-            raise ValueError(f'legacy CALMET does not allow IGFMET=1 with IPROG={config.iprog}')
-    wind_mode=(config.iprog,config.iwfcod)
-    if wind_mode not in {(0,0),(0,1),(1,0),(2,1),(3,0),(4,1),(5,0),(5,1),
-                         (13,0),(14,1),(15,0),(15,1)}:
-        raise ValueError(f'legacy CALMET does not allow IPROG={config.iprog} with IWFCOD={config.iwfcod}')
-    if config.iprog in {0,1,2} and config.noobs!=0:
-        raise ValueError(f'legacy CALMET requires NOOBS=0 for IPROG={config.iprog}')
     if config.iprog in {3,13} and config.noobs!=2:
         if config.weight_data is None: raise ValueError(f'observed IPROG={config.iprog} requires weight_data/WTDAT')
     if config.iprog in {1,3,13} and config.prognostic_radius_km==0.:
@@ -601,27 +643,25 @@ def _validate(config: CalmetConfig):
                         config.diagnostic_upper_wind)
     if any(value not in {0,1} for value in diagnostic_options):
         raise ValueError('IDIOPT1..5 must be zero or one')
-    if any(diagnostic_options) and config.diagnostic_data is None:
+    effective_diagnostic=_diagnostic_input_options(config)
+    if any(effective_diagnostic.values()) and config.diagnostic_data is None:
         raise ValueError('enabled IDIOPT option requires diagnostic_data/DIADAT')
-    if (config.diagnostic_surface_wind or config.diagnostic_upper_wind) and config.run_type!=0:
-        raise ValueError('legacy CALMET allows IDIOPT4/5 only when IRTYPE=0')
-    if (config.iprog in {5,15} and config.iwfcod==1 and config.noobs>=1 and
-            not config.diagnostic_initial_wind):
-        raise ValueError(f'legacy CALMET requires IDIOPT3=1 for IPROG={config.iprog} with NOOBS=1 or 2')
-    if config.diagnostic_surface_temperature and config.surface_temperature_option==-1:
-        raise ValueError('legacy CALMET does not allow ISURFT=-1 with IDIOPT1=1')
     if (config.noobs in {0,1} and config.surface_data is None and
-            not config.diagnostic_surface_wind):
+            (not config.diagnostic_surface_wind or config.run_type!=0)):
         raise ValueError('NOOBS=0/1 requires surface_data/SRFDAT')
     if (config.noobs in {0,1} and config.diagnostic_surface_wind and
+            config.surface_data is None and
             not config.surface_control_stations):
         raise ValueError('IDIOPT4 requires surface_control_stations/SS records when SURF.DAT is omitted')
-    if config.noobs==0 and not config.upper_air_files and not config.diagnostic_upper_wind:
+    if (config.noobs==0 and not config.upper_air_files and
+            (not config.diagnostic_upper_wind or config.run_type!=0)):
         raise ValueError('NOOBS=0 requires upper_air_files/UPDAT')
-    if config.noobs==0 and config.diagnostic_upper_wind and not config.upper_control_stations:
+    if (config.noobs==0 and config.diagnostic_upper_wind and
+            not config.upper_air_files and not config.upper_control_stations):
         raise ValueError('IDIOPT5 requires upper_control_stations/US records when UPDAT is omitted')
     upper_station_count=(len(config.upper_control_stations)
-                         if config.diagnostic_upper_wind else len(config.upper_air_files))
+                         if config.diagnostic_upper_wind and not config.upper_air_files
+                         else len(config.upper_air_files))
     if (config.noobs==0 and not config.diagnostic_initial_wind and
             config.initial_guess_upper_station!=-1 and
             not 1<=config.initial_guess_upper_station<=upper_station_count):
@@ -641,8 +681,6 @@ def _validate(config: CalmetConfig):
         raise ValueError('IRHPROG must be zero or one')
     if config.iprog<3 and config.irhprog!=0:
         raise ValueError('legacy CALMET requires IRHPROG=0 when IPROG<3')
-    if config.noobs==2 and config.irhprog!=1:
-        config.irhprog=1
     if config.temperature_interpolation_power not in {1,2}:
         raise ValueError('temperature_interpolation_power/IRAD must be 1 or 2')
     if config.temperature_radius_km<0. or config.temperature_station_limit<1:
@@ -686,8 +724,6 @@ def _validate(config: CalmetConfig):
         raise ValueError('prognostic_timestep_seconds/ISTEPPGS must be a positive multiple of NSECDT')
     if config.prognostic_timestep_seconds>43200:
         raise ValueError('prognostic_timestep_seconds/ISTEPPGS must not exceed 12 hours')
-    if config.iprog<13 and config.prognostic_timestep_seconds!=3600:
-        raise ValueError('legacy CALMET requires ISTEPPGS=3600 when IPROG<13')
     if config.cloud_method not in {1,2,3,4}:
         raise ValueError('cloud_method/MCLOUD must be 1, 2, 3, or 4')
     if config.cloud_output not in {0,1}:
@@ -726,9 +762,6 @@ def _validate(config: CalmetConfig):
         raise ValueError('ISURFT must be -2, -1, or a positive surface-station number')
     if config.itprog>0 and config.surface_temperature_option not in {-2,-1}:
         raise ValueError('ITPROG>0 requires ISURFT=-1 or -2')
-    if config.itprog==0 and config.surface_temperature_option==-2:
-        raise ValueError(
-            'ITPROG=0 with ISURFT=-2 enters undefined TEMPK(-2) access in legacy CALMET')
     if config.upper_temperature_option==0 or config.upper_temperature_option < -2:
         raise ValueError('IUPT must be -2, -1, or a positive upper-air station number')
     if config.itprog>0 and config.upper_temperature_option not in {-2,-1}:
@@ -740,22 +773,17 @@ def _validate(config: CalmetConfig):
         raise ValueError('positive IUPT requires NOOBS=0 upper-air observations')
     if config.lapse_height_m<=0.:
         raise ValueError('lapse_height_m must be positive')
-    faces=np.asarray(config.z_faces_m,dtype=float)
+    faces=np.asarray(config.z_faces_m,dtype=np.float32)
     if faces.ndim!=1 or faces.size<2 or faces[0]!=0. or np.any(np.diff(faces)<=0.):
         raise ValueError('z_faces_m must be strictly increasing and begin at zero')
-    first_center=np.asarray(
-        np.float32(.5)*np.asarray(
-            np.float32(faces[0])+np.float32(faces[1]),dtype=np.float32),
-        dtype=np.float32)
-    if config.run_type!=0 and not np.float32(9.)<=first_center<=np.float32(11.):
+    first_center=.5*(faces[0]+faces[1])
+    if config.run_type!=0 and not 9.<=first_center<=11.:
         raise ValueError(
             'full CALMET runs require the first layer midpoint to be between 9 and 11 m')
     if config.barrier_top_level is None:
         config.barrier_top_level=faces.size-1
     if config.barrier_count and not 1<=config.barrier_top_level<faces.size:
         raise ValueError('barrier_top_level/KBAR must identify a CALMET layer')
-    if config.grid.dx_km!=config.grid.dy_km:
-        raise ValueError('legacy CALMET DGRID requires equal X and Y grid spacing')
     if len(config.smoothing_passes)!=faces.size-1:
         raise ValueError('smoothing_passes must contain one value per CALMET layer')
     if config.noobs!=2:
@@ -769,18 +797,16 @@ def _validate(config: CalmetConfig):
             raise ValueError('wind_bias/BIAS must provide one value in [-1,1] per CALMET layer')
         if config.extrapolate_calm not in {0,1}:
             raise ValueError('extrapolate_calm/ICALM must be zero or one')
-    elif abs(config.wind_extrapolation)!=1:
-        raise ValueError('legacy CALMET requires |IEXTRP|=1 when NOOBS=2')
     if config.iavezi and not 1<=config.mixing_wind_level<faces.size:
         raise ValueError('mixing_wind_level must identify a CALMET layer using one-based indexing')
-    begin=_stamp(config.start); finish=_stamp(config.end)
-    # READCF converts an explicit beginning time to its first hour-ending
-    # internal timestamp before applying ``IBHR > 5``.  Consequently a
-    # user-facing 05:00 start is already too late; 04:xx is the last hour.
+    begin=config.start; finish=config.end
+    # Full runs initialize their stateful convective-height history from zero;
+    # a pre-dawn interval is required before daytime surface heating begins.
     if config.run_type!=0 and begin.hour>=5:
         raise ValueError('CALMET prognostic mixing-height runs must start before 05 LST')
     for label,value in (('start',begin),('end',finish)):
-        seconds=value.minute*60+value.second
+        hour=value.replace(minute=0,second=0,microsecond=0)
+        seconds=(value-hour).total_seconds()
         if seconds%config.timestep_seconds:
             raise ValueError(f'CALMET {label} time must align with NSECDT')
     return faces
@@ -797,23 +823,22 @@ def _initial_guess_at(config,initial_guess,timestamp,centers):
 
 def _noobs_step_transform(config,initial_guess,diagnostic,precipitation=None,
                           precipitation_points=None,sea=()):
-    centers=.5*(np.asarray(config.z_faces_m[:-1])+np.asarray(config.z_faces_m[1:]))
+    faces=np.asarray(config.z_faces_m,dtype=np.float32)
+    centers=.5*(faces[:-1]+faces[1:])
     sea=tuple(sea)
     sea_points=(np.stack([data.point(config.grid) for data in sea])
                 if sea else np.empty((0,2)))
     sea_longitudes=[data.longitude_latitude()[0] for data in sea]
     def transform(step,timestamp):
         changes={}
-        # DIAG gives the prognostic Step-1 field precedence for IPROG=4/14.
-        # run() still opens and validates IGFDAT, just as RDHDMET does.
-        if initial_guess is not None and config.iprog not in {4,14}:
+        if initial_guess is not None:
             changes['u'],changes['v']=_initial_guess_at(
                 config,initial_guess,timestamp,centers)
         if diagnostic is not None:
             record=diagnostic.at_begin(timestamp)
             if record.surface_temperature_k is not None:
                 changes['diagnostic_surface_temperature']=np.full_like(
-                    step.surface_temperature,record.surface_temperature_k,dtype=float)
+                    step.surface_temperature,record.surface_temperature_k,dtype=np.float32)
         if precipitation is not None:
             record=precipitation.at_begin(timestamp)
             if not (config.run_type==0 and config.diagnostic_lapse_rate):
@@ -835,8 +860,8 @@ def _noobs_step_transform(config,initial_guess,diagnostic,precipitation=None,
             else:
                 changes['overwater_data']=observed_water
             if config.water_temperature_mode==0:
-                below=np.asarray([item.gradient_below_k_m for item in records])
-                above=np.asarray([item.gradient_above_k_m for item in records])
+                below=np.asarray([item.gradient_below_k_m for item in records],dtype=np.float32)
+                above=np.asarray([item.gradient_above_k_m for item in records],dtype=np.float32)
                 below=np.where(below<9998.,below,config.water_temperature_gradient_below)
                 above=np.where(above<9998.,above,config.water_temperature_gradient_above)
                 interpolation=dict(radius_km=config.temperature_radius_km,
@@ -867,13 +892,16 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
     relative=points-np.array([config.grid.x_origin_km,config.grid.y_origin_km])
     station_ix=np.clip(np.floor(relative[:,0]/config.grid.dx_km).astype(int),0,config.grid.nx-1)
     station_iy=np.clip(np.floor(relative[:,1]/config.grid.dy_km).astype(int),0,config.grid.ny-1)
-    roughness=np.asarray(geo['roughness_length'])[station_iy,station_ix]
+    roughness=np.asarray(geo['roughness_length'][:],dtype=np.float32)[station_iy,station_ix]
     latitude=np.array([station.latitude for station in surface_stations])
     longitude=np.array([station.longitude for station in surface_stations])
     convergence=grid_convergence(config.grid,longitude,latitude)
-    anemometer=np.array([station.anemometer_height_m for station in surface_stations])
-    centers=.5*(np.asarray(config.z_faces_m[:-1])+np.asarray(config.z_faces_m[1:]))
-    landuse=np.asarray(geo['dominant_landuse'])
+    anemometer=np.asarray(
+        [station.anemometer_height_m for station in surface_stations],dtype=np.float32,
+    )
+    faces=np.asarray(config.z_faces_m,dtype=np.float32)
+    centers=.5*(faces[:-1]+faces[1:])
+    landuse=np.asarray(geo['dominant_landuse'][:],dtype=np.int16)
     upper_air=tuple(upper_air)
     upper_stations=tuple((data.station for data in upper_air) if upper_stations is None
                          else upper_stations)
@@ -945,7 +973,7 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
                 np.trunc(np.asarray(step.ceiling_height)[sample]/30.48).astype(np.int32),
                 np.trunc(np.asarray(step.cloud_fraction)[sample]*10.).astype(np.int32),
                 np.asarray(step.surface_temperature,dtype=np.float32)[sample],
-                np.trunc(np.asarray(step.surface_relative_humidity)[sample]).astype(np.int32),
+                np.asarray(step.surface_relative_humidity,dtype=np.float32)[sample],
                 np.asarray(step.surface_pressure_mb,dtype=np.float32)[sample],
                 np.asarray(step.precipitation_code,dtype=np.int32)[sample])
         else:
@@ -961,8 +989,10 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
         elif config.itprog in {0,1}:
             water_min=config.water_temperature_category_min
             water_max=config.water_temperature_category_max
-            temperature_values=np.concatenate((np.asarray(raw_record.temperature_k),
-                                               [item.air_temperature_k for item in sea_records]))
+            temperature_values=np.concatenate((
+                np.asarray(raw_record.temperature_k,dtype=np.float32),
+                np.asarray([item.air_temperature_k for item in sea_records],dtype=np.float32),
+            ))
             temperature_points=np.vstack((points,sea_points))
             observed_surface_temperature=np.asarray(interpolate_surface_scalar(
                 temperature_values,temperature_points,config.grid,
@@ -975,45 +1005,38 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
         if config.itprog==0 and upper_air:
             end=timestamp+timedelta(seconds=config.timestep_seconds,
                                     hours=config.base_timezone)
-            station_faces=np.stack(
-                [data.temperature_faces_at(end,config.z_faces_m) for data in upper_air])
+            station_faces=np.asarray(np.stack(
+                [data.temperature_faces_at(end,config.z_faces_m) for data in upper_air]),
+                dtype=np.float32,
+            )
             observed_temperature_faces=grid_temperature_faces(
                 station_faces,np.asarray(upper_points),config.grid,
                 config.temperature_interpolation_power)
-            layer_temperature=np.asarray(np.float32(.5)*np.asarray(
-                observed_temperature_faces[:-1]+observed_temperature_faces[1:],
-                dtype=np.float32),dtype=np.float32)
+            layer_temperature=.5*(
+                observed_temperature_faces[:-1]+observed_temperature_faces[1:])
             layer_temperature[0]=observed_surface_temperature
-            faces=np.asarray(config.z_faces_m,dtype=np.float32)
-            profile_centers=np.asarray(np.float32(.5)*np.asarray(
-                faces[:-1]+faces[1:],dtype=np.float32),dtype=np.float32)
             observed_profile_height=np.broadcast_to(
-                np.r_[np.float32(0.),profile_centers][:,None,None],
-                (profile_centers.size+1,config.grid.ny,config.grid.nx))
+                np.r_[np.float32(0.),centers][:,None,None],
+                (centers.size+1,config.grid.ny,config.grid.nx))
             observed_profile_temperature=np.concatenate(
                 (observed_surface_temperature[None],layer_temperature),axis=0)
         elif config.itprog==0:
             # IDIOPT5 omits every sounding, including its temperature profile.
             # IRTYPE=0 never writes temperature, but the Python hour object still
             # carries a well-shaped field through the wind solve.
-            faces=np.asarray(config.z_faces_m,dtype=np.float32)
             target_temperature=np.asarray(step.temperature,dtype=np.float32)
             observed_temperature_faces=np.empty(
                 (faces.size,config.grid.ny,config.grid.nx),dtype=np.float32)
             observed_temperature_faces[0]=observed_surface_temperature
             for level in range(target_temperature.shape[0]):
-                observed_temperature_faces[level+1]=np.asarray(
-                    np.float32(2.)*target_temperature[level]-
-                    observed_temperature_faces[level],dtype=np.float32)
-            layer_temperature=np.asarray(np.float32(.5)*np.asarray(
-                observed_temperature_faces[:-1]+observed_temperature_faces[1:],
-                dtype=np.float32),dtype=np.float32)
+                observed_temperature_faces[level+1]=(
+                    2.*target_temperature[level]-observed_temperature_faces[level])
+            layer_temperature=.5*(
+                observed_temperature_faces[:-1]+observed_temperature_faces[1:])
             layer_temperature[0]=observed_surface_temperature
-            profile_centers=np.asarray(np.float32(.5)*np.asarray(
-                faces[:-1]+faces[1:],dtype=np.float32),dtype=np.float32)
             observed_profile_height=np.broadcast_to(
-                np.r_[np.float32(0.),profile_centers][:,None,None],
-                (profile_centers.size+1,config.grid.ny,config.grid.nx))
+                np.r_[np.float32(0.),centers][:,None,None],
+                (centers.size+1,config.grid.ny,config.grid.nx))
             observed_profile_temperature=np.concatenate(
                 (observed_surface_temperature[None],layer_temperature),axis=0)
         upper_u=upper_v=None
@@ -1027,8 +1050,8 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
             else:
                 upper_profiles=()
             if diagnostic_record is not None and diagnostic_record.upper_u_m_s is not None:
-                upper_u=np.asarray(diagnostic_record.upper_u_m_s,dtype=float).copy()
-                upper_v=np.asarray(diagnostic_record.upper_v_m_s,dtype=float).copy()
+                upper_u=np.asarray(diagnostic_record.upper_u_m_s,dtype=np.float32).copy()
+                upper_v=np.asarray(diagnostic_record.upper_v_m_s,dtype=np.float32).copy()
             elif not upper_air:
                 raise ValueError('IDIOPT5 requires upper-air wind records in DIAG.DAT')
             upper_valid=np.any((upper_u<900.)|(upper_v<900.),axis=0)
@@ -1050,23 +1073,31 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
         else:
             upper_valid=np.empty(0,dtype=bool)
             debug_upper=()
-        sea_speed=np.asarray([item.wind_speed_m_s for item in sea_records],dtype=float)
-        sea_direction=np.asarray([item.wind_direction_deg for item in sea_records],dtype=float)
-        sea_anemometer=np.asarray([item.anemometer_height_m for item in sea_records],dtype=float)
+        sea_speed=np.asarray([item.wind_speed_m_s for item in sea_records],dtype=np.float32)
+        sea_direction=np.asarray([item.wind_direction_deg for item in sea_records],dtype=np.float32)
+        sea_anemometer=np.asarray([item.anemometer_height_m for item in sea_records],dtype=np.float32)
         sea_anemometer=np.where(sea_anemometer>9998.,10.,sea_anemometer)
         sea_roughness=hosker_roughness(np.where(
             (sea_speed>0.)&(sea_speed<9998.),sea_speed,0.))
-        wind_speed=np.concatenate((np.asarray(record.wind_speed),sea_speed))
-        wind_direction=np.concatenate((np.asarray(record.wind_direction),sea_direction))
-        wind_anemometer=np.concatenate((anemometer,sea_anemometer))
-        wind_roughness=np.concatenate((roughness,sea_roughness))
+        wind_speed=np.concatenate((
+            np.asarray(record.wind_speed,dtype=np.float32),sea_speed,
+        )).astype(np.float32,copy=False)
+        wind_direction=np.concatenate((
+            np.asarray(record.wind_direction,dtype=np.float32),sea_direction,
+        )).astype(np.float32,copy=False)
+        wind_anemometer=np.concatenate((anemometer,sea_anemometer)).astype(
+            np.float32,copy=False,
+        )
+        wind_roughness=np.concatenate((
+            roughness,np.asarray(sea_roughness,dtype=np.float32),
+        )).astype(np.float32,copy=False)
         wind_latitude=np.concatenate((latitude,np.asarray(
             [item[1] for item in sea_locations],dtype=float)))
         wind_convergence=np.concatenate((convergence,sea_convergence))
         surface_relative=np.vstack((relative,sea_points-np.array(
             [config.grid.x_origin_km,config.grid.y_origin_km]))) if sea else relative
-        power_exponent=np.r_[np.full(len(record.wind_speed),.143),
-                             np.full(len(sea_records),.286)]
+        power_exponent=np.r_[np.full(len(record.wind_speed),.143,dtype=np.float32),
+                             np.full(len(sea_records),.286,dtype=np.float32)]
         profile_options=dict(station_xy=surface_relative,
             upper_xy=(np.asarray(upper_points)-np.array(
                 [config.grid.x_origin_km,config.grid.y_origin_km]) if upper_points else None),
@@ -1108,10 +1139,10 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
             station_heat,_=heat_flux(
                 physical_context.solar_elevation_sine[station_iy,station_ix],station_cloud,
                 station_temperature,station_landuse,
-                np.asarray(geo['albedo'])[station_iy,station_ix],
-                np.asarray(geo['bowen_ratio'])[station_iy,station_ix],
-                np.asarray(geo['soil_heat_flux_parameter'])[station_iy,station_ix],
-                np.asarray(geo['anthropogenic_heat_flux'])[station_iy,station_ix],
+                np.asarray(geo['albedo'][:],dtype=np.float32)[station_iy,station_ix],
+                np.asarray(geo['bowen_ratio'][:],dtype=np.float32)[station_iy,station_ix],
+                np.asarray(geo['soil_heat_flux_parameter'][:],dtype=np.float32)[station_iy,station_ix],
+                np.asarray(geo['anthropogenic_heat_flux'][:],dtype=np.float32)[station_iy,station_ix],
                 water_range=common['water_range'],**radiation_options)
             mixing_options=dict(timestep_s=config.timestep_seconds,
                 depth_m=config.mixing_lapse_depth_m,
@@ -1126,43 +1157,22 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
             ipsifcn=1 if config.overwater_flux_method==0 else 0
             def ordered_water_profiles(function,arguments,keywords,grid_iy=None,grid_ix=None):
                 warm=(config.warm_layer and function is coare_water_station_profiles)
-                if config.imixh!=1 and not warm:
-                    return function(*arguments,**keywords)
+                station_keywords=dict(keywords)
                 if warm:
                     if grid_iy is None or grid_ix is None:
                         raise RuntimeError('COARE warm-layer stations require grid indices')
                     if physical_context.warm_layer_state is None:
                         physical_context.warm_layer_state=initial_warm_layer_state(landuse.shape)
-                shared_jump=np.float32(physical_context.previous_temperature_jump[0,0])
-                profile_u=[]; profile_v=[]; count=len(arguments[0])
-                for station_index in range(count):
-                    station_arguments=tuple(np.asarray(value)[station_index:station_index+1]
-                                            for value in arguments)
-                    station_keywords={}
-                    for name,value in keywords.items():
-                        array=np.asarray(value)
-                        station_keywords[name]=(array[station_index:station_index+1]
-                            if array.shape==(count,) else value)
-                    station_keywords['previous_temperature_jump_k']=np.array(
-                        [shared_jump],dtype=np.float32)
-                    if warm:
-                        iy=int(grid_iy[station_index]); ix=int(grid_ix[station_index])
-                        state=physical_context.warm_layer_state
-                        station_keywords['warm_layer_state']=WarmLayerState(*(
-                            np.asarray(getattr(state,name))[iy,ix].reshape(1)
-                            for name in WarmLayerState.__dataclass_fields__))
-                    station_profiles=function(*station_arguments,**station_keywords)
-                    profile_u.append(station_profiles[0][:,0])
-                    profile_v.append(station_profiles[1][:,0])
-                    next_jump=np.asarray(station_profiles[7],dtype=np.float32)[0]
-                    if np.isfinite(next_jump): shared_jump=next_jump
-                    if warm:
-                        next_state=station_profiles[-1]
-                        for name in WarmLayerState.__dataclass_fields__:
-                            np.asarray(getattr(physical_context.warm_layer_state,name))[iy,ix]=(
-                                np.asarray(getattr(next_state,name)).reshape(-1)[0])
-                physical_context.previous_temperature_jump[0,0]=shared_jump
-                return np.column_stack(profile_u),np.column_stack(profile_v)
+                    iy=np.asarray(grid_iy,dtype=np.intp)
+                    ix=np.asarray(grid_ix,dtype=np.intp)
+                    state=physical_context.warm_layer_state
+                    station_keywords['warm_layer_state']=WarmLayerState(*(
+                        np.array(np.asarray(getattr(state,name))[iy,ix],copy=True)
+                        for name in WarmLayerState.__dataclass_fields__))
+                    # Station profiles sample the previous grid state.  The
+                    # later full-grid surface solve advances that state once.
+                station_profiles=function(*arguments,**station_keywords)
+                return station_profiles[0],station_profiles[1]
 
             surface_water=(station_landuse>=water_min)&(station_landuse<=water_max)
             surface_land=~surface_water
@@ -1170,14 +1180,14 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
                 selected=np.flatnonzero(surface_land)
                 land_profiles=land_station_similarity_theory(
                     raw_u[selected],raw_v[selected],roughness[selected],anemometer[selected],
-                    centers[0],np.asarray(step.surface_density)[station_iy[selected],station_ix[selected]],
+                    centers[0],np.asarray(step.surface_density,dtype=np.float32)[station_iy[selected],station_ix[selected]],
                     station_temperature[selected],station_cloud[selected],station_heat[selected],
                     np.asarray(observed_profile_temperature
                         if config.itprog==0 else step.profile_temperature
-                        )[:,station_iy[selected],station_ix[selected]],
+                        ,dtype=np.float32)[:,station_iy[selected],station_ix[selected]],
                     np.asarray(observed_profile_height
                         if config.itprog==0 else step.profile_height
-                        )[:,station_iy[selected],station_ix[selected]],
+                        ,dtype=np.float32)[:,station_iy[selected],station_ix[selected]],
                     physical_context.previous_convective_height[station_iy[selected],station_ix[selected]],
                     physical_context.previous_temperature_jump[station_iy[selected],station_ix[selected]],
                     physical_context.coriolis[station_iy[selected],station_ix[selected]],centers,
@@ -1199,11 +1209,11 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
                     if step.overwater_data is None:
                         raise ValueError('ITWPROG=2 requires prognostic offshore data')
                     iy=station_iy[selected]; ix=station_ix[selected]; offshore=step.overwater_data
-                    air=np.asarray(offshore.air_temperature_k)[iy,ix]
-                    sea_temperature=np.asarray(offshore.sea_temperature_k)[iy,ix]
-                    delta=np.asarray(air-sea_temperature,dtype=np.float32)
-                    humidity=np.asarray(offshore.relative_humidity)[iy,ix]
-                    thermal_height=np.asarray(offshore.air_sensor_height_m)[iy,ix]
+                    air=np.asarray(offshore.air_temperature_k,dtype=np.float32)[iy,ix]
+                    sea_temperature=np.asarray(offshore.sea_temperature_k,dtype=np.float32)[iy,ix]
+                    delta=air-sea_temperature
+                    humidity=np.asarray(offshore.relative_humidity,dtype=np.float32)[iy,ix]
+                    thermal_height=np.asarray(offshore.air_sensor_height_m,dtype=np.float32)[iy,ix]
                     preliminary=neutral_water_station_profiles(
                         raw_u[selected],raw_v[selected],anemometer[selected],
                         physical_context.previous_mixing_height[iy,ix],
@@ -1212,8 +1222,8 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
                         minimum_height_m=config.minimum_water_mixing_height_m,
                         maximum_height_m=config.maximum_water_mixing_height_m,ipsifcn=ipsifcn)
                     _,_,potential_lapse=profile_temperature_layer(
-                        np.asarray(step.profile_temperature)[:,iy,ix][:,None,:],
-                        np.asarray(step.profile_height)[:,iy,ix][:,None,:],
+                        np.asarray(step.profile_temperature,dtype=np.float32)[:,iy,ix][:,None,:],
+                        np.asarray(step.profile_height,dtype=np.float32)[:,iy,ix][:,None,:],
                         preliminary[5][None,:],config.mixing_lapse_depth_m,
                         minimum_lapse=config.minimum_lapse_rate)
                     water_common=dict(observed_mixing_height_m=np.full(selected.size,9999.,dtype=np.float32),
@@ -1237,17 +1247,19 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
                             temperature_measurement_height_m=thermal_height,
                             sea_temperature_k=sea_temperature)
                     else:
-                        cloud=np.asarray(step.cloud_fraction)[iy,ix]
+                        cloud=np.asarray(step.cloud_fraction,dtype=np.float32)[iy,ix]
                         _,shortwave=heat_flux(
                             physical_context.solar_elevation_sine[iy,ix],cloud,
-                            np.asarray(step.temperature[0])[iy,ix],landuse[iy,ix],
-                            np.asarray(geo['albedo'])[iy,ix],np.asarray(geo['bowen_ratio'])[iy,ix],
-                            np.asarray(geo['soil_heat_flux_parameter'])[iy,ix],
-                            np.asarray(geo['anthropogenic_heat_flux'])[iy,ix],
+                            np.asarray(step.temperature[0],dtype=np.float32)[iy,ix],landuse[iy,ix],
+                            np.asarray(geo['albedo'][:],dtype=np.float32)[iy,ix],
+                            np.asarray(geo['bowen_ratio'][:],dtype=np.float32)[iy,ix],
+                            np.asarray(geo['soil_heat_flux_parameter'][:],dtype=np.float32)[iy,ix],
+                            np.asarray(geo['anthropogenic_heat_flux'][:],dtype=np.float32)[iy,ix],
                             water_range=common['water_range'],**radiation_options)
-                        longwave=downward_longwave(np.asarray(step.temperature[0])[iy,ix],
+                        longwave=downward_longwave(
+                            np.asarray(step.temperature[0],dtype=np.float32)[iy,ix],
                             np.asarray(step.surface_relative_humidity)[iy,ix],cloud,
-                            np.asarray(step.ceiling_height)[iy,ix])
+                            np.asarray(step.ceiling_height,dtype=np.float32)[iy,ix])
                         coast=distance_to_coast(landuse,common['water_range'],
                                                 config.grid.dx_km,config.grid.dy_km)
                         function=coare_water_station_profiles
@@ -1255,7 +1267,7 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
                                    thermal_height,air,delta,humidity)
                         keywords=dict(water_common,sea_temperature_k=sea_temperature,
                             shortwave_down_w_m2=shortwave,longwave_down_w_m2=longwave,
-                            rainfall_mm_h=np.asarray(step.precipitation_rate)[iy,ix],
+                            rainfall_mm_h=np.asarray(step.precipitation_rate,dtype=np.float32)[iy,ix],
                             coare_method=config.overwater_flux_method,
                             coastal_shelf_length_km=config.coastal_shelf_length_km,
                             distance_to_coast_km=coast[iy,ix],cool_skin=bool(config.cool_skin),
@@ -1292,8 +1304,8 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
                             maximum_height_m=config.maximum_water_mixing_height_m,
                             ipsifcn=ipsifcn)
                         _,_,potential_lapse=profile_temperature_layer(
-                            np.asarray(step.profile_temperature)[:,sea_iy,sea_ix][:,None,:],
-                            np.asarray(step.profile_height)[:,sea_iy,sea_ix][:,None,:],
+                            np.asarray(step.profile_temperature,dtype=np.float32)[:,sea_iy,sea_ix][:,None,:],
+                            np.asarray(step.profile_height,dtype=np.float32)[:,sea_iy,sea_ix][:,None,:],
                             preliminary[5][None,:],config.mixing_lapse_depth_m,
                             minimum_lapse=config.minimum_lapse_rate)
                         potential_lapse=potential_lapse[0]
@@ -1301,12 +1313,12 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
                     if step.overwater_data is None:
                         raise ValueError('ITWPROG=2 requires prognostic offshore data')
                     offshore=step.overwater_data
-                    sea_air=np.asarray(offshore.air_temperature_k)[sea_iy,sea_ix]
-                    sea_temperature=np.asarray(offshore.sea_temperature_k)[sea_iy,sea_ix]
-                    sea_delta=np.asarray(sea_air-sea_temperature,dtype=np.float32)
-                    sea_rh=np.asarray(offshore.relative_humidity)[sea_iy,sea_ix]
-                    sea_observed=np.full(len(sea_records),np.float32(9999.))
-                    thermal_height=np.asarray(offshore.air_sensor_height_m)[sea_iy,sea_ix]
+                    sea_air=np.asarray(offshore.air_temperature_k,dtype=np.float32)[sea_iy,sea_ix]
+                    sea_temperature=np.asarray(offshore.sea_temperature_k,dtype=np.float32)[sea_iy,sea_ix]
+                    sea_delta=sea_air-sea_temperature
+                    sea_rh=np.asarray(offshore.relative_humidity,dtype=np.float32)[sea_iy,sea_ix]
+                    sea_observed=np.full(len(sea_records),9999.,dtype=np.float32)
+                    thermal_height=np.asarray(offshore.air_sensor_height_m,dtype=np.float32)[sea_iy,sea_ix]
                     preliminary=neutral_water_station_profiles(
                         raw_u[selected],raw_v[selected],sea_anemometer,
                         physical_context.previous_mixing_height[sea_iy,sea_ix],
@@ -1315,8 +1327,8 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
                         minimum_height_m=config.minimum_water_mixing_height_m,
                         maximum_height_m=config.maximum_water_mixing_height_m,ipsifcn=ipsifcn)
                     _,_,potential_lapse=profile_temperature_layer(
-                        np.asarray(step.profile_temperature)[:,sea_iy,sea_ix][:,None,:],
-                        np.asarray(step.profile_height)[:,sea_iy,sea_ix][:,None,:],
+                        np.asarray(step.profile_temperature,dtype=np.float32)[:,sea_iy,sea_ix][:,None,:],
+                        np.asarray(step.profile_height,dtype=np.float32)[:,sea_iy,sea_ix][:,None,:],
                         preliminary[5][None,:],config.mixing_lapse_depth_m,
                         minimum_lapse=config.minimum_lapse_rate)
                     potential_lapse=potential_lapse[0]
@@ -1342,19 +1354,20 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
                         dict(common_water,temperature_measurement_height_m=thermal_height,
                              sea_temperature_k=sea_temperature))
                 else:
-                    cloud=np.asarray(step.cloud_fraction)[sea_iy,sea_ix]
+                    cloud=np.asarray(step.cloud_fraction,dtype=np.float32)[sea_iy,sea_ix]
                     _,shortwave=heat_flux(
                         physical_context.solar_elevation_sine[sea_iy,sea_ix],cloud,
-                        np.asarray(step.temperature[0])[sea_iy,sea_ix],landuse[sea_iy,sea_ix],
-                        np.asarray(geo['albedo'])[sea_iy,sea_ix],
-                        np.asarray(geo['bowen_ratio'])[sea_iy,sea_ix],
-                        np.asarray(geo['soil_heat_flux_parameter'])[sea_iy,sea_ix],
-                        np.asarray(geo['anthropogenic_heat_flux'])[sea_iy,sea_ix],
+                        np.asarray(step.temperature[0],dtype=np.float32)[sea_iy,sea_ix],
+                        landuse[sea_iy,sea_ix],
+                        np.asarray(geo['albedo'][:],dtype=np.float32)[sea_iy,sea_ix],
+                        np.asarray(geo['bowen_ratio'][:],dtype=np.float32)[sea_iy,sea_ix],
+                        np.asarray(geo['soil_heat_flux_parameter'][:],dtype=np.float32)[sea_iy,sea_ix],
+                        np.asarray(geo['anthropogenic_heat_flux'][:],dtype=np.float32)[sea_iy,sea_ix],
                         water_range=common['water_range'],**radiation_options)
                     longwave=downward_longwave(
-                        np.asarray(step.temperature[0])[sea_iy,sea_ix],
+                        np.asarray(step.temperature[0],dtype=np.float32)[sea_iy,sea_ix],
                         np.asarray(step.surface_relative_humidity)[sea_iy,sea_ix],cloud,
-                        np.asarray(step.ceiling_height)[sea_iy,sea_ix])
+                        np.asarray(step.ceiling_height,dtype=np.float32)[sea_iy,sea_ix])
                     coast=distance_to_coast(landuse,common['water_range'],
                                             config.grid.dx_km,config.grid.dy_km)
                     if thermal_height is None:
@@ -1369,21 +1382,25 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
                         **({} if thermal_height is None else
                            {'sea_temperature_k':sea_temperature}),
                         shortwave_down_w_m2=shortwave,longwave_down_w_m2=longwave,
-                        rainfall_mm_h=np.asarray(step.precipitation_rate)[sea_iy,sea_ix],
+                        rainfall_mm_h=np.asarray(step.precipitation_rate,dtype=np.float32)[sea_iy,sea_ix],
                         coare_method=config.overwater_flux_method,
-                        wave_period_s=np.asarray([item.wave_period_s for item in sea_records]),
-                        wave_height_m=np.asarray([item.wave_height_m for item in sea_records]),
+                        wave_period_s=np.asarray(
+                            [item.wave_period_s for item in sea_records],dtype=np.float32),
+                        wave_height_m=np.asarray(
+                            [item.wave_height_m for item in sea_records],dtype=np.float32),
                         coastal_shelf_length_km=config.coastal_shelf_length_km,
                         distance_to_coast_km=coast[sea_iy,sea_ix],cool_skin=bool(config.cool_skin),
                         solar_time_s=np.mod((np.asarray(offshore.station_longitude)[sea_iy,sea_ix]
                             if thermal_height is not None else
                             np.asarray([item[0] for item in sea_locations]))/15.
                             +(physical_context.gmt_hour or 0)+24.,24.)*3600.,
-                        water_sensor_depth_m=(.05 if thermal_height is not None else
-                            np.where(np.asarray([item.water_sensor_depth_m
-                                for item in sea_records])<9998.,
+                        water_sensor_depth_m=(np.float32(.05)
+                            if thermal_height is not None else np.where(
                                 np.asarray([item.water_sensor_depth_m
-                                    for item in sea_records]),.6)),
+                                            for item in sea_records],dtype=np.float32)<9998.,
+                                np.asarray([item.water_sensor_depth_m
+                                            for item in sea_records],dtype=np.float32),
+                                np.float32(.6))),
                     )
                 sea_profiles=ordered_water_profiles(
                     profile_function,profile_arguments,profile_keywords,sea_iy,sea_ix)
@@ -1403,7 +1420,7 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
             if config.surface_temperature_option>0:
                 tinf=float(record.temperature_k[config.surface_temperature_option-1])
             elif config.surface_temperature_option==-2:
-                tinf=float(_domain_mean_real4(step.temperature[0]))
+                tinf=float(_domain_mean(step.temperature[0]))
             else:
                 tinf=None
             if (diagnostic_record is not None and
@@ -1420,8 +1437,8 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
                     domain_v=float(domain_profile[1][0])
                 else:
                     valid=(upper_u[:,selected]<900.)&(upper_v[:,selected]<900.)
-                    domain_u=float(np.mean(upper_u[valid,selected],dtype=np.float32))
-                    domain_v=float(np.mean(upper_v[valid,selected],dtype=np.float32))
+                    domain_u=float(_domain_mean(upper_u[valid,selected]))
+                    domain_v=float(_domain_mean(upper_v[valid,selected]))
             else:
                 domain_u=domain_v=0.
             debug_wind=dict(
@@ -1454,7 +1471,7 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
             analysis_common={**common,'observation_weight':weights,
                 'background_weight':(1.-weights)*prognostic_strength}
         background_u,background_v=step.u,step.v
-        if initial_guess is not None and config.iprog not in {4,14}:
+        if initial_guess is not None:
             background_u,background_v=_initial_guess_at(
                 config,initial_guess,timestamp,centers)
         elif (config.iprog==0 and not config.diagnostic_initial_wind and
@@ -1476,10 +1493,10 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
                     selected=(selected_u<900.)&(selected_v<900.)
                 if not selected.any():
                     raise ValueError('DIAG.DAT has no valid upper-air wind for IUPWND')
-                initial_u=float(np.mean(selected_u[selected],dtype=np.float32))
-                initial_v=float(np.mean(selected_v[selected],dtype=np.float32))
-            background_u=np.full_like(step.u,initial_u,dtype=float)
-            background_v=np.full_like(step.v,initial_v,dtype=float)
+                initial_u=float(_domain_mean(selected_u[selected]))
+                initial_v=float(_domain_mean(selected_v[selected]))
+            background_u=np.full_like(step.u,initial_u,dtype=np.float32)
+            background_v=np.full_like(step.v,initial_v,dtype=np.float32)
         elif config.iprog==0 and not config.diagnostic_initial_wind:
             wind1_roughness=wind_roughness.copy()
             land_count=len(record.wind_speed)
@@ -1489,20 +1506,18 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
             if diagnostic_record is not None and diagnostic_record.surface_u_m_s is not None:
                 land_u=np.asarray(diagnostic_record.surface_u_m_s[:land_count],dtype=np.float32)
                 land_v=np.asarray(diagnostic_record.surface_v_m_s[:land_count],dtype=np.float32)
-                land_speed=np.asarray(np.sqrt(np.asarray(
-                    land_u*land_u+land_v*land_v,dtype=np.float32)),dtype=np.float32)
+                land_speed=np.hypot(land_u,land_v)
                 valid_land=(land_u<=900.)&(land_v<=900.)&(land_speed>0.)
             else:
                 land_u,land_v,valid_land,_=_wind_components(
                     record.wind_speed,record.wind_direction,convergence)
-                land_speed=np.asarray(np.sqrt(np.asarray(
-                    land_u*land_u+land_v*land_v,dtype=np.float32)),dtype=np.float32)
+                land_speed=np.hypot(land_u,land_v)
                 valid_land&=land_speed>0.
             water_wind=land_on_water&valid_land
             dynamic_z0=hosker_roughness(land_speed[water_wind])
             land_roughness=wind1_roughness[:land_count]
             land_roughness[water_wind]=dynamic_z0
-            roughness_override=np.asarray(geo['roughness_length']).copy()
+            roughness_override=np.asarray(geo['roughness_length'][:],dtype=np.float32).copy()
             for x_index,y_index,value in zip(station_ix[water_wind],station_iy[water_wind],dynamic_z0):
                 roughness_override[y_index,x_index]=value
             if diagnostic_record is not None and diagnostic_record.surface_u_m_s is not None:
@@ -1518,7 +1533,7 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
                     power_exponent=power_exponent)
             if upper_stations:
                 initial_u=np.hstack((initial_u,upper_u)); initial_v=np.hstack((initial_v,upper_v))
-            bias=np.asarray(config.wind_bias[:centers.size],dtype=float).copy()
+            bias=np.asarray(config.wind_bias[:centers.size],dtype=np.float32).copy()
             if config.wind_extrapolation<0.: bias[0]=-1.
             if abs(config.wind_extrapolation)==1: bias[1:]=1.
             background_u,background_v=wind1_initial_guess(initial_u,initial_v,all_relative,
@@ -1527,8 +1542,8 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
                 extrapolate_calm=bool(config.extrapolate_calm),barriers=config.barriers,
                 barrier_top_level=config.barrier_top_level)
         elif config.iprog==0:
-            background_u=np.full_like(step.u,diagnostic_record.initial_u_m_s,dtype=float)
-            background_v=np.full_like(step.v,diagnostic_record.initial_v_m_s,dtype=float)
+            background_u=np.full_like(step.u,diagnostic_record.initial_u_m_s,dtype=np.float32)
+            background_v=np.full_like(step.v,diagnostic_record.initial_v_m_s,dtype=np.float32)
         u=objective_analysis_component(observed_u,all_relative,background_u,landuse,
             config.grid.dx_km,config.grid.dy_km,**analysis_common)
         v=objective_analysis_component(observed_v,all_relative,background_v,landuse,
@@ -1548,15 +1563,15 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
         if diagnostic_record is not None:
             if diagnostic_record.surface_temperature_k is not None:
                 changes['diagnostic_surface_temperature']=np.full_like(
-                    step.surface_temperature,diagnostic_record.surface_temperature_k,dtype=float)
+                    step.surface_temperature,diagnostic_record.surface_temperature_k,dtype=np.float32)
             if diagnostic_record.lapse_rate_k_m is not None:
                 changes['diagnostic_lapse_rate']=np.full_like(
-                    step.surface_temperature,diagnostic_record.lapse_rate_k_m,dtype=float)
+                    step.surface_temperature,diagnostic_record.lapse_rate_k_m,dtype=np.float32)
         if config.surface_temperature_option>0 and not config.diagnostic_surface_temperature:
             index=config.surface_temperature_option-1
             if index>=len(surface_stations): raise ValueError('ISURFT exceeds the SURF.DAT station count')
             changes['diagnostic_surface_temperature']=np.full_like(
-                step.surface_temperature,float(record.temperature_k[index]))
+                step.surface_temperature,record.temperature_k[index],dtype=np.float32)
         if (config.upper_temperature_option>0 and not config.diagnostic_lapse_rate and
                 upper_air):
             index=config.upper_temperature_option-1
@@ -1568,7 +1583,9 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
                 [config.grid.x_origin_km,config.grid.y_origin_km])
             ix=int(np.clip(np.floor(point[0]/config.grid.dx_km),0,config.grid.nx-1))
             iy=int(np.clip(np.floor(point[1]/config.grid.dy_km),0,config.grid.ny-1))
-            changes['diagnostic_lapse_rate']=np.full_like(step.surface_temperature,gamma,dtype=float)
+            changes['diagnostic_lapse_rate']=np.full_like(
+                step.surface_temperature,gamma,dtype=np.float32,
+            )
             changes['diagnostic_lapse_station_index']=(iy,ix)
             changes['diagnostic_lapse_data']=upper_air[index]
             changes['diagnostic_lapse_timestamp']=end
@@ -1594,10 +1611,13 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
         if config.irhprog==0:
             water_min=config.water_temperature_category_min
             water_max=config.water_temperature_category_max
-            sea_humidity=np.asarray([item.relative_humidity for item in sea_records])
+            sea_humidity=np.asarray(
+                [item.relative_humidity for item in sea_records],dtype=np.float32,
+            )
             sea_humidity=np.where(sea_humidity<9998.99,sea_humidity,100.)
-            sea_humidity=np.trunc(sea_humidity)
-            humidity_values=np.concatenate((np.asarray(raw_record.relative_humidity),sea_humidity))
+            humidity_values=np.concatenate((
+                np.asarray(raw_record.relative_humidity,dtype=np.float32),sea_humidity,
+            ))
             humidity_points=np.vstack((points,sea_points))
             humidity=interpolate_surface_scalar(humidity_values,humidity_points,config.grid,
                 radius_km=config.temperature_radius_km,maximum_stations=config.temperature_station_limit,
@@ -1605,10 +1625,16 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
                 target_water=(landuse>=water_min)&(landuse<=water_max),
                 station_water=np.r_[np.zeros(len(points),dtype=bool),np.ones(len(sea),dtype=bool)],
                 empty_fallback=(80.,100.))
-            changes['surface_relative_humidity']=np.trunc(humidity).astype(np.int32)
+            changes['surface_relative_humidity']=np.asarray(humidity,dtype=np.float32)
         if sea and config.water_temperature_mode==0:
-            below=np.array([getattr(item,'gradient_below_k_m',9999.) for item in sea_records])
-            above=np.array([getattr(item,'gradient_above_k_m',9999.) for item in sea_records])
+            below=np.asarray(
+                [getattr(item,'gradient_below_k_m',9999.) for item in sea_records],
+                dtype=np.float32,
+            )
+            above=np.asarray(
+                [getattr(item,'gradient_above_k_m',9999.) for item in sea_records],
+                dtype=np.float32,
+            )
             below=np.where(below<9998.,below,config.water_temperature_gradient_below)
             above=np.where(above<9998.,above,config.water_temperature_gradient_above)
             changes['water_gradient_below']=interpolate_surface_scalar(below,sea_points,config.grid,
@@ -1641,7 +1667,10 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
         if config.cloud_method in {1,2}:
             external=None if config.cloud_method==1 else step.cloud_fraction
             cloud,ceiling=surface_cloud_fields(record,nearest,external)
-            changes.update(cloud_fraction=cloud,ceiling_height=ceiling.astype(float)*30.48)
+            changes.update(
+                cloud_fraction=np.asarray(cloud,dtype=np.float32),
+                ceiling_height=(np.asarray(ceiling,dtype=np.float32)*np.float32(30.48)),
+            )
         return replace(step,**changes)
     transform.uses_physical_context=True
     return transform,nearest
@@ -1656,7 +1685,7 @@ def run(config: CalmetConfig) -> Path:
         if not path.is_file(): raise FileNotFoundError(path)
     geophysical=Path(config.geophysical)
     if not geophysical.is_file(): raise FileNotFoundError(geophysical)
-    start,end=_stamp(config.start),_stamp(config.end)
+    start,end=config.start,config.end
     if end<=start: raise ValueError('CALMET end must be later than start')
     output=_output_path(config); output.parent.mkdir(parents=True,exist_ok=True)
     with (_meteorology_input(config,meteorology,output.parent,start,end) as meteorology_input,
@@ -1693,9 +1722,16 @@ def run(config: CalmetConfig) -> Path:
                 fraction=(boundary-times[left]).total_seconds()/timeline_step
                 time_samples.append((left,right,fraction,boundary))
                 boundary+=timedelta(seconds=config.timestep_seconds)
-        geo_fields={name:np.asarray(geo[name][:]) for name in
-                    ('terrain_height','dominant_landuse','roughness_length','albedo','bowen_ratio',
-                     'soil_heat_flux_parameter','anthropogenic_heat_flux')}
+        geo_fields={
+            name:np.asarray(
+                geo[name][:],
+                dtype=(np.int16 if name=='dominant_landuse' else np.float32),
+            )
+            for name in (
+                'terrain_height','dominant_landuse','roughness_length','albedo',
+                'bowen_ratio','soil_heat_flux_parameter','anthropogenic_heat_flux',
+            )
+        }
         diagnostic=None
         initial_guess=(InitialGuessCalmetSeries(config.initial_guess_calmet_files)
                        if config.use_initial_guess_calmet else None)
@@ -1786,7 +1822,9 @@ def run(config: CalmetConfig) -> Path:
             precipitation_coordinates=precipitation_points
         if config.noobs in {0,1}:
             surface_metadata=_surface_control_metadata(config)
-            if config.diagnostic_surface_wind:
+            omit_surface_file=bool(config.diagnostic_surface_wind and
+                                   config.run_type==0)
+            if omit_surface_file:
                 surface_stations=surface_metadata
                 surface_datum=config.grid.datum
             else:
@@ -1798,11 +1836,14 @@ def run(config: CalmetConfig) -> Path:
                 surface_stations=surface.stations
                 surface_datum=surface.datum
             upper_metadata=_upper_control_metadata(config)
-            if (config.noobs==0 and not config.diagnostic_upper_wind and
+            omit_upper_files=bool(config.noobs==0 and
+                                  config.diagnostic_upper_wind and
+                                  config.run_type==0)
+            if (config.noobs==0 and not omit_upper_files and
                     upper_metadata is not None and
                     len(upper_metadata)!=len(config.upper_air_files)):
                 raise ValueError('upper-air control-station count does not match UPDAT files')
-            if config.noobs==0 and config.diagnostic_upper_wind:
+            if omit_upper_files:
                 upper=()
                 upper_stations=upper_metadata
             else:
@@ -1814,25 +1855,16 @@ def run(config: CalmetConfig) -> Path:
                 upper_stations=tuple(data.station for data in upper)
             for data in upper:
                 _validate_upper_span(data,start,end,config.base_timezone)
-            active_diagnostic=any((config.diagnostic_surface_temperature,
-                config.diagnostic_lapse_rate,config.diagnostic_initial_wind,
-                config.diagnostic_surface_wind,config.diagnostic_upper_wind))
+            diagnostic_options=_diagnostic_input_options(config)
+            active_diagnostic=any(diagnostic_options.values())
             if active_diagnostic:
                 diagnostic=DiagnosticData(config.diagnostic_data,start,
                     int(duration/config.timestep_seconds),config.timestep_seconds,
-                    surface_temperature=bool(config.diagnostic_surface_temperature and
-                                             config.surface_temperature_option!=-1),
-                    lapse_rate=bool(config.diagnostic_lapse_rate and config.noobs==0),
-                    initial_wind=bool(config.diagnostic_initial_wind and config.noobs==0),
-                    surface_wind=bool(config.diagnostic_surface_wind),
-                    # PREPDI branches to its return before IDIOPT5 when
-                    # NOOBS>=1, so the upper-wind block is present only in
-                    # the full-observation path.
-                    upper_wind=bool(config.diagnostic_upper_wind and config.noobs==0),
+                    **diagnostic_options,
                     surface_wind_names=([item.name for item in surface_stations]+
-                        [item.name for item in sea] if config.diagnostic_surface_wind else ()),
+                        [item.name for item in sea] if diagnostic_options['surface_wind'] else ()),
                     upper_wind_names=([item.name for item in upper_stations]
-                        if config.diagnostic_upper_wind and config.noobs==0 else ()),
+                        if diagnostic_options['upper_wind'] else ()),
                     levels=faces.size-1,iextrp=config.wind_extrapolation)
             weights=(read_weight_data(config.weight_data,config.grid.nx,config.grid.ny,
                 .5*(faces[:-1]+faces[1:])) if config.iprog in {3,5,13,15} and config.noobs!=2 else None)
@@ -1849,18 +1881,12 @@ def run(config: CalmetConfig) -> Path:
                     for index,station in enumerate(upper_stations)
                 ])-np.array([config.grid.x_origin_km,config.grid.y_origin_km])
         else:
-            active_diagnostic=any((config.diagnostic_surface_temperature,
-                config.diagnostic_lapse_rate,config.diagnostic_initial_wind,
-                config.diagnostic_surface_wind,config.diagnostic_upper_wind))
+            diagnostic_options=_diagnostic_input_options(config)
+            active_diagnostic=any(diagnostic_options.values())
             if active_diagnostic:
                 diagnostic=DiagnosticData(config.diagnostic_data,start,
                     int(duration/config.timestep_seconds),config.timestep_seconds,
-                    surface_temperature=bool(config.diagnostic_surface_temperature and
-                                             config.surface_temperature_option!=-1),
-                    # COMP does not call PREPDI at all for NOOBS=2.  OPENOT
-                    # still requires DIAG.DAT when an IDIOPT flag is set,
-                    # but no surface/upper wind records are consumed.
-                    surface_wind=False,upper_wind=False,levels=faces.size-1,
+                    **diagnostic_options,levels=faces.size-1,
                     iextrp=config.wind_extrapolation)
             if initial_guess is not None or diagnostic is not None or precipitation is not None:
                 options['step_transform']=_noobs_step_transform(
@@ -1871,7 +1897,8 @@ def run(config: CalmetConfig) -> Path:
             options['cloud_provider']=cloud.at_end
         if step_provider is None:
             options['mapper']=PrognosticMapper.build(
-                np.asarray(met['latitude'][:]),np.asarray(met['longitude'][:]),config.grid,
+                np.asarray(met['latitude'][:],dtype=np.float64),
+                np.asarray(met['longitude'][:],dtype=np.float64),config.grid,
                 validate_domain=True)
             options['precipitation_radius_km']=_prognostic_precipitation_radius(
                 options['mapper'],config.precipitation_radius_km,
@@ -1924,8 +1951,7 @@ def run(config: CalmetConfig) -> Path:
                         raise RuntimeError(f'missing retained wind debug stage {stage}')
                     writer.append_fields(hour.timestamp,*fields)
         def open_wind_print():
-            if not any(config.wind_debug_fields[:3]) and not any(
-                    config.wind_debug_fields[4:9]):
+            if not any(config.wind_debug_fields):
                 return None
             target=(Path(config.wind_print_output) if config.wind_print_output is not None
                     else output.parent/'test.prt')
@@ -1967,7 +1993,7 @@ def run(config: CalmetConfig) -> Path:
             writer=(LegacyCalmetWriter(output,config.grid,faces,geo,start,end,
                     control_lines=config.control_lines,
                     base_timezone=(config.base_timezone_label or
-                                   _timezone_label(config.base_timezone)),
+                                   format_timezone_label(config.base_timezone)),
                     include_w_temperature=config.include_w_temperature,water_range=water_range,
                     landuse_category_count=landuse_category_count,run_type=config.run_type,
                     timestep_seconds=config.timestep_seconds,
@@ -1982,7 +2008,7 @@ def run(config: CalmetConfig) -> Path:
         auxiliary=(AuxiliaryCalmetWriter(str(output)+'.aux',config.grid,faces,start,end,
                     control_lines=config.control_lines,
                     base_timezone=(config.base_timezone_label or
-                                   _timezone_label(config.base_timezone)),
+                                   format_timezone_label(config.base_timezone)),
                     available='qcloud' in met.variables,
                     timestep_seconds=config.timestep_seconds)
                    if legacy and not mesopac else None)

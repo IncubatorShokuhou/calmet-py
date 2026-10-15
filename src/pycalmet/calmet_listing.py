@@ -47,9 +47,7 @@ def format_surface_input_debug(record,stations) -> str:
 
 
 def format_no_upper_prepdi_debug(step, ending: datetime) -> str:
-    """Reproduce COMP formats 153--156 for ``NOOBS=1`` PREPDI data."""
-    if step.debug_domain_temperature is None:
-        raise ValueError('ISURFT=-1 leaves legacy TINF undefined in LDB output')
+    """Format ``NOOBS=1`` PREPDI diagnostics, including unavailable data."""
     names=tuple(step.debug_station_names)
     u=np.asarray(step.debug_station_u)
     v=np.asarray(step.debug_station_v)
@@ -57,11 +55,15 @@ def format_no_upper_prepdi_debug(step, ending: datetime) -> str:
         raise ValueError('PREPDI debug winds do not match station count')
     day=ending.timetuple().tm_yday
     second=ending.minute*60+ending.second
+    temperature=(
+        "  Domain scale surf. temperature (TINF) = N/A (not available)"
+        if step.debug_domain_temperature is None else
+        (f"  Domain scale surf. temperature (TINF) = "
+         f"{step.debug_domain_temperature:10.2f} (deg. K)"))
     lines=[
         (f"\n  Diagnostic wind field data -- Year: {ending.year:4d}   "
          f"Julian day: {day:3d}   Hour: {ending.hour:2d}   Second: {second:4d}"),
-        (f"  Domain scale surf. temperature (TINF) = "
-         f"{step.debug_domain_temperature:10.2f} (deg. K)"),
+        temperature,
         "  Domain-scale temp. lapse rate (GAMMA) is not yet  defined",
         "  Domain-scale U-component of wind (UM) is not yet  defined",
         "  Domain-scale V-component of wind (VM) is not yet  defined",
@@ -115,22 +117,25 @@ def format_upper_air_input_debug(station_number,sounding,convergence_degrees,
 
 def format_full_prepdi_debug(step,ending: datetime,lapse_rate) -> str:
     """Reproduce COMP formats 152, 154--159 for ``NOOBS=0``."""
-    if any(value is None for value in (step.debug_domain_temperature,
-                                       step.debug_domain_u,step.debug_domain_v)):
-        raise ValueError('complete PREPDI debug scalars are required')
+    if any(value is None for value in (step.debug_domain_u,step.debug_domain_v)):
+        raise ValueError('complete PREPDI debug wind scalars are required')
     names=tuple(step.debug_station_names)
     u=np.asarray(step.debug_station_u); v=np.asarray(step.debug_station_v)
     if u.shape!=(len(names),) or v.shape!=(len(names),):
         raise ValueError('PREPDI debug winds do not match station count')
     day=ending.timetuple().tm_yday
     second=ending.minute*60+ending.second
+    temperature=(
+        "  Domain scale surf. temperature (TINF) = N/A (not available)"
+        if step.debug_domain_temperature is None else
+        (f"  Domain scale surf. temperature (TINF) = "
+         f"{step.debug_domain_temperature:10.2f} (deg. K)"))
     lines=[
         (f"\n  Diagnostic wind field data -- Year: {ending.year:4d}   "
          f"Julian day: {day:3d}   Hour: {ending.hour:2d}   Second: {second:4d}"),
         ("  Domain-scale temp. lapse rate at point (1,1)(GAMMA) = "
          f"{float(np.asarray(lapse_rate)[0,0]):10.5f} (deg. K/m)"),
-        (f"  Domain scale surf. temperature (TINF) = "
-         f"{step.debug_domain_temperature:10.2f} (deg. K)"),
+        temperature,
         (f"  Domain-scale U-component of wind (UM) = "
          f"{step.debug_domain_u:10.3f} (m/s)"),
         (f"  Domain-scale V-component of wind (VM) = "

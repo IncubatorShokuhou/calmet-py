@@ -11,6 +11,11 @@ import numpy as np
 from .config import GridConfig
 from .datetime_utils import parse_ordinal
 from .projections import transform_grid,unproject_geographic
+from .surface_data import _nearest_indices
+
+
+COMPUTE_DTYPE=np.float32
+SPATIAL_DTYPE=np.float64
 
 
 def _julian(year,day,hour):
@@ -158,7 +163,8 @@ class SeaData:
         """Transform the current record-independent station coordinate to target km."""
         record=self.records[0]
         return np.asarray(transform_grid(record.x_km,record.y_km,
-                                         self.source_grid,target_grid,units='km'),dtype=float)
+                                         self.source_grid,target_grid,units='km'),
+                          dtype=SPATIAL_DTYPE)
 
     def longitude_latitude(self):
         """Return station longitude/latitude derived from its projected coordinate."""
@@ -168,130 +174,122 @@ class SeaData:
 
 
 def grid_sea_mixing_height(values,station_xy,grid,block_size=65536):
-    """Reproduce WATER's all-station 1/R**2 interpolation of observed ZIOW."""
-    f32=np.float64
-    data=np.asarray(values,dtype=f32); points=np.asarray(station_xy,dtype=f32)
-    valid=data<f32(9998.)
+    """Interpolate observed overwater mixing height with all valid stations."""
+    data=np.asarray(values,dtype=COMPUTE_DTYPE)
+    points=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
+    valid=data<COMPUTE_DTYPE(9998.)
     if points.shape!=(data.size,2): raise ValueError('SEA mixing-height coordinates do not match values')
-    if not valid.any(): return np.full((grid.ny,grid.nx),np.nan,dtype=f32)
+    if not valid.any(): return np.full((grid.ny,grid.nx),np.nan,dtype=COMPUTE_DTYPE)
     # WATER has a separate exact-value branch only when NOWSTA itself is one;
     # with several stations it still divides the accumulators even if only one
     # station has a valid ZIOW.
-    if data.size==1: return np.full((grid.ny,grid.nx),data[0],dtype=f32)
-    origin=np.asarray((grid.x_origin_km,grid.y_origin_km),dtype=f32)
-    relative=np.asarray((points-origin)*f32(1000.),dtype=f32)
-    tx=np.asarray((np.arange(grid.nx,dtype=f32)+f32(.5))*
-                  (f32(grid.dx_km)*f32(1000.)),dtype=f32)
-    ty=np.asarray((np.arange(grid.ny,dtype=f32)+f32(.5))*
-                  (f32(grid.dy_km)*f32(1000.)),dtype=f32)
+    if data.size==1: return np.full((grid.ny,grid.nx),data[0],dtype=COMPUTE_DTYPE)
+    origin=np.asarray((grid.x_origin_km,grid.y_origin_km),dtype=SPATIAL_DTYPE)
+    relative=(points-origin)*1000.
+    tx=(np.arange(grid.nx,dtype=SPATIAL_DTYPE)+.5)*(float(grid.dx_km)*1000.)
+    ty=(np.arange(grid.ny,dtype=SPATIAL_DTYPE)+.5)*(float(grid.dy_km)*1000.)
     xx,yy=np.meshgrid(tx,ty); targets=np.column_stack((xx.ravel(),yy.ravel()))
-    output=np.empty(targets.shape[0],dtype=f32)
+    output=np.empty(targets.shape[0],dtype=COMPUTE_DTYPE)
     for begin in range(0,targets.shape[0],block_size):
         end=min(begin+block_size,targets.shape[0])
-        xsum=np.zeros(end-begin,dtype=f32)
-        ysum=np.zeros(end-begin,dtype=f32)
+        # These all-station sums can span many magnitudes, so accumulate in
+        # double precision and cast only the returned model field.
+        xsum=np.zeros(end-begin,dtype=np.float64)
+        ysum=np.zeros(end-begin,dtype=np.float64)
         for station in np.flatnonzero(valid):
-            delta=np.asarray(relative[station]-targets[begin:end],dtype=f32)
-            distance2=np.asarray(delta[:,0]*delta[:,0]+delta[:,1]*delta[:,1],
-                                 dtype=f32)
-            distance2=np.maximum(distance2,f32(1.e-30))
-            xsum=np.asarray(xsum+data[station]/distance2,dtype=f32)
-            ysum=np.asarray(ysum+f32(1.)/distance2,dtype=f32)
+            delta=relative[station]-targets[begin:end]
+            distance2=np.maximum(np.sum(delta*delta,axis=1),1.e-30)
+            xsum+=np.float64(data[station])/distance2
+            ysum+=1./distance2
         output[begin:end]=np.divide(xsum,ysum,out=np.full_like(xsum,np.nan),
-                                    where=xsum>f32(0.))
+                                    where=xsum>0.).astype(COMPUTE_DTYPE)
     return output.reshape(grid.ny,grid.nx)
 
 
 def grid_water_mixing_gradient(values,station_xy,grid,default,block_size=65536):
-    """Reproduce WATER's station handling for the above-ZI lapse rate."""
-    f32=np.float64
-    data=np.asarray(values,dtype=f32); points=np.asarray(station_xy,dtype=f32)
+    """Interpolate the above-mixing-height lapse rate from SEA stations."""
+    data=np.asarray(values,dtype=COMPUTE_DTYPE)
+    points=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
     if points.shape!=(data.size,2):
         raise ValueError('SEA gradient coordinates do not match values')
-    fallback=f32(default)
-    valid=data<f32(9998.)
+    fallback=COMPUTE_DTYPE(default)
+    valid=data<COMPUTE_DTYPE(9998.)
     if data.size==1:
         value=data[0] if valid[0] else fallback
-        return np.full((grid.ny,grid.nx),value,dtype=f32)
+        return np.full((grid.ny,grid.nx),value,dtype=COMPUTE_DTYPE)
     if not valid.any():
-        return np.full((grid.ny,grid.nx),fallback,dtype=f32)
-    origin=np.asarray((grid.x_origin_km,grid.y_origin_km),dtype=f32)
-    relative=np.asarray((points-origin)*f32(1000.),dtype=f32)
-    tx=np.asarray((np.arange(grid.nx,dtype=f32)+f32(.5))*
-                  (f32(grid.dx_km)*f32(1000.)),dtype=f32)
-    ty=np.asarray((np.arange(grid.ny,dtype=f32)+f32(.5))*
-                  (f32(grid.dy_km)*f32(1000.)),dtype=f32)
+        return np.full((grid.ny,grid.nx),fallback,dtype=COMPUTE_DTYPE)
+    origin=np.asarray((grid.x_origin_km,grid.y_origin_km),dtype=SPATIAL_DTYPE)
+    relative=(points-origin)*1000.
+    tx=(np.arange(grid.nx,dtype=SPATIAL_DTYPE)+.5)*(float(grid.dx_km)*1000.)
+    ty=(np.arange(grid.ny,dtype=SPATIAL_DTYPE)+.5)*(float(grid.dy_km)*1000.)
     xx,yy=np.meshgrid(tx,ty); targets=np.column_stack((xx.ravel(),yy.ravel()))
-    output=np.empty(targets.shape[0],dtype=f32)
+    output=np.empty(targets.shape[0],dtype=COMPUTE_DTYPE)
     for begin in range(0,targets.shape[0],block_size):
         end=min(begin+block_size,targets.shape[0])
-        xsum=np.zeros(end-begin,dtype=f32); ysum=np.zeros(end-begin,dtype=f32)
+        xsum=np.zeros(end-begin,dtype=np.float64)
+        ysum=np.zeros(end-begin,dtype=np.float64)
         for station in np.flatnonzero(valid):
-            delta=np.asarray(relative[station]-targets[begin:end],dtype=f32)
-            distance2=np.asarray(delta[:,0]*delta[:,0]+delta[:,1]*delta[:,1],
-                                 dtype=f32)
-            distance2=np.maximum(distance2,f32(1.e-30))
-            xsum=np.asarray(xsum+data[station]/distance2,dtype=f32)
-            ysum=np.asarray(ysum+f32(1.)/distance2,dtype=f32)
-        output[begin:end]=np.where(xsum>f32(0.),
-                                   np.asarray(xsum/ysum,dtype=f32),fallback)
+            delta=relative[station]-targets[begin:end]
+            distance2=np.maximum(np.sum(delta*delta,axis=1),1.e-30)
+            xsum+=np.float64(data[station])/distance2
+            ysum+=1./distance2
+        output[begin:end]=np.where(xsum>0.,xsum/ysum,fallback).astype(COMPUTE_DTYPE)
     return output.reshape(grid.ny,grid.nx)
 
 
 def _nearest_sea_indices(points,valid,grid):
-    """Return WATER's first-on-tie nearest indices into a valid subset."""
-    f32=np.float64
-    points=np.asarray(points,dtype=f32); valid=np.asarray(valid,dtype=bool)
-    origin=np.asarray((grid.x_origin_km,grid.y_origin_km),dtype=f32)
-    relative=np.asarray((points-origin)*f32(1000.),dtype=f32)
-    target_x=np.asarray((np.arange(grid.nx,dtype=f32)+f32(.5))*
-                        f32(f32(grid.dx_km)*f32(1000.)),dtype=f32)
-    target_y=np.asarray((np.arange(grid.ny,dtype=f32)+f32(.5))*
-                        f32(f32(grid.dy_km)*f32(1000.)),dtype=f32)
+    """Return nearest SEA-station indices into a valid subset."""
+    points=np.asarray(points,dtype=SPATIAL_DTYPE)
+    valid=np.asarray(valid,dtype=bool)
+    if points.ndim!=2 or points.shape[1]!=2 or valid.shape!=(points.shape[0],):
+        raise ValueError('SEA station coordinates and validity mask do not match')
+    if not valid.any(): raise ValueError('nearest SEA station requires a valid candidate')
+    origin=np.asarray((grid.x_origin_km,grid.y_origin_km),dtype=SPATIAL_DTYPE)
+    relative=(points-origin)*1000.
+    target_x=(np.arange(grid.nx,dtype=SPATIAL_DTYPE)+.5)*(float(grid.dx_km)*1000.)
+    target_y=(np.arange(grid.ny,dtype=SPATIAL_DTYPE)+.5)*(float(grid.dy_km)*1000.)
     xx,yy=np.meshgrid(target_x,target_y); targets=np.column_stack((xx.ravel(),yy.ravel()))
-    candidates=relative[valid]
-    selected=np.empty(targets.shape[0],dtype=np.intp)
-    for begin in range(0,targets.shape[0],65536):
-        delta=np.asarray(candidates[None,:,:]-targets[begin:begin+65536,None,:],dtype=f32)
-        distance2=np.asarray(delta[...,0]*delta[...,0]+delta[...,1]*delta[...,1],dtype=f32)
-        selected[begin:begin+65536]=np.argmin(distance2,axis=1)
+    selected=_nearest_indices(relative[valid],targets)
     return np.flatnonzero(valid)[selected]
 
 
 def nearest_sea_waves(records,station_xy,grid):
     """Grid WATERP's independently selected valid SEA wave observations."""
-    records=tuple(records); points=np.asarray(station_xy,dtype=np.float64)
+    records=tuple(records); points=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
     valid=np.array([(item.wave_period_s>=0.) and (item.wave_height_m>=0.)
                     for item in records])
     chosen=(_nearest_sea_indices(points,valid,grid) if valid.any() else
             np.zeros(grid.nx*grid.ny,dtype=np.intp))
     def field(name):
         return np.asarray([getattr(records[index],name) for index in chosen],
-                          dtype=np.float64).reshape(grid.ny,grid.nx)
+                          dtype=COMPUTE_DTYPE).reshape(grid.ny,grid.nx)
     return field('wave_period_s'),field('wave_height_m')
 
 
 def nearest_sea_data(records,station_xy,longitudes,grid):
     """Reproduce WATER's nearest station having a valid air-water delta."""
-    records=tuple(records); points=np.asarray(station_xy,dtype=np.float64)
-    longitude=np.asarray(longitudes,dtype=np.float64)
+    records=tuple(records); points=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
+    longitude=np.asarray(longitudes,dtype=SPATIAL_DTYPE)
     if points.shape!=(len(records),2) or longitude.shape!=(len(records),):
         raise ValueError('SEA station metadata do not match records')
     valid=np.array([item.air_water_delta_k<9998. for item in records])
     if not valid.any(): return None
-    f32=np.float64
     chosen=_nearest_sea_indices(points,valid,grid)
     def field(name):
         return np.asarray([getattr(records[index],name) for index in chosen],
-                          dtype=f32).reshape(grid.ny,grid.nx)
+                          dtype=COMPUTE_DTYPE).reshape(grid.ny,grid.nx)
     air=field('air_temperature_k'); delta=field('air_water_delta_k')
     anemometer=field('anemometer_height_m')
-    anemometer=np.where(anemometer<9998.,anemometer,10.)
+    anemometer=np.where(anemometer<COMPUTE_DTYPE(9998.),anemometer,
+                        COMPUTE_DTYPE(10.)).astype(COMPUTE_DTYPE)
     sensor=field('air_sensor_height_m')
-    sensor=np.where(sensor<9998.,sensor,anemometer)
-    depth=field('water_sensor_depth_m'); depth=np.where(depth<9998.,depth,.6)
+    sensor=np.where(sensor<COMPUTE_DTYPE(9998.),sensor,anemometer).astype(COMPUTE_DTYPE)
+    depth=field('water_sensor_depth_m')
+    depth=np.where(depth<COMPUTE_DTYPE(9998.),depth,COMPUTE_DTYPE(.6)).astype(COMPUTE_DTYPE)
     humidity=field('relative_humidity')
-    humidity=np.where(humidity<9998.99,humidity,100.)
+    humidity=np.where(humidity<COMPUTE_DTYPE(9998.99),humidity,
+                      COMPUTE_DTYPE(100.)).astype(COMPUTE_DTYPE)
     wave_valid=np.array([(item.wave_period_s>=0.) and (item.wave_height_m>=0.)
                          for item in records])
     if wave_valid.any():
@@ -301,9 +299,11 @@ def nearest_sea_data(records,station_xy,longitudes,grid):
         wave_chosen=np.zeros(chosen.size,dtype=np.intp)
     def wave_field(name):
         return np.asarray([getattr(records[index],name) for index in wave_chosen],
-                          dtype=f32).reshape(grid.ny,grid.nx)
+                          dtype=COMPUTE_DTYPE).reshape(grid.ny,grid.nx)
     return GriddedSeaData(
-        np.where(air<f32(9998.),air,f32(288.7)),
-        np.asarray(np.where(air<f32(9998.),air,f32(288.7))-delta,dtype=f32),
+        np.where(air<COMPUTE_DTYPE(9998.),air,
+                 COMPUTE_DTYPE(288.7)).astype(COMPUTE_DTYPE),
+        np.asarray(np.where(air<COMPUTE_DTYPE(9998.),air,
+                            COMPUTE_DTYPE(288.7))-delta,dtype=COMPUTE_DTYPE),
         humidity,anemometer,sensor,depth,wave_field('wave_period_s'),wave_field('wave_height_m'),
         longitude[chosen].reshape(grid.ny,grid.nx))

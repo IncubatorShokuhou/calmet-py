@@ -14,7 +14,10 @@ Python 主流程无需编译 Fortran。
 
 - 使用 Python、NumPy 和 SciPy 执行，无需 Fortran 编译器。
 - 一个软件包覆盖五个公开处理阶段和完整流水线。
-- 支持 WRF NetCDF 输入和 CF 兼容的 NetCDF 输出。
+- WRF NetCDF 输入和 CF 兼容的 NetCDF 输出全部通过 `netCDF4` 完成。
+- 模型场默认使用 FP32；时间、地理坐标、空间搜索和敏感归约具有明确的高精度边界。
+- 标准栅格使用 Rasterio，几何运算使用 Shapely，空间索引使用 SciPy，减少通用
+  功能的自研实现。
 - 兼容传统 CALWRF、TERREL、CTGPROC、MAKEGEO 和 CALMET 文件。
 - WRF 数据按时次流式处理，可处理超过内存容量的数据集。
 - 提供经过无损压缩的浙江真实 WRF 示例。
@@ -204,13 +207,13 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 `python tools/generate_parameter_reference.py` 重新生成；CI 可使用 `--check` 检查。
 
 <details>
-<summary><strong>CALWRF</strong> — 共 14 个参数；浙江控制文件：`examples/zhejiang/config/calwrf.inp`。</summary>
+<summary><strong>CALWRF</strong> — 共 13 个参数；浙江控制文件：`examples/zhejiang/config/calwrf.inp`。</summary>
 
 | 参数 | 含义 | Python 类型 | Python 默认值 | 浙江示例值 |
 | --- | --- | --- | --- | --- |
 | `wrf_files` | 按时间顺序排列的 WRF NetCDF 文件。 | `Sequence[str \| Path] \| None` | `必填` | `[examples/zhejiang/wrfout_d01_2018-03-18_00_00_00.nc, examples/zhejiang/wrfout_d01_2018-03-18_01_00_00.nc, … (3 items)]` |
-| `start` | 计算开始时刻。 | `str \| int \| datetime \| None` | `必填` | `'2018031800'` |
-| `end` | 计算结束时刻。 | `str \| int \| datetime \| None` | `必填` | `'2018031802'` |
+| `start` | 计算开始时刻；使用无时区且精确到秒的时间，接受 datetime 或 YYYYMMDDHH/ISO 风格文本。 | `datetime \| str \| None` | `必填` | `2018-03-18 00:00:00` |
+| `end` | 计算结束时刻；使用无时区且精确到秒的时间，接受 datetime 或 YYYYMMDDHH/ISO 风格文本。 | `datetime \| str \| None` | `必填` | `2018-03-18 02:00:00` |
 | `output` | 主输出文件路径。 | `str \| Path \| None` | `必填` | `output/zhejiang/calwrf.nc` |
 | `create_surface` | 同时请求 legacy_output 时，是否另外生成传统 M2D 地面气象文件。 | `bool` | `True` | `False` |
 | `compression` | CALWRF 输出的 NetCDF deflate 压缩级别（0 表示不压缩）。 | `int` | `1` | `1` |
@@ -221,7 +224,6 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 | `surface_output` | 可选的传统 CALWRF 二维地面/M2D 路径；create_surface 为真且同时请求 legacy_output 时写出。 | `str \| Path \| None` | `None` | `None` |
 | `title` | 写入 CALWRF 输出元数据的说明标题。 | `str` | `'Create 3D.DAT file for WRF output'` | `'Create CALWRF data for the Zhejiang example'` |
 | `listing_output` | CALWRF 处理日志/列表文件输出路径。 | `str \| Path \| None` | `None` | `output/zhejiang/calwrf.lst` |
-| `legacy_file_rain_reset` | 是否在每个传统输入文件边界重置累计降水。 | `bool` | `False` | `False` |
 
 </details>
 
@@ -261,8 +263,8 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 | `grid` | 完整网格对象，可替代下方展开的网格参数。 | `GridConfig \| Mapping[str, Any] \| None` | `None` | `见下方展开的网格参数` |
 | `nx` | 笛卡尔 X/东西方向网格数；TERREL 极坐标网格中表示环数。 | `int \| None` | `必填` | `610` |
 | `ny` | 笛卡尔 Y/南北方向网格数；TERREL 极坐标网格中表示射线数。 | `int \| None` | `必填` | `499` |
-| `dx_km` | 笛卡尔 X 方向网格间距，单位 km；TERREL 要求 X/Y 间距相等，极坐标环位置不使用该值。 | `float \| None` | `必填` | `1.0` |
-| `dy_km` | 笛卡尔 Y 方向网格间距，单位 km；TERREL 要求 X/Y 间距相等，极坐标环位置不使用该值。 | `float \| None` | `必填` | `1.0` |
+| `dx_km` | 笛卡尔 X 方向网格间距，单位 km；可与 dy_km 不同，极坐标环位置不使用该值。 | `float \| None` | `必填` | `1.0` |
+| `dy_km` | 笛卡尔 Y 方向网格间距，单位 km；可与 dx_km 不同，极坐标射线位置不使用该值。 | `float \| None` | `必填` | `1.0` |
 | `projection` | 投影代码：UTM、横轴墨卡托 (TTM)、兰伯特正形圆锥 (LCC)、极射赤面 (PS)、赤道墨卡托 (EM) 或兰伯特方位等积 (LAZA)。 | `str` | `'UTM'` | `'LCC'` |
 | `lat0` | 投影原点或切点的带符号纬度，单位度（北纬为正）；EM 固定为 0。 | `float` | `27.0` | `27.0` |
 | `lon0` | 中央经线或切点的带符号经度，单位度（东经为正）。 | `float` | `117.5` | `117.5` |
@@ -311,8 +313,8 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 | `grid` | 完整网格对象，可替代下方展开的网格参数。 | `GridConfig \| Mapping[str, Any] \| None` | `None` | `见下方展开的网格参数` |
 | `nx` | 笛卡尔 X/东西方向网格数；TERREL 极坐标网格中表示环数。 | `int \| None` | `必填` | `610` |
 | `ny` | 笛卡尔 Y/南北方向网格数；TERREL 极坐标网格中表示射线数。 | `int \| None` | `必填` | `499` |
-| `dx_km` | 笛卡尔 X 方向网格间距，单位 km；TERREL 要求 X/Y 间距相等，极坐标环位置不使用该值。 | `float \| None` | `必填` | `1.0` |
-| `dy_km` | 笛卡尔 Y 方向网格间距，单位 km；TERREL 要求 X/Y 间距相等，极坐标环位置不使用该值。 | `float \| None` | `必填` | `1.0` |
+| `dx_km` | 笛卡尔 X 方向网格间距，单位 km；可与 dy_km 不同，极坐标环位置不使用该值。 | `float \| None` | `必填` | `1.0` |
+| `dy_km` | 笛卡尔 Y 方向网格间距，单位 km；可与 dx_km 不同，极坐标射线位置不使用该值。 | `float \| None` | `必填` | `1.0` |
 | `projection` | 投影代码：UTM、横轴墨卡托 (TTM)、兰伯特正形圆锥 (LCC)、极射赤面 (PS)、赤道墨卡托 (EM) 或兰伯特方位等积 (LAZA)。 | `str` | `'UTM'` | `'LCC'` |
 | `lat0` | 投影原点或切点的带符号纬度，单位度（北纬为正）；EM 固定为 0。 | `float` | `27.0` | `27.0` |
 | `lon0` | 中央经线或切点的带符号经度，单位度（东经为正）。 | `float` | `117.5` | `117.5` |
@@ -355,8 +357,8 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 | `qa_cell` | 可选的从 1 开始 `(i, j)` 格点，用于报告地形、土地利用和地表属性的中间计算。 | `tuple[int, int] \| None` | `None` | `(20, 15)` |
 | `snow_processing` | 根据 SNODAS 雪深/雪龄，在包含首尾日期的 snow_start_date..snow_end_date 范围内逐日生成积雪修正 GEO 文件。 | `bool` | `False` | `False` |
 | `snow_data` | 用于生成逐日积雪修正地理物理文件的 SNODAS 雪深/雪龄输入。 | `str \| Path \| None` | `None` | `None` |
-| `snow_start_date` | 积雪处理覆盖的首个日期，格式 YYYYMMDD。 | `int \| None` | `None` | `None` |
-| `snow_end_date` | 积雪处理覆盖的末个日期，格式 YYYYMMDD。 | `int \| None` | `None` | `None` |
+| `snow_start_date` | 积雪处理覆盖的首个日历日期；接受 date、午夜 datetime 或 YYYY-MM-DD/YYYYMMDD 文本。 | `date \| datetime \| str \| None` | `None` | `None` |
+| `snow_end_date` | 积雪处理覆盖的末个日历日期；接受 date、午夜 datetime 或 YYYY-MM-DD/YYYYMMDD 文本。 | `date \| datetime \| str \| None` | `None` | `None` |
 | `snow_properties` | 积雪条件属性，七个字段与 input_properties 相同；映射后的输出类别必须与正常属性记录一致。 | `dict[int, tuple[float, float, float, float, float, float, int]] \| None` | `{}` | `{}` |
 | `snow_age_parameters` | 各积雪类别的 `(老化时间尺度_天, 反照率衰减系数)`，供雪龄反照率算法使用。 | `dict[int, tuple[int, float]] \| None` | `{}` | `{}` |
 | `snow_roughness_method` | 积雪粗糙度方法：1 从推算的障碍物高度中扣除雪深；2 有积雪时直接采用用户给定的积雪粗糙度。 | `int` | `1` | `1` |
@@ -371,8 +373,8 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 | `grid` | 完整网格对象，可替代下方展开的网格参数。 | `GridConfig \| Mapping[str, Any] \| None` | `None` | `见下方展开的网格参数` |
 | `nx` | 笛卡尔 X/东西方向网格数；TERREL 极坐标网格中表示环数。 | `int \| None` | `必填` | `610` |
 | `ny` | 笛卡尔 Y/南北方向网格数；TERREL 极坐标网格中表示射线数。 | `int \| None` | `必填` | `499` |
-| `dx_km` | 笛卡尔 X 方向网格间距，单位 km；TERREL 要求 X/Y 间距相等，极坐标环位置不使用该值。 | `float \| None` | `必填` | `1.0` |
-| `dy_km` | 笛卡尔 Y 方向网格间距，单位 km；TERREL 要求 X/Y 间距相等，极坐标环位置不使用该值。 | `float \| None` | `必填` | `1.0` |
+| `dx_km` | 笛卡尔 X 方向网格间距，单位 km；可与 dy_km 不同，极坐标环位置不使用该值。 | `float \| None` | `必填` | `1.0` |
+| `dy_km` | 笛卡尔 Y 方向网格间距，单位 km；可与 dx_km 不同，极坐标射线位置不使用该值。 | `float \| None` | `必填` | `1.0` |
 | `projection` | 投影代码：UTM、横轴墨卡托 (TTM)、兰伯特正形圆锥 (LCC)、极射赤面 (PS)、赤道墨卡托 (EM) 或兰伯特方位等积 (LAZA)。 | `str` | `'UTM'` | `'LCC'` |
 | `lat0` | 投影原点或切点的带符号纬度，单位度（北纬为正）；EM 固定为 0。 | `float` | `27.0` | `27.0` |
 | `lon0` | 中央经线或切点的带符号经度，单位度（东经为正）。 | `float` | `117.5` | `117.5` |
@@ -401,8 +403,8 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 | `meteorology` | 格点预报气象输入；iprog 决定其作为第一步风场、初始猜测场还是伪观测。 | `str \| Path \| Sequence[str \| Path] \| None` | `必填` | `output/zhejiang/calwrf.nc` |
 | `geophysical` | GEO 地理物理网格，包含地形、土地利用、粗糙度、反照率、Bowen 比、土壤/人为热参数和叶面积指数。 | `str \| Path \| None` | `必填` | `output/zhejiang/geo.nc` |
 | `output` | 主输出文件路径。 | `str \| Path \| None` | `必填` | `output/zhejiang/calmet.nc` |
-| `start` | CALMET 输出区间 `[start, end)` 的闭合下界；实现选择满足 `start < t <= end` 的气象边界时刻，并将输出时间戳记为 `t - timestep_seconds`。 | `str \| datetime \| None` | `必填` | `'2018-03-18_00:00:00'` |
-| `end` | CALMET 输出区间 `[start, end)` 的开放上界；实现选择满足 `start < t <= end` 的气象边界时刻，并将输出时间戳记为 `t - timestep_seconds`。 | `str \| datetime \| None` | `必填` | `'2018-03-18_01:00:00'` |
+| `start` | CALMET 输出区间 `[start, end)` 的闭合下界；实现选择满足 `start < t <= end` 的气象边界时刻，并将输出时间戳记为 `t - timestep_seconds`。 | `datetime \| str \| None` | `必填` | `2018-03-18 00:00:00` |
+| `end` | CALMET 输出区间 `[start, end)` 的开放上界；实现选择满足 `start < t <= end` 的气象边界时刻，并将输出时间戳记为 `t - timestep_seconds`。 | `datetime \| str \| None` | `必填` | `2018-03-18 01:00:00` |
 | `noobs` | 观测模式：0 使用地面、水面和高空观测；1 用预报资料替代高空观测；2 所有高度均使用预报资料。 | `int` | `0` | `2` |
 | `run_type` | 运行类型：0 仅计算风场；1 还计算微气象量，CALPUFF/CALGRID 要求使用 1。 | `int` | `1` | `1` |
 | `save_output` | 是否写出由 legacy_output_format 选择的格点气象磁盘输出。 | `bool` | `True` | `True` |
@@ -410,26 +412,26 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 | `test_mode` | 1 在输入设置检查后停止；2 继续执行模型计算。 | `int` | `2` | `2` |
 | `regulatory_mode` | 法规检查模式：0 关闭；1 强制采用 USEPA 要求的混合层、水面通量、松弛和代表温度选项。 | `int` | `0` | `0` |
 | `timestep_seconds` | CALMET 计算时间步长，必须能整除 1 小时。 | `int` | `3600` | `3600` |
-| `prognostic_timestep_seconds` | 相邻预报记录的秒数：必须为 timestep_seconds 的正整数倍且不超过 12 小时；传统 IPROG<13 要求 3600 s。 | `int` | `3600` | `3600` |
+| `prognostic_timestep_seconds` | 相邻预报记录的秒数：必须为 timestep_seconds 的正整数倍且不超过 12 小时。传统 PROG.DAT 与原生 MM4.DAT 受文件格式限制，仍为逐小时资料。 | `int` | `3600` | `3600` |
 | `cloud_method` | 云场来源：1 地面观测（NOOBS 0/1），2 已有 CLOUD.DAT，3 预报场 850 hPa 相对湿度，4 预报场所有高度的相对湿度。 | `int` | `4` | `4` |
 | `cloud_data` | CLOUD.DAT 路径：cloud_method=2 时作为输入，cloud_output=1 时作为输出目标。 | `str \| Path \| None` | `None` | `examples/zhejiang/config/cloud.dat` |
 | `cloud_data_format` | CLOUD.DAT 格式：非格式化二进制 (1) 或格式化文本 (2)。 | `int` | `2` | `2` |
 | `cloud_output` | 是否把内部生成的格点云场写为 CLOUD.DAT（0=否，1=是）；cloud_method=2 读取已有文件时不能同时输出。 | `int` | `0` | `0` |
-| `surface_data` | 逐小时 SURF.DAT 观测；NOOBS 为 0/1 时使用，除非相应变量改由 DIAG.DAT 提供。 | `str \| Path \| None` | `None` | `examples/zhejiang/config/surf.dat` |
+| `surface_data` | NOOBS 为 0/1 时使用的逐小时 SURF.DAT 观测。DIAG.DAT 可替换其中的风；完整气象运行仍读取 SURF.DAT 热力字段。 | `str \| Path \| None` | `None` | `examples/zhejiang/config/surf.dat` |
 | `surface_data_format` | SURF.DAT 格式：非格式化二进制 (1) 或格式化文本 (2)。 | `int` | `2` | `2` |
 | `surface_control_stations` | 模型坐标下的 `(4字符站名, 站号, x_km, y_km, 时区, 风速仪高度_m)`；陆水分开插值时这里只列陆地站。 | `Sequence[tuple[str, int, float, float, float, float]]` | `()` | `()` |
-| `upper_air_files` | 每个高空站一个探空文件；NOOBS=0 时使用，除非高空风改由 DIAG.DAT 提供。 | `Sequence[str \| Path]` | `()` | `()` |
+| `upper_air_files` | NOOBS=0 时每个高空站一个探空文件。DIAG.DAT 可替换探空风；完整气象运行仍读取探空温度。 | `Sequence[str \| Path]` | `()` | `()` |
 | `upper_control_stations` | 高空站记录 `(4字符站名, 站号, x_km, y_km, 时区)`，每个高空文件对应一条。 | `Sequence[tuple[str, int, float, float, float]]` | `()` | `()` |
 | `sea_files` | 每个水面站一个文件；可包含水面 ΔT、递减率、观测混合层高度，以及负 COARE 波浪代码所需的观测波浪。 | `Sequence[str \| Path]` | `()` | `()` |
-| `diagnostic_data` | 逐小时预处理 DIAG.DAT 温度、递减率或 U/V 风；相应 diagnostic_* 来源选项设为 1 时需要。 | `str \| Path \| None` | `None` | `examples/zhejiang/config/diag.dat` |
+| `diagnostic_data` | 逐小时预处理 DIAG.DAT 温度、递减率或 U/V 风。仅当所选观测模式确实使用已启用的诊断来源时才需要该文件。 | `str \| Path \| None` | `None` | `examples/zhejiang/config/diag.dat` |
 | `diagnostic_surface_temperature` | 诊断风模块的地表温度来源：内部计算 (0)，或从 DIAG.DAT 读取逐小时预处理值 (1)。 | `int` | `0` | `0` |
 | `diagnostic_lapse_rate` | 地形环流所用区域温度递减率来源：由高空观测/预报资料内部计算 (0)，或读取 DIAG.DAT 逐小时值 (1)。 | `int` | `0` | `0` |
 | `diagnostic_initial_wind` | 诊断模块初始猜测风来源：由高空/预报资料计算 (0)，或从 DIAG.DAT 读取逐小时预处理 U/V (1)。 | `int` | `0` | `0` |
-| `diagnostic_surface_wind` | 地面风来源：SURF.DAT 风速风向 (0)，或预处理 DIAG.DAT U/V (1)；传统校验仅在只计算风场时允许选项 1。 | `int` | `0` | `0` |
-| `diagnostic_upper_wind` | 高空风来源：探空风速风向 (0)，或预处理 DIAG.DAT U/V (1)；传统校验仅在只计算风场时允许选项 1。 | `int` | `0` | `0` |
+| `diagnostic_surface_wind` | 地面风来源：SURF.DAT 风速风向 (0)，或预处理 DIAG.DAT U/V (1)。完整运行中，选项 1 只替换风，仍使用 SURF.DAT 热力字段。 | `int` | `0` | `0` |
+| `diagnostic_upper_wind` | 高空风来源：探空风速风向 (0)，或预处理 DIAG.DAT U/V (1)。完整运行中，选项 1 只替换风，仍使用探空温度。 | `int` | `0` | `0` |
 | `initial_guess_upper_station` | 内部计算初始风时，1..NUSTA 选择一个探空站生成均匀猜测场；-1 对全部探空站作 1/R² 加权，生成空间变化猜测场。 | `int` | `-1` | `-1` |
 | `initial_guess_height_range_m` | 生成诊断模块区域均匀初始风时采用的底部与顶部高度，单位 m。 | `Sequence[float]` | `(1.0, 1000.0)` | `(1.0, 1000.0)` |
-| `use_initial_guess_calmet` | 是否使用粗网格 CALMET 风场作为初始猜测（0=否，1=是），并取代预报初始猜测；与第一步 IPROG 1/3/13 不兼容。 | `int` | `0` | `0` |
+| `use_initial_guess_calmet` | 是否使用粗网格 CALMET 风场作为初始风猜测（0=否，1=是）；启用后会在所有 IPROG 模式下取代背景风场。 | `int` | `0` | `0` |
 | `initial_guess_calmet_files` | use_initial_guess_calmet=1 时作为初始风猜测场的粗网格 CALMET 文件。 | `Sequence[str \| Path]` | `()` | `()` |
 | `weight_data` | WT.DAT 三维观测权重 Wo；预报场使用互补权重 1−Wo。 | `str \| Path \| None` | `None` | `examples/zhejiang/config/wt.dat` |
 | `precipitation_station_count` | 降水来源：正数为 PRECIP.DAT 站点数，0 不使用降水输入，-1 使用预报降水。 | `int` | `0` | `-1` |
@@ -437,7 +439,7 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 | `precipitation_data_format` | PRECIP.DAT 格式：非格式化二进制 (1) 或格式化文本 (2)。 | `int` | `2` | `2` |
 | `precipitation_control_stations` | 降水站记录 `(4字符站名, 6位站码, x_km, y_km)`；传统站码由 2 位州码和 4 位站号组成。 | `Sequence[tuple[str, int, float, float]]` | `()` | `()` |
 | `iprog` | 预报风用法：0 关闭；1/3/13 作第一步风场（IWFCOD=0）；2/4/14 作初始猜测（IWFCOD=1）；5/15 作伪观测。各代码族对应 CSUMM、MM4 或 MM5/3D。 | `int` | `0` | `14` |
-| `irhprog` | 相对湿度来源：0 使用 SURF/SEA 观测（NOOBS 0/1）；1 使用预报相对湿度（NOOBS=2 时必需）。 | `int` | `0` | `1` |
+| `irhprog` | NOOBS 为 0/1 时的相对湿度来源：0 使用 SURF/SEA 观测，1 使用预报相对湿度。NOOBS=2 始终使用预报相对湿度，且不会改写此设置。 | `int` | `0` | `1` |
 | `itprog` | 温度来源：0 地面及高空观测（NOOBS=0）；1 地面观测加高层预报；2 地面及高层均用预报资料。 | `int` | `0` | `2` |
 | `imixh` | 混合层方法：1 陆水均用 Maul–Carson；-1 陆地 Maul–Carson、水面 OCD；2 陆水均用 Batchvarova–Gryning；-2 陆地 BG、水面 OCD。 | `int` | `1` | `1` |
 | `constb` | Venkatram 中性机械混合层高度关系中的无量纲 B，控制摩擦速度相对于科里奥利参数和自由大气稳定度的尺度。 | `float` | `1.41` | `1.41` |
@@ -515,7 +517,7 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 | `kinematic_alpha` | 运动学修正中施加于地形诱导垂直速度垂直梯度的经验乘数。 | `float` | `0.1` | `0.1` |
 | `z_faces_m` | 垂直网格界面高度，单位 m；需提供 NZ+1 个值，第 k 层中心为 `(face[k] + face[k+1]) / 2`。 | `Sequence[float]` | `(0.0, 20.0, … (11 items))` | `[0.0, 20.0, … (11 items)]` |
 | `base_timezone` | CALMET 采用的基准时区偏移，按 UTC 以西小时数计（例如 5=EST；东半球为负）。 | `int` | `0` | `0` |
-| `base_timezone_label` | 与 base_timezone 表示同一偏移量的现代 `UTC±HHMM` 标签。 | `str \| None` | `None` | `'UTC-0000'` |
+| `base_timezone_label` | 与 base_timezone 表示同一偏移量的现代 `UTC±HHMM` 标签。 | `str \| None` | `None` | `'UTC+0000'` |
 | `terrain_radius_km` | 搜索附近地形极值并确定 Froude 修正有效障碍高度的半径，单位 km。 | `float` | `15.0` | `15.0` |
 | `half_average_angle` | 上风向空间平均锥的半张角，单位度；完整张角为该值的两倍。 | `float` | `30.0` | `30.0` |
 | `include_w_temperature` | 是否存储 CALGRID 以及 CALPUFF 亚网格复杂地形选项所需的三维垂直风速和温度场。 | `bool` | `True` | `False` |
@@ -544,8 +546,8 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 | `grid` | 完整网格对象，可替代下方展开的网格参数。 | `GridConfig \| Mapping[str, Any] \| None` | `None` | `见下方展开的网格参数` |
 | `nx` | 笛卡尔 X/东西方向网格数；TERREL 极坐标网格中表示环数。 | `int \| None` | `必填` | `610` |
 | `ny` | 笛卡尔 Y/南北方向网格数；TERREL 极坐标网格中表示射线数。 | `int \| None` | `必填` | `499` |
-| `dx_km` | 笛卡尔 X 方向网格间距，单位 km；TERREL 要求 X/Y 间距相等，极坐标环位置不使用该值。 | `float \| None` | `必填` | `1.0` |
-| `dy_km` | 笛卡尔 Y 方向网格间距，单位 km；TERREL 要求 X/Y 间距相等，极坐标环位置不使用该值。 | `float \| None` | `必填` | `1.0` |
+| `dx_km` | 笛卡尔 X 方向网格间距，单位 km；可与 dy_km 不同，极坐标环位置不使用该值。 | `float \| None` | `必填` | `1.0` |
+| `dy_km` | 笛卡尔 Y 方向网格间距，单位 km；可与 dx_km 不同，极坐标射线位置不使用该值。 | `float \| None` | `必填` | `1.0` |
 | `projection` | 投影代码：UTM、横轴墨卡托 (TTM)、兰伯特正形圆锥 (LCC)、极射赤面 (PS)、赤道墨卡托 (EM) 或兰伯特方位等积 (LAZA)。 | `str` | `'UTM'` | `'LCC'` |
 | `lat0` | 投影原点或切点的带符号纬度，单位度（北纬为正）；EM 固定为 0。 | `float` | `27.0` | `27.0` |
 | `lon0` | 中央经线或切点的带符号经度，单位度（东经为正）。 | `float` | `117.5` | `117.5` |
@@ -580,9 +582,9 @@ pycalmet.calmet(...)
 pycalmet.readlst(...)
 ```
 
-默认 API 使用常规 NumPy 计算、`pyproj`、`datetime`，并让 CALWRF 通过 NetCDF
-直接向 CALMET 传递数据。只有确实需要旧单精度运算顺序或 M3D 中转时，才使用冻结
-的兼容实现：
+默认 API 使用常规 NumPy 计算、`pyproj`、`datetime`，并统一通过 `netCDF4`
+读写 NetCDF 文件；CALWRF 通过 NetCDF 直接向 CALMET 传递数据。只有确实需要旧
+单精度运算顺序或 M3D 中转时，才使用冻结的兼容实现：
 
 ```python
 pycalmet.legacy.calwrf(...)
@@ -621,13 +623,21 @@ tools/                 维护工具
 
 ## 数据和输出约定
 
-规范输出为可由 `xarray.open_dataset` 打开的 NetCDF 文件。只有在显式指定传统
-输出路径或兼容选项时，才会写出 CALMET 系列旧格式文件。大型用户输入应放在源码
-树之外；生成结果统一写入 Git 忽略的 `output/`。
+规范输出统一由 `netCDF4.Dataset` 创建和读取，软件包不再依赖 xarray。只有在
+显式指定传统输出路径或兼容选项时，才会写出 CALMET 系列旧格式文件。大型用户
+输入应放在源码树之外；生成结果统一写入 Git 忽略的 `output/`。
+
+物理场和模型状态数组默认使用 32 位浮点数。时间坐标、整数类别与索引、投影坐标，
+以及少量涉及收敛判断或大规模归约的标量，会保留保证时间、空间与数值正确性所需的
+精度。
+
+标准 SRTM HGT 和 GeoTIFF 输入由 Rasterio 解码，datum 变换通过 `pyproj` 交给
+PROJ，海岸线裁剪使用 Shapely，最近邻搜索使用 SciPy `cKDTree`。CALMET 专有物理
+参数化和少见的历史输入格式仍由软件包实现。
 
 浙江示例采用 LCC 投影、1 km 网格距和 `610 × 499` 网格。示例 WRF 数据覆盖
-2018-03-18 00:00–02:00 UTC；最后一个时次用于提供生成 00:00–01:00 CALMET
-结果所需的下一小时边界。
+2018-03-18 00:00–02:00 UTC。当前配置的 00:00–01:00 CALMET 时段使用前两个
+时次；如果将运行扩展到下一个时段，可直接使用 02:00 记录。
 
 ## 验证
 

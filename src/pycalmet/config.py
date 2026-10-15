@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from pathlib import Path
 from typing import Sequence
 
 from ._path_safety import validate_calwrf_paths
+from .datetime_utils import exact_integer,parse_date,parse_naive_datetime
 
 
 @dataclass(slots=True)
 class CalwrfConfig:
     wrf_files: Sequence[str | Path]
-    start: str | int
-    end: str | int
+    start: datetime
+    end: datetime
     output: str | Path
     create_surface: bool = True
     compression: int = 1
@@ -24,9 +26,10 @@ class CalwrfConfig:
     surface_output: str | Path | None = None
     title: str = "Create 3D.DAT file for WRF output"
     listing_output: str | Path | None = None
-    legacy_file_rain_reset: bool = False
 
     def __post_init__(self) -> None:
+        self.start=parse_naive_datetime(self.start,'CALWRF start')
+        self.end=parse_naive_datetime(self.end,'CALWRF end')
         validate_calwrf_paths(
             self.wrf_files, self.output, self.legacy_output,
             (self.surface_output
@@ -158,8 +161,8 @@ class MakegeoConfig:
     qa_cell: tuple[int,int] | None = None
     snow_processing: bool = False
     snow_data: str | Path | None = None
-    snow_start_date: int | None = None
-    snow_end_date: int | None = None
+    snow_start_date: date | None = None
+    snow_end_date: date | None = None
     snow_properties: dict[int, tuple[float,float,float,float,float,float,int]] = field(default_factory=dict)
     snow_age_parameters: dict[int, tuple[int,float]] = field(default_factory=dict)
     snow_roughness_method: int = 1
@@ -172,14 +175,22 @@ class MakegeoConfig:
     image_mode: int = 0
     title: str = "PyCALMET Application"
 
+    def __post_init__(self) -> None:
+        if self.snow_start_date is not None:
+            self.snow_start_date=parse_date(
+                self.snow_start_date,'MAKEGEO snow_start_date')
+        if self.snow_end_date is not None:
+            self.snow_end_date=parse_date(
+                self.snow_end_date,'MAKEGEO snow_end_date')
+
 
 @dataclass(slots=True)
 class CalmetConfig:
     meteorology: str | Path | Sequence[str | Path]
     geophysical: str | Path
     output: str | Path
-    start: str
-    end: str
+    start: datetime
+    end: datetime
     grid: GridConfig
     noobs: int = 0
     run_type: int = 1
@@ -323,6 +334,13 @@ class CalmetConfig:
     wind_print_output: str | Path | None = None
 
     def __post_init__(self) -> None:
+        self.start=parse_naive_datetime(self.start,'CALMET start')
+        self.end=parse_naive_datetime(self.end,'CALMET end')
+        for name in ('timestep_seconds','prognostic_timestep_seconds',
+                     'base_timezone','print_interval_hours',
+                     'debug_first_step','debug_last_step'):
+            setattr(self,name,exact_integer(getattr(self,name),
+                                            f'CALMET {name}'))
         layers=len(self.z_faces_m)-1
         if self.wind_bias is None:
             self.wind_bias=(0.,)*layers

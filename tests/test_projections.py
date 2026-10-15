@@ -151,23 +151,36 @@ def test_complete_nima_datum_table_can_construct_geographic_crs():
         assert geographic_crs(datum).is_geographic
 
 
-def test_vectorized_datum_shift_matches_legacy_coordlib_values():
+def test_vectorized_proj_datum_shift_stays_within_legacy_coordlib_tolerance():
     longitude=np.array([-100.,-100.]); latitude=np.array([40.,40.]); height=np.array([123.,123.])
     actual=np.asarray(datum_shift(longitude,latitude,height,source='NAS-C',target='WGS-84'))
-    expected=np.array([
+    legacy=np.array([
         [-100.00041760087252,-100.00041760087252],
         [40.0000094957673,40.0000094957673],
         [87.38544217546216,87.38544217546216],
     ])
-    np.testing.assert_allclose(actual,expected,rtol=0.,atol=1.e-12)
+    assert actual.dtype==np.float64
+    np.testing.assert_allclose(actual[:2],legacy[:2],rtol=0.,atol=2.e-8)
+    np.testing.assert_allclose(actual[2],legacy[2],rtol=0.,atol=1.e-4)
 
 
-def test_wgs72_uses_coordlib_special_correction_and_spheres_do_not_shift():
+def test_wgs72_uses_standard_proj_helmert_and_spheres_do_not_shift():
     actual=np.asarray(datum_shift(-100.,40.,123.,source='WGS-72',target='WGS-84'))
-    np.testing.assert_allclose(actual,[-99.99984611111111,40.000032742747266,
-                                       125.3754912624908],rtol=0.,atol=1.e-12)
+    legacy=np.array([-99.99984611111111,40.000032742747266,125.3754912624908])
+    np.testing.assert_allclose(actual[0],legacy[0],rtol=0.,atol=1.e-12)
+    np.testing.assert_allclose(actual[1],legacy[1],rtol=0.,atol=2.e-7)
+    np.testing.assert_allclose(actual[2],legacy[2],rtol=0.,atol=3.e-3)
     sphere=np.asarray(datum_shift(-100.,40.,123.,source='NWS-84',target='WGS-84'))
     np.testing.assert_array_equal(sphere,[-100.,40.,123.])
+
+
+def test_proj_datum_shift_round_trip_preserves_coordinates_and_longitude_branch():
+    original=np.array([190.,40.,123.],dtype=np.float64)
+    shifted=np.asarray(datum_shift(*original,source='NAS-C',target='WGS-84'))
+    restored=np.asarray(datum_shift(*shifted,source='WGS-84',target='NAS-C'))
+    assert shifted[0]>180.
+    np.testing.assert_allclose(restored[:2],original[:2],rtol=0.,atol=1.e-10)
+    np.testing.assert_allclose(restored[2],original[2],rtol=0.,atol=1.e-5)
 
 
 def test_projection_helpers_apply_coordlib_shift_before_projection():

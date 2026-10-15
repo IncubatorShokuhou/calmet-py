@@ -6,9 +6,16 @@ inverse flattening. Duplicate IDN and CAC source rows are represented once.
 """
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import NamedTuple
 
 import numpy as np
+
+from ._proj_data import configure_proj_data
+
+configure_proj_data()
+
+from pyproj import CRS, Transformer
 
 # Date stamp returned by the legacy COORDLIB ``NIMADATE`` routine.  It is
 # part of every TERREL/CTGPROC/MAKEGEO formatted output datum record.
@@ -278,85 +285,67 @@ def datum_definition(datum: str) -> DatumDefinition:
         raise ValueError(f"unknown CALPUFF datum {datum!r}") from error
 
 
-def _to_reference(longitude, latitude, height, definition, *, reverse=False):
-    """Vectorized transcription of COORDLIB DATSHFT's Molodensky equations."""
-    lon, lat, z = np.broadcast_arrays(
-        np.asarray(longitude, dtype=float),
-        np.asarray(latitude, dtype=float),
-        np.asarray(height, dtype=float),
-    )
+def datum_proj4_parameters(datum: str) -> str:
+    """Return the PROJ ellipsoid and Helmert parameters for a CALPUFF datum.
+
+    CALPUFF's WGS-72 correction is the standard legacy WGS-72 to WGS-84
+    seven-parameter operation.  PROJ expresses rotations in arc-seconds and
+    scale in parts per million, matching the NIMA definition used here.
+    """
+    normalized = normalize_datum(datum)
+    definition = datum_definition(normalized)
     if definition.inv_f >= 1.0e20:
-        return lon.copy(), lat.copy(), z.copy()
+        return f"+R={definition.radius:.15g}"
+    if normalized == "WGS-72":
+        return (f"+a={definition.radius:.15g} +rf={definition.inv_f:.15g} "
+                "+towgs84=0,0,4.5,0,0,0.554,0.219")
+    return (f"+a={definition.radius:.15g} +rf={definition.inv_f:.15g} "
+            f"+towgs84={definition.dx:g},{definition.dy:g},{definition.dz:g}")
 
-    reference = DATUMS["WGS-84"]
-    ai, fi = definition.radius, 1.0 / definition.inv_f
-    ao, fo = reference.radius, 1.0 / reference.inv_f
-    radians = np.pi / 180.0
-    phi, theta = lat * radians, lon * radians
-    sin_phi, cos_phi = np.sin(phi), np.cos(phi)
-    sin_theta, cos_theta = np.sin(theta), np.cos(theta)
-    eccentricity_squared = 2.0 * fi - fi * fi
-    axis_ratio = 1.0 - fi
-    prime_vertical = ai / np.sqrt(1.0 - eccentricity_squared * sin_phi**2)
-    meridional = ai * (1.0 - eccentricity_squared) / (
-        1.0 - eccentricity_squared * sin_phi**2
-    ) ** 1.5
-    da, df = ao - ai, fo - fi
-    dlat = (
-        -definition.dx * sin_phi * cos_theta
-        - definition.dy * sin_phi * sin_theta
-        + definition.dz * cos_phi
-        + da * prime_vertical * eccentricity_squared * sin_phi * cos_phi / ai
-        + df * (meridional / axis_ratio + prime_vertical * axis_ratio)
-        * sin_phi
-        * cos_phi
-    ) / (meridional + z)
-    dlon = (-definition.dx * sin_theta + definition.dy * cos_theta) / (
-        (prime_vertical + z) * cos_phi
+
+@lru_cache(maxsize=None)
+def _transformation_crs(datum: str) -> CRS:
+    """Build a three-dimensional CRS used only for datum transformations."""
+    normalized = normalize_datum(datum)
+    definition = datum_definition(normalized)
+    # CALPUFF's spherical earth choices define projection geometry.  They do
+    # not define a geodetic transformation, so retain their geographic
+    # coordinates while PROJ transforms any datum on the other side.
+    parameters = (datum_proj4_parameters("WGS-84")
+                  if definition.inv_f >= 1.0e20
+                  else datum_proj4_parameters(normalized))
+    return CRS.from_proj4(f"+proj=longlat {parameters} +type=crs").to_3d()
+
+
+@lru_cache(maxsize=None)
+def _datum_transformer(source: str, target: str) -> Transformer:
+    return Transformer.from_crs(
+        _transformation_crs(source),
+        _transformation_crs(target),
+        always_xy=True,
+        allow_ballpark=False,
     )
-    dh = (
-        definition.dx * cos_phi * cos_theta
-        + definition.dy * cos_phi * sin_theta
-        + definition.dz * sin_phi
-        - da * ai / prime_vertical
-        + df * axis_ratio * prime_vertical * sin_phi**2
-    )
-    sign = -1.0 if reverse else 1.0
-    return lon + sign * dlon / radians, lat + sign * dlat / radians, z + sign * dh
-
-
-def _shift_wgs72(longitude, latitude, height, *, reverse=False):
-    """Apply COORDLIB's special WGS-72 correction."""
-    definition = DATUMS["WGS-72"]
-    fi = 1.0 / definition.inv_f
-    reference = DATUMS["WGS-84"]
-    fo = 1.0 / reference.inv_f
-    da, df = reference.radius - definition.radius, fo - fi
-    phi = np.radians(latitude)
-    arcsecond = np.sin(np.radians(1.0 / 3600.0))
-    dlat = (4.5 * np.cos(phi) / (definition.radius * arcsecond)
-            + df * np.sin(2.0 * phi) / arcsecond) / 3600.0
-    dh = 4.5 * np.sin(phi) + definition.radius * df * np.sin(phi) ** 2 - da + 1.4
-    sign = -1.0 if reverse else 1.0
-    return longitude + sign * 0.554 / 3600.0, latitude + sign * dlat, height + sign * dh
 
 
 def datum_shift(longitude, latitude, height=0.0, *, source="WGS-84", target="WGS-84"):
-    """Transform coordinates using the same two-stage algorithm as COORDLIB."""
+    """Transform CALPUFF datum coordinates with PROJ in float64 precision."""
     source_name, target_name = normalize_datum(source), normalize_datum(target)
-    source_definition = datum_definition(source_name)
-    target_definition = datum_definition(target_name)
+    datum_definition(source_name)
+    datum_definition(target_name)
     lon, lat, z = np.broadcast_arrays(
-        np.asarray(longitude, dtype=float),
-        np.asarray(latitude, dtype=float),
-        np.asarray(height, dtype=float),
+        np.asarray(longitude, dtype=np.float64),
+        np.asarray(latitude, dtype=np.float64),
+        np.asarray(height, dtype=np.float64),
     )
     if source_name == target_name:
         return lon.copy(), lat.copy(), z.copy()
-    if source_name == "WGS-72":
-        lon, lat, z = _shift_wgs72(lon, lat, z)
-    else:
-        lon, lat, z = _to_reference(lon, lat, z, source_definition)
-    if target_name == "WGS-72":
-        return _shift_wgs72(lon, lat, z, reverse=True)
-    return _to_reference(lon, lat, z, target_definition, reverse=True)
+    transformed = _datum_transformer(source_name, target_name).transform(
+        lon.ravel(), lat.ravel(), z.ravel(), errcheck=True)
+    shifted_lon = np.asarray(transformed[0], dtype=np.float64).reshape(lon.shape)
+    shifted_lat = np.asarray(transformed[1], dtype=np.float64).reshape(lat.shape)
+    shifted_height = np.asarray(transformed[2], dtype=np.float64).reshape(z.shape)
+    # PROJ normalizes geographic longitudes.  CALPUFF accepts continuous
+    # longitude branches around the antimeridian, so restore the branch of
+    # each source coordinate after applying the geodetic transformation.
+    shifted_lon += 360.0 * np.rint((lon - shifted_lon) / 360.0)
+    return shifted_lon, shifted_lat, shifted_height

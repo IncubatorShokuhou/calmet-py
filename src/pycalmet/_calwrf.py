@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from datetime import datetime,timedelta
 from pathlib import Path
 
@@ -40,12 +39,12 @@ def _horizontal_range_check(values, low, high, ys, xs):
     ny, nx = original.shape[-2:]
     jb, je, ib, ie = ys.start + 1, ys.stop, xs.start + 1, xs.stop
     jb_edge, je_edge = min(jb, 2), max(je, ny - 1)
+    ib_edge, ie_edge = min(ib, 2), max(ie, nx - 1)
     jj, ii = np.arange(jb, je + 1), np.arange(ib, ie + 1)
     j1 = np.maximum(jj - 1, jb_edge) - 1
     j2 = np.minimum(jj + 1, je_edge) - 1
-    # The original accidentally uses J-edge bounds for I too; retain it.
-    i1 = np.maximum(ii - 1, jb_edge) - 1
-    i2 = np.minimum(ii + 1, je_edge) - 1
+    i1 = np.maximum(ii - 1, ib_edge) - 1
+    i2 = np.minimum(ii + 1, ie_edge) - 1
     neighbours = np.stack((
         original[..., jj[:, None] - 1, i1[None, :]],
         original[..., jj[:, None] - 1, i2[None, :]],
@@ -82,7 +81,7 @@ def _times(ds: nc.Dataset) -> list[str]:
     return [str(x) for x in np.asarray(values).tolist()]
 
 
-def _stamp(value: str) -> datetime:
+def _wrf_timestamp(value: str) -> datetime:
     try: return parse_timestamp(value)
     except ValueError as error: raise ValueError(f"invalid CALWRF timestamp: {value!r}") from error
 
@@ -100,20 +99,32 @@ def _selection(value,size,label):
 
 
 def destagger_x(a: np.ndarray) -> np.ndarray:
-    return np.float64(0.5) * (a[..., :-1] + a[..., 1:])
+    values = np.asarray(a, dtype=np.float32)
+    return (np.float32(0.5) * (values[..., :-1] + values[..., 1:])).astype(
+        np.float32, copy=False,
+    )
 
 
 def destagger_y(a: np.ndarray) -> np.ndarray:
-    return np.float64(0.5) * (a[..., :-1, :] + a[..., 1:, :])
+    values = np.asarray(a, dtype=np.float32)
+    return (np.float32(0.5) * (values[..., :-1, :] + values[..., 1:, :])).astype(
+        np.float32, copy=False,
+    )
 
 
 def destagger_z(a: np.ndarray) -> np.ndarray:
-    return np.float64(0.5) * (a[:-1, ...] + a[1:, ...])
+    values = np.asarray(a, dtype=np.float32)
+    return (np.float32(0.5) * (values[:-1, ...] + values[1:, ...])).astype(
+        np.float32, copy=False,
+    )
 
 
 def _geopotential_height(ph: np.ndarray, phb: np.ndarray) -> np.ndarray:
     """Convert staggered geopotential to mass-level height."""
-    return destagger_z((np.asarray(ph)+np.asarray(phb))/9.81)
+    geopotential = np.asarray(ph, dtype=np.float32) + np.asarray(
+        phb, dtype=np.float32,
+    )
+    return destagger_z(geopotential / np.float32(9.81))
 
 
 def _cone(truelat1: float, truelat2: float) -> float:
@@ -138,46 +149,53 @@ def rotation_angle(ds: nc.Dataset, lat: np.ndarray, lon: np.ndarray) -> np.ndarr
         return np.zeros_like(lon, dtype="f4")
     if map_projection not in {1,2}:
         raise ValueError(f"CALWRF does not support WRF MAP_PROJ={map_projection}")
-    f32=np.float64
-    latitude=np.asarray(lat,dtype=f32); longitude=np.asarray(lon,dtype=f32)
-    stand_lon=f32(getattr(ds,"STAND_LON"))
-    cone=(f32(1.) if map_projection==2 else
-          _cone(getattr(ds,"TRUELAT1"),getattr(ds,"TRUELAT2")))
-    delta=np.asarray(longitude-stand_lon,dtype=f32)
-    delta=np.where(delta>f32(180.),np.asarray(delta-f32(360.),dtype=f32),delta)
-    delta=np.where(delta<f32(-180.),np.asarray(delta+f32(360.),dtype=f32),delta)
-    rpd=np.asarray(f32(3.141592653589793)/f32(180.),dtype=f32)
-    alpha=np.asarray(np.asarray(delta*cone,dtype=f32)*rpd,dtype=f32)
-    return np.where(latitude<f32(0.),np.asarray(-f32(1.)*alpha,dtype=f32),alpha).astype(f32)
+    # Keep coordinate arithmetic in double precision, then cross into the
+    # model's FP32 boundary once the angle has been calculated.
+    latitude=np.asarray(lat,dtype=np.float64)
+    longitude=np.asarray(lon,dtype=np.float64)
+    stand_lon=float(getattr(ds,"STAND_LON"))
+    cone=1.0 if map_projection==2 else _cone(
+        getattr(ds,"TRUELAT1"),getattr(ds,"TRUELAT2"),
+    )
+    delta=longitude-stand_lon
+    delta=np.where(delta>180.0,delta-360.0,delta)
+    delta=np.where(delta<-180.0,delta+360.0,delta)
+    alpha=np.deg2rad(delta*cone)
+    return np.asarray(np.where(latitude<0.0,-alpha,alpha),dtype=np.float32)
 
 
 def earth_wind(u: np.ndarray, v: np.ndarray, alpha: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Rotate WRF grid-relative U/V to eastward/northward components."""
-    f32=np.float64
-    u=np.asarray(u,dtype=f32); v=np.asarray(v,dtype=f32); angle=np.asarray(alpha,dtype=f32)
-    ca=np.asarray(np.cos(angle.astype(np.float64)),dtype=f32)
-    sa=np.asarray(np.sin(angle.astype(np.float64)),dtype=f32)
-    east=np.asarray(np.asarray(v*sa,dtype=f32)+np.asarray(u*ca,dtype=f32),dtype=f32)
-    north=np.asarray(np.asarray(v*ca,dtype=f32)-np.asarray(u*sa,dtype=f32),dtype=f32)
-    return east,north
+    u=np.asarray(u,dtype=np.float32)
+    v=np.asarray(v,dtype=np.float32)
+    angle=np.asarray(alpha,dtype=np.float32)
+    cosine=np.cos(angle)
+    sine=np.sin(angle)
+    east=v*sine+u*cosine
+    north=v*cosine-u*sine
+    return (np.asarray(east,dtype=np.float32),
+            np.asarray(north,dtype=np.float32))
 
 
 def speed_direction(u: np.ndarray, v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    f32=np.float64
-    u=np.asarray(u,dtype=f32); v=np.asarray(v,dtype=f32)
-    speed=np.asarray(np.sqrt(np.asarray(
-        np.asarray(u*u,dtype=f32)+np.asarray(v*v,dtype=f32),dtype=f32)),dtype=f32)
-    pi=f32(3.141592653589793); degrees_per_radian=np.asarray(f32(180.)/pi,dtype=f32)
-    angle=np.arctan2(v,u)
-    calculated=np.asarray(f32(270.)-np.asarray(degrees_per_radian*angle,dtype=f32),dtype=f32)
-    direction=np.where(speed>=f32(1.e-9),calculated,f32(0.)).astype(f32)
-    direction=np.where(direction>f32(360.),np.asarray(direction-f32(360.),dtype=f32),direction)
-    direction=np.where(direction<=f32(0.),np.asarray(direction+f32(360.),dtype=f32),direction)
-    return speed, direction
+    u=np.asarray(u,dtype=np.float32)
+    v=np.asarray(v,dtype=np.float32)
+    speed=np.hypot(u,v).astype(np.float32,copy=False)
+    calculated=np.float32(270.0)-np.rad2deg(np.arctan2(v,u))
+    direction=np.where(speed>=np.float32(1.e-9),calculated,np.float32(0.0))
+    direction=np.mod(direction,np.float32(360.0))
+    direction=np.where(direction<=np.float32(0.0),
+                       direction+np.float32(360.0),direction)
+    return speed,np.asarray(direction,dtype=np.float32)
 
 
-def _var(dst: nc.Dataset,name: str,dims: tuple[str,...],units: str,compression=1) -> nc.Variable:
-    var=dst.createVariable(name,"f4",dims,zlib=compression>0,complevel=compression,shuffle=compression>0)
+def _var(
+    dst: nc.Dataset, name: str, dims: tuple[str, ...], units: str,
+    compression=1, dtype="f4",
+) -> nc.Variable:
+    var=dst.createVariable(name,dtype,dims,
+                           zlib=compression>0,complevel=compression,
+                           shuffle=compression>0)
     var.units = units
     return var
 
@@ -186,44 +204,28 @@ def _mass_coordinate(source: nc.Dataset,name: str,time_index=0) -> np.ndarray:
     """Read WRF mass-point coordinates using CALWRF's alias fallback."""
     for candidate in (name,f'{name}_M'):
         if candidate in source.variables:
-            return np.asarray(source[candidate][time_index],dtype='f4')
+            return np.asarray(source[candidate][time_index],dtype='f8')
     raise ValueError(f'WRF file has neither {name} nor {name}_M')
 
 
 def _rain_increment(current,previous):
-    """CALWRF accumulation difference from the preceding processed time."""
+    """Return an accumulation increment, detecting a counter reset."""
     values=np.asarray(current,dtype='f4')
-    return (values.copy() if previous is None else
-            np.asarray(values-np.asarray(previous,dtype='f4'),dtype='f4'))
+    if previous is None:
+        return values.copy()
+    delta=values-np.asarray(previous,dtype='f4')
+    return np.where(delta>=0.,delta,values).astype('f4',copy=False)
 
 
-def _rain_increments(rainnc,rainc,previous,*,reset_total=False):
-    """Return total, grid and convective increments with legacy reset support.
-
-    CALWRF 2.0.2 clears only ``PPOLD`` when it opens each WRF file.  Its
-    component baselines, ``PPNCOLD`` and ``PPCOLD``, continue across the same
-    boundary.  ``reset_total`` reproduces that asymmetric behavior for strict
-    comparisons while the normal path keeps all three accumulations continuous.
-    """
+def _rain_increments(rainnc,rainc,previous):
+    """Return reset-aware total, grid, and convective rain increments."""
     nonconvective=np.asarray(rainnc,dtype='f4')
     convective=np.asarray(rainc,dtype='f4')
     previous_nonconvective=None if previous is None else previous[0]
     previous_convective=None if previous is None else previous[1]
-    previous_total=(None if previous is None or reset_total else
-                    np.asarray(previous_nonconvective,dtype='f4')+
-                    np.asarray(previous_convective,dtype='f4'))
-    total=np.asarray(nonconvective+convective,dtype='f4')
-    return (
-        _rain_increment(total,previous_total),
-        _rain_increment(nonconvective,previous_nonconvective),
-        _rain_increment(convective,previous_convective),
-    )
-
-
-def _reset_total_rain_at_file_boundary(enabled,previous,previous_path,current_path):
-    """Select CALWRF 2.0.2's asymmetric reset at a real file change."""
-    return bool(enabled and previous is not None and previous_path is not None and
-                Path(previous_path)!=Path(current_path))
+    grid=_rain_increment(nonconvective,previous_nonconvective)
+    convective_increment=_rain_increment(convective,previous_convective)
+    return np.asarray(grid+convective_increment,dtype='f4'),grid,convective_increment
 
 
 def _surface_variable(source,index,name,shape,*,required=False):
@@ -260,66 +262,43 @@ def _surface_wind(source,index,shape,alpha):
 
 def _pressure_temperature(perturbation_pressure,base_pressure,perturbation_theta):
     """CALWRF pressure (hPa) and potential-temperature conversion."""
-    f32=np.float64
-    pressure=np.asarray(np.asarray(perturbation_pressure,dtype=f32)+
-                        np.asarray(base_pressure,dtype=f32),dtype=f32)
-    pressure=np.asarray(pressure*f32(.01),dtype=f32)
-    ratio=np.asarray(pressure/f32(1000.),dtype=f32)
-    exponent=np.asarray(f32(287.04)/f32(1004.),dtype=f32)
-    factor=np.power(ratio,exponent)
-    theta=np.asarray(np.asarray(perturbation_theta,dtype=f32)+f32(300.),dtype=f32)
-    temperature=np.asarray(theta*factor,dtype=f32)
-    return pressure,temperature
+    pressure=(np.asarray(perturbation_pressure,dtype=np.float32)+
+              np.asarray(base_pressure,dtype=np.float32))*np.float32(0.01)
+    theta=np.asarray(perturbation_theta,dtype=np.float32)+np.float32(300.0)
+    exponent=np.float32(287.04/1004.0)
+    temperature=theta*np.power(pressure/np.float32(1000.0),exponent)
+    return (np.asarray(pressure,dtype=np.float32),
+            np.asarray(temperature,dtype=np.float32))
 
 
 def _select_wrf_times(paths,begin,end):
     """Select output records and CALWRF's optional preceding rain record."""
-    selected=[]
+    selected_by_time={}
     baseline=None
     baseline_time=begin-timedelta(hours=1)
-    seen=set()
     for path in paths:
         with nc.Dataset(path) as dataset:
             for index,text in enumerate(_times(dataset)):
-                when=_stamp(text)
+                when=_wrf_timestamp(text)
+                canonical=when.strftime('%Y-%m-%d_%H:%M:%S')
                 if when==baseline_time and baseline is None:
-                    baseline=(path,index,text)
-                if begin<=when<=end and text not in seen:
-                    selected.append((path,index,text)); seen.add(text)
-    selected.sort(key=lambda item:item[2])
+                    baseline=(path,index,canonical)
+                if begin<=when<=end:
+                    selected_by_time.setdefault(when,(path,index,canonical))
+    selected=[selected_by_time[when] for when in sorted(selected_by_time)]
     return selected,baseline
 
 
-def _requested_interval(
-    paths: Sequence[Path], start: str | int, end: str | int,
-) -> tuple[datetime, datetime]:
-    """Resolve CALWRF's negative-date sentinel to the available interval."""
-    def all_times_requested(value: str | int) -> bool:
-        token=str(value).strip()
-        try:
-            return int(token)<1
-        except ValueError:
-            return token.startswith('-')
-
-    if not (all_times_requested(start) or all_times_requested(end)):
-        return _stamp(str(start)),_stamp(str(end))
-    available=[]
-    for path in paths:
-        with nc.Dataset(path) as dataset:
-            available.extend(_stamp(text) for text in _times(dataset))
-    if not available:
-        raise ValueError('WRF inputs contain no dated records')
-    return min(available),max(available)
-
-
 def _copy_static(src: nc.Dataset,dst: nc.Dataset,ys,xs,zs,compression=1) -> None:
-    for name, units in (("latitude", "degrees_north"), ("longitude", "degrees_east"),
-                        ("terrain", "m"), ("landuse", "category")):
+    for name, units in (("terrain", "m"),):
         _var(dst,name,("y","x"),units,compression)
+    for name,units in (("latitude","degrees_north"),("longitude","degrees_east")):
+        _var(dst,name,("y","x"),units,compression,dtype="f8")
+    _var(dst,"landuse",("y","x"),"category",compression,dtype="i2")
     dst["latitude"][:] = _mass_coordinate(src,"XLAT")[ys,xs]
     dst["longitude"][:] = _mass_coordinate(src,"XLONG")[ys,xs]
     dst["terrain"][:] = np.asarray(src["HGT"][0,ys,xs], dtype="f4")
-    dst["landuse"][:] = np.asarray(src["LU_INDEX"][0,ys,xs], dtype="f4")
+    dst["landuse"][:] = np.asarray(src["LU_INDEX"][0,ys,xs], dtype="i2")
     _var(dst,"sigma",("level",),"1",compression)[:]=np.asarray(src["ZNU"][0,zs],dtype="f4")
 
 
@@ -397,7 +376,7 @@ def run(config: CalwrfConfig) -> Path:
     for path in paths:
         if not path.is_file():
             raise FileNotFoundError(path)
-    begin,end=_requested_interval(paths,config.start,config.end)
+    begin,end=config.start,config.end
     if end < begin:
         raise ValueError("end precedes start")
     if not 0<=config.compression<=9:
@@ -406,7 +385,7 @@ def run(config: CalwrfConfig) -> Path:
     selected,rain_baseline=_select_wrf_times(paths,begin,end)
     if not selected:
         raise ValueError("no WRF times fall inside requested interval")
-    selected_times=[_stamp(item[2]) for item in selected]
+    selected_times=[_wrf_timestamp(item[2]) for item in selected]
     if selected_times[0]!=begin or selected_times[-1]!=end or any(
             right-left!=timedelta(hours=1) for left,right in zip(selected_times[:-1],selected_times[1:])):
         raise ValueError('selected CALWRF output times must cover the requested interval hourly')
@@ -420,9 +399,7 @@ def run(config: CalwrfConfig) -> Path:
         dst=_create_output(Path(config.output),first,len(selected),ny,nx,nz,ys,xs,zs,
                            compression=config.compression)
         dst.title=config.title
-        dst.legacy_file_rain_reset=int(config.legacy_file_rain_reset)
     previous_rain=None
-    previous_rain_path=None
     if rain_baseline is not None:
         baseline_path,baseline_index,_=rain_baseline
         with nc.Dataset(baseline_path) as baseline_source:
@@ -432,7 +409,6 @@ def run(config: CalwrfConfig) -> Path:
                                      required=True)
             rainc=_surface_variable(baseline_source,baseline_index,'RAINC',baseline_shape)
             previous_rain=(rainnc,rainc)
-            previous_rain_path=Path(baseline_path)
     try:
         for out_index, (path, time_index, text) in enumerate(selected):
             with nc.Dataset(path) as src:
@@ -472,12 +448,9 @@ def run(config: CalwrfConfig) -> Path:
 
                 rainnc=_surface_variable(src,time_index,'RAINNC',surface_shape,required=True)
                 rainc=_surface_variable(src,time_index,'RAINC',surface_shape)
-                reset_total=_reset_total_rain_at_file_boundary(
-                    config.legacy_file_rain_reset,previous_rain,previous_rain_path,path)
                 increment,grid_increment,convective_increment=_rain_increments(
-                    rainnc,rainc,previous_rain,reset_total=reset_total)
+                    rainnc,rainc,previous_rain)
                 previous_rain=(rainnc.copy(),rainc.copy())
-                previous_rain_path=Path(path)
                 surface={
                     "surface_pressure":_surface_variable(
                         src,time_index,'PSFC',surface_shape,required=True),

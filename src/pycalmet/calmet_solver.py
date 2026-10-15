@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass,replace
 from datetime import datetime,timedelta
 from itertools import chain
-import math
 import numpy as np
 from scipy.spatial import cKDTree
 from .datetime_utils import parse_timestamp
@@ -19,79 +18,64 @@ from .calmet_numerics import (cloud_cover_mm5,cloud_fraction,cloud_liquid_water_
     overwater_delta_temperature_state,prognostic_temperature_3d,saturation_vapor_pressure_lowe,terrain_extrema,topographic_vertical_velocity,upwind_mixing_average,
     barrier_blocked_pairs,terrain_adjust_surface_wind)
 
+
+# Keep model fields in single precision.  Geographic coordinates and the
+# explicitly documented reduction/convergence paths remain double precision.
+MODEL_DTYPE = np.float32
+ACCUMULATION_DTYPE = np.float64
+COORDINATE_DTYPE = np.float64
+
+
+def _model_array(value):
+    """Return a physical field or model-state array in default precision."""
+    return np.asarray(value,dtype=MODEL_DTYPE)
+
 def solar_at_step_midpoint(begin,timestep_seconds,base_timezone,latitude,longitude):
-    """Interpolate SOLAR's half-hour samples exactly as COMP does."""
-    samples=solar_sine(begin.timetuple().tm_yday,base_timezone,latitude,longitude)
-    middle=int(begin.minute*60+begin.second)+int(timestep_seconds)//2
-    distance=np.float64(abs(np.float64(middle-1800)/np.float64(3600.)))
-    center=begin.hour+1
-    if middle==1800.: return samples[center]
-    adjacent=center+1 if middle>1800. else center-1
-    if middle>1800:
-        return np.asarray(samples[center]*(np.float64(1.)-distance)+
-                          samples[adjacent]*distance,dtype=np.float64)
-    return np.asarray(samples[adjacent]*distance+
-                      samples[center]*(np.float64(1.)-distance),dtype=np.float64)
+    """Interpolate half-hour solar samples at the true model-step midpoint."""
+    midpoint=begin+timedelta(seconds=timestep_seconds/2)
+    samples=_model_array(solar_sine(
+        midpoint.timetuple().tm_yday,base_timezone,latitude,longitude))
+    midnight=midpoint.replace(hour=0,minute=0,second=0,microsecond=0)
+    sample_position=(midpoint-midnight).total_seconds()/3600.+.5
+    lower=int(sample_position)
+    fraction=sample_position-lower
+    if fraction==0.:
+        return samples[lower]
+    return _model_array(samples[lower]*(1.-fraction)+
+                        samples[lower+1]*fraction)
 
-def _prognostic_record_solar(record_time,base_timezone,latitude,longitude,*,
-                             solar_day=None):
-    """Return RDMM5's half-hour solar sample for an ending-time M3D record.
+def _prognostic_record_solar(record_time,base_timezone,latitude,longitude):
+    """Return the half-hour solar sample for an ending-time prognostic record.
 
-    ``solar_sine`` index zero represents 23:30 on the preceding day.  RDMM5's
-    one-based ``MHR + 1`` subscript therefore maps to zero-based
-    ``record_time.hour`` regardless of the prognostic-record interval.  MHR is
-    the record hour after RDMM5 converts it from GMT to CALMET base time.
-
-    COMP computes one SOLAR table per CALMET day.  A future prognostic record
-    can already be on the next date, so ``solar_day`` keeps the table tied to
-    the current CALMET day just as the legacy common block does.
+    ``solar_sine`` index zero represents 23:30 on the preceding day, so an
+    ending record maps directly to ``record_time.hour`` in the table for that
+    record's actual local date.
     """
-    table_time=record_time if solar_day is None else solar_day
-    samples=solar_sine(table_time.timetuple().tm_yday,base_timezone,
+    samples=solar_sine(record_time.timetuple().tm_yday,base_timezone,
                        latitude,longitude)
     return samples[record_time.hour]
 
 def _coare_ending_gmt_hour(ending,base_timezone):
-    """Return COARE's integer NHRZ, with CALMET's west-positive IBTZ."""
-    return int((ending.hour+base_timezone)%24)
+    """Return the UTC decimal hour, with CALMET's west-positive IBTZ."""
+    utc=ending+timedelta(hours=base_timezone)
+    return (utc.hour+utc.minute/60.+utc.second/3600.+
+            utc.microsecond/3_600_000_000.)
 
 def _output_crs(g: GridConfig):
     return grid_crs(g,units='km')
 
-def _fortran_nearest_indices(source,target,count):
-    """Return nearest points ordered like a strict Fortran scan."""
+def _nearest_indices(source,target,count):
+    """Return the nearest source indices for each target point."""
     source=np.asarray(source,dtype=np.float64)
     target=np.asarray(target,dtype=np.float64)
     if source.ndim!=2 or target.ndim!=2 or source.shape[1:]!=(2,) or target.shape[1:]!=(2,):
         raise ValueError('nearest-point coordinates must have shape (n, 2)')
     if count<1 or source.shape[0]<count:
         raise ValueError('not enough source points for nearest-point mapping')
-    tree=cKDTree(source)
-    provisional=np.asarray(tree.query(target,k=count)[1],dtype=np.intp)
+    nearest=np.asarray(cKDTree(source).query(target,k=count)[1],dtype=np.intp)
     if count==1:
-        provisional=provisional[:,None]
-    edge_delta=np.asarray(source[provisional[:,-1]]-target,dtype=np.float64)
-    edge_d2=np.asarray(edge_delta[:,0]*edge_delta[:,0]+
-                       edge_delta[:,1]*edge_delta[:,1],dtype=np.float64)
-    edge=np.asarray(np.sqrt(edge_d2),dtype=np.float64)
-    radius=edge.copy()
-    for _ in range(8):
-        radius=np.nextafter(radius,np.float64(np.inf),dtype=np.float64)
-    candidates=tree.query_ball_point(target,np.asarray(radius,dtype=float))
-    lengths=np.fromiter((len(items) for items in candidates),dtype=np.intp,
-                        count=target.shape[0])
-    offsets=np.concatenate(([0],np.cumsum(lengths)))
-    candidate=np.concatenate(candidates).astype(np.intp,copy=False)
-    repeated=np.repeat(np.arange(target.shape[0]),lengths)
-    delta=np.asarray(source[candidate]-target[repeated],dtype=np.float64)
-    distance2=np.asarray(delta[:,0]*delta[:,0]+delta[:,1]*delta[:,1],
-                         dtype=np.float64)
-    distance=np.asarray(np.sqrt(distance2),dtype=np.float64)
-    # lexsort's last key is primary: target, REAL distance, source scan index.
-    order=np.lexsort((candidate,distance,repeated))
-    candidate=candidate[order]
-    ranks=np.arange(candidate.size)-np.repeat(offsets[:-1],lengths)
-    return candidate[ranks<count].reshape(target.shape[0],count)
+        nearest=nearest[:,None]
+    return nearest
 
 @dataclass(frozen=True,slots=True)
 class PrognosticMapper:
@@ -104,15 +88,28 @@ class PrognosticMapper:
     target_coordinates: np.ndarray
     grid_origin: tuple[float,float]=(0.,0.)
 
+    def __post_init__(self):
+        """Normalize geometry independently from model-field precision."""
+        object.__setattr__(self,'source_coordinates',np.asarray(
+            self.source_coordinates,dtype=COORDINATE_DTYPE))
+        object.__setattr__(self,'target_coordinates',np.asarray(
+            self.target_coordinates,dtype=COORDINATE_DTYPE))
+
     @classmethod
     def build(cls,latitude,longitude,grid: GridConfig,*,validate_domain=False):
         lat=np.asarray(latitude); lon=np.asarray(longitude)
         if lat.shape!=lon.shape: raise ValueError('latitude/longitude shape mismatch')
         sx,sy=project_geographic(lon,lat,grid,'WGS-84',units='km')
-        source=np.asarray(np.column_stack((np.ravel(sx,order='F'),np.ravel(sy,order='F'))),dtype=np.float64)
-        tx=np.asarray(np.float64(grid.x_origin_km)+(np.arange(grid.nx,dtype=np.float64)+np.float64(.5))*np.float64(grid.dx_km),dtype=np.float64)
-        ty=np.asarray(np.float64(grid.y_origin_km)+(np.arange(grid.ny,dtype=np.float64)+np.float64(.5))*np.float64(grid.dy_km),dtype=np.float64)
-        xx,yy=np.meshgrid(tx,ty); target=np.asarray(np.column_stack((xx.ravel(),yy.ravel())),dtype=np.float64)
+        source=np.asarray(np.column_stack((np.ravel(sx,order='F'),
+                                           np.ravel(sy,order='F'))),
+                          dtype=COORDINATE_DTYPE)
+        tx=(float(grid.x_origin_km)+
+            (np.arange(grid.nx,dtype=COORDINATE_DTYPE)+.5)*float(grid.dx_km))
+        ty=(float(grid.y_origin_km)+
+            (np.arange(grid.ny,dtype=COORDINATE_DTYPE)+.5)*float(grid.dy_km))
+        xx,yy=np.meshgrid(tx,ty)
+        target=np.asarray(np.column_stack((xx.ravel(),yy.ravel())),
+                          dtype=COORDINATE_DTYPE)
         if validate_domain:
             # RDHD4/RDHD5 trace every edge point (not merely the four source
             # corners) because a projected curvilinear grid can bow inward.
@@ -141,11 +138,9 @@ class PrognosticMapper:
             if not np.all(inside):
                 outside=np.flatnonzero(~inside)[0]+1
                 raise ValueError(f'CALMET grid corner {outside} is outside prognostic domain')
-        indices=_fortran_nearest_indices(source,target,4)
-        delta=np.asarray(source[indices]-target[:,None,:],dtype=np.float64)
-        distances=np.asarray(np.sqrt(np.asarray(
-            delta[:,:,0]*delta[:,:,0]+delta[:,:,1]*delta[:,:,1],dtype=np.float64)),
-            dtype=np.float64)
+        indices=_nearest_indices(source,target,4)
+        delta=source[indices]-target[:,None,:]
+        distances=np.sqrt(delta[:,:,0]**2+delta[:,:,1]**2)
         squared=np.maximum(distances*distances,.001); inverse=1./squared; weights=inverse/inverse.sum(axis=1,keepdims=True)
         return cls(lat.shape,indices,weights,(grid.ny,grid.nx),source,target,
                    (grid.x_origin_km,grid.y_origin_km))
@@ -155,74 +150,68 @@ class PrognosticMapper:
         data=np.asarray(field)
         if data.shape[-2:]!=self.source_shape: raise ValueError('source field shape mismatch')
         leading=data.shape[:-2]; flat=np.reshape(np.swapaxes(data,-1,-2),leading+(-1,))
-        selected=np.asarray(np.take(flat,self.indices,axis=-1),dtype=np.float64)
-        source=np.asarray(self.source_coordinates[self.indices],dtype=np.float64)
-        target=np.asarray(self.target_coordinates,dtype=np.float64)
-        delta=np.asarray(source-target[:,None,:],dtype=np.float64)
-        distance2=np.asarray(delta[:,:,0]*delta[:,:,0]+delta[:,:,1]*delta[:,:,1],
-                             dtype=np.float64)
-        weights=np.asarray(np.float64(1.)/
-                           np.maximum(distance2,np.float64(.001)),dtype=np.float64)
+        selected=np.asarray(np.take(flat,self.indices,axis=-1),dtype=MODEL_DTYPE)
+        source=self.source_coordinates[self.indices]
+        target=self.target_coordinates
+        delta=source-target[:,None,:]
+        distance2=delta[:,:,0]**2+delta[:,:,1]**2
+        weights=1./np.maximum(distance2,.001)
         if ignore_zero:
-            weights=np.where(selected>=np.float64(1.e-6),weights,np.float64(0.))
-        total=np.zeros(selected.shape[:-1],dtype=np.float64)
-        denominator=np.zeros(weights.shape[:-1],dtype=np.float64)
-        for neighbour in range(4):
-            total=np.asarray(total+selected[...,neighbour]*weights[:,neighbour],
-                             dtype=np.float64)
-            denominator=np.asarray(denominator+weights[:,neighbour],dtype=np.float64)
+            weights=np.where(selected>=1.e-6,weights,0.)
+        total=(selected*weights).sum(axis=-1,dtype=ACCUMULATION_DTYPE)
+        denominator=weights.sum(axis=-1,dtype=ACCUMULATION_DTYPE)
         mapped=np.divide(total,denominator,out=np.zeros_like(total),where=denominator>0.)
-        return mapped.reshape(leading+self.target_shape)
+        return _model_array(mapped.reshape(leading+self.target_shape))
 
     def interpolate_observations(self,field,rmin_km,*,barriers=(),barrier_top_level=0):
         """Map four MM5 neighbours and retain INTERP's unnormalised 1/R² sum."""
-        f32=np.float64
-        data=np.asarray(field,dtype=f32)
+        data=np.asarray(field,dtype=MODEL_DTYPE)
         if data.shape[-2:]!=self.source_shape: raise ValueError('prognostic observation field shape mismatch')
         if rmin_km<=0.: raise ValueError('prognostic observation RMIN must be positive')
         leading=data.shape[:-2]; flat=np.reshape(np.swapaxes(data,-1,-2),leading+(-1,))
-        selected=np.asarray(np.take(flat,self.indices,axis=-1),dtype=f32)
-        source=np.asarray(self.source_coordinates[self.indices],dtype=f32)
-        target=np.asarray(self.target_coordinates,dtype=f32)
-        delta=np.asarray(source-target[:,None,:],dtype=f32)
-        distance2=np.asarray(delta[:,:,0]**2+delta[:,:,1]**2,dtype=f32)
-        floor=f32(f32(rmin_km)*f32(rmin_km))
-        raw=np.asarray(f32(1.)/np.maximum(distance2,floor),dtype=f32)
-        barrier_array=np.asarray(barriers,dtype=f32)
+        selected=np.asarray(np.take(flat,self.indices,axis=-1),dtype=MODEL_DTYPE)
+        source=np.asarray(self.source_coordinates[self.indices],dtype=COORDINATE_DTYPE)
+        target=np.asarray(self.target_coordinates,dtype=COORDINATE_DTYPE)
+        delta=source-target[:,None,:]
+        distance2=delta[:,:,0]**2+delta[:,:,1]**2
+        floor=np.float64(rmin_km)**2
+        raw=1.0/np.maximum(distance2,floor)
+        barrier_array=np.asarray(barriers,dtype=COORDINATE_DTYPE)
         if barrier_array.size:
             if data.ndim!=3:
                 raise ValueError('level-dependent prognostic barriers require a 3-D field')
-            origin=np.asarray(self.grid_origin,dtype=f32)
+            origin=np.asarray(self.grid_origin,dtype=COORDINATE_DTYPE)
             blocked=barrier_blocked_pairs(target-origin,
                                            source-origin,barrier_array)
             available=np.ones((leading[0],)+raw.shape,dtype=bool)
             available[:barrier_top_level] &= ~blocked[None,:,:]
-            factors=np.asarray(raw[None,:,:]*available,dtype=f32)
-            strength=np.zeros(factors.shape[:-1],dtype=f32)
-            numerator=np.zeros_like(strength)
-            for neighbour in range(4):
-                strength=np.asarray(strength+factors[...,neighbour],dtype=f32)
-                numerator=np.asarray(numerator+selected[...,neighbour]*factors[...,neighbour],dtype=f32)
-            mapped=np.divide(numerator,strength,out=np.zeros_like(numerator),where=strength>f32(0.))
+            factors=raw[None,:,:]*available
+            strength=factors.sum(axis=-1,dtype=ACCUMULATION_DTYPE)
+            numerator=(selected*factors).sum(axis=-1,dtype=ACCUMULATION_DTYPE)
+            mapped=np.divide(numerator,strength,out=np.zeros_like(numerator),where=strength>0.)
             mapped=mapped.reshape(leading+self.target_shape)
-            return mapped,strength.reshape(leading+self.target_shape)
-        strength=np.zeros(raw.shape[0],dtype=f32)
-        numerator=np.zeros(selected.shape[:-1],dtype=f32)
-        for neighbour in range(4):
-            strength=np.asarray(strength+raw[:,neighbour],dtype=f32)
-            numerator=np.asarray(numerator+selected[...,neighbour]*raw[:,neighbour],dtype=f32)
-        mapped=np.divide(numerator,strength,out=np.zeros_like(numerator),where=strength>f32(0.)).reshape(leading+self.target_shape)
-        return mapped,strength.reshape(self.target_shape)
+            return (_model_array(mapped),
+                    _model_array(strength.reshape(leading+self.target_shape)))
+        strength=raw.sum(axis=-1,dtype=ACCUMULATION_DTYPE)
+        numerator=(selected*raw).sum(axis=-1,dtype=ACCUMULATION_DTYPE)
+        mapped=np.divide(numerator,strength,out=np.zeros_like(numerator),
+                         where=strength>0.).reshape(leading+self.target_shape)
+        return _model_array(mapped),_model_array(strength.reshape(self.target_shape))
 
     def nearest(self,field):
         """Map with RDMM5's closest prognostic cell (mixing-height profiles)."""
         data=np.asarray(field)
         if data.shape[-2:]!=self.source_shape: raise ValueError('source field shape mismatch')
         leading=data.shape[:-2]; flat=np.reshape(np.swapaxes(data,-1,-2),leading+(-1,))
-        return np.take(flat,self.indices[:,0],axis=-1).reshape(leading+self.target_shape)
+        return _model_array(np.take(flat,self.indices[:,0],axis=-1).reshape(
+            leading+self.target_shape))
 
-    def nearest_masked(self,field,source_mask):
-        """Map to RDHD5's nearest masked source, preserving scan-order ties."""
+    def nearest_masked(self,field,source_mask,*,dtype=MODEL_DTYPE):
+        """Map to the nearest masked source.
+
+        Physical fields use the model dtype by default.  Callers mapping a
+        coordinate can request ``COORDINATE_DTYPE`` explicitly.
+        """
         data=np.asarray(field)
         mask=np.asarray(source_mask,dtype=bool)
         if data.shape[-2:]!=self.source_shape or mask.shape!=self.source_shape:
@@ -233,27 +222,31 @@ class PrognosticMapper:
         available=np.flatnonzero(flat_mask)
         source=np.asarray(self.source_coordinates[available],dtype=np.float64)
         target=np.asarray(self.target_coordinates,dtype=np.float64)
-        local=_fortran_nearest_indices(source,target,1)[:,0]
+        local=_nearest_indices(source,target,1)[:,0]
         selected=available[local]
         leading=data.shape[:-2]
         flat=np.reshape(np.swapaxes(data,-1,-2),leading+(-1,))
-        return np.take(flat,selected,axis=-1).reshape(leading+self.target_shape)
+        mapped=np.take(flat,selected,axis=-1).reshape(leading+self.target_shape)
+        return np.asarray(mapped,dtype=dtype)
 
     def radius_interpolate(self,field,radius_km,*,cutoff=0.,method=2):
-        """INTERPQR radius-limited precipitation objective mapping."""
+        """Radius-limited precipitation objective mapping.
+
+        Coordinate distances and weighted reductions use double precision;
+        the returned model field is converted to :data:`MODEL_DTYPE` once.
+        For exponential mapping with an automatic scale, the Gaussian sigma
+        is half the closest wet-to-dry source distance.  The legacy API keeps
+        the historical INTERPQR assignment bug that used the unhalved value.
+        """
         data=np.asarray(field,dtype=np.float64)
         if data.shape!=self.source_shape: raise ValueError('radius interpolation expects one source 2-D field')
         if method not in {1,2,3}: raise ValueError('INTERPQR method must be 1, 2, or 3')
         if radius_km<0. or (method in {1,2} and radius_km==0.):
             raise ValueError('INTERPQR radius must be non-negative and nonzero for methods 1 and 2')
         source_values=np.ravel(data,order='F')
-        origin=np.asarray(self.grid_origin,dtype=np.float64)
-        source_coordinates=np.asarray(
-            (np.asarray(self.source_coordinates,dtype=np.float64)-origin)*np.float64(1000.),
-            dtype=np.float64)
-        target_coordinates=np.asarray(np.asarray(
-            np.asarray(self.target_coordinates,dtype=np.float64)-origin,dtype=np.float64)*
-            np.float64(1000.),dtype=np.float64)
+        origin=np.asarray(self.grid_origin,dtype=COORDINATE_DTYPE)
+        source_coordinates=(self.source_coordinates-origin)*1000.
+        target_coordinates=(self.target_coordinates-origin)*1000.
         source_tree=cKDTree(source_coordinates); nearest=np.take(source_values,self.indices[:,0])
         automatic_sigma=method==3 and radius_km==0.
         if automatic_sigma:
@@ -261,29 +254,23 @@ class PrognosticMapper:
             if wet.any() and dry.any():
                 dry_coordinates=source_coordinates[dry]
                 nearest_dry=cKDTree(dry_coordinates).query(source_coordinates[wet],k=1)[1]
-                delta=np.asarray(source_coordinates[wet]-dry_coordinates[nearest_dry],
-                                 dtype=np.float64)
-                distance2=np.asarray(delta[:,0]*delta[:,0]+delta[:,1]*delta[:,1],
-                                     dtype=np.float64)
-                sigma2=np.min(distance2)
+                delta=source_coordinates[wet]-dry_coordinates[nearest_dry]
+                distance2=delta[:,0]**2+delta[:,1]**2
+                minimum_wet_dry_distance2=np.min(distance2)
             else:
-                sigma2=np.float64(1.e37)
-            # INTERPQR assigns SIGMA1=.5*SQRT(SIGMA2), but never writes the
-            # halved value back to SIGMA2.  The exponential branch below
-            # therefore uses the original minimum-distance squared.
-            radius_m=np.asarray(np.sqrt(sigma2),dtype=np.float64)
+                minimum_wet_dry_distance2=1.e37
+            radius_m=.5*np.sqrt(minimum_wet_dry_distance2)
+            sigma2=radius_m**2
         else:
-            radius_m=np.float64(radius_km)*np.float64(1000.)
-            sigma2=np.asarray(radius_m*radius_m,dtype=np.float64)
+            radius_m=float(radius_km)*1000.
+            sigma2=radius_m**2
         if method in {1,2}:
             limit2=sigma2
         else:
-            cutoff_ratio=np.nextafter(np.float64(60.),np.float64(np.inf),dtype=np.float64)
-            maximum=np.float64(np.finfo(np.float64).max/float(cutoff_ratio))
-            limit2=(np.float64(np.inf) if sigma2>maximum else
-                    np.asarray(cutoff_ratio*sigma2,dtype=np.float64))
-        candidate_limit2=np.nextafter(limit2,np.float64(np.inf),dtype=np.float64)
-        search_radius=np.sqrt(float(candidate_limit2))
+            cutoff_ratio=60.
+            maximum=np.finfo(np.float64).max/cutoff_ratio
+            limit2=np.inf if sigma2>maximum else cutoff_ratio*sigma2
+        search_radius=np.sqrt(float(limit2))
         result=np.empty(self.target_coordinates.shape[0],dtype=np.float64)
         weighted=np.zeros(result.size,dtype=bool)
         # A whole-domain sparse distance matrix can contain tens of millions
@@ -294,51 +281,34 @@ class PrognosticMapper:
             end=min(begin+chunk_size,result.size); targets=target_coordinates[begin:end]
             neighbours=(source_tree.query_ball_point(targets,search_radius) if np.isfinite(search_radius)
                         else [np.arange(source_values.size,dtype=np.intp)]*len(targets))
-            neighbours=[np.sort(item) for item in neighbours]
             lengths=np.fromiter((len(item) for item in neighbours),dtype=np.intp,count=end-begin)
             source_indices=np.concatenate(neighbours) if lengths.sum() else np.empty(0,dtype=np.intp)
             local_targets=np.repeat(np.arange(end-begin),lengths)
-            difference=np.asarray(source_coordinates[source_indices]-targets[local_targets],
-                                  dtype=np.float64)
-            distance2=np.asarray(difference[:,0]*difference[:,0]+difference[:,1]*difference[:,1],
-                                 dtype=np.float64)
+            difference=source_coordinates[source_indices]-targets[local_targets]
+            distance2=difference[:,0]**2+difference[:,1]**2
             if method==1:
                 eligible=distance2<=sigma2
-                safe_distance=np.maximum(np.sqrt(distance2),np.float64(.01))
-                weights=np.where(eligible,np.asarray(
-                    np.float64(1.)/safe_distance,dtype=np.float64),np.float64(0.))
-                weighted_values=np.where(eligible,np.asarray(
-                    source_values[source_indices]/safe_distance,dtype=np.float64),np.float64(0.))
+                safe_distance=np.maximum(np.sqrt(distance2),.01)
+                weights=np.where(eligible,1./safe_distance,0.)
+                weighted_values=np.where(
+                    eligible,source_values[source_indices]/safe_distance,0.)
             elif method==2:
                 eligible=distance2<=sigma2
-                safe_distance=np.maximum(distance2,np.float64(.01))
-                weights=np.where(eligible,np.asarray(
-                    np.float64(1.)/safe_distance,dtype=np.float64),np.float64(0.))
-                weighted_values=np.where(eligible,np.asarray(
-                    source_values[source_indices]/safe_distance,dtype=np.float64),np.float64(0.))
+                safe_distance=np.maximum(distance2,.01)
+                weights=np.where(eligible,1./safe_distance,0.)
+                weighted_values=np.where(
+                    eligible,source_values[source_indices]/safe_distance,0.)
             else:
-                exponent=np.asarray(distance2/sigma2,dtype=np.float64)
-                eligible=exponent<=np.float64(60.)
-                decay=np.where(eligible,np.exp(np.asarray(-exponent,dtype=np.float64)),
-                               np.float64(0.))
-                safe_distance=np.maximum(distance2,np.float64(.01))
-                weights=np.asarray(decay/safe_distance,dtype=np.float64)
-                weighted_values=np.asarray(
-                    source_values[source_indices]*decay/safe_distance,dtype=np.float64)
-            width=int(lengths.max(initial=0))
-            numerator_terms=np.zeros((end-begin,width),dtype=np.float64)
-            denominator_terms=np.zeros_like(numerator_terms)
-            if source_indices.size:
-                offsets=np.repeat(np.cumsum(lengths)-lengths,lengths)
-                columns=np.arange(source_indices.size)-offsets
-                denominator_terms[local_targets,columns]=weights
-                numerator_terms[local_targets,columns]=weighted_values
-            # CUMSUM along the source-point axis preserves INTERPQR's ordered
-            # REAL additions while evaluating all target cells together.
-            numerator=(np.cumsum(numerator_terms,axis=1,dtype=np.float64)[:,-1]
-                       if width else np.zeros(end-begin,dtype=np.float64))
-            denominator=(np.cumsum(denominator_terms,axis=1,dtype=np.float64)[:,-1]
-                         if width else np.zeros(end-begin,dtype=np.float64))
+                exponent=distance2/sigma2
+                eligible=exponent<=60.
+                decay=np.where(eligible,np.exp(-exponent),0.)
+                safe_distance=np.maximum(distance2,.01)
+                weights=decay/safe_distance
+                weighted_values=source_values[source_indices]*decay/safe_distance
+            numerator=np.bincount(local_targets,weights=weighted_values,
+                                  minlength=end-begin).astype(ACCUMULATION_DTYPE)
+            denominator=np.bincount(local_targets,weights=weights,
+                                    minlength=end-begin).astype(ACCUMULATION_DTYPE)
             if method==3:
                 # INTERPQR does not use the nearest-cell fallback in the
                 # exponential branch.  If every EXP(-R²/SIGMA²) term was
@@ -346,14 +316,14 @@ class PrognosticMapper:
                 # literal test TOP < 1E-30 returns zero.
                 result[begin:end]=np.divide(numerator,denominator,
                     out=np.zeros(end-begin,dtype=np.float64),
-                    where=(numerator>=np.float64(1.e-30))&(denominator>np.float64(0.)))
+                    where=(numerator>=1.e-30)&(denominator>0.))
             else:
-                weighted[begin:end]=denominator>np.float64(0.)
+                weighted[begin:end]=denominator>0.
                 result[begin:end]=np.divide(numerator,denominator,
                     out=nearest[begin:end].copy(),where=denominator>0.)
         apply_cutoff=np.ones(result.size,dtype=bool) if method==3 else weighted
-        result=np.where(apply_cutoff&(result<np.float64(cutoff)),np.float64(0.),result)
-        return result.reshape(self.target_shape)
+        result=np.where(apply_cutoff&(result<float(cutoff)),0.,result)
+        return _model_array(result.reshape(self.target_shape))
 
 @dataclass(frozen=True,slots=True)
 class SourceThermalState:
@@ -423,41 +393,29 @@ class StepTransformContext:
     previous_temperature_jump: np.ndarray
     coriolis: np.ndarray
     warm_layer_state: object | None = None
-    gmt_hour: int | None = None
+    gmt_hour: float | None = None
 
 
-def _domain_mean_real4(field):
-    """CGAMMA2 domain mean in its I-outer/J-inner REAL accumulation order."""
-    values=np.asarray(field,dtype=np.float64)
-    total=np.float64(0.)
-    for value in values.ravel(order='F'):
-        total=np.float64(total+value)
-    return np.float64(total/np.float64(values.size))
+def _domain_mean(field):
+    """Return a stable double-precision mean for domain-scale diagnostics."""
+    return np.mean(np.asarray(field,dtype=ACCUMULATION_DTYPE),
+                   dtype=ACCUMULATION_DTYPE)
 
-def _interpolate_ceiling(left,right,fraction,*,literal_endpoint=False):
-    """RDMM5's special nonzero-aware ICEILG time interpolation."""
-    f=np.float64(fraction)
-    left=np.asarray(left,dtype=np.float64); right=np.asarray(right,dtype=np.float64)
-    if f==np.float64(1.) and not literal_endpoint:
-        interpolated=right.copy()
-    else:
-        interpolated=np.asarray(
-            left+np.asarray(f*np.asarray(right-left,dtype=np.float64),dtype=np.float64),
-            dtype=np.float64)
-    return np.where((left!=np.float64(0.))&(right!=np.float64(0.)),
-                    interpolated,np.maximum(left,right)).astype(np.float64)
+def _interpolate_ceiling(left,right,fraction):
+    """Interpolate ceiling height while retaining nonzero observations."""
+    f=MODEL_DTYPE(fraction)
+    left=np.asarray(left,dtype=MODEL_DTYPE); right=np.asarray(right,dtype=MODEL_DTYPE)
+    interpolated=left+f*(right-left)
+    return _model_array(np.where(
+        (left!=0.)&(right!=0.),interpolated,np.maximum(left,right)))
 
-def interpolate_step1_fields(left: Step1Fields,right: Step1Fields,fraction,*,cloud_method=4,
-                             literal_endpoint=False):
-    """RDMM5 sub-hour interpolation between two actual prognostic records."""
-    f=np.float64(fraction)
+def interpolate_step1_fields(left: Step1Fields,right: Step1Fields,fraction,*,cloud_method=4):
+    """Interpolate between two actual prognostic records."""
+    f=MODEL_DTYPE(fraction)
     if not 0.<=f<=1.: raise ValueError('prognostic interpolation fraction must be between zero and one')
     def lerp(a,b):
-        a=np.asarray(a,dtype=np.float64); b=np.asarray(b,dtype=np.float64)
-        if f==np.float64(1.) and not literal_endpoint:
-            return b.copy()
-        delta=np.asarray(b-a,dtype=np.float64)
-        return np.asarray(a+np.asarray(f*delta,dtype=np.float64),dtype=np.float64)
+        a=np.asarray(a,dtype=MODEL_DTYPE); b=np.asarray(b,dtype=MODEL_DTYPE)
+        return _model_array(a+f*(b-a))
     if cloud_method==4:
         cloud=lerp(left.cloud_fraction,right.cloud_fraction)
     elif cloud_method==3:
@@ -466,8 +424,7 @@ def interpolate_step1_fields(left: Step1Fields,right: Step1Fields,fraction,*,clo
         cloud=cloud_fraction(lerp(left.cloud_relative_humidity_850,right.cloud_relative_humidity_850))
     else:
         raise ValueError('cloud_method must be MCLOUD 3 or 4')
-    ceiling=_interpolate_ceiling(left.ceiling_height,right.ceiling_height,f,
-                                 literal_endpoint=literal_endpoint)
+    ceiling=_interpolate_ceiling(left.ceiling_height,right.ceiling_height,f)
     cloud_water=None
     if left.integrated_cloud_water is not None and right.integrated_cloud_water is not None:
         cloud_water=lerp(left.integrated_cloud_water,right.integrated_cloud_water)
@@ -494,13 +451,9 @@ def interpolate_step1_fields(left: Step1Fields,right: Step1Fields,fraction,*,clo
         lerp(left.surface_density,right.surface_density),lerp(left.relative_humidity,right.relative_humidity),
         lerp(left.pbl_height,right.pbl_height),lerp(left.sensible_heat_flux,right.sensible_heat_flux),
         lerp(left.friction_velocity,right.friction_velocity),cloud,ceiling,
-        # RDMM5 deliberately does not time-interpolate the sounding used by
-        # MIXDT2.  TZ0/ZL0 are copied from the current (left) M3D record at
-        # the start of the step, while the ordinary prognostic fields are
-        # interpolated through the ending time.
-        np.asarray(left.profile_temperature,dtype=np.float64),
-        np.asarray(left.profile_height,dtype=np.float64),
-        np.trunc(lerp(left.surface_relative_humidity,right.surface_relative_humidity)).astype(np.int32),
+        lerp(left.profile_temperature,right.profile_temperature),
+        lerp(left.profile_height,right.profile_height),
+        lerp(left.surface_relative_humidity,right.surface_relative_humidity),
         precipitation,precipitation_code,right.thermal_state,rh850,cloud_water,
         prognostic_observation_u=(None if left.prognostic_observation_u is None else
                                   lerp(left.prognostic_observation_u,right.prognostic_observation_u)),
@@ -508,7 +461,7 @@ def interpolate_step1_fields(left: Step1Fields,right: Step1Fields,fraction,*,clo
                                   lerp(left.prognostic_observation_v,right.prognostic_observation_v)),
         prognostic_observation_strength=(None if right.prognostic_observation_strength is None else
                                           np.asarray(right.prognostic_observation_strength,
-                                                     dtype=np.float64)),
+                                                     dtype=MODEL_DTYPE)),
         prognostic_temperature=prognostic_temperature,
         cloud_liquid_water_3d=auxiliary_cloud[0],
         cloud_liquid_water_above=auxiliary_cloud[1],
@@ -520,46 +473,41 @@ def observed_temperature_3d(surface_temperature,face_temperature,convective_heig
                             *,landuse=None,water_range=(55,55),mixing_height=None,
                             water_gradient_below=None,water_gradient_above=None):
     """Vectorized land branch of TEMP3D for ITPROG=0."""
-    f32=np.float64
-    surface=np.asarray(surface_temperature,dtype=f32)
-    faces=np.asarray(face_temperature,dtype=f32)
-    z=np.asarray(z_faces_m,dtype=f32)
+    surface=np.asarray(surface_temperature,dtype=MODEL_DTYPE)
+    faces=np.asarray(face_temperature,dtype=MODEL_DTYPE)
+    z=np.asarray(z_faces_m,dtype=MODEL_DTYPE)
     if faces.shape!=(z.size,)+surface.shape:
         raise ValueError('observed face temperature dimensions do not match the CALMET grid')
-    result=np.empty((z.size-1,)+surface.shape,dtype=f32); result[0]=surface
-    zi=np.asarray(convective_height,dtype=f32)
+    result=np.empty((z.size-1,)+surface.shape,dtype=MODEL_DTYPE); result[0]=surface
+    zi=np.asarray(convective_height,dtype=MODEL_DTYPE)
     for k in range(1,z.size-1):
         low,high=z[k],z[k+1]; top=faces[k+1]
-        above=np.asarray(f32(.5)*np.asarray(faces[k]+top,dtype=f32),dtype=f32)
-        below=np.asarray(surface-f32(.0098)*f32(.5)*f32(low+high),dtype=f32)
-        middle=np.asarray(surface-f32(.0098)*zi,dtype=f32)
-        lower_sum=np.asarray(surface-f32(.0098)*low+middle,dtype=f32)
-        upper_sum=np.asarray(middle+top,dtype=f32)
-        crossing=np.asarray(f32(.5)*np.asarray(
-            lower_sum*np.asarray(zi-low,dtype=f32)+
-            upper_sum*np.asarray(high-zi,dtype=f32),dtype=f32)/f32(high-low),dtype=f32)
+        above=.5*(faces[k]+top)
+        below=surface-.0098*.5*(low+high)
+        middle=surface-.0098*zi
+        lower_sum=surface-.0098*low+middle
+        upper_sum=middle+top
+        crossing=.5*(lower_sum*(zi-low)+upper_sum*(high-zi))/(high-low)
         result[k]=np.where(low>zi,above,np.where(high<=zi,below,crossing))
     if landuse is not None and water_gradient_below is not None and water_gradient_above is not None:
         water=(np.asarray(landuse)>=water_range[0])&(np.asarray(landuse)<=water_range[1])
-        water_zi=np.asarray(mixing_height,dtype=f32)
-        below_gradient=np.asarray(water_gradient_below,dtype=f32)
-        above_gradient=np.asarray(water_gradient_above,dtype=f32)
+        water_zi=np.asarray(mixing_height,dtype=MODEL_DTYPE)
+        below_gradient=np.asarray(water_gradient_below,dtype=MODEL_DTYPE)
+        above_gradient=np.asarray(water_gradient_above,dtype=MODEL_DTYPE)
         for k in range(1,z.size-1):
-            low,high=z[k],z[k+1]; center=f32(f32(.5)*f32(low+high))
-            wholly_below=np.asarray(surface+below_gradient*center,dtype=f32)
-            wholly_above=np.asarray(surface+below_gradient*water_zi+
-                                     above_gradient*np.asarray(center-water_zi,dtype=f32),dtype=f32)
-            low_temp=np.asarray(surface+below_gradient*low,dtype=f32)
-            middle_temp=np.asarray(surface+below_gradient*water_zi,dtype=f32)
-            high_temp=np.asarray(middle_temp+above_gradient*np.asarray(high-water_zi,dtype=f32),dtype=f32)
-            crossing=np.asarray(f32(.5)*np.asarray(
-                np.asarray(low_temp+middle_temp,dtype=f32)*np.asarray(water_zi-low,dtype=f32)+
-                np.asarray(middle_temp+high_temp,dtype=f32)*np.asarray(high-water_zi,dtype=f32),
-                dtype=f32)/f32(high-low),dtype=f32)
+            low,high=z[k],z[k+1]; center=.5*(low+high)
+            wholly_below=surface+below_gradient*center
+            wholly_above=(surface+below_gradient*water_zi+
+                           above_gradient*(center-water_zi))
+            low_temp=surface+below_gradient*low
+            middle_temp=surface+below_gradient*water_zi
+            high_temp=middle_temp+above_gradient*(high-water_zi)
+            crossing=.5*((low_temp+middle_temp)*(water_zi-low)+
+                         (middle_temp+high_temp)*(high-water_zi))/(high-low)
             water_value=np.where(high<=water_zi,wholly_below,
                                  np.where(low>water_zi,wholly_above,crossing))
             result[k]=np.where(water,water_value,result[k])
-    return result
+    return _model_array(result)
 
 def map_prognostic_cloud(source_cloud,source_rh850,mapper,cloud_method):
     """Apply RDMM5's method-specific horizontal interpolation order."""
@@ -613,105 +561,83 @@ class HourFields:
 
 def target_latitude_longitude(grid: GridConfig):
     """Latitude/longitude at CALMET cell centres (MICROI grid geometry)."""
-    f32=np.float64
-    ix=np.arange(grid.nx,dtype=f32)+f32(.5)
-    iy=np.arange(grid.ny,dtype=f32)+f32(.5)
-    dx_m=f32(f32(grid.dx_km)*f32(1000.))
-    dy_m=f32(f32(grid.dy_km)*f32(1000.))
-    x=np.asarray(f32(grid.x_origin_km)+np.asarray(ix*dx_m,dtype=f32)*f32(.001),dtype=f32)
-    y=np.asarray(f32(grid.y_origin_km)+np.asarray(iy*dy_m,dtype=f32)*f32(.001),dtype=f32)
+    ix=np.arange(grid.nx,dtype=COORDINATE_DTYPE)+.5
+    iy=np.arange(grid.ny,dtype=COORDINATE_DTYPE)+.5
+    x=float(grid.x_origin_km)+ix*float(grid.dx_km)
+    y=float(grid.y_origin_km)+iy*float(grid.dy_km)
     xx,yy=np.meshgrid(x,y)
     longitude,latitude=unproject_geographic(xx,yy,grid,'WGS-84',units='km')
     return np.asarray(latitude),np.asarray(longitude)
 
 def _vertical_centers(field,height,centers,*,wind=False):
-    """RDMM5 interpolation/persistence, including low-level wind log law."""
-    f32=np.float64
-    data=np.asarray(field,dtype=f32); z=np.asarray(height,dtype=f32)
+    """Interpolate vertical profiles, including the low-level wind log law."""
+    data=np.asarray(field,dtype=MODEL_DTYPE)
+    z=np.asarray(height,dtype=MODEL_DTYPE)
     if data.shape!=z.shape or data.ndim!=3: raise ValueError('vertical fields must have shape (level,y,x)')
     levels,y,x=data.shape; flat=data.reshape(levels,-1); zflat=z.reshape(levels,-1); columns=np.arange(flat.shape[1]); out=[]
-    for center in np.asarray(centers,dtype=f32):
+    for center in np.asarray(centers,dtype=MODEL_DTYPE):
         above=np.sum(zflat<=center,axis=0); lower=np.clip(above-1,0,levels-1); upper=np.clip(above,0,levels-1)
         zl,zu=zflat[lower,columns],zflat[upper,columns]; vl,vu=flat[lower,columns],flat[upper,columns]
-        ratio=np.divide(np.asarray(center-zl,dtype=f32),np.asarray(zu-zl,dtype=f32),
-                        out=np.zeros_like(zl,dtype=f32),where=zu!=zl)
-        value=np.asarray(vl+np.asarray((vu-vl)*ratio,dtype=f32),dtype=f32)
+        ratio=np.divide(center-zl,zu-zl,out=np.zeros_like(zl),where=zu!=zl)
+        value=vl+(vu-vl)*ratio
         below=center<zflat[0]; value=np.where(below,flat[0],value); value=np.where(center>=zflat[-1],flat[-1],value)
         if wind:
-            log_half=f32(np.log(f32(.5)))
-            numerator=f32(np.log(center)-log_half)
-            denominator=np.asarray(
-                np.log(np.maximum(zflat[0],f32(.500001)))-log_half,dtype=f32)
-            logratio=np.divide(numerator,denominator,out=np.ones_like(zl,dtype=f32),
-                               where=zflat[0]>f32(.500001))
-            value=np.where(below,np.asarray(logratio*flat[0],dtype=f32),value)
+            log_half=MODEL_DTYPE(np.log(.5))
+            numerator=np.log(center)-log_half
+            denominator=np.log(np.maximum(zflat[0],.500001))-log_half
+            logratio=np.divide(numerator,denominator,out=np.ones_like(zl),
+                               where=zflat[0]>.500001)
+            value=np.where(below,logratio*flat[0],value)
         out.append(value.reshape(y,x))
-    return np.stack(out).astype(f32)
+    return _model_array(np.stack(out))
 
 def _prognostic_wind_components(speed,direction,convergence):
-    """RDMM5 true-north direction rotation and floating-point component split."""
-    f32=np.float64
-    velocity=np.asarray(speed,dtype=f32)
-    grid_direction=np.asarray(np.asarray(direction,dtype=f32)-
-                              np.asarray(convergence,dtype=f32),dtype=f32)
-    grid_direction=np.where(grid_direction<f32(0.),grid_direction+f32(360.),grid_direction)
-    grid_direction=np.where(grid_direction>f32(360.),grid_direction-f32(360.),
-                            grid_direction).astype(f32)
-    radians=np.asarray(f32(.0174533)*grid_direction,dtype=f32)
-    return (np.asarray(-velocity*np.sin(radians),dtype=f32),
-            np.asarray(-velocity*np.cos(radians),dtype=f32))
+    """Rotate true-north meteorological wind into grid components."""
+    velocity=np.asarray(speed,dtype=MODEL_DTYPE)
+    grid_direction=(np.asarray(direction,dtype=MODEL_DTYPE)-
+                    np.asarray(convergence,dtype=MODEL_DTYPE))%360.
+    radians=np.deg2rad(grid_direction)
+    return (_model_array(-velocity*np.sin(radians)),
+            _model_array(-velocity*np.cos(radians)))
 
 def _relative_humidity(qvapor,pressure_hpa,temperature_k):
-    f32=np.float64
-    temperature=np.asarray(temperature_k,dtype=f32)
-    pressure=np.asarray(pressure_hpa,dtype=f32)
-    vapor=np.asarray(qvapor,dtype=f32)
-    tc=np.asarray(temperature-f32(273.15),dtype=f32)
-    # CALWRF GETRH1 deliberately uses qsat=0.622*es/p (rather than the
-    # more usual epsilon*es/(p-es)); preserve that legacy definition.
-    exponent=np.asarray(f32(17.67)*tc/np.asarray(temperature-f32(29.65),dtype=f32),dtype=f32)
-    es=np.asarray(f32(6.112)*np.exp(exponent),dtype=f32)
-    saturation=np.asarray(f32(.622)*es/pressure,dtype=f32)
-    return np.clip(np.asarray(f32(100.)*vapor/saturation,dtype=f32),f32(0.),f32(100.))
+    """Diagnose RH from WRF water-vapour mixing ratio.
 
-def _fortran_nint_positive(values):
-    """Fortran NINT for the non-negative CALWRF fields used here."""
-    data=np.asarray(values,dtype=np.float64)
-    return np.floor(np.asarray(data+np.float64(.5),dtype=np.float64)).astype(np.float64)
+    ``QVAPOR`` is the mass ratio of water vapour to dry air, so its saturation
+    value is ``epsilon * e_s / (p - e_s)``.  The legacy API retains CALWRF's
+    ``epsilon * e_s / p`` approximation.
+    """
+    temperature=np.asarray(temperature_k,dtype=MODEL_DTYPE)
+    pressure=np.asarray(pressure_hpa,dtype=MODEL_DTYPE)
+    vapor=np.asarray(qvapor,dtype=MODEL_DTYPE)
+    tc=temperature-273.15
+    es=6.112*np.exp(17.67*tc/(tc+243.5))
+    saturation=.622*es/(pressure-es)
+    return _model_array(np.clip(100.*vapor/saturation,0.,100.))
 
-
-def _quantize_real4(values,scale):
-    """Round a non-negative floating-point field after applying a decimal scale."""
-    f32=np.float64; factor=f32(scale)
-    data=np.asarray(values,dtype=f32)
-    return np.asarray(_fortran_nint_positive(np.asarray(data*factor,dtype=f32))/factor,dtype=f32)
+def _cloud_water_g_kg(values):
+    """Convert canonical cloud water from kg/kg to g/kg without packing."""
+    values=np.asarray(values,dtype=MODEL_DTYPE)
+    return _model_array(values*1000.)
 
 
-def _m3d_cloud_water_g_kg(values):
-    """Recover the F6.3 M3D cloud-water value from canonical kg/kg."""
-    data=np.asarray(values,dtype=np.float64)
-    thousandths=_fortran_nint_positive(
-        np.asarray(data*np.float64(1.e6),dtype=np.float64))
-    return np.asarray(thousandths/np.float64(1000.),dtype=np.float64)
-
-
-def _m3d_relative_humidity(dataset,time_index,qvapor,pressure,temperature):
-    """Return RDMM5's stored integer IRH field, with a schema fallback."""
+def _source_relative_humidity(dataset,time_index,qvapor,pressure,temperature):
+    """Read canonical relative humidity, with a diagnostic schema fallback."""
     if 'relative_humidity' in dataset.variables:
-        values=np.asarray(dataset['relative_humidity'][time_index])
+        values=np.asarray(dataset['relative_humidity'][time_index],dtype=MODEL_DTYPE)
     else:
         values=_relative_humidity(qvapor,pressure,temperature)
-    return np.clip(_fortran_nint_positive(values),1.,100.)
+    return _model_array(np.clip(values,0.,100.))
 
 
 def _rdmm5_surface_density(pressure_mb,temperature_k,height_agl_m):
     """RDMM5 RHOP from the first prognostic level at/above ground."""
-    pressure=np.asarray(pressure_mb,dtype=np.float64)
-    temperature=np.asarray(temperature_k,dtype=np.float64)
-    height=np.asarray(height_agl_m,dtype=np.float64)
+    pressure=np.asarray(pressure_mb,dtype=MODEL_DTYPE)
+    temperature=np.asarray(temperature_k,dtype=MODEL_DTYPE)
+    height=np.asarray(height_agl_m,dtype=MODEL_DTYPE)
     if pressure.shape!=temperature.shape or pressure.shape!=height.shape or pressure.ndim!=3:
         raise ValueError('RDMM5 density profiles must share shape (level,y,x)')
-    above=height>=np.float64(0.)
+    above=height>=0.
     if not np.all(above.any(axis=0)):
         raise ValueError('RDMM5 profile has no level at or above ground')
     level=np.argmax(above,axis=0); yy,xx=np.indices(level.shape)
@@ -721,11 +647,11 @@ def _rdmm5_surface_density(pressure_mb,temperature_k,height_agl_m):
 
 def _rdmm5_above_ground_profiles(height_agl_m,*fields):
     """Pack RDMM5 levels from per-column INDPX through the model top."""
-    height=np.asarray(height_agl_m,dtype=np.float64)
-    values=(height,*(np.asarray(field,dtype=np.float64) for field in fields))
+    height=np.asarray(height_agl_m,dtype=MODEL_DTYPE)
+    values=(height,*(np.asarray(field,dtype=MODEL_DTYPE) for field in fields))
     if height.ndim!=3 or any(value.shape!=height.shape for value in values):
         raise ValueError('RDMM5 vertical profiles must share shape (level,y,x)')
-    levels=height.shape[0]; above=height>=np.float64(0.); count=above.sum(axis=0)
+    levels=height.shape[0]; above=height>=0.; count=above.sum(axis=0)
     if not np.all(count):
         raise ValueError('RDMM5 profile has no level at or above ground')
     level_index=np.arange(levels,dtype=np.int32)[:,None,None]
@@ -737,44 +663,38 @@ def _rdmm5_above_ground_profiles(height_agl_m,*fields):
 
 def _rdmm5_sst_profile(centers_m,lowest_height_m,lowest_temperature_k,sst_k,ocean):
     """RDMM5 ITWPROG=2 actual-temperature interpolation below INDPX."""
-    centers=np.asarray(centers_m,dtype=np.float64)
-    height=np.asarray(lowest_height_m,dtype=np.float64)
-    temperature=np.asarray(lowest_temperature_k,dtype=np.float64)
-    sst=np.asarray(sst_k,dtype=np.float64)
+    centers=np.asarray(centers_m,dtype=MODEL_DTYPE)
+    height=np.asarray(lowest_height_m,dtype=MODEL_DTYPE)
+    temperature=np.asarray(lowest_temperature_k,dtype=MODEL_DTYPE)
+    sst=np.asarray(sst_k,dtype=MODEL_DTYPE)
     ratio=np.divide(centers[:,None,None],height[None,:,:],
-                    out=np.zeros((centers.size,*height.shape),dtype=np.float64),
-                    where=height[None,:,:]!=np.float64(0.))
-    profile=np.asarray(sst[None,:,:]*np.asarray(np.float64(1.)-ratio,dtype=np.float64)+
-                       temperature[None,:,:]*ratio,dtype=np.float64)
+                    out=np.zeros((centers.size,*height.shape),dtype=MODEL_DTYPE),
+                    where=height[None,:,:]!=0.)
+    profile=sst[None,:,:]*(1.-ratio)+temperature[None,:,:]*ratio
     use=(centers[:,None,None]<height[None,:,:])&np.asarray(ocean,dtype=bool)[None,:,:]
-    return profile,use
+    return _model_array(profile),use
 
 def _stull_temperature(theta2,z2,theta3,z3,theta20,theta30,z1):
     """STULL nighttime potential-temperature extrapolation."""
-    f32=np.float64
-    t2=np.asarray(theta2,dtype=f32); t3=np.asarray(theta3,dtype=f32)
-    t20=np.asarray(theta20,dtype=f32); t30=np.asarray(theta30,dtype=f32)
-    height2=np.asarray(z2,dtype=f32); height3=np.asarray(z3,dtype=f32)
-    dt2=np.asarray(t2-t20,dtype=f32); dt3=np.asarray(t3-t30,dtype=f32)
-    well=(t3>t2)&(dt3<f32(0.))&(dt2<f32(0.))&(dt2<dt3)
-    ratio=np.divide(dt2,dt3,out=np.ones_like(dt2,dtype=f32),where=dt3!=f32(0.))
-    logarithm=np.log(np.maximum(ratio,f32(1.e-30)))
-    fallback=np.asarray(height3/f32(5.),dtype=f32)
-    calculated=np.divide(np.asarray(f32(.77)*(height3-height2),dtype=f32),logarithm,
-                         out=fallback.copy(),where=well&(ratio>f32(0.))&
-                         (np.abs(logarithm)>f32(1.e-30)))
+    t2=np.asarray(theta2,dtype=MODEL_DTYPE); t3=np.asarray(theta3,dtype=MODEL_DTYPE)
+    t20=np.asarray(theta20,dtype=MODEL_DTYPE); t30=np.asarray(theta30,dtype=MODEL_DTYPE)
+    height2=np.asarray(z2,dtype=MODEL_DTYPE); height3=np.asarray(z3,dtype=MODEL_DTYPE)
+    dt2=t2-t20; dt3=t3-t30
+    well=(t3>t2)&(dt3<0.)&(dt2<0.)&(dt2<dt3)
+    ratio=np.divide(dt2,dt3,out=np.ones_like(dt2),where=dt3!=0.)
+    logarithm=np.log(np.maximum(ratio,1.e-30))
+    fallback=height3/5.
+    calculated=np.divide(.77*(height3-height2),logarithm,
+                         out=fallback.copy(),where=well&(ratio>0.)&
+                         (np.abs(logarithm)>1.e-30))
     scale=np.maximum(np.where(well,calculated,fallback),
-                     np.asarray(height2/f32(10.),dtype=f32))
-    surface_drop=np.maximum(np.minimum(f32(0.),np.asarray(
-        dt2*np.exp(np.asarray(f32(.77)*height2/scale,dtype=f32)),
-        dtype=f32)),f32(-15.))
-    drop=np.asarray(surface_drop*np.exp(np.asarray(
-        -f32(.77)*np.asarray(z1,dtype=f32)/scale,dtype=f32)),dtype=f32)
-    drop=np.where(dt2>f32(0.),dt2,drop).astype(f32)
-    return np.asarray(t20+drop,dtype=f32)
+                     height2/10.)
+    surface_drop=np.clip(dt2*np.exp(.77*height2/scale),-15.,0.)
+    drop=surface_drop*np.exp(-.77*np.asarray(z1,dtype=MODEL_DTYPE)/scale)
+    drop=np.where(dt2>0.,dt2,drop)
+    return _model_array(t20+drop)
 
 def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp=None,
-                       solar_day=None,
                        base_timezone=0,thermal_state: SourceThermalState | None=None,
                        mapper: PrognosticMapper | None=None,prognostic_ocean_category=16,
                        water_temperature_mode=0,
@@ -782,26 +702,24 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
                        precipitation_interpolation=2,precipitation_radius_km=50.,
                        precipitation_cutoff=.01,prognostic_observation_rmin_km=None,
                        prognostic_observation_barriers=(),prognostic_observation_barrier_top_level=0):
-    """Read one canonical CALWRF time and reproduce RDMM5 Step-1 fields."""
+    """Read one canonical CALWRF time and construct Step-1 model fields."""
     lat=np.asarray(dataset['latitude'][:]); lon=np.asarray(dataset['longitude'][:])
     if mapper is None:
         mapper=PrognosticMapper.build(lat,lon,grid,validate_domain=True)
     # CALWRF stores geopotential height MSL.  RDMM5 subtracts the source-cell
     # terrain before all vertical interpolation and CLOUD4 calculations.
-    terrain=_fortran_nint_positive(np.asarray(dataset['terrain'][:]))
-    height=_fortran_nint_positive(np.asarray(dataset['height'][time_index]))-terrain[None,:,:]
-    speed=_quantize_real4(dataset['wind_speed'][time_index],10.)
-    direction=np.asarray(
-        _fortran_nint_positive(np.asarray(dataset['wind_direction'][time_index])),
-        dtype=np.float64)
+    terrain=np.asarray(dataset['terrain'][:],dtype=MODEL_DTYPE)
+    height=(np.asarray(dataset['height'][time_index],dtype=MODEL_DTYPE)-
+            terrain[None,:,:])
+    speed=np.asarray(dataset['wind_speed'][time_index],dtype=MODEL_DTYPE)
+    direction=np.asarray(dataset['wind_direction'][time_index],dtype=MODEL_DTYPE)
     source_sun=None
     if timestamp is not None:
-        source_sun=_prognostic_record_solar(
-            timestamp,base_timezone,lat,lon,solar_day=solar_day)
-    convergence=np.asarray(grid_convergence(grid,lon,lat),dtype=np.float64)
+        source_sun=_prognostic_record_solar(timestamp,base_timezone,lat,lon)
+    convergence=np.asarray(grid_convergence(grid,lon,lat),dtype=MODEL_DTYPE)
     source_u,source_v=_prognostic_wind_components(speed,direction,convergence[None,:,:])
-    centers=np.asarray(np.float64(.5)*(np.asarray(z_faces_m[:-1],dtype=np.float64)+
-                                       np.asarray(z_faces_m[1:],dtype=np.float64)),dtype=np.float64)
+    faces=np.asarray(z_faces_m,dtype=MODEL_DTYPE)
+    centers=.5*(faces[:-1]+faces[1:])
     wind_height,source_u_above,source_v_above=_rdmm5_above_ground_profiles(
         height,source_u,source_v)
     source_u_centers=_vertical_centers(source_u_above,wind_height,centers,wind=True)
@@ -817,13 +735,11 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
             source_v_centers,prognostic_observation_rmin_km,
             barriers=prognostic_observation_barriers,
             barrier_top_level=prognostic_observation_barrier_top_level)
-    source_temperature=_quantize_real4(dataset['temperature'][time_index],10.)
-    source_q=_quantize_real4(dataset['qvapor'][time_index],1.e5)
-    source_pressure=_fortran_nint_positive(np.asarray(dataset['pressure'][time_index]))
-    theta=np.asarray(source_temperature*np.power(
-        np.asarray(np.float64(1000.)/source_pressure,dtype=np.float64),np.float64(.286)),
-        dtype=np.float64)
-    if np.any(np.sum(height>=np.float64(0.),axis=0)<2):
+    source_temperature=np.asarray(dataset['temperature'][time_index],dtype=MODEL_DTYPE)
+    source_q=np.asarray(dataset['qvapor'][time_index],dtype=MODEL_DTYPE)
+    source_pressure=np.asarray(dataset['pressure'][time_index],dtype=MODEL_DTYPE)
+    theta=_model_array(source_temperature*np.power(1000./source_pressure,.286))
+    if np.any(np.sum(height>=0.,axis=0)<2):
         raise ValueError('RDMM5 temperature profile requires two levels at or above ground')
     (thermo_height,source_temperature_above,source_q_above,
      source_pressure_above,theta_above)=_rdmm5_above_ground_profiles(
@@ -831,19 +747,18 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
     theta2,theta3=theta_above[0],theta_above[1]
     z2,z3=thermo_height[0],thermo_height[1]
     if thermal_state is None:
-        scale=np.asarray(z3/np.float64(5.),dtype=np.float64)
-        upper_exp=np.exp(np.asarray(-np.float64(.77)*z3/scale,dtype=np.float64))
-        lower_exp=np.exp(np.asarray(-np.float64(.77)*z2/scale,dtype=np.float64))
-        denominator=np.asarray(upper_exp-lower_exp,dtype=np.float64)
-        surface_drop=np.divide(np.asarray(theta3-theta2,dtype=np.float64),denominator,
-                               out=np.zeros_like(theta2,dtype=np.float64),where=denominator!=np.float64(0.))
-        surface_drop=np.maximum(np.minimum(surface_drop,np.float64(0.)),np.float64(-15.))
-        theta30=np.asarray(theta3-np.asarray(surface_drop*upper_exp,dtype=np.float64),
-                           dtype=np.float64)
+        scale=z3/5.
+        upper_exp=np.exp(-.77*z3/scale)
+        lower_exp=np.exp(-.77*z2/scale)
+        denominator=upper_exp-lower_exp
+        surface_drop=np.divide(theta3-theta2,denominator,
+                               out=np.zeros_like(theta2),where=denominator!=0.)
+        surface_drop=np.clip(surface_drop,-15.,0.)
+        theta30=_model_array(theta3-surface_drop*upper_exp)
         theta20=theta30.copy()
     else:
-        theta20=np.asarray(thermal_state.pt20,dtype=np.float64)
-        theta30=np.asarray(thermal_state.pt30,dtype=np.float64)
+        theta20=np.asarray(thermal_state.pt20,dtype=MODEL_DTYPE)
+        theta30=np.asarray(thermal_state.pt30,dtype=MODEL_DTYPE)
     if source_sun is not None:
         daylight=source_sun>0.; theta20=np.where(daylight,theta2,theta20); theta30=np.where(daylight,theta3,theta30)
     next_thermal_state=SourceThermalState(theta20.copy(),theta30.copy())
@@ -853,31 +768,25 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
     if water_temperature_mode==2:
         if 'sst' not in dataset.variables:
             raise ValueError('ITWPROG=2 requires SST in prognostic data')
-        source_sst=_quantize_real4(dataset['sst'][time_index],10.)
-        if np.any((source_sst<np.float64(150.))|(source_sst>np.float64(350.))):
+        source_sst=np.asarray(dataset['sst'][time_index],dtype=MODEL_DTYPE)
+        if np.any((source_sst<150.)|(source_sst>350.)):
             raise ValueError('ITWPROG=2 requires prognostic SST between 150 and 350 K')
     if source_sun is not None:
         below=centers[:,None,None]<z2[None,:,:]
         daytime_below=below&(source_sun[None,:,:]>0.)
-        extrapolated=np.asarray(source_temperature_above[0][None,:,:]+np.float64(.0098)*
-            np.asarray(z2[None,:,:]-centers[:,None,None],dtype=np.float64),dtype=np.float64)
+        extrapolated=(source_temperature_above[0][None,:,:]+.0098*
+                      (z2[None,:,:]-centers[:,None,None]))
         source_temperature_centers=np.where(daytime_below,extrapolated,source_temperature_centers)
         night_below=below&~(source_sun[None,:,:]>0.)
         ocean=np.asarray(dataset['landuse'][:])==prognostic_ocean_category
-        fraction=np.asarray((centers[:,None,None]-z2[None,:,:])/
-                            np.asarray(z3-z2,dtype=np.float64)[None,:,:],dtype=np.float64)
-        water_theta=np.asarray(theta2[None,:,:]+fraction*np.asarray(
-            theta3-theta2,dtype=np.float64)[None,:,:],dtype=np.float64)
+        fraction=(centers[:,None,None]-z2[None,:,:])/(z3-z2)[None,:,:]
+        water_theta=theta2[None,:,:]+fraction*(theta3-theta2)[None,:,:]
         land_theta=np.stack([_stull_temperature(theta2,z2,theta3,z3,theta20,theta30,center) for center in centers])
         below_theta=np.where(ocean[None,:,:],water_theta,land_theta)
-        beta=np.asarray(np.log(np.asarray(
-            source_pressure[0]/source_pressure[1],dtype=np.float64))/
-            np.asarray(height[1]-height[0],dtype=np.float64),dtype=np.float64)
-        center_pressure=np.asarray(source_pressure[0][None,:,:]*np.exp(np.asarray(
-            -beta[None,:,:]*np.asarray(centers[:,None,None]-height[0][None,:,:],dtype=np.float64),
-            dtype=np.float64)),dtype=np.float64)
-        night_temperature=np.asarray(below_theta*np.power(np.asarray(
-            center_pressure/np.float64(1000.),dtype=np.float64),np.float64(.286)),dtype=np.float64)
+        beta=np.log(source_pressure[0]/source_pressure[1])/(height[1]-height[0])
+        center_pressure=source_pressure[0][None,:,:]*np.exp(
+            -beta[None,:,:]*(centers[:,None,None]-height[0][None,:,:]))
+        night_temperature=below_theta*np.power(center_pressure/1000.,.286)
         source_temperature_centers=np.where(night_below,night_temperature,source_temperature_centers)
     if source_sst is not None:
         ocean=np.asarray(dataset['landuse'][:])==prognostic_ocean_category
@@ -888,11 +797,8 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
     temperature=mapper.interpolate(source_temperature_centers)
     q=mapper.interpolate(_vertical_centers(source_q_above,thermo_height,centers))
     pressure=mapper.interpolate(_vertical_centers(source_pressure_above,thermo_height,centers))
-    # RDMM5 reads the integer IRH field written in every M3D level record; it
-    # does not reconstruct RH from the separately rounded Q/T/P fields.  That
-    # reconstruction can differ by one percent (and much more in very dry
-    # upper layers), which changes CLOUD4 at its 99/100-percent boundary.
-    source_rh=_m3d_relative_humidity(
+    # Prefer the canonical relative-humidity field when it is available.
+    source_rh=_source_relative_humidity(
         dataset,time_index,source_q,source_pressure,source_temperature)
     _,source_rh_above=_rdmm5_above_ground_profiles(height,source_rh)
     rh850=None
@@ -906,7 +812,7 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
     else:
         raise ValueError('cloud_method must be MCLOUD 3 or 4')
     if 'qcloud' in dataset.variables:
-        source_qcloud=_m3d_cloud_water_g_kg(dataset['qcloud'][time_index])
+        source_qcloud=_cloud_water_g_kg(dataset['qcloud'][time_index])
         source_aux=cloud_liquid_water_profile(source_qcloud,height,z_faces_m)
         auxiliary_cloud=(mapper.nearest(source_aux[0]),mapper.nearest(source_aux[1]),
                          mapper.nearest(source_aux[2]),mapper.nearest(source_aux[3]))
@@ -917,9 +823,6 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
         source_qc_ceiling=np.take_along_axis(height,first[None,:,:],axis=0)[0]
         source_qc_ceiling=np.where(present.any(axis=0),source_qc_ceiling,0.)
         mapped_ceiling=mapper.interpolate(source_qc_ceiling,ignore_zero=True)
-        # ICEILG is integer hundreds of feet; expose metres while retaining
-        # the old INT(ceil/30.28) quantisation used by PGTSTB.
-        mapped_ceiling=np.trunc(mapped_ceiling/30.28)*30.48
     else:
         cloudy=np.ones(mapper.target_shape,dtype=bool)
         cloud_water=None
@@ -929,44 +832,33 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
         source_cloud,source_rh850 if cloud_method==3 else None,mapper,cloud_method)
     mapped_cloud=np.where(cloudy,mapped_source_cloud,0.)
     mapped_ceiling=np.where(cloudy,mapped_ceiling,0.)
-    surface_profile=np.asarray(source_temperature_above[0]+np.float64(.0098)*z2,
-                               dtype=np.float64)
+    surface_profile=source_temperature_above[0]+.0098*z2
     if source_sun is not None:
         water_surface=theta2-z2*(theta3-theta2)/(z3-z2)
         land_surface=_stull_temperature(theta2,z2,theta3,z3,theta20,theta30,0.)
         surface_theta=np.where(
             np.asarray(dataset['landuse'][:])==prognostic_ocean_category,
             water_surface,land_surface)
-        beta=np.asarray(np.log(np.asarray(
-            source_pressure[0]/source_pressure[1],dtype=np.float64))/
-            np.asarray(height[1]-height[0],dtype=np.float64),dtype=np.float64)
-        surface_p=np.asarray(source_pressure[0]*np.exp(
-            np.asarray(beta*height[0],dtype=np.float64)),dtype=np.float64)
-        night_surface=np.asarray(surface_theta*np.power(np.asarray(
-            surface_p/np.float64(1000.),dtype=np.float64),np.float64(.286)),dtype=np.float64)
+        beta=np.log(source_pressure[0]/source_pressure[1])/(height[1]-height[0])
+        surface_p=source_pressure[0]*np.exp(beta*height[0])
+        night_surface=surface_theta*np.power(surface_p/1000.,.286)
         surface_profile=np.where(source_sun>0.,surface_profile,night_surface)
     if source_sst is not None:
         ocean=np.asarray(dataset['landuse'][:])==prognostic_ocean_category
-        surface_profile=np.where(ocean,source_sst,surface_profile).astype(np.float64)
+        surface_profile=_model_array(np.where(ocean,source_sst,surface_profile))
     profile_temperature=np.concatenate((mapper.nearest(surface_profile)[None,:,:],
                                         mapper.nearest(source_temperature_above)),axis=0)
-    profile_height=np.concatenate((np.zeros((1,grid.ny,grid.nx),dtype=np.float64),
+    profile_height=np.concatenate((np.zeros((1,grid.ny,grid.nx),dtype=MODEL_DTYPE),
                                    mapper.nearest(thermo_height)),axis=0)
-    surface_temperature=mapper.interpolate(_quantize_real4(dataset['temperature_2m'][time_index],10.))
-    raw_surface_pressure=np.asarray(dataset['surface_pressure'][time_index],dtype=np.float64)
-    surface_pressure=mapper.interpolate(np.asarray(_fortran_nint_positive(
-        np.asarray(raw_surface_pressure*np.float64(.1),dtype=np.float64))/np.float64(10.),
-        dtype=np.float64))
+    surface_temperature=mapper.interpolate(np.asarray(
+        dataset['temperature_2m'][time_index],dtype=MODEL_DTYPE))
+    raw_surface_pressure=np.asarray(
+        dataset['surface_pressure'][time_index],dtype=MODEL_DTYPE)
+    surface_pressure=mapper.interpolate(raw_surface_pressure*.01)
     surface_density=mapper.interpolate(_rdmm5_surface_density(
         source_pressure,source_temperature,height))
-    # Despite its comment, RDMM5's R2INTERP2 call receives RH(:,:,1): the
-    # integer RH of the first 3-D prognostic layer, not Q2/T2 surface RH.
-    mapped_surface_rh=mapper.interpolate(source_rh[0])
-    nearest_integer=np.rint(mapped_surface_rh)
-    mapped_surface_rh=np.where(
-        np.abs(mapped_surface_rh-nearest_integer)<1.e-6,
-        nearest_integer,mapped_surface_rh)
-    surface_rh=np.trunc(mapped_surface_rh).astype(np.int32)
+    # Surface RH follows the first three-dimensional prognostic layer.
+    surface_rh=mapper.interpolate(source_rh[0])
     precipitation=mapper.radius_interpolate(np.asarray(dataset['precipitation'][time_index]),
         precipitation_radius_km,cutoff=precipitation_cutoff,method=precipitation_interpolation)
     overwater_data=None
@@ -975,14 +867,15 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
         source_ocean=np.asarray(dataset['landuse'][:])==prognostic_ocean_category
         nearest_ocean=lambda field: mapper.nearest_masked(field,source_ocean)
         ocean_height=nearest_ocean(z2)
-        ocean_longitude=nearest_ocean(lon)
+        ocean_longitude=mapper.nearest_masked(
+            lon,source_ocean,dtype=COORDINATE_DTYPE)
         shape=mapper.target_shape
         overwater_data=GriddedSeaData(
             nearest_ocean(source_temperature_above[0]),nearest_ocean(source_sst),
             nearest_ocean(source_rh_above[0]),ocean_height,ocean_height,
-            np.full(shape,np.float64(.05),dtype=np.float64),
-            np.full(shape,np.float64(-999.),dtype=np.float64),
-            np.full(shape,np.float64(-999.),dtype=np.float64),ocean_longitude)
+            np.full(shape,.05,dtype=MODEL_DTYPE),
+            np.full(shape,-999.,dtype=MODEL_DTYPE),
+            np.full(shape,-999.,dtype=MODEL_DTYPE),ocean_longitude)
     return Step1Fields(
         u,v,temperature,
         surface_temperature,
@@ -1016,27 +909,27 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
 
 def build_prog_step_fields(prog_data,ending_hour,grid: GridConfig,z_faces_m,*,record=None):
     """Create the wind-only Step-1 scaffold used by legacy ``PROG.DAT``."""
-    faces=np.asarray(z_faces_m,dtype=np.float64)
+    faces=np.asarray(z_faces_m,dtype=MODEL_DTYPE)
     centers=.5*(faces[:-1]+faces[1:])
     u,v=(prog_data.interpolate(ending_hour,grid,centers) if record is None else
          prog_data.interpolate_record(record,grid,centers))
     shape=(grid.ny,grid.nx)
     level_shape=(centers.size,*shape)
-    surface_temperature=np.full(shape,np.float64(288.7),dtype=np.float64)
-    profile_height=np.broadcast_to(np.r_[np.float64(0.),centers][:,None,None],
+    surface_temperature=np.full(shape,288.7,dtype=MODEL_DTYPE)
+    profile_height=np.broadcast_to(np.r_[MODEL_DTYPE(0.),centers][:,None,None],
                                    (centers.size+1,*shape)).copy()
-    profile_temperature=np.full_like(profile_height,np.float64(288.7))
+    profile_temperature=np.full_like(profile_height,288.7)
     return Step1Fields(
-        u,v,np.full(level_shape,np.float64(288.7),dtype=np.float64),surface_temperature,
-        np.full(shape,np.float64(1000.),dtype=np.float64),
-        np.full(shape,np.float64(.3484321)*np.float64(1000.)/np.float64(288.7),dtype=np.float64),
-        np.full(level_shape,np.float64(80.),dtype=np.float64),
-        np.full(shape,np.float64(50.),dtype=np.float64),np.zeros(shape,dtype=np.float64),
-        np.full(shape,np.float64(.1),dtype=np.float64),np.zeros(shape,dtype=np.float64),
-        np.zeros(shape,dtype=np.float64),profile_temperature,profile_height,
-        np.full(shape,80,dtype=np.int32),np.zeros(shape,dtype=np.float64),
+        u,v,np.full(level_shape,288.7,dtype=MODEL_DTYPE),surface_temperature,
+        np.full(shape,1000.,dtype=MODEL_DTYPE),
+        np.full(shape,.3484321*1000./288.7,dtype=MODEL_DTYPE),
+        np.full(level_shape,80.,dtype=MODEL_DTYPE),
+        np.full(shape,50.,dtype=MODEL_DTYPE),np.zeros(shape,dtype=MODEL_DTYPE),
+        np.full(shape,.1,dtype=MODEL_DTYPE),np.zeros(shape,dtype=MODEL_DTYPE),
+        np.zeros(shape,dtype=MODEL_DTYPE),profile_temperature,profile_height,
+        np.full(shape,80.,dtype=MODEL_DTYPE),np.zeros(shape,dtype=MODEL_DTYPE),
         np.zeros(shape,dtype=np.int32),prognostic_temperature=np.full(
-            level_shape,np.float64(288.7),dtype=np.float64))
+            level_shape,288.7,dtype=MODEL_DTYPE))
 
 
 def build_mm4_step_fields(mm4_data,record,grid: GridConfig,z_faces_m,*,cloud_method=4,
@@ -1047,8 +940,8 @@ def build_mm4_step_fields(mm4_data,record,grid: GridConfig,z_faces_m,*,cloud_met
                           prognostic_observation_barrier_top_level=0,
                           prognostic_ocean_category=16):
     """Create the complete Step-1 scaffold produced by native ``RDMM4``."""
-    faces=np.asarray(z_faces_m,dtype=np.float64)
-    centers=np.float64(.5)*(faces[:-1]+faces[1:])
+    faces=np.asarray(z_faces_m,dtype=MODEL_DTYPE)
+    centers=.5*(faces[:-1]+faces[1:])
     fields=mm4_data.interpolate_record(record,grid,centers,cloud_method=cloud_method,
         precipitation_method=precipitation_interpolation,
         precipitation_radius_km=precipitation_radius_km,
@@ -1061,10 +954,10 @@ def build_mm4_step_fields(mm4_data,record,grid: GridConfig,z_faces_m,*,cloud_met
     shape=(grid.ny,grid.nx)
     return Step1Fields(fields.u,fields.v,fields.temperature_k,
         fields.surface_temperature_k,fields.surface_pressure_mb,fields.surface_density,
-        fields.relative_humidity,np.zeros(shape,dtype=np.float64),
-        np.zeros(shape,dtype=np.float64),np.full(shape,np.float64(.1),dtype=np.float64),
+        fields.relative_humidity,np.zeros(shape,dtype=MODEL_DTYPE),
+        np.zeros(shape,dtype=MODEL_DTYPE),np.full(shape,.1,dtype=MODEL_DTYPE),
         fields.cloud_fraction,fields.ceiling_height_m,fields.profile_temperature_k,
-        fields.profile_height_m,fields.surface_relative_humidity,
+        fields.profile_height_m,_model_array(fields.surface_relative_humidity),
         fields.precipitation_mm_h,fields.precipitation_code,fields.thermal_state,
         prognostic_observation_u=fields.prognostic_observation_u,
         prognostic_observation_v=fields.prognostic_observation_v,
@@ -1100,8 +993,9 @@ def build_surface_fields(step: Step1Fields, landuse, roughness, albedo,
                          previous_water_mixing_height=None):
     """Compose COMP's current NOOBS land and no-SEA.DAT water pathways."""
     landuse=np.asarray(landuse); water=(landuse>=water_range[0])&(landuse<=water_range[1]); land=~water
-    temp=np.asarray(step.temperature[0] if surface_temperature is None else surface_temperature)
-    density=np.asarray(step.surface_density)
+    temp=np.asarray(step.temperature[0] if surface_temperature is None else
+                    surface_temperature,dtype=MODEL_DTYPE)
+    density=np.asarray(step.surface_density,dtype=MODEL_DTYPE)
     qh,qsw=heat_flux(solar_elevation_sine,step.cloud_fraction,temp,
         landuse,albedo,bowen_ratio,soil_heat_flux_parameter,anthropogenic_heat_flux,
         water_range=water_range,turbidity_coefficient_1=turbidity_coefficient_1,
@@ -1131,9 +1025,8 @@ def build_surface_fields(step: Step1Fields, landuse, roughness, albedo,
     water_z0,water_ustar,water_length,water_qh,water_zi,water_zic=neutral_water_parameters(
         step.u[0],step.v[0],coriolis,constw=constw,minimum_height_m=minimum_water_height_m,
         maximum_height_m=maximum_water_height_m)
-    initial_water_mechanical=np.asarray(
-        np.float64(constw)*water_ustar/np.asarray(coriolis,dtype=np.float64),
-        dtype=np.float64)
+    initial_water_mechanical=_model_array(
+        constw*water_ustar/np.asarray(coriolis,dtype=MODEL_DTYPE))
     # WATERP (ITWPROG=2) always computes offshore mixing height from the
     # prognostic profile.  SEA.DAT may still be open for wave observations,
     # but its ZIOW records are not consulted on this path.
@@ -1141,47 +1034,38 @@ def build_surface_fields(step: Step1Fields, landuse, roughness, albedo,
         observed_water_mixing_height=None
     if observed_water_mixing_height is None:
         observed_water=np.zeros_like(water,dtype=bool)
-        observed_zi=np.zeros_like(water_zi,dtype=np.float64)
+        observed_zi=np.zeros_like(water_zi,dtype=MODEL_DTYPE)
     else:
-        observed_zi=np.asarray(observed_water_mixing_height,dtype=np.float64)
+        observed_zi=np.asarray(observed_water_mixing_height,dtype=MODEL_DTYPE)
         if observed_zi.shape!=water.shape:
             raise ValueError('observed water mixing-height shape mismatch')
         observed_water=water&np.isfinite(observed_zi)
-        # WATER assigns observed ZIOW before COARE maps ZI to its REAL*8 RZI
-        # input.  Restore it again below because only unobserved cells execute
-        # the subsequent mechanical/convective height update in the source.
-        water_zi=np.where(observed_water,observed_zi,water_zi).astype(np.float64)
-    coare_water_zi=np.where(observed_water,observed_zi,
-                            initial_water_mechanical).astype(np.float64)
-    # MIXHT/MIXHT2 has already updated land DPTT before WATER is called.
-    # Water cells retain their previous values until WATER's scalar
-    # sequence-association path updates DPTT(1,1).  Initialising the complete
-    # array to zero discarded every new land-cell jump when no SEA data were
-    # configured, which first became visible in the following hour.
-    water_jump=np.where(
-        water,np.asarray(previous_temperature_jump,dtype=np.float64),
-        np.asarray(jump,dtype=np.float64)).astype(np.float64)
+        water_zi=_model_array(np.where(observed_water,observed_zi,water_zi))
+    coare_water_zi=_model_array(np.where(
+        observed_water,observed_zi,initial_water_mechanical))
+    # Preserve each water cell's state until its own surface calculation
+    # supplies an update; land cells use the newly calculated jump.
+    water_jump=_model_array(np.where(
+        water,np.asarray(previous_temperature_jump,dtype=MODEL_DTYPE),
+        np.asarray(jump,dtype=MODEL_DTYPE)))
     water_theta=temp
-    water_state=(np.zeros_like(water_zi,dtype=np.float64)
+    water_state=(np.zeros_like(water_zi,dtype=MODEL_DTYPE)
                  if previous_water_convective_height is None else
-                 np.asarray(previous_water_convective_height,dtype=np.float64).copy())
+                 np.asarray(previous_water_convective_height,dtype=MODEL_DTYPE).copy())
     if water_state.shape!=water.shape:
         raise ValueError('previous water convective-height state shape mismatch')
     if step.overwater_data is not None:
         sea=step.overwater_data
-        f32=np.float64
-        humidity=np.asarray(np.where(sea.relative_humidity<f32(9998.99),
-                                     sea.relative_humidity,f32(100.)),dtype=f32)
-        saturation=saturation_vapor_pressure_lowe(
-            np.asarray(sea.air_temperature_k,dtype=f32)-f32(273.15))
-        vapor_pressure=np.asarray(f32(.01)*humidity*saturation,dtype=f32)
-        mixing_ratio=np.asarray(f32(.622)*vapor_pressure/
-                                (f32(1000.)-vapor_pressure),dtype=f32)
-        specific_humidity=np.asarray(mixing_ratio/(f32(1.)+mixing_ratio)*f32(1000.),
-                                     dtype=f32)
-        water_theta=np.asarray(np.asarray(sea.air_temperature_k,dtype=f32)*
-            (f32(1.)+f32(.61)*mixing_ratio)+
-            f32(.01)*np.asarray(sea.anemometer_height_m,dtype=f32),dtype=f32)
+        air_temperature=np.asarray(sea.air_temperature_k,dtype=MODEL_DTYPE)
+        humidity=_model_array(np.where(
+            sea.relative_humidity<9998.99,sea.relative_humidity,100.))
+        saturation=saturation_vapor_pressure_lowe(air_temperature-273.15)
+        vapor_pressure=.01*humidity*saturation
+        mixing_ratio=.622*vapor_pressure/(1000.-vapor_pressure)
+        specific_humidity=_model_array(mixing_ratio/(1.+mixing_ratio)*1000.)
+        water_theta=_model_array(
+            air_temperature*(1.+.61*mixing_ratio)+
+            .01*np.asarray(sea.anemometer_height_m,dtype=MODEL_DTYPE))
         if overwater_flux_method==0:
             water_theta,difference,difference_10m,theta_10m=(
                 overwater_delta_temperature_state(
@@ -1190,18 +1074,18 @@ def build_surface_fields(step: Step1Fields, landuse, roughness, albedo,
             water_length,water_ustar,water_qh=delta_temperature_flux(
                 np.hypot(step.u[0],step.v[0]),sea.anemometer_height_m,difference,
                 difference_10m,theta_10m,water_theta,water_z0)
-            water_length=np.asarray(water_length,dtype=np.float64)
-            water_ustar=np.asarray(water_ustar,dtype=np.float64)
-            water_qh=np.asarray(water_qh,dtype=np.float64)
-            water_wt=np.asarray(water_qh/np.float64(1195.2),dtype=np.float64)
+            water_length=np.asarray(water_length,dtype=MODEL_DTYPE)
+            water_ustar=np.asarray(water_ustar,dtype=MODEL_DTYPE)
+            water_qh=np.asarray(water_qh,dtype=MODEL_DTYPE)
+            water_wt=_model_array(water_qh/1195.2)
         else:
             longwave=downward_longwave(temp,step.surface_relative_humidity,
                                        step.cloud_fraction,step.ceiling_height)
             coast=distance_to_coast(landuse,water_range,dx_km,dy_km)
             # WATER/WATERP clamp SST only on entry to COARE.  DELTAT above
             # deliberately receives the original, potentially colder value.
-            sea_temperature=np.maximum(np.asarray(sea.sea_temperature_k,dtype=np.float64),
-                                       np.float64(270.15))
+            sea_temperature=np.maximum(
+                np.asarray(sea.sea_temperature_k,dtype=MODEL_DTYPE),270.15)
             next_warm_state=warm_layer_state
             if warm_layer:
                 if next_warm_state is None:
@@ -1225,70 +1109,56 @@ def build_surface_fields(step: Step1Fields, landuse, roughness, albedo,
                 wave_height_m=(sea.wave_height_m if overwater_flux_method<0 else -999.),
                 coastal_shelf_length_km=coastal_shelf_length_km,
                 distance_to_coast_km=coast,cool_skin=cool_skin)
-            water_z0=np.asarray(flux.roughness_m,dtype=np.float64)
-            water_ustar=np.asarray(flux.friction_velocity_m_s,dtype=np.float64)
-            water_length=np.asarray(flux.monin_obukhov_m,dtype=np.float64)
-            # WATER converts COARE's REAL*8 EL back to default REAL before
-            # applying its near-zero guard.  EL=0 follows the positive arm.
-            water_length=np.where(np.abs(water_length)<np.float64(5.),
-                np.where(water_length<np.float64(0.),np.float64(-5.),np.float64(5.)),
-                water_length).astype(np.float64)
-            water_wt=np.asarray(flux.buoyancy_flux_k_m_s,dtype=np.float64)
-            water_qh=np.asarray(water_wt*np.float64(1195.2),dtype=np.float64)
+            water_z0=np.asarray(flux.roughness_m,dtype=MODEL_DTYPE)
+            water_ustar=np.asarray(flux.friction_velocity_m_s,dtype=MODEL_DTYPE)
+            water_length=np.asarray(flux.monin_obukhov_m,dtype=MODEL_DTYPE)
+            water_length=_model_array(np.where(
+                np.abs(water_length)<5.,np.where(water_length<0.,-5.,5.),water_length))
+            water_wt=np.asarray(flux.buoyancy_flux_k_m_s,dtype=MODEL_DTYPE)
+            water_qh=_model_array(water_wt*1195.2)
             if warm_layer:
                 next_warm_state=update_warm_layer_fluxes(next_warm_state,flux)
         mechanical=water_mechanical_height(water_ustar,coriolis,constw=constw,
             minimum_height_m=minimum_water_height_m,
             maximum_height_m=maximum_water_height_m)
         if mixing_method>0:
-            prior_water_zi=(np.full_like(water_state,np.float64(minimum_water_height_m))
+            prior_water_zi=(np.full_like(water_state,minimum_water_height_m)
                             if previous_water_mixing_height is None else
-                            np.asarray(previous_water_mixing_height,dtype=np.float64))
+                            np.asarray(previous_water_mixing_height,dtype=MODEL_DTYPE))
             if prior_water_zi.shape!=water.shape:
                 raise ValueError('previous water mixing-height state shape mismatch')
             # WATER first bounds last hour's ZI by ZIMINW, then constrains its
             # saved ZICOLD not to exceed that total height.
-            prior_water_zi=np.maximum(prior_water_zi,np.float64(minimum_water_height_m))
+            prior_water_zi=np.maximum(prior_water_zi,minimum_water_height_m)
             old_water=np.maximum(np.minimum(water_state,prior_water_zi),
-                                 np.float64(minimum_water_height_m))
+                                 minimum_water_height_m)
             if water_temperature_mode==0:
                 gradient=(default_water_gradient_above
                           if step.water_mixing_gradient_above is None
                           else step.water_mixing_gradient_above)
-                potential_lapse=np.asarray(gradient)+.0098
+                potential_lapse=np.asarray(gradient,dtype=MODEL_DTYPE)+.0098
             else:
                 _,_,potential_lapse=profile_temperature_layer(
                     step.profile_temperature,step.profile_height,old_water,lapse_depth_m,
                     minimum_lapse=minimum_lapse)
             if abs(mixing_method)==1:
-                # WATER passes bare ``DPTT`` (rather than DPTT(I,J)) to
-                # MIXHMC.  Fortran sequence association therefore makes all
-                # water calls share DPTT(1,1).  Preserve its I-outer/J-inner
-                # order because each call feeds the next one.
-                water_zic=np.zeros_like(old_water,dtype=np.float64)
-                shared_jump=np.float64(
-                    np.asarray(previous_temperature_jump,dtype=np.float64)[0,0])
                 active_water=water&~observed_water
-                cell_lapse=np.broadcast_to(np.asarray(potential_lapse,dtype=np.float64),
-                                           water.shape)
-                for ix in range(water.shape[1]):
-                    for iy in range(water.shape[0]):
-                        if not active_water[iy,ix]:
-                            continue
-                        cell_zic,cell_jump=convective_height_maul_carson(
-                            old_water[iy,ix],shared_jump,water_wt[iy,ix],
-                            cell_lapse[iy,ix],timestep_s=timestep_s,
-                            threshold_flux_per_m=water_flux_threshold,
-                            maximum_height_m=maximum_water_height_m,
-                            minimum_lapse=minimum_lapse,conste=conste,
-                            relaxation=relaxation,
-                            relaxation_time_s=relaxation_time_s)
-                        water_zic[iy,ix]=cell_zic
-                        shared_jump=np.float64(cell_jump)
-                water_jump=np.where(
-                    water,np.asarray(previous_temperature_jump,dtype=np.float64),
-                    np.asarray(jump,dtype=np.float64)).astype(np.float64)
-                water_jump[0,0]=shared_jump
+                calculated_zic,calculated_jump=convective_height_maul_carson(
+                    old_water,np.asarray(previous_temperature_jump,dtype=MODEL_DTYPE),
+                    water_wt,np.broadcast_to(
+                        np.asarray(potential_lapse,dtype=MODEL_DTYPE),water.shape),
+                    timestep_s=timestep_s,
+                    threshold_flux_per_m=water_flux_threshold,
+                    maximum_height_m=maximum_water_height_m,
+                    minimum_lapse=minimum_lapse,conste=conste,
+                    relaxation=relaxation,
+                    relaxation_time_s=relaxation_time_s)
+                water_zic=_model_array(np.where(active_water,calculated_zic,0.))
+                water_jump=_model_array(np.where(
+                    water,np.where(active_water,calculated_jump,
+                                   np.asarray(previous_temperature_jump,
+                                              dtype=MODEL_DTYPE)),
+                    np.asarray(jump,dtype=MODEL_DTYPE)))
             else:
                 water_zic=convective_height_batchvarova_gryning(
                     old_water,water_wt,potential_lapse,water_ustar,
@@ -1297,33 +1167,36 @@ def build_surface_fields(step: Step1Fields, landuse, roughness, albedo,
                     maximum_height_m=maximum_water_height_m,
                     threshold_flux_per_m=water_flux_threshold,minimum_lapse=minimum_lapse,
                     relaxation=relaxation,relaxation_time_s=relaxation_time_s)
-                water_jump=np.asarray(previous_temperature_jump,dtype=np.float64)
-            water_zi=np.clip(np.maximum(mechanical,np.asarray(water_zic,dtype=np.float64)),
-                np.float64(minimum_water_height_m),np.float64(maximum_water_height_m)).astype(np.float64)
-            water_state=np.where(water&~observed_water,water_zic,water_state).astype(np.float64)
+                water_jump=np.asarray(previous_temperature_jump,dtype=MODEL_DTYPE)
+            water_zi=_model_array(np.clip(
+                np.maximum(mechanical,np.asarray(water_zic,dtype=MODEL_DTYPE)),
+                minimum_water_height_m,maximum_water_height_m))
+            water_state=_model_array(np.where(
+                water&~observed_water,water_zic,water_state))
         else:
             water_zi=mechanical; water_zic=np.zeros_like(mechanical)
             water_jump=np.zeros_like(mechanical)
-            water_state=np.where(water&~observed_water,np.float64(0.),water_state).astype(
-                np.float64)
-    water_zi=np.where(observed_water,observed_zi,water_zi).astype(np.float64)
+            water_state=_model_array(np.where(water&~observed_water,0.,water_state))
+    water_zi=_model_array(np.where(observed_water,observed_zi,water_zi))
     water_wstar=convective_velocity_scale(
         water_zi if mixing_method<0 else water_zic,water_qh,water_theta,density,
         landuse,water_range=water_range)
     # WATER's scalar ZICONV is local to that subroutine and is used for its
     # pre-AVEMIX WSTAR only.  The COMP/MIXHT ZICONV grid skips water cells,
     # retaining their previous value until optional AVEMIX changes the grid.
-    grid_zic=np.where(water,np.asarray(previous_convective_height,dtype=np.float64),zic)
+    grid_zic=np.where(water,np.asarray(previous_convective_height,dtype=MODEL_DTYPE),zic)
     return SurfaceFields(
-        np.where(water,water_z0,roughness),density,qsw,np.where(water,water_qh,qh),
-        np.where(water,water_ustar,ustar),np.where(water,water_length,length),
-        np.where(water,water_zi,zi),grid_zic,
-        (water_jump if abs(mixing_method)==1 and mixing_method>0 else
-         np.where(water,water_jump,jump)),
+        _model_array(np.where(water,water_z0,roughness)),_model_array(density),
+        _model_array(qsw),_model_array(np.where(water,water_qh,qh)),
+        _model_array(np.where(water,water_ustar,ustar)),
+        _model_array(np.where(water,water_length,length)),
+        _model_array(np.where(water,water_zi,zi)),_model_array(grid_zic),
+        _model_array(water_jump if abs(mixing_method)==1 and mixing_method>0 else
+                     np.where(water,water_jump,jump)),
         next_warm_state if step.overwater_data is not None and
         abs(overwater_flux_method)>=10 and warm_layer else warm_layer_state,
-        np.where(water,water_wstar,0.).astype(np.float64),
-        water_state,
+        _model_array(np.where(water,water_wstar,0.)),
+        _model_array(water_state),
     )
 
 def build_diagnostic_wind(step: Step1Fields, terrain_m, landuse, roughness,
@@ -1348,25 +1221,27 @@ def build_diagnostic_wind(step: Step1Fields, terrain_m, landuse, roughness,
                           smoothing_passes=(2,4,4,4,4,4,4,4,4,4),
                           retain_debug_stages=False):
     """Current Zhejiang DIAGNO path (IKINE=0, IFRADJ=1, ISLOPE=1)."""
-    terrain=np.asarray(terrain_m,dtype=np.float64)
-    faces=np.asarray(z_faces_m,dtype=np.float64)
-    centers=np.float64(.5)*(faces[:-1]+faces[1:])
+    terrain=np.asarray(terrain_m,dtype=MODEL_DTYPE)
+    faces=np.asarray(z_faces_m,dtype=MODEL_DTYPE)
+    centers=.5*(faces[:-1]+faces[1:])
     gamma=(lapse_rate(step.temperature,previous_convective_height,centers,lapse_height_m,spatial=spatial_lapse)
-           if lapse_rate_override is None else np.asarray(lapse_rate_override,dtype=np.float64))
+           if lapse_rate_override is None else np.asarray(lapse_rate_override,dtype=MODEL_DTYPE))
     if terrain_context is None:
         terrain_context=terrain_extrema(terrain,terrain_radius_km,dx_m,dy_m)
     highest,lowest,distance_high,distance_low=terrain_context
-    u=np.asarray(step.u); v=np.asarray(step.v)
+    u=np.asarray(step.u,dtype=MODEL_DTYPE)
+    v=np.asarray(step.v,dtype=MODEL_DTYPE)
     if step.diagnostic_surface_temperature is not None:
-        diagnostic_temperature=np.asarray(step.diagnostic_surface_temperature)
+        diagnostic_temperature=np.asarray(step.diagnostic_surface_temperature,
+                                          dtype=MODEL_DTYPE)
     elif spatial_surface_temperature:
-        diagnostic_temperature=np.asarray(step.temperature[0])
+        diagnostic_temperature=np.asarray(step.temperature[0],dtype=MODEL_DTYPE)
     else:
         prognostic=(step.temperature if step.prognostic_temperature is None else
                     step.prognostic_temperature)
         diagnostic_temperature=np.full_like(
-            step.temperature[0],_domain_mean_real4(np.asarray(prognostic)[0]))
-    stage_w=np.zeros((faces.size,*terrain.shape),dtype=np.float64)
+            step.temperature[0],_domain_mean(np.asarray(prognostic)[0]))
+    stage_w=np.zeros((faces.size,*terrain.shape),dtype=MODEL_DTYPE)
     if use_kinematic:
         boundaries=(u[:,:,0].copy(),u[:,:,-1].copy(),v[:,0,:].copy(),v[:,-1,:].copy())
         topo_w=topographic_vertical_velocity(u,v,terrain,z_faces_m,gamma,step.temperature[0],
@@ -1376,13 +1251,13 @@ def build_diagnostic_wind(step: Step1Fields, terrain_m, landuse, roughness,
             maximum_iterations=divergence_iterations,limit=divergence_limit)
     kinematic_stage=((u.copy(),v.copy(),stage_w.copy()) if retain_debug_stages else None)
     if use_froude:
-        preliminary_temp,_=upwind_mixing_average(u[0],v[0],diagnostic_temperature,diagnostic_temperature,dx_m,
+        preliminary_temp,_=upwind_mixing_average(u[0],v[0],diagnostic_temperature,diagnostic_temperature,dx_m,dy_m,
             minimum_radius_cells=minimum_average_radius,half_angle_degrees=half_average_angle,timestep_s=timestep_s)
         u,v=froude_adjustment(u,v,terrain,highest,gamma,preliminary_temp,centers,critical_froude,dx_m,dy_m)
     froude_stage=((u.copy(),v.copy(),stage_w.copy()) if retain_debug_stages else None)
     preliminary_qh=np.zeros_like(terrain)
     if use_slope:
-        preliminary_temp,_=upwind_mixing_average(u[0],v[0],diagnostic_temperature,diagnostic_temperature,dx_m,
+        preliminary_temp,_=upwind_mixing_average(u[0],v[0],diagnostic_temperature,diagnostic_temperature,dx_m,dy_m,
             minimum_radius_cells=minimum_average_radius,half_angle_degrees=half_average_angle,timestep_s=timestep_s)
         preliminary_qh,_=heat_flux(solar_elevation_sine,step.cloud_fraction,preliminary_temp,
             landuse,albedo,bowen_ratio,soil_heat_flux_parameter,anthropogenic_heat_flux,
@@ -1396,7 +1271,7 @@ def build_diagnostic_wind(step: Step1Fields, terrain_m, landuse, roughness,
         # DIAGNO calls AIRDEN here only while ITPROG < 2.  The complete
         # prognostic-temperature path retains RDMM5's density derived from
         # the first source-model level at or above ground.
-        density=(np.asarray(step.surface_density,dtype=np.float64)
+        density=(np.asarray(step.surface_density,dtype=MODEL_DTYPE)
                  if temperature_mode==2 else
                  density_from_pressure_temperature(
                      step.surface_pressure_mb,preliminary_temp))
@@ -1429,11 +1304,12 @@ def build_objective_wind(step: Step1Fields, terrain_m, previous_convective_heigh
                          retain_debug_stages=False):
     """IWFCOD=0 wind finalisation after INTERP objective analysis."""
     gamma=(lapse_rate(step.temperature,previous_convective_height,
-                      np.float64(.5)*(np.asarray(z_faces_m[:-1],dtype=np.float64)+
-                                      np.asarray(z_faces_m[1:],dtype=np.float64)),
+                      .5*(np.asarray(z_faces_m[:-1],dtype=MODEL_DTYPE)+
+                          np.asarray(z_faces_m[1:],dtype=MODEL_DTYPE)),
                       lapse_height_m,spatial=spatial_lapse)
-           if lapse_rate_override is None else np.asarray(lapse_rate_override,dtype=np.float64))
-    interpolated=((np.asarray(step.u).copy(),np.asarray(step.v).copy())
+           if lapse_rate_override is None else np.asarray(lapse_rate_override,dtype=MODEL_DTYPE))
+    interpolated=((np.asarray(step.u,dtype=MODEL_DTYPE).copy(),
+                   np.asarray(step.v,dtype=MODEL_DTYPE).copy())
                   if retain_debug_stages else None)
     u,v=terrain_adjust_surface_wind(step.u,step.v,terrain_m,z_faces_m[-1],dx_m,dy_m)
     adjusted=((u.copy(),v.copy()) if retain_debug_stages else None)
@@ -1448,7 +1324,7 @@ def build_objective_wind(step: Step1Fields, terrain_m, previous_convective_heigh
             u,v,w,z_faces_m,dx_m,dy_m,boundaries=boundaries,
             maximum_iterations=divergence_iterations,limit=divergence_limit)
     return DiagnosticWindFields(u,v,w,divergence,gamma,
-        np.zeros_like(terrain_m,dtype=np.float64),interpolated_stage=interpolated,
+        np.zeros_like(terrain_m,dtype=MODEL_DTYPE),interpolated_stage=interpolated,
         terrain_adjusted_stage=adjusted,initial_stage=initial)
 
 def solve_hour(dataset, time_index, grid: GridConfig, z_faces_m, geophysical,
@@ -1499,7 +1375,11 @@ def solve_hour(dataset, time_index, grid: GridConfig, z_faces_m, geophysical,
     ``timestamp`` is the beginning of the timestep in the CALMET base time
     zone. SOLAR is linearly interpolated to the timestep midpoint as in COMP.
     """
-    geo={name:np.asarray(geophysical[name]) for name in ('terrain_height','dominant_landuse','roughness_length','albedo','bowen_ratio','soil_heat_flux_parameter','anthropogenic_heat_flux')}
+    geo={name:(np.asarray(geophysical[name]) if name=='dominant_landuse' else
+               np.asarray(geophysical[name],dtype=MODEL_DTYPE))
+         for name in ('terrain_height','dominant_landuse','roughness_length',
+                      'albedo','bowen_ratio','soil_heat_flux_parameter',
+                      'anthropogenic_heat_flux')}
     if step_override is not None:
         step=step_override
     elif step_provider is not None:
@@ -1508,7 +1388,7 @@ def solve_hour(dataset, time_index, grid: GridConfig, z_faces_m, geophysical,
         record_time=_prognostic_local_timestamp(
             dataset,time_index,base_timezone)
         step=build_step1_fields(dataset,time_index,grid,z_faces_m,
-              timestamp=record_time,solar_day=timestamp,base_timezone=base_timezone,
+              timestamp=record_time,base_timezone=base_timezone,
               thermal_state=source_thermal_state,mapper=mapper,cloud_method=4 if cloud_method in {1,2} else cloud_method,
               precipitation_interpolation=precipitation_interpolation,
               precipitation_radius_km=precipitation_radius_km,
@@ -1523,36 +1403,36 @@ def solve_hour(dataset, time_index, grid: GridConfig, z_faces_m, geophysical,
             raise ValueError('IPROG=15 requires prognostic observation mapping fields')
         step=replace(step,u=step.prognostic_observation_u,v=step.prognostic_observation_v)
     if cloud_fraction_override is not None:
-        cloud=np.asarray(cloud_fraction_override,dtype=np.float64)
+        cloud=np.asarray(cloud_fraction_override,dtype=MODEL_DTYPE)
         if cloud.shape!=(grid.ny,grid.nx): raise ValueError('CLOUD.DAT field does not match CALMET grid')
         step=replace(step,cloud_fraction=cloud)
     if cloud_ceiling_override is not None:
-        ceiling=np.asarray(cloud_ceiling_override,dtype=np.float64)
+        ceiling=np.asarray(cloud_ceiling_override,dtype=MODEL_DTYPE)
         if ceiling.shape!=(grid.ny,grid.nx): raise ValueError('surface cloud ceiling does not match CALMET grid')
         # ICEIL is stored in hundreds of feet; Step1Fields uses metres.
-        step=replace(step,ceiling_height=ceiling*np.float64(30.48))
+        step=replace(step,ceiling_height=_model_array(ceiling*30.48))
     latitude,longitude=(target_latitude_longitude(grid)
                         if target_coordinates is None else target_coordinates)
     sun=solar_at_step_midpoint(timestamp,timestep_s,base_timezone,latitude,longitude)
     coriolis=coriolis_parameter(latitude,coriolis_value)
     end_time=timestamp+timedelta(seconds=timestep_s)
-    # COMP passes only integer NHRZE to COARE; NSECE is deliberately absent.
+    # Preserve the complete interval-ending instant for sub-hourly COARE runs.
     gmt_hour=_coare_ending_gmt_hour(end_time,base_timezone)
     if step_transform is not None:
         if getattr(step_transform,'uses_physical_context',False):
             previous_mixing=(previous_convective_height
                 if previous_water_mixing_height is None else previous_water_mixing_height)
             context=StepTransformContext(
-                sun,np.asarray(previous_convective_height,dtype=np.float64),
-                np.asarray(previous_mixing,dtype=np.float64),
-                np.asarray(previous_temperature_jump,dtype=np.float64),coriolis,
+                sun,np.asarray(previous_convective_height,dtype=MODEL_DTYPE),
+                np.asarray(previous_mixing,dtype=MODEL_DTYPE),
+                np.asarray(previous_temperature_jump,dtype=MODEL_DTYPE),coriolis,
                 warm_layer_state,gmt_hour)
             step=step_transform(step,timestamp,context)
             warm_layer_state=context.warm_layer_state
         else:
             step=step_transform(step,timestamp)
     roughness=(geo['roughness_length'] if step.roughness_override is None else
-               np.asarray(step.roughness_override,dtype=np.float64))
+               np.asarray(step.roughness_override,dtype=MODEL_DTYPE))
     if roughness.shape!=(grid.ny,grid.nx):
         raise ValueError('dynamic roughness field does not match the CALMET grid')
     lapse_override=step.diagnostic_lapse_rate
@@ -1582,20 +1462,20 @@ def solve_hour(dataset, time_index, grid: GridConfig, z_faces_m, geophysical,
               retain_debug_stages=retain_debug_stages))
     final_step=replace(step,u=wind.u,v=wind.v)
     if wind_only:
-        zeros=np.zeros_like(previous_convective_height,dtype=np.float64)
+        zeros=np.zeros_like(previous_convective_height,dtype=MODEL_DTYPE)
         surface=SurfaceFields(
-            np.asarray(roughness,dtype=np.float64),
-            np.asarray(step.surface_density,dtype=np.float64),zeros,zeros,zeros,zeros,
-            np.asarray(previous_convective_height,dtype=np.float64),
-            np.asarray(previous_convective_height,dtype=np.float64),
-            np.asarray(previous_temperature_jump,dtype=np.float64),warm_layer_state)
+            np.asarray(roughness,dtype=MODEL_DTYPE),
+            np.asarray(step.surface_density,dtype=MODEL_DTYPE),zeros,zeros,zeros,zeros,
+            np.asarray(previous_convective_height,dtype=MODEL_DTYPE),
+            np.asarray(previous_convective_height,dtype=MODEL_DTYPE),
+            np.asarray(previous_temperature_jump,dtype=MODEL_DTYPE),warm_layer_state)
         return HourFields(timestamp,final_step,wind,surface,
-                          np.asarray(step.temperature,dtype=np.float64),
+                          np.asarray(step.temperature,dtype=MODEL_DTYPE),
                           selected_lapse_convective_time,step)
     if average_temperature:
-        final_temp,_=upwind_mixing_average(wind.u[0],wind.v[0],surface_temperature_source,surface_temperature_source,grid.dx_km*1000.,minimum_radius_cells=minimum_average_radius,half_angle_degrees=half_average_angle,timestep_s=timestep_s)
+        final_temp,_=upwind_mixing_average(wind.u[0],wind.v[0],surface_temperature_source,surface_temperature_source,grid.dx_km*1000.,grid.dy_km*1000.,minimum_radius_cells=minimum_average_radius,half_angle_degrees=half_average_angle,timestep_s=timestep_s)
     else:
-        final_temp=np.asarray(surface_temperature_source).copy()
+        final_temp=np.asarray(surface_temperature_source,dtype=MODEL_DTYPE).copy()
     surface=build_surface_fields(final_step,geo['dominant_landuse'],roughness,geo['albedo'],geo['bowen_ratio'],geo['soil_heat_flux_parameter'],geo['anthropogenic_heat_flux'],sun,coriolis,previous_convective_height,previous_temperature_jump,first_level_height_m=.5*(z_faces_m[0]+z_faces_m[1]),minimum_height_m=minimum_mixing_height_m,maximum_height_m=maximum_mixing_height_m,minimum_water_height_m=minimum_water_mixing_height_m,maximum_water_height_m=maximum_water_mixing_height_m,water_range=water_range,turbidity_coefficient_1=turbidity_coefficient_1,turbidity_coefficient_2=turbidity_coefficient_2,cloudiness_coefficient_1=cloudiness_coefficient_1,cloudiness_coefficient_2=cloudiness_coefficient_2,net_radiation_coefficient_1=net_radiation_coefficient_1,net_radiation_coefficient_2=net_radiation_coefficient_2,net_radiation_coefficient_3=net_radiation_coefficient_3,mixing_method=mixing_method,minimum_lapse=minimum_lapse,lapse_depth_m=lapse_depth_m,threshold_flux_per_m=land_flux_threshold,constb=constb,conste=conste,constn=constn,constw=constw,relaxation=convective_relaxation,relaxation_time_s=convective_relaxation_time_s,timestep_s=timestep_s,surface_temperature=final_temp,overwater_flux_method=overwater_flux_method,coastal_shelf_length_km=coastal_shelf_length_km,cool_skin=cool_skin,dx_km=grid.dx_km,dy_km=grid.dy_km,water_flux_threshold=water_flux_threshold,water_temperature_mode=water_temperature_mode,default_water_gradient_above=default_water_gradient_above,warm_layer=warm_layer,warm_layer_state=warm_layer_state,longitude=longitude,gmt_hour=gmt_hour,observed_water_mixing_height=step.observed_water_mixing_height,previous_water_convective_height=previous_water_convective_height,previous_water_mixing_height=previous_water_mixing_height)
     if retain_micrometeorology_debug:
         surface=replace(surface,
@@ -1603,7 +1483,7 @@ def solve_hour(dataset, time_index, grid: GridConfig, z_faces_m, geophysical,
             unaveraged_convective_mixing_height=surface.convective_mixing_height.copy())
     if average_mixing_height:
         level=mixing_wind_level-1
-        zi,zic=upwind_mixing_average(wind.u[level],wind.v[level],surface.mixing_height,surface.convective_mixing_height,grid.dx_km*1000.,minimum_radius_cells=minimum_average_radius,half_angle_degrees=half_average_angle,timestep_s=timestep_s)
+        zi,zic=upwind_mixing_average(wind.u[level],wind.v[level],surface.mixing_height,surface.convective_mixing_height,grid.dx_km*1000.,grid.dy_km*1000.,minimum_radius_cells=minimum_average_radius,half_angle_degrees=half_average_angle,timestep_s=timestep_s)
         surface=replace(surface,mixing_height=zi,convective_mixing_height=zic)
     else:
         zic=surface.convective_mixing_height
@@ -1612,7 +1492,10 @@ def solve_hour(dataset, time_index, grid: GridConfig, z_faces_m, geophysical,
                     mixing_height=surface.mixing_height,water_gradient_below=step.water_gradient_below,
                     water_gradient_above=step.water_gradient_above)
                  if temperature_mode==0 else
-                 prognostic_temperature_3d(step.temperature,final_temp,zic,.5*(np.asarray(z_faces_m[:-1])+np.asarray(z_faces_m[1:]))))
+                 prognostic_temperature_3d(
+                     step.temperature,final_temp,zic,
+                     .5*(np.asarray(z_faces_m[:-1],dtype=MODEL_DTYPE)+
+                         np.asarray(z_faces_m[1:],dtype=MODEL_DTYPE))))
     return HourFields(timestamp,final_step,wind,surface,temperature,
                       selected_lapse_convective_time,step)
 
@@ -1625,7 +1508,7 @@ def dataset_timestamp(dataset, time_index):
     return parse_timestamp(text)
 
 def _prognostic_local_timestamp(dataset,time_index,base_timezone):
-    """Convert a canonical CALWRF/M3D GMT record time to CALMET base time."""
+    """Convert a canonical CALWRF GMT record time to CALMET base time."""
     return dataset_timestamp(dataset,time_index)-timedelta(hours=base_timezone)
 
 def iter_hours(dataset, grid: GridConfig, z_faces_m, geophysical, *,
@@ -1640,14 +1523,14 @@ def iter_hours(dataset, grid: GridConfig, z_faces_m, geophysical, *,
     produced from indices ``1..N-1``.
     """
     shape=(grid.ny,grid.nx)
-    convective=(np.zeros(shape,dtype=np.float64) if initial_convective_height is None else
-                np.asarray(initial_convective_height,dtype=np.float64))
-    jump=(np.zeros(shape,dtype=np.float64) if initial_temperature_jump is None else
-          np.asarray(initial_temperature_jump,dtype=np.float64))
+    convective=(np.zeros(shape,dtype=MODEL_DTYPE) if initial_convective_height is None else
+                np.asarray(initial_convective_height,dtype=MODEL_DTYPE))
+    jump=(np.zeros(shape,dtype=MODEL_DTYPE) if initial_temperature_jump is None else
+          np.asarray(initial_temperature_jump,dtype=MODEL_DTYPE))
     source_thermal_state=None
     warm_layer_state=solver_options.pop('warm_layer_state',None)
-    water_convective_state=np.zeros(shape,dtype=np.float64)
-    water_mixing_state=np.zeros(shape,dtype=np.float64)
+    water_convective_state=np.zeros(shape,dtype=MODEL_DTYPE)
+    water_mixing_state=np.zeros(shape,dtype=MODEL_DTYPE)
     selected_lapse_convective_time=None
     if convective.shape!=shape or jump.shape!=shape: raise ValueError('initial CALMET state does not match output grid')
     step_provider=solver_options.get('step_provider')
@@ -1659,7 +1542,7 @@ def iter_hours(dataset, grid: GridConfig, z_faces_m, geophysical, *,
                 _prognostic_local_timestamp(dataset,index,base_timezone))
     if use_endpoints:
         endpoint_cache={}; endpoint_state=None; last_endpoint=-1
-        def endpoint(index,solar_day):
+        def endpoint(index):
             nonlocal endpoint_state,last_endpoint
             if index in endpoint_cache: return endpoint_cache[index]
             if index<=last_endpoint: raise ValueError('prognostic endpoint requests must be chronological')
@@ -1667,7 +1550,7 @@ def iter_hours(dataset, grid: GridConfig, z_faces_m, geophysical, *,
                 record_time=timeline_timestamp(current)
                 method=solver_options.get('cloud_method',4)
                 value=build_step1_fields(dataset,current,grid,z_faces_m,
-                    timestamp=record_time,solar_day=solar_day,
+                    timestamp=record_time,
                     base_timezone=solver_options.get('base_timezone',0),thermal_state=endpoint_state,
                     mapper=solver_options.get('mapper'),cloud_method=4 if method in {1,2} else method,
                     precipitation_interpolation=solver_options.get('precipitation_interpolation',2),
@@ -1705,41 +1588,16 @@ def iter_hours(dataset, grid: GridConfig, z_faces_m, geophysical, *,
         indices=list(range(1,dataset['time_text'].shape[0]) if time_indices is None else time_indices)
         iterator=((None,time_index,1.,timeline_timestamp(time_index),
                   index==len(indices)-1) for index,time_index in enumerate(indices))
-    first_output=True
     for left_index,time_index,fraction,end,final_input in iterator:
         timestep_s=float(solver_options.get('timestep_s',3600.))
         begin=end-timedelta(seconds=timestep_s)
-        step_override=(endpoint(time_index,begin)
+        step_override=(endpoint(time_index)
                        if use_endpoints and left_index is None else None)
         if left_index is not None:
             method=solver_options.get('cloud_method',4)
             step_override=interpolate_step1_fields(
-                endpoint(left_index,begin),endpoint(time_index,begin),fraction,
-                cloud_method=4 if method in {1,2} else method,
-                literal_endpoint=final_input)
-        # At an exact M3D boundary, RDMM5 immediately reads the following
-        # record and resets DTINC to zero.  The sole exception is the final
-        # step after its initial call; initialization always reads ahead even
-        # for a one-step run.  Ordinary fields are unchanged whether written
-        # as OLD+1*(NEW-OLD) or NEW+0*(FUTURE-NEW), but ICEILG takes MAX when
-        # either endpoint is clear.  Override just that special field.  Native
-        # MM4/PROG providers already implement their own record progression.
-        eager_ceiling=(step_provider is None and fraction==1. and
-                       (first_output or not final_input))
-        if eager_ceiling:
-            if time_index+1>=dataset['time_text'].shape[0]:
-                raise ValueError(
-                    'eager CALMET M3D boundary requires a following prognostic record')
-            current=endpoint(time_index,begin)
-            following=endpoint(time_index+1,begin)
-            ceiling=_interpolate_ceiling(
-                current.ceiling_height,following.ceiling_height,0.)
-            if step_override.integrated_cloud_water is not None:
-                ceiling=np.where(
-                    step_override.integrated_cloud_water>=np.float64(1.e-6),
-                    ceiling,np.float64(0.)).astype(np.float64)
-            step_override=replace(step_override,ceiling_height=ceiling)
-        first_output=False
+                endpoint(left_index),endpoint(time_index),fraction,
+                cloud_method=4 if method in {1,2} else method)
         cloud_provider=solver_options.get('cloud_provider')
         supplied=None if cloud_provider is None else cloud_provider(end)
         if isinstance(supplied,tuple): cloud_override,ceiling_override=supplied

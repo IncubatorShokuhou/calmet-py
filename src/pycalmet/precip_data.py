@@ -10,6 +10,10 @@ from .legacy_io import FortranSequentialReader
 from .surface_data import SurfaceStation,_coded_instant,_coordinate,_instant
 
 
+MODEL_DTYPE=np.float32
+ACCUM_DTYPE=np.float64
+
+
 @dataclass(frozen=True,slots=True)
 class PrecipitationRecord:
     begin: datetime
@@ -83,7 +87,8 @@ class PrecipitationData:
             else:
                 end=_instant(*times,0); begin=end-timedelta(hours=1)
             if not begin<end or (end-begin).total_seconds()>3600: raise ValueError('PRECIP.DAT record interval must be positive and at most one hour')
-            records.append(PrecipitationRecord(begin,end,np.asarray(fields[time_width:],dtype=float)))
+            records.append(PrecipitationRecord(
+                begin,end,np.asarray(fields[time_width:],dtype=MODEL_DTYPE)))
         if not records: raise ValueError('PRECIP.DAT contains no records')
         if records[0].begin<self.start or records[-1].end>self.end: raise ValueError('PRECIP.DAT records lie outside declared span')
         if any(left.end!=right.begin for left,right in zip(records[:-1],records[1:])): raise ValueError('PRECIP.DAT records are not contiguous')
@@ -98,11 +103,11 @@ class PrecipitationData:
 def unpack_precipitation(words,count):
     """Expand CALMET PACK zero runs (negative word means that many zeros)."""
     output=[]
-    for word in np.asarray(words,dtype=float):
+    for word in np.asarray(words,dtype=MODEL_DTYPE):
         if word>=0.: output.append(float(word))
         else: output.extend([0.]*int(abs(word)+.1))
     if len(output)!=count: raise ValueError('packed PRECIP.DAT record expands to wrong station count')
-    return np.asarray(output,dtype=float)
+    return np.asarray(output,dtype=MODEL_DTYPE)
 
 
 def read_unformatted_precipitation(path,*,station_metadata=None,datum=None):
@@ -165,7 +170,7 @@ def read_unformatted_precipitation(path,*,station_metadata=None,datum=None):
                 if len(payload)!=20: raise ValueError('packed PRECIP.DAT record header has wrong size')
                 begin_code,begin_sec,end_code,end_sec,nwords=struct.unpack('<5i',payload)
                 if nwords<0: raise ValueError('packed PRECIP.DAT word count cannot be negative')
-                rates=(np.zeros(count) if nwords==0 else
+                rates=(np.zeros(count,dtype=MODEL_DTYPE) if nwords==0 else
                        unpack_precipitation(np.frombuffer(record(4*nwords,'packed values'),dtype='<f4'),count))
             elif explicit:
                 if len(payload)!=16+4*count: raise ValueError('PRECIP.DAT record has wrong size')
@@ -175,7 +180,7 @@ def read_unformatted_precipitation(path,*,station_metadata=None,datum=None):
                 if len(payload)!=8: raise ValueError('packed legacy PRECIP.DAT record header has wrong size')
                 end_code,nwords=struct.unpack('<2i',payload)
                 if nwords<0: raise ValueError('packed PRECIP.DAT word count cannot be negative')
-                rates=(np.zeros(count) if nwords==0 else
+                rates=(np.zeros(count,dtype=MODEL_DTYPE) if nwords==0 else
                        unpack_precipitation(np.frombuffer(record(4*nwords,'packed values'),dtype='<f4'),count))
                 end=_coded_instant(end_code); begin=end-timedelta(hours=1)
             else:
@@ -201,57 +206,60 @@ def load_precipitation(path,format=2,*,station_metadata=None,datum=None):
 
 def grid_precipitation(values,station_xy,grid,method=2,radius_km=50.,cutoff=.01):
     """Vectorized/blockwise CALMET GRIDE methods 1, 2 and 3."""
-    f32=np.float64
+    f32=MODEL_DTYPE
     rates=np.asarray(values,dtype=f32)
-    points=np.asarray(np.asarray(station_xy,dtype=f32)*f32(1000.),dtype=f32)
+    # Spatial distances and weighted station accumulations are the deliberate
+    # FP64 boundary; precipitation fields enter and leave as FP32.
+    points=np.asarray(station_xy,dtype=ACCUM_DTYPE)*ACCUM_DTYPE(1000.)
     if points.shape!=(rates.size,2): raise ValueError('precipitation station coordinates have wrong shape')
     valid=rates<9998.
     if not valid.any(): return np.zeros((grid.ny,grid.nx),dtype=f32)
     points=points[valid]; rates=rates[valid]
     if method not in {1,2,3}: raise ValueError('precipitation interpolation method must be 1, 2, or 3')
-    sigma=np.asarray(f32(1000.)*f32(radius_km),dtype=f32)
+    sigma=ACCUM_DTYPE(1000.)*ACCUM_DTYPE(radius_km)
     if method==3 and sigma==0.:
         wet=rates>0.; pairs=wet[:,None]!=wet[None,:]
-        delta=np.asarray(points[:,None,:]-points[None,:,:],dtype=f32)
-        pair_distance=np.asarray(delta[...,0]*delta[...,0]+delta[...,1]*delta[...,1],dtype=f32)
-        if pairs.any(): sigma=np.asarray(f32(.5)*np.sqrt(np.min(pair_distance[pairs])),dtype=f32)
-        else: sigma=np.asarray(f32(.5)*np.sqrt(f32(1.e37)),dtype=f32)
-    x=np.asarray((np.arange(grid.nx,dtype=f32)+f32(.5))*f32(grid.dx_km)*f32(1000.),dtype=f32)
-    y=np.asarray((np.arange(grid.ny,dtype=f32)+f32(.5))*f32(grid.dy_km)*f32(1000.),dtype=f32)
+        delta=points[:,None,:]-points[None,:,:]
+        pair_distance=delta[...,0]*delta[...,0]+delta[...,1]*delta[...,1]
+        if pairs.any(): sigma=ACCUM_DTYPE(.5)*np.sqrt(np.min(pair_distance[pairs]))
+        else: sigma=ACCUM_DTYPE(.5)*np.sqrt(ACCUM_DTYPE(1.e37))
+    x=(np.arange(grid.nx,dtype=ACCUM_DTYPE)+ACCUM_DTYPE(.5))*ACCUM_DTYPE(
+        grid.dx_km)*ACCUM_DTYPE(1000.)
+    y=(np.arange(grid.ny,dtype=ACCUM_DTYPE)+ACCUM_DTYPE(.5))*ACCUM_DTYPE(
+        grid.dy_km)*ACCUM_DTYPE(1000.)
     xx,yy=np.meshgrid(x,y); targets=np.column_stack((xx.ravel(),yy.ravel()))
     output=np.empty(targets.shape[0],dtype=f32)
     for start in range(0,targets.shape[0],65536):
-        delta=np.asarray(targets[start:start+65536,None,:]-points[None,:,:],dtype=f32)
-        d2=np.asarray(delta[...,0]*delta[...,0]+delta[...,1]*delta[...,1],dtype=f32)
+        delta=targets[start:start+65536,None,:]-points[None,:,:]
+        d2=delta[...,0]*delta[...,0]+delta[...,1]*delta[...,1]
         if method in {1,2}:
-            sigma2=np.asarray(sigma*sigma,dtype=f32); inside=d2<=sigma2
-            denominator=np.zeros(d2.shape[0],dtype=f32); numerator=np.zeros_like(denominator)
+            sigma2=sigma*sigma; inside=d2<=sigma2
+            denominator=np.zeros(d2.shape[0],dtype=ACCUM_DTYPE)
+            numerator=np.zeros_like(denominator)
             for station in range(rates.size):
-                distance=(np.asarray(np.sqrt(d2[:,station]),dtype=f32)
+                distance=(np.sqrt(d2[:,station])
                           if method==1 else d2[:,station])
-                safe=np.maximum(distance,f32(.01))
-                weight=np.where(inside[:,station],np.asarray(f32(1.)/safe,dtype=f32),f32(0.))
-                denominator=np.asarray(denominator+weight,dtype=f32)
-                numerator=np.asarray(numerator+np.asarray(
-                    rates[station]*weight,dtype=f32),dtype=f32)
+                safe=np.maximum(distance,ACCUM_DTYPE(.01))
+                weight=np.where(inside[:,station],ACCUM_DTYPE(1.)/safe,
+                                ACCUM_DTYPE(0.))
+                denominator+=weight
+                numerator+=ACCUM_DTYPE(rates[station])*weight
             weighted=np.divide(numerator,denominator,out=np.zeros_like(denominator),where=denominator!=0.)
             nearest=rates[np.argmin(d2,axis=1)]
             result=np.where(denominator==f32(0.),nearest,
-                            np.where(weighted<f32(cutoff),f32(0.),weighted))
+                            np.where(weighted<ACCUM_DTYPE(cutoff),0.,weighted))
         else:
-            sigma2=np.asarray(sigma*sigma,dtype=f32)
-            denominator=np.zeros(d2.shape[0],dtype=f32); numerator=np.zeros_like(denominator)
+            sigma2=sigma*sigma
+            denominator=np.zeros(d2.shape[0],dtype=ACCUM_DTYPE)
+            numerator=np.zeros_like(denominator)
             for station in range(rates.size):
-                exponent=np.asarray(d2[:,station]/sigma2,dtype=f32)
-                decay=np.where(exponent>f32(60.),f32(0.),
-                               np.asarray(np.exp((-exponent).astype(np.float64)),dtype=f32))
-                safe=np.maximum(d2[:,station],f32(.01))
-                weight=np.asarray(decay/safe,dtype=f32)
-                denominator=np.asarray(denominator+weight,dtype=f32)
-                numerator=np.asarray(numerator+np.asarray(
-                    np.asarray(rates[station]*decay,dtype=f32)/safe,dtype=f32),dtype=f32)
-            result=np.where(numerator<f32(1.e-30),f32(0.),
-                            np.asarray(numerator/denominator,dtype=f32))
-            result=np.where(result<f32(cutoff),f32(0.),result)
-        output[start:start+d2.shape[0]]=result
+                exponent=d2[:,station]/sigma2
+                decay=np.where(exponent>60.,0.,np.exp(-exponent))
+                safe=np.maximum(d2[:,station],ACCUM_DTYPE(.01))
+                weight=decay/safe
+                denominator+=weight
+                numerator+=ACCUM_DTYPE(rates[station])*weight
+            result=np.where(numerator<1.e-30,0.,numerator/denominator)
+            result=np.where(result<ACCUM_DTYPE(cutoff),0.,result)
+        output[start:start+d2.shape[0]]=np.asarray(result,dtype=MODEL_DTYPE)
     return output.reshape(grid.ny,grid.nx)

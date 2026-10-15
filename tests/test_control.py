@@ -1,6 +1,9 @@
 from pathlib import Path
+from datetime import datetime, date
 import re
 
+import netCDF4 as nc
+import numpy as np
 import pycalmet
 import pytest
 from pycalmet.control import (_angle,_date,assignments,calmet_config,calwrf_config,ctgproc_config,
@@ -208,23 +211,65 @@ def test_ctgproc_legacy_glaz_requires_valid_region(tmp_path):
 def test_calmet_control_hour_24_rolls_to_next_day():
     values={'IBYR':['2018'],'IBMO':['12'],'IBDY':['31'],'IBHR':['24'],
             'IBSEC':['3600']}
-    assert _date(values,'IB')=='2019-01-01_01:00:00'
+    assert _date(values,'IB')==datetime(2019,1,1,1)
     values['IBHR']=['25']
     with pytest.raises(ValueError,match='between 0 and 24'): _date(values,'IB')
 
 
-def test_calmet_control_preserves_fractional_utc_label(tmp_path):
+def test_calmet_control_uses_standard_two_digit_year_window():
+    values={'IBYR':['18'],'IBMO':['3'],'IBDY':['18'],'IBHR':['0'],
+            'IBSEC':['0']}
+    assert _date(values,'IB')==datetime(2018,3,18)
+
+
+def test_calmet_control_rejects_fractional_calendar_fields():
+    values={'IBYR':['2018'],'IBMO':['1'],'IBDY':['1'],'IBHR':['1.5'],
+            'IBSEC':['0']}
+    with pytest.raises(ValueError,match='IBHR must be an integer'):
+        _date(values,'IB')
+
+
+@pytest.mark.parametrize(('field','value'),(
+    ('IBYR','2018.5'),('IBMO','1.5'),('IBDY','1.5'),
+    ('IBHR','1.5'),('IBSEC','.5'),
+))
+def test_calmet_control_never_truncates_calendar_fields(field,value):
+    values={'IBYR':['2018'],'IBMO':['1'],'IBDY':['1'],'IBHR':['0'],
+            'IBSEC':['0']}
+    values[field]=[value]
+    with pytest.raises(ValueError,match=field):
+        _date(values,'IB')
+
+
+@pytest.mark.parametrize('seconds',('-1','3601'))
+def test_calmet_control_rejects_out_of_range_seconds(seconds):
+    values={'IBYR':['2018'],'IBMO':['1'],'IBDY':['1'],'IBHR':['0'],
+            'IBSEC':[seconds]}
+    with pytest.raises(ValueError,match='seconds'):
+        _date(values,'IB')
+
+
+def test_calmet_control_rejects_fractional_utc_offset(tmp_path):
     text=(CALMET_CONTROL).read_text(encoding='ascii')
     text=text.replace('! ABTZ= UTC-0000 !','! ABTZ= UTC-0830 !')
     control=tmp_path/'calmet.inp'; control.write_text(text,encoding='ascii')
+    with pytest.raises(ValueError,match='whole-hour ABTZ'):
+        calmet_config(control)
+
+
+def test_calmet_control_parses_whole_hour_utc_offset(tmp_path):
+    text=(CALMET_CONTROL).read_text(encoding='ascii')
+    text=text.replace('! ABTZ= UTC-0000 !','! ABTZ= UTC+0800 !')
+    control=tmp_path/'calmet.inp'; control.write_text(text,encoding='ascii')
     config=calmet_config(control)
-    assert config.base_timezone==8
-    assert config.base_timezone_label=='UTC-0830'
+    assert config.base_timezone==-8
+    assert config.base_timezone_label=='UTC+0800'
 
 
 def test_pre21_calmet_control_converts_hour_ending_period_and_ibtz(tmp_path):
     text=(CALMET_CONTROL).read_text(encoding='ascii')
     text='CALMET.INP      2.0             legacy hour-ending controls\n'+text.split('\n',1)[1]
+    text=text.replace('! IBYR  =  2018  !','! IBYR = 18 !',1)
     for name in ('IBSEC','IEYR','IEMO','IEDY','IEHR','IESEC'):
         text=re.sub(rf'!\s*{name}\s*=\s*[^!]*!',lambda match: match.group().replace('!','*'),text)
     for name in ('MCLOUD','ICLDOUT'):
@@ -232,8 +277,8 @@ def test_pre21_calmet_control_converts_hour_ending_period_and_ibtz(tmp_path):
     text+='\n! IRLG = 3 !\n! IBTZ = 8 !\n! ICLOUD = 4 !\n!END!\n'
     control=tmp_path/'calmet.inp'; control.write_text(text,encoding='ascii')
     config=calmet_config(control)
-    assert config.start=='2018-03-17_23:00:00'
-    assert config.end=='2018-03-18_02:00:00'
+    assert config.start==datetime(2018,3,17,23)
+    assert config.end==datetime(2018,3,18,2)
     assert config.base_timezone==8
 
 
@@ -274,10 +319,17 @@ def test_calwrf_control_accepts_inline_comments_and_inactive_paths(tmp_path):
     lines[4]='-2018051700 ! use all available records'
     lines[5]='-2018051712 ! use all available records'
     lines[7:]=['! ignored/wrf.nc', 'active/wrf.nc ! selected input']
+    wrf=tmp_path/'active/wrf.nc'; wrf.parent.mkdir()
+    with nc.Dataset(wrf,'w') as dataset:
+        dataset.createDimension('Time',2); dataset.createDimension('DateStrLen',19)
+        times=dataset.createVariable('Times','S1',('Time','DateStrLen'))
+        times[:]=np.asarray([list('2018-05-17_01:00:00'),
+                            list('2018-05-17_03:00:00')],dtype='S1')
     control=tmp_path/'calwrf.inp'
     control.write_text('\n'.join(lines)+'\n',encoding='ascii')
     config=calwrf_config(control)
-    assert config.start=='-2018051700'
+    assert config.start==datetime(2018,5,17,1)
+    assert config.end==datetime(2018,5,17,3)
     assert config.wrf_files==[tmp_path/'active/wrf.nc']
 
 
@@ -359,7 +411,7 @@ def test_calmet_21_uses_icloud_even_if_new_fields_are_present(tmp_path):
 
 def test_existing_component_controls_map_to_typed_configs():
     calwrf=calwrf_config(CALWRF_CONTROL)
-    assert calwrf.start=='2018031800' and len(calwrf.wrf_files)==1
+    assert calwrf.start==datetime(2018,3,18) and len(calwrf.wrf_files)==1
     assert Path(calwrf.output).suffix=='.nc'
     assert Path(calwrf.legacy_output).suffix=='.m3d'
     assert Path(calwrf.surface_output).suffix=='.m2d'
@@ -396,8 +448,8 @@ def test_existing_component_controls_map_to_typed_configs():
     assert geo.image_mode==0
 
     calmet=calmet_config(CALMET_CONTROL)
-    assert calmet.start=='2018-03-18_00:00:00'
-    assert calmet.end=='2018-03-18_12:00:00'
+    assert calmet.start==datetime(2018,3,18)
+    assert calmet.end==datetime(2018,3,18,12)
     assert calmet.base_timezone==0 and calmet.iprog==14
     assert calmet.regulatory_mode==0
     assert calmet.run_type==1 and not calmet.include_w_temperature
@@ -484,7 +536,7 @@ def test_calmet_control_parses_lake_breeze_regions(tmp_path):
 
 
 @pytest.mark.parametrize(('source','reader','attribute','expected'),(
-    (CALWRF_CONTROL,calwrf_config,'start','2018031800'),
+    (CALWRF_CONTROL,calwrf_config,'start',datetime(2018,3,18)),
     (ROOT/'examples/zhejiang/config/terrel.inp',terrel_config,'grid.nx',610),
     (ROOT/'examples/zhejiang/config/ctgproc.inp',ctgproc_config,'mesh_density',12),
     (ROOT/'examples/zhejiang/config/makegeo.inp',makegeo_config,'grid.ny',499),
@@ -594,11 +646,26 @@ def test_makegeo_control_reads_daily_snow_configuration(tmp_path):
     config=makegeo_config(control)
     assert config.snow_processing
     assert config.snow_data==tmp_path/'daily-snow.dat'
-    assert (config.snow_start_date,config.snow_end_date)==(20180101,20180103)
+    assert (config.snow_start_date,config.snow_end_date)==(
+        date(2018,1,1),date(2018,1,3))
     assert config.snow_properties[11]==config.input_properties[11]
     assert config.snow_age_parameters[11]==(5,.1)
     assert (config.snow_roughness_method,config.snow_height_scale_m)==(1,.4)
     assert (config.snow_albedo_method,config.snow_depth_minimum_m)==(2,.02)
+
+
+def test_makegeo_control_rejects_fractional_snow_date(tmp_path):
+    base=(ROOT/'examples/zhejiang/config/makegeo.inp').read_text(encoding='ascii')
+    properties=assignments(ROOT/'examples/zhejiang/config/makegeo.inp')['X']
+    extra=['! LSNOW = T !','! SNOWDAT = daily-snow.dat !',
+           '! IDATEBEG = 20180101.5 !','! IDATEEND = 20180103 !']
+    extra.extend(f'! XS = {record} !' for record in properties)
+    extra.extend(f'! XF = {record.split(",",1)[0]}, 5, 0.1 !'
+                 for record in properties)
+    control=tmp_path/'makegeo.inp'
+    control.write_text(base+'\n'+'\n'.join(extra)+'\n',encoding='ascii')
+    with pytest.raises(ValueError,match='IDATEBEG'):
+        makegeo_config(control)
 
 
 def test_makegeo_control_honors_uppercase_file_policy(tmp_path):
@@ -894,8 +961,8 @@ def test_calmet_subhour_seconds_and_timestep_are_parsed(tmp_path):
         '! IESEC =  0  !','! IESEC =  1800  !').replace('! NSECDT =  3600  !','! NSECDT =  900  !')
     control=tmp_path/'calmet.inp'; control.write_text(source,encoding='ascii')
     config=calmet_config(control)
-    assert config.start=='2018-03-18_00:15:00'
-    assert config.end=='2018-03-18_12:30:00'
+    assert config.start==datetime(2018,3,18,0,15)
+    assert config.end==datetime(2018,3,18,12,30)
     assert config.timestep_seconds==900
 
 
@@ -961,6 +1028,25 @@ def test_calmet_control_supports_legacy_prognostic_hours_fallback(tmp_path):
                           '! ISTEPPG = 3 !\n       ! ISTEPPGS = 0 !',1)
     control=tmp_path/'calmet.inp'; control.write_text(source,encoding='ascii')
     assert calmet_config(control).prognostic_timestep_seconds==10800
+
+
+@pytest.mark.parametrize(('old','new','label'),(
+    ('! NSECDT =  3600  !','! NSECDT = 900.5 !','NSECDT'),
+    ('! ISTEPPGS =  3600   !','! ISTEPPGS = 900.5 !','ISTEPPGS'),
+    ('! ISTEPPGS =  3600   !',
+     '! ISTEPPG = 1.5 !\n! ISTEPPGS = 0 !','ISTEPPG'),
+    ('! IPRINF =  1  !','! IPRINF = 1.5 !','IPRINF'),
+    ('! NN1 =  1  !','! NN1 = 1.5 !','NN1'),
+    ('! NN2 =  1  !','! NN2 = 1.5 !','NN2'),
+))
+def test_calmet_control_rejects_fractional_time_integer_fields(
+        tmp_path,old,new,label):
+    source=CALMET_CONTROL.read_text(encoding='ascii')
+    assert old in source
+    control=tmp_path/'calmet.inp'
+    control.write_text(source.replace(old,new,1),encoding='ascii')
+    with pytest.raises(ValueError,match=label):
+        calmet_config(control)
 
 
 def test_calmet_control_supports_pre_multiple_file_mm4dat(tmp_path):
