@@ -41,7 +41,7 @@ def test_example_controls_form_a_complete_source_to_output_chain():
     assert calmet.meteorology == calwrf.output
 
 
-def test_runner_calls_each_stage_with_only_its_control_file(tmp_path):
+def test_runner_calls_the_complete_pipeline_once(tmp_path):
     capture = tmp_path / "calls.jsonl"
     patch_dir = tmp_path / "python-patch"
     patch_dir.mkdir()
@@ -53,19 +53,17 @@ def test_runner_calls_each_stage_with_only_its_control_file(tmp_path):
             from pathlib import Path
             import pycalmet
 
-            def replacement(name):
-                def run(*args, **kwargs):
-                    with Path(os.environ["PYCALMET_TEST_CAPTURE"]).open("a") as stream:
-                        stream.write(json.dumps({
-                            "name": name,
-                            "args": [str(item) for item in args],
-                            "kwargs": kwargs,
-                        }) + "\\n")
-                    return Path("output") / (name + ".nc")
-                return run
+            def run_pipeline(*args, **kwargs):
+                with Path(os.environ["PYCALMET_TEST_CAPTURE"]).open("a") as stream:
+                    stream.write(json.dumps({
+                        "args": [str(item) for item in args],
+                        "kwargs": {
+                            name: str(value) for name, value in kwargs.items()
+                        },
+                    }) + "\\n")
+                return Path(kwargs["output"])
 
-            for name in ("calwrf", "terrel", "ctrproc", "makegeo", "calmet"):
-                setattr(pycalmet, name, replacement(name))
+            pycalmet.run_pipeline = run_pipeline
             """
         ),
         encoding="ascii",
@@ -86,11 +84,13 @@ def test_runner_calls_each_stage_with_only_its_control_file(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     calls = [json.loads(line) for line in capture.read_text().splitlines()]
-    assert [call["name"] for call in calls] == [
-        "calwrf",
-        "terrel",
-        "ctrproc",
-        "makegeo",
-        "calmet",
+    assert calls == [
+        {
+            "args": [str(CONFIG)],
+            "kwargs": {
+                "output": str(ROOT / "output" / "zhejiang" / "calmet.nc")
+            },
+        }
     ]
-    assert all(len(call["args"]) == 1 and not call["kwargs"] for call in calls)
+    final_output = ROOT / "output" / "zhejiang" / "calmet.nc"
+    assert f"CALMET -> {final_output}" in result.stdout

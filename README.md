@@ -139,7 +139,9 @@ output path from `calmet.inp`. The grouped `calwrf=`, `terrel=`, `ctgproc=`,
 `makegeo=`, and `calmet=` inputs also accept one control-file path, parameter
 mapping, or typed configuration object per stage. `PipelineConfig` groups the
 five typed stage configurations and can be passed as the first argument to
-`run_pipeline`.
+`run_pipeline`. This is the form used by `examples/zhejiang/run.py`; execute it
+with `./examples/zhejiang/run.sh`. For debugging individual stages and keeping
+their outputs, use `examples/zhejiang/run_stages.py`.
 
 Each stage accepts either explicit keyword arguments or its legacy
 CALMET-family control file. These `.inp` files are program-specific control
@@ -653,7 +655,7 @@ frozen historical formulas and level-centre TEMP3D switch for reproducibility.
 The bundled example contains three consecutive WRF records, 42 original SRTM3
 `.hgt` tiles, and a categorical land-use point dataset. It rebuilds terrain,
 land use, and the geophysical grid instead of using a prepared `geo.nc`.
-Run all five stages from the repository root:
+Run the complete five-stage pipeline from the repository root:
 
 ```bash
 sha256sum -c examples/zhejiang/SHA256SUMS

@@ -128,6 +128,9 @@ result = pycalmet.run_pipeline(
 输出路径。分组形式的 `calwrf=`、`terrel=`、`ctgproc=`、`makegeo=` 和 `calmet=`
 也可以分别接收一份控制文件路径、参数映射或对应的类型化配置对象。`PipelineConfig`
 可将五个阶段的类型化配置集中为一个对象，并作为 `run_pipeline` 的第一个参数传入。
+`examples/zhejiang/run.py` 使用的就是这种目录形式，可通过
+`./examples/zhejiang/run.sh` 运行。若要逐阶段调试并保留各阶段输出，请运行
+`examples/zhejiang/run_stages.py`。
 
 每个阶段既可以直接传入关键字参数，也可以读取对应的 CALMET 系列传统控制文件。
 这里的 `.inp` 是各程序自己的控制文件，并不是标准 Fortran `NAMELIST`。浙江示例
@@ -622,7 +625,7 @@ TEMP3D 行为，以支持结果复现。
 
 仓库内置三个连续 WRF 时次、42 个原始 SRTM3 `.hgt` 瓦片和分类土地利用点数据。
 示例会重新生成地形、土地利用和地理场，不依赖预先做好的 `geo.nc`。从仓库根目录
-运行全部五个阶段：
+运行完整的五阶段流水线：
 
 ```bash
 sha256sum -c examples/zhejiang/SHA256SUMS

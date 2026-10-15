@@ -22,11 +22,7 @@ python -m pytest -q
 Run the bundled smoke workflow from the repository root:
 
 ```bash
-./examples/zhejiang/run.sh \
-  --wrf examples/zhejiang \
-  --geo examples/zhejiang/geo.nc \
-  --start 2018031800 --end 2018031801 \
-  --skip-static --output output/zhejiang.nc
+./examples/zhejiang/run.sh
 ```
 
 ## Changes
