@@ -145,10 +145,10 @@ output path from `calmet.inp`. The grouped `calwrf=`, `terrel=`, `ctgproc=`,
 `makegeo=`, and `calmet=` inputs also accept one control-file path, parameter
 mapping, or typed configuration object per stage. `PipelineConfig` groups the
 five typed stage configurations and can be passed as the first argument to
-`run_pipeline`. This is the form used by `examples/zhejiang/run.py`; execute it
-with `./examples/zhejiang/run.sh`. For debugging individual stages and keeping
-their outputs, use `examples/zhejiang/run_stages.py`, which demonstrates the
-pure keyword-parameter API without reading control files.
+`run_pipeline`. The runnable `examples/zhejiang/run.py` instead demonstrates
+the parameter-only pipeline form shown in Quick start; execute it with
+`./examples/zhejiang/run.sh`. To run and inspect individual stages using the
+five traditional control files, use `examples/zhejiang/run_stages.py`.
 
 Each stage accepts either explicit keyword arguments or its legacy
 CALMET-family control file. These `.inp` files are program-specific control

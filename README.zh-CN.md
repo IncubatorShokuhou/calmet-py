@@ -134,9 +134,9 @@ result = pycalmet.run_pipeline(
 输出路径。分组形式的 `calwrf=`、`terrel=`、`ctgproc=`、`makegeo=` 和 `calmet=`
 也可以分别接收一份控制文件路径、参数映射或对应的类型化配置对象。`PipelineConfig`
 可将五个阶段的类型化配置集中为一个对象，并作为 `run_pipeline` 的第一个参数传入。
-`examples/zhejiang/run.py` 使用的就是这种目录形式，可通过
-`./examples/zhejiang/run.sh` 运行。若要逐阶段调试并保留各阶段输出，请运行
-`examples/zhejiang/run_stages.py`；该脚本演示纯关键字参数 API，不读取控制文件。
+可执行的 `examples/zhejiang/run.py` 使用“快速开始”中展示的纯参数流水线形式，可通过
+`./examples/zhejiang/run.sh` 运行。若要用五份传统控制文件逐阶段运行并查看各阶段输出，
+请运行 `examples/zhejiang/run_stages.py`。
 
 每个阶段既可以直接传入关键字参数，也可以读取对应的 CALMET 系列传统控制文件。
 这里的 `.inp` 是各程序自己的控制文件，并不是标准 Fortran `NAMELIST`。浙江示例

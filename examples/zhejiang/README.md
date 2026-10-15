@@ -1,8 +1,8 @@
 # Zhejiang end-to-end pipeline example
 
-This example runs all five PyCALMET stages from source datasets and traditional
-control files through one `run_pipeline` call. It does not use a prepared
-geophysical grid.
+This example runs all five PyCALMET stages from source datasets through one
+parameter-only `run_pipeline` call. It does not use a prepared geophysical
+grid or read a traditional control file in its default runner.
 
 ## Bundled inputs
 
@@ -15,8 +15,9 @@ geophysical grid.
   one source record at each target-grid cell center. Its categories preserve
   the validated Zhejiang example's dominant land use using the corresponding
   USGS classes.
-- One control file per stage under `config/`. Their relative input and output
-  paths form a complete processing chain.
+- One control file per stage under `config/`, used by the separate
+  `run_stages.py` example. Their relative paths form a complete processing
+  chain.
 
 Verify the source files from the repository root:
 
@@ -34,19 +35,10 @@ python -m pip install -e .
 ./examples/zhejiang/run.sh
 ```
 
-The default runner passes the directory containing all five control files to
-the complete pipeline API:
-
-```python
-from pathlib import Path
-
-import pycalmet
-
-result = pycalmet.run_pipeline(
-    Path("examples/zhejiang/config"),
-    output=Path("output/zhejiang/calmet.nc"),
-)
-```
+The default runner, [`run.py`](run.py), declares the WRF inputs, 42 SRTM
+sources, land-use input, datetimes, shared `GridConfig`, and active CALMET
+controls as typed Python values. It passes them to one
+`pycalmet.run_pipeline(inp=None, ...)` call; no `.inp` file is read.
 
 `run_pipeline` creates the CALWRF, terrain, land-use, and geophysical NetCDF
 datasets in a private temporary directory and removes them after CALMET
@@ -69,10 +61,16 @@ To inspect the output from every stage, run the separate debugging example:
 PYTHONPATH=src python examples/zhejiang/run_stages.py
 ```
 
-This script does not read any `.inp` file. It supplies typed Python keyword
-parameters to the five public stage APIs and lets omitted controls use their
-documented Python defaults. The parameters that affect the Zhejiang run are
-written explicitly, including the source datum for every SRTM tile and the
-prognostic meteorology, humidity, temperature, precipitation, and mixing-height
-settings. It retains `calwrf.nc`, `terrain.nc`, `landuse.nc`, `geo.nc`, and
-`calmet.nc` under `output/zhejiang/`.
+This runner demonstrates the control-file API by making exactly these calls:
+
+```python
+pycalmet.calwrf("examples/zhejiang/config/calwrf.inp")
+pycalmet.terrel("examples/zhejiang/config/terrel.inp")
+pycalmet.ctrproc("examples/zhejiang/config/ctgproc.inp")
+pycalmet.makegeo("examples/zhejiang/config/makegeo.inp")
+pycalmet.calmet("examples/zhejiang/config/calmet.inp")
+```
+
+It retains `calwrf.nc`, `terrain.nc`, `landuse.nc`, `geo.nc`, and `calmet.nc`
+under `output/zhejiang/`, along with the diagnostic products enabled by those
+control files.

@@ -6,7 +6,6 @@ import runpy
 import subprocess
 import sys
 from collections.abc import Callable
-from datetime import datetime
 from pathlib import Path
 from textwrap import dedent
 from typing import Any
@@ -26,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "examples" / "zhejiang"
 CONFIG = EXAMPLE / "config"
 SCRIPT = EXAMPLE / "run.sh"
+PIPELINE_SCRIPT = EXAMPLE / "run.py"
 STAGES_SCRIPT = EXAMPLE / "run_stages.py"
 
 
@@ -48,7 +48,7 @@ def test_example_controls_form_a_complete_source_to_output_chain():
     assert calmet.meteorology == calwrf.output
 
 
-def test_runner_calls_the_complete_pipeline_once(tmp_path):
+def test_runner_calls_parameter_only_pipeline_once(tmp_path):
     capture = tmp_path / "calls.jsonl"
     patch_dir = tmp_path / "python-patch"
     patch_dir.mkdir()
@@ -61,12 +61,74 @@ def test_runner_calls_the_complete_pipeline_once(tmp_path):
             import pycalmet
 
             def run_pipeline(*args, **kwargs):
+                grid = kwargs["calmet_grid"]
                 with Path(os.environ["PYCALMET_TEST_CAPTURE"]).open("a") as stream:
                     stream.write(json.dumps({
                         "args": [str(item) for item in args],
-                        "kwargs": {
-                            name: str(value) for name, value in kwargs.items()
+                        "inp": kwargs["inp"],
+                        "keys": sorted(kwargs),
+                        "wrf_files": [
+                            str(path) for path in kwargs["calwrf_wrf_files"]
+                        ],
+                        "wrf_start": kwargs["calwrf_start"].isoformat(),
+                        "wrf_end": kwargs["calwrf_end"].isoformat(),
+                        "terrain_sources": [{
+                            "path": str(source.path),
+                            "input_type": source.input_type,
+                            "input_datum": source.input_datum,
+                        } for source in kwargs["terrel_terrain_sources"]],
+                        "landuse_files": [
+                            str(path) for path in kwargs["ctgproc_landuse_files"]
+                        ],
+                        "grid": {
+                            "nx": grid.nx,
+                            "ny": grid.ny,
+                            "dx_km": grid.dx_km,
+                            "dy_km": grid.dy_km,
+                            "projection": grid.projection,
+                            "datum": grid.datum,
                         },
+                        "shared_grid": all(
+                            kwargs[name] is grid for name in (
+                                "terrel_grid",
+                                "ctgproc_grid",
+                                "makegeo_grid",
+                                "calmet_grid",
+                            )
+                        ),
+                        "stage_controls": {
+                            "calwrf_create_surface": kwargs[
+                                "calwrf_create_surface"
+                            ],
+                            "calwrf_title": kwargs["calwrf_title"],
+                            "terrel_srtm_dir": str(kwargs["terrel_srtm_dir"]),
+                            "terrel_sampling": kwargs["terrel_sampling"],
+                            "ctgproc_input_type": kwargs[
+                                "ctgproc_input_type"
+                            ],
+                            "ctgproc_mesh_density": kwargs[
+                                "ctgproc_mesh_density"
+                            ],
+                            "makegeo_title": kwargs["makegeo_title"],
+                        },
+                        "calmet_end": kwargs["calmet_end"].isoformat(),
+                        "calmet_controls": {
+                            name: kwargs[name] for name in (
+                                "calmet_noobs",
+                                "calmet_iprog",
+                                "calmet_irhprog",
+                                "calmet_itprog",
+                                "calmet_coriolis",
+                                "calmet_maximum_mixing_height_m",
+                                "calmet_maximum_water_mixing_height_m",
+                                "calmet_precipitation_radius_km",
+                                "calmet_mnmdav",
+                                "calmet_wind_extrapolation",
+                                "calmet_precipitation_station_count",
+                                "calmet_include_w_temperature",
+                            )
+                        },
+                        "output": str(kwargs["output"]),
                     }) + "\\n")
                 return Path(kwargs["output"])
 
@@ -91,19 +153,99 @@ def test_runner_calls_the_complete_pipeline_once(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     calls = [json.loads(line) for line in capture.read_text().splitlines()]
-    assert calls == [
-        {
-            "args": [str(CONFIG)],
-            "kwargs": {
-                "output": str(ROOT / "output" / "zhejiang" / "calmet.nc")
-            },
-        }
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["args"] == []
+    assert call["inp"] is None
+    assert ".inp" not in PIPELINE_SCRIPT.read_text(encoding="utf-8")
+    assert set(call["keys"]) == {
+        "inp",
+        "calwrf_wrf_files",
+        "calwrf_start",
+        "calwrf_end",
+        "calwrf_create_surface",
+        "calwrf_title",
+        "terrel_srtm_dir",
+        "terrel_sampling",
+        "terrel_terrain_sources",
+        "terrel_grid",
+        "ctgproc_landuse_files",
+        "ctgproc_input_type",
+        "ctgproc_mesh_density",
+        "ctgproc_grid",
+        "makegeo_title",
+        "makegeo_grid",
+        "calmet_start",
+        "calmet_end",
+        "calmet_grid",
+        "calmet_noobs",
+        "calmet_iprog",
+        "calmet_irhprog",
+        "calmet_itprog",
+        "calmet_coriolis",
+        "calmet_maximum_mixing_height_m",
+        "calmet_maximum_water_mixing_height_m",
+        "calmet_precipitation_radius_km",
+        "calmet_mnmdav",
+        "calmet_wind_extrapolation",
+        "calmet_precipitation_station_count",
+        "calmet_include_w_temperature",
+        "output",
+    }
+    assert call["wrf_files"] == [
+        str(EXAMPLE / f"wrfout_d01_2018-03-18_{hour:02d}_00_00.nc")
+        for hour in range(3)
     ]
+    assert call["wrf_start"] == "2018-03-18T00:00:00"
+    assert call["wrf_end"] == "2018-03-18T02:00:00"
+    assert len(call["terrain_sources"]) == 42
+    assert all(
+        source["input_type"] == "SRTM3"
+        and source["input_datum"] == "WGS-96"
+        for source in call["terrain_sources"]
+    )
+    assert call["landuse_files"] == [
+        str(EXAMPLE / "landuse" / "zhejiang_generic.landuse")
+    ]
+    assert call["grid"] == {
+        "nx": 610,
+        "ny": 499,
+        "dx_km": 1.0,
+        "dy_km": 1.0,
+        "projection": "LCC",
+        "datum": "WGS-84",
+    }
+    assert call["shared_grid"] is True
+    assert call["stage_controls"] == {
+        "calwrf_create_surface": False,
+        "calwrf_title": "Create CALWRF data for the Zhejiang example",
+        "terrel_srtm_dir": str(ROOT / "terrain" / "srtm3"),
+        "terrel_sampling": "bilinear",
+        "ctgproc_input_type": "GEN",
+        "ctgproc_mesh_density": 12,
+        "makegeo_title": "Demo Application",
+    }
+    assert call["calmet_end"] == "2018-03-18T01:00:00"
+    assert call["calmet_controls"] == {
+        "calmet_noobs": 2,
+        "calmet_iprog": 14,
+        "calmet_irhprog": 1,
+        "calmet_itprog": 2,
+        "calmet_coriolis": 1.0e-4,
+        "calmet_maximum_mixing_height_m": 2500.0,
+        "calmet_maximum_water_mixing_height_m": 2500.0,
+        "calmet_precipitation_radius_km": 50.0,
+        "calmet_mnmdav": 10,
+        "calmet_wind_extrapolation": -1,
+        "calmet_precipitation_station_count": -1,
+        "calmet_include_w_temperature": False,
+    }
     final_output = ROOT / "output" / "zhejiang" / "calmet.nc"
+    assert call["output"] == str(final_output)
     assert f"CALMET -> {final_output}" in result.stdout
 
 
-def test_stage_runner_uses_only_typed_keyword_parameters(
+def test_stage_runner_calls_each_stage_with_its_control_file(
     monkeypatch,
     capsys,
     tmp_path,
@@ -113,71 +255,23 @@ def test_stage_runner_uses_only_typed_keyword_parameters(
     def replacement(name: str) -> Callable[..., Path]:
         def run(*args: Any, **kwargs: Any) -> Path:
             calls.append((name, args, kwargs))
-            return Path(kwargs["output"])
+            return tmp_path / f"{name}.nc"
 
         return run
 
     for name in ("calwrf", "terrel", "ctrproc", "makegeo", "calmet"):
         monkeypatch.setattr(pycalmet, name, replacement(name))
 
-    source = STAGES_SCRIPT.read_text(encoding="utf-8")
-    assert ".inp" not in source
     namespace = runpy.run_path(str(STAGES_SCRIPT))
     main = namespace["main"]
     main.__globals__["OUTPUT"] = tmp_path / "output"
     main()
     capsys.readouterr()
 
-    assert [name for name, _, _ in calls] == [
-        "calwrf",
-        "terrel",
-        "ctrproc",
-        "makegeo",
-        "calmet",
+    assert [(name, args, kwargs) for name, args, kwargs in calls] == [
+        ("calwrf", (CONFIG / "calwrf.inp",), {}),
+        ("terrel", (CONFIG / "terrel.inp",), {}),
+        ("ctrproc", (CONFIG / "ctgproc.inp",), {}),
+        ("makegeo", (CONFIG / "makegeo.inp",), {}),
+        ("calmet", (CONFIG / "calmet.inp",), {}),
     ]
-    assert all(not args for _, args, _ in calls)
-    assert all(parameters["inp"] is None for _, _, parameters in calls)
-
-    parameters = {name: kwargs for name, _, kwargs in calls}
-    assert parameters["calwrf"]["wrf_files"] == tuple(
-        EXAMPLE / f"wrfout_d01_2018-03-18_{hour:02d}_00_00.nc"
-        for hour in range(3)
-    )
-    assert parameters["calwrf"]["start"] == datetime(2018, 3, 18, 0)
-    assert parameters["calwrf"]["end"] == datetime(2018, 3, 18, 2)
-    assert parameters["terrel"]["srtm_dir"] == ROOT / "terrain" / "srtm3"
-    assert len(parameters["terrel"]["terrain_sources"]) == 42
-    assert all(
-        source.input_datum == "WGS-96"
-        for source in parameters["terrel"]["terrain_sources"]
-    )
-    assert parameters["ctrproc"]["landuse_files"] == (
-        EXAMPLE / "landuse" / "zhejiang_generic.landuse",
-    )
-    assert parameters["ctrproc"]["input_type"] == "GEN"
-    assert parameters["ctrproc"]["mesh_density"] == 12
-    assert "input_datum" not in parameters["ctrproc"]
-    assert parameters["makegeo"]["terrain"] == parameters["terrel"]["output"]
-    assert parameters["makegeo"]["landuse"] == parameters["ctrproc"]["output"]
-    assert parameters["calmet"]["meteorology"] == parameters["calwrf"]["output"]
-    assert parameters["calmet"]["geophysical"] == parameters["makegeo"]["output"]
-    grid = parameters["terrel"]["grid"]
-    assert (grid.nx, grid.ny, grid.dx_km, grid.dy_km) == (610, 499, 1.0, 1.0)
-    assert (grid.projection, grid.datum) == ("LCC", "WGS-84")
-    assert all(
-        parameters[stage]["grid"] is grid
-        for stage in ("terrel", "ctrproc", "makegeo", "calmet")
-    )
-    assert parameters["calmet"]["end"] == datetime(2018, 3, 18, 1)
-    assert parameters["calmet"]["noobs"] == 2
-    assert parameters["calmet"]["iprog"] == 14
-    assert parameters["calmet"]["irhprog"] == 1
-    assert parameters["calmet"]["itprog"] == 2
-    assert parameters["calmet"]["precipitation_station_count"] == -1
-    assert parameters["calmet"]["coriolis"] == 1.0e-4
-    assert parameters["calmet"]["maximum_mixing_height_m"] == 2500.0
-    assert parameters["calmet"]["maximum_water_mixing_height_m"] == 2500.0
-    assert parameters["calmet"]["precipitation_radius_km"] == 50.0
-    assert parameters["calmet"]["mnmdav"] == 10
-    assert parameters["calmet"]["wind_extrapolation"] == -1
-    assert parameters["calmet"]["include_w_temperature"] is False
