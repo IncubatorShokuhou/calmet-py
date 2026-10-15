@@ -69,10 +69,10 @@ result = pycalmet.run_pipeline(
     calwrf_wrf_files=[
         example / "wrfout_d01_2018-03-18_00_00_00.nc",
         example / "wrfout_d01_2018-03-18_01_00_00.nc",
-        example / "wrfout_d01_2018-03-18_02_00_00.nc",
     ],
+    # CALWRF 包含首尾边界；这两个时次界定 CALMET 的 [00:00, 01:00) 小时。
     calwrf_start=datetime(2018, 3, 18, 0),
-    calwrf_end=datetime(2018, 3, 18, 2),
+    calwrf_end=datetime(2018, 3, 18, 1),
     terrel_srtm_dir=Path("data/terrain/srtm3"),
     terrel_grid=grid,
     terrel_sampling="bilinear",
@@ -226,9 +226,9 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 
 | 参数 | 含义 | Python 类型 | Python 默认值 | 浙江示例值 |
 | --- | --- | --- | --- | --- |
-| `wrf_files` | 按时间顺序排列的 WRF NetCDF 文件。 | `Sequence[str \| Path] \| None` | `必填` | `[examples/zhejiang/wrfout_d01_2018-03-18_00_00_00.nc, examples/zhejiang/wrfout_d01_2018-03-18_01_00_00.nc, … (3 items)]` |
+| `wrf_files` | 按时间顺序排列的 WRF NetCDF 文件。 | `Sequence[str \| Path] \| None` | `必填` | `[examples/zhejiang/wrfout_d01_2018-03-18_00_00_00.nc, examples/zhejiang/wrfout_d01_2018-03-18_01_00_00.nc]` |
 | `start` | 计算开始时刻；使用无时区且精确到秒的时间，接受 datetime 或 YYYYMMDDHH/ISO 风格文本。 | `datetime \| str \| None` | `必填` | `2018-03-18 00:00:00` |
-| `end` | 计算结束时刻；使用无时区且精确到秒的时间，接受 datetime 或 YYYYMMDDHH/ISO 风格文本。 | `datetime \| str \| None` | `必填` | `2018-03-18 02:00:00` |
+| `end` | 计算结束时刻；使用无时区且精确到秒的时间，接受 datetime 或 YYYYMMDDHH/ISO 风格文本。 | `datetime \| str \| None` | `必填` | `2018-03-18 01:00:00` |
 | `output` | 主输出文件路径。 | `str \| Path \| None` | `必填` | `output/zhejiang/calwrf.nc` |
 | `create_surface` | 同时请求 legacy_output 时，是否另外生成传统 M2D 地面气象文件。 | `bool` | `True` | `False` |
 | `compression` | CALWRF 输出的 NetCDF deflate 压缩级别（0 表示不压缩）。 | `int` | `1` | `1` |
@@ -679,9 +679,9 @@ tools/                 维护工具
 PROJ，海岸线裁剪使用 Shapely，最近邻搜索使用 SciPy `cKDTree`。CALMET 专有物理
 参数化和少见的历史输入格式仍由软件包实现。
 
-浙江示例采用 LCC 投影、1 km 网格距和 `610 × 499` 网格。示例 WRF 数据覆盖
-2018-03-18 00:00–02:00 UTC。当前配置的 00:00–01:00 CALMET 时段使用前两个
-时次；如果将运行扩展到下一个时段，可直接使用 02:00 记录。
+浙江示例采用 LCC 投影、1 km 网格距和 `610 × 499` 网格。当前运行脚本只传入
+00:00 和 01:00 UTC 两个 WRF 边界场，用于配置的 `[00:00, 01:00)` CALMET
+时段。仓库仍提供 02:00 记录以便扩展运行，但当前脚本不会读取它。
 
 ## 验证
 

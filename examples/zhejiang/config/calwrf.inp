@@ -3,9 +3,8 @@ Create CALWRF data for the Zhejiang example
 ../../../output/zhejiang/calwrf.nc
 -9,-9,-9,-9,-9,-9
 2018031800
-2018031802
-3
+2018031801
+2
 ../wrfout_d01_2018-03-18_00_00_00.nc
 ../wrfout_d01_2018-03-18_01_00_00.nc
-../wrfout_d01_2018-03-18_02_00_00.nc
 0

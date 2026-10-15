@@ -17,7 +17,7 @@ LANDUSE_FILE: Final[Path] = DATA / "landuse" / "usgs-glcc" / "EAUSGS1.IMG"
 OUTPUT: Final[Path] = ROOT / "output" / "zhejiang"
 WRF_FILES: Final[tuple[Path, ...]] = tuple(
     EXAMPLE / f"wrfout_d01_2018-03-18_{hour:02d}_00_00.nc"
-    for hour in range(3)
+    for hour in range(2)
 )
 SRTM_FILES: Final[tuple[Path, ...]] = tuple(
     SRTM_DIRECTORY / f"N{latitude:02d}E{longitude:03d}.hgt"
@@ -32,9 +32,9 @@ TERRAIN_SOURCES: Final[tuple[pycalmet.TerrelSource, ...]] = tuple(
     )
     for path in SRTM_FILES
 )
-WRF_START: Final[datetime] = datetime(2018, 3, 18, 0)
-WRF_END: Final[datetime] = datetime(2018, 3, 18, 2)
-CALMET_END: Final[datetime] = datetime(2018, 3, 18, 1)
+# CALWRF includes both boundary times; CALMET writes the interval [start, end).
+RUN_START: Final[datetime] = datetime(2018, 3, 18, 0)
+RUN_END: Final[datetime] = datetime(2018, 3, 18, 1)
 GRID: Final[pycalmet.GridConfig] = pycalmet.GridConfig(
     nx=610,
     ny=499,
@@ -55,8 +55,8 @@ def main() -> None:
     result: Path = pycalmet.run_pipeline(
         inp=None,
         calwrf_wrf_files=WRF_FILES,
-        calwrf_start=WRF_START,
-        calwrf_end=WRF_END,
+        calwrf_start=RUN_START,
+        calwrf_end=RUN_END,
         calwrf_create_surface=False,
         calwrf_title="Create CALWRF data for the Zhejiang example",
         terrel_srtm_dir=SRTM_DIRECTORY,
@@ -70,8 +70,8 @@ def main() -> None:
         ctgproc_grid=GRID,
         makegeo_title="Demo Application",
         makegeo_grid=GRID,
-        calmet_start=WRF_START,
-        calmet_end=CALMET_END,
+        calmet_start=RUN_START,
+        calmet_end=RUN_END,
         calmet_grid=GRID,
         calmet_noobs=2,
         calmet_iprog=14,

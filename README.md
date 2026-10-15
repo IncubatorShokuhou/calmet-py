@@ -73,10 +73,10 @@ result = pycalmet.run_pipeline(
     calwrf_wrf_files=[
         example / "wrfout_d01_2018-03-18_00_00_00.nc",
         example / "wrfout_d01_2018-03-18_01_00_00.nc",
-        example / "wrfout_d01_2018-03-18_02_00_00.nc",
     ],
+    # CALWRF includes both endpoints; they bracket CALMET's [00:00, 01:00) hour.
     calwrf_start=datetime(2018, 3, 18, 0),
-    calwrf_end=datetime(2018, 3, 18, 2),
+    calwrf_end=datetime(2018, 3, 18, 1),
     terrel_srtm_dir=Path("data/terrain/srtm3"),
     terrel_grid=grid,
     terrel_sampling="bilinear",
@@ -249,9 +249,9 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 
 | Parameter | Meaning | Python type | Python default | Zhejiang value |
 | --- | --- | --- | --- | --- |
-| `wrf_files` | WRF NetCDF files, in chronological order. | `Sequence[str \| Path] \| None` | `required` | `[examples/zhejiang/wrfout_d01_2018-03-18_00_00_00.nc, examples/zhejiang/wrfout_d01_2018-03-18_01_00_00.nc, … (3 items)]` |
+| `wrf_files` | WRF NetCDF files, in chronological order. | `Sequence[str \| Path] \| None` | `required` | `[examples/zhejiang/wrfout_d01_2018-03-18_00_00_00.nc, examples/zhejiang/wrfout_d01_2018-03-18_01_00_00.nc]` |
 | `start` | First naive, second-precision timestamp included in the run; accepts datetime or YYYYMMDDHH/ISO-like text. | `datetime \| str \| None` | `required` | `2018-03-18 00:00:00` |
-| `end` | Last naive, second-precision timestamp included in the run; accepts datetime or YYYYMMDDHH/ISO-like text. | `datetime \| str \| None` | `required` | `2018-03-18 02:00:00` |
+| `end` | Last naive, second-precision timestamp included in the run; accepts datetime or YYYYMMDDHH/ISO-like text. | `datetime \| str \| None` | `required` | `2018-03-18 01:00:00` |
 | `output` | Primary output file path. | `str \| Path \| None` | `required` | `output/zhejiang/calwrf.nc` |
 | `create_surface` | Create the separate legacy M2D surface file when legacy_output is also requested. | `bool` | `True` | `False` |
 | `compression` | NetCDF deflate compression level for CALWRF output (0 disables compression). | `int` | `1` | `1` |
@@ -720,9 +720,10 @@ nearest-neighbour searches use SciPy `cKDTree`. CALMET-specific parameterization
 and uncommon historical input formats remain implemented in the package.
 
 The Zhejiang example uses an LCC grid with a 1 km spacing and a `610 × 499`
-domain. Its WRF records cover 2018-03-18 00:00–02:00 UTC. The configured
-00:00–01:00 CALMET period uses the first two records; the 02:00 record is
-available when extending the run through the next interval.
+domain. Its active runners pass the 00:00 and 01:00 UTC WRF boundary records
+needed for the configured `[00:00, 01:00)` CALMET interval. A bundled 02:00
+record is available for extending the run, but the current runners do not read
+it.
 
 ## Validation
 

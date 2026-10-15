@@ -36,8 +36,10 @@ def test_example_controls_form_a_complete_source_to_output_chain():
     geo = makegeo_config(CONFIG / "makegeo.inp")
     calmet = calmet_config(CONFIG / "calmet.inp")
 
-    assert len(calwrf.wrf_files) == 3
+    assert len(calwrf.wrf_files) == 2
     assert all(Path(path).is_file() for path in calwrf.wrf_files)
+    assert calwrf.start == calmet.start
+    assert calwrf.end == calmet.end
     assert len(terrain.terrain_files) == 42
     assert all(Path(path).is_file() for path in terrain.terrain_files)
     assert landuse.input_type == "GLAZAS"
@@ -210,10 +212,10 @@ def test_runner_calls_parameter_only_pipeline_once(tmp_path):
     }
     assert call["wrf_files"] == [
         str(EXAMPLE / f"wrfout_d01_2018-03-18_{hour:02d}_00_00.nc")
-        for hour in range(3)
+        for hour in range(2)
     ]
     assert call["wrf_start"] == "2018-03-18T00:00:00"
-    assert call["wrf_end"] == "2018-03-18T02:00:00"
+    assert call["wrf_end"] == "2018-03-18T01:00:00"
     assert len(call["terrain_sources"]) == 42
     assert all(
         source["input_type"] == "SRTM3"

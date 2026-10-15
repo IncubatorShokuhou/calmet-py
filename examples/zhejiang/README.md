@@ -6,9 +6,10 @@ grid or read a traditional control file in its default runner.
 
 ## Bundled inputs
 
-- Three WRF records for 2018-03-18 00:00, 01:00, and 02:00 UTC. The configured
-  00:00–01:00 CALMET period uses the first two; the final record supports
-  extending the example through the next interval.
+- Two active WRF records for 2018-03-18 00:00 and 01:00 UTC. They are the
+  boundary fields required for the configured CALMET output interval
+  `[00:00, 01:00)`. A bundled 02:00 record remains available for extending the
+  example, but the current runners do not read it.
 - 42 original SRTM3 tiles under `data/terrain/srtm3/`, covering N26–N31 and
   E117–E123. Each `.hgt` file is a 1201 × 1201 signed 16-bit elevation grid.
 - `data/landuse/usgs-glcc/EAUSGS1.IMG`, the original `13000 × 12000`
