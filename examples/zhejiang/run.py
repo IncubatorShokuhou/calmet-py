@@ -11,8 +11,9 @@ import pycalmet
 
 ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 EXAMPLE: Final[Path] = ROOT / "examples" / "zhejiang"
-SRTM_DIRECTORY: Final[Path] = ROOT / "terrain" / "srtm3"
-LANDUSE_FILE: Final[Path] = EXAMPLE / "landuse" / "zhejiang_generic.landuse"
+DATA: Final[Path] = ROOT / "data"
+SRTM_DIRECTORY: Final[Path] = DATA / "terrain" / "srtm3"
+LANDUSE_FILE: Final[Path] = DATA / "landuse" / "usgs-glcc" / "EAUSGS1.IMG"
 OUTPUT: Final[Path] = ROOT / "output" / "zhejiang"
 WRF_FILES: Final[tuple[Path, ...]] = tuple(
     EXAMPLE / f"wrfout_d01_2018-03-18_{hour:02d}_00_00.nc"
@@ -63,7 +64,8 @@ def main() -> None:
         terrel_terrain_sources=TERRAIN_SOURCES,
         terrel_grid=GRID,
         ctgproc_landuse_files=(LANDUSE_FILE,),
-        ctgproc_input_type="GEN",
+        ctgproc_input_type="GLAZAS",
+        ctgproc_input_datum="ESR-S",
         ctgproc_mesh_density=12,
         ctgproc_grid=GRID,
         makegeo_title="Demo Application",

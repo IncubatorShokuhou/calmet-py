@@ -7,8 +7,8 @@ API 提供 CALWRF、TERREL、CTGPROC、MAKEGEO 和 CALMET 五个阶段，推荐�
 NetCDF 作为中间格式，同时保留对 CALPUFF 传统文件的读写兼容能力。
 
 本项目面向可复现实验、自动化气象数据处理和既有 CALMET 工作流现代化。仓库将
-Python 库、Fortran 参考源码、浙江真实数据示例和 SRTM3 地形数据分别管理，运行
-Python 主流程无需编译 Fortran。
+Python 库、Fortran 参考源码、浙江真实数据示例以及原始地形和土地利用数据分别
+管理，运行 Python 主流程无需编译 Fortran。
 
 ## 主要特性
 
@@ -73,12 +73,13 @@ result = pycalmet.run_pipeline(
     ],
     calwrf_start=datetime(2018, 3, 18, 0),
     calwrf_end=datetime(2018, 3, 18, 2),
-    terrel_srtm_dir=Path("terrain/srtm3"),
+    terrel_srtm_dir=Path("data/terrain/srtm3"),
     terrel_grid=grid,
     terrel_sampling="bilinear",
-    ctgproc_landuse_files=[example / "landuse/zhejiang_generic.landuse"],
+    ctgproc_landuse_files=[Path("data/landuse/usgs-glcc/EAUSGS1.IMG")],
     ctgproc_grid=grid,
-    ctgproc_input_type="GEN",
+    ctgproc_input_type="GLAZAS",
+    ctgproc_input_datum="ESR-S",
     ctgproc_mesh_density=12,
     makegeo_grid=grid,
     calmet_start=datetime(2018, 3, 18, 0),
@@ -100,10 +101,11 @@ result = pycalmet.run_pipeline(
 )
 ```
 
-浙江 `GENERIC.LANDUSE` 文件已在文件头声明其源坐标基准为 `WGS-84`，CTGPROC
-会直接读取，因此无需再传 `ctgproc_input_datum`。只有土地利用格式未携带可用的
-datum 或 CRS 元数据时才需要该参数；它描述源数据，不能从目标
-`GridConfig.datum` 推断。
+浙江示例直接读取原始 `EAUSGS1.IMG`：它是一个 `13000 × 12000`、无文件头的
+`uint8` 栅格，采用面向亚洲区域优化的 USGS Global/GLCC 风格兰伯特方位等积
+网格。`GLAZAS` 指定这套固定栅格布局，`ESR-S` 指定源数据基准；
+`mesh_density=12` 对应传统配置中的 `MESHGLAZ=12` 重采样控制。源基准不同于
+目标网格的 `GridConfig.datum="WGS-84"`，因此必须显式填写。
 
 下方各阶段参数表中的每个字段，都可分别加上 `calwrf_`、`terrel_`、`ctgproc_`、
 `makegeo_` 或 `calmet_` 前缀后直接传入。例如 CALMET 的 `z_faces_m` 对应
@@ -249,8 +251,8 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 | `output` | 主输出文件路径。 | `str \| Path \| None` | `必填` | `output/zhejiang/terrain.nc` |
 | `datum` | 输出网格的大地基准/区域代码；各输入源另行指定其输入基准。 | `str` | `'WGS-84'` | `'WGS-84'` |
 | `sampling` | 地形坐标转换方法：`direct` 逐个转换 DEM 样本，精度较高；`bilinear`/`legacy` 只转换图幅角点，再插值内部坐标。 | `str` | `'bilinear'` | `'legacy'` |
-| `terrain_files` | 选定的地形文件路径；相对 SRTM 瓦片名会在 srtm_dir 内解析。 | `Sequence[str \| Path]` | `()` | `[terrain/srtm3/N26E117.hgt, terrain/srtm3/N26E118.hgt, … (42 items)]` |
-| `terrain_sources` | 地形源记录 `(路径, 输入类型, 输入基准)`；输入类型选择 DEM 读取器，例如 SRTM1/3、GTOPO30、CDED、GEN 或 GEOTIFF。 | `Sequence[TerrelSource]` | `()` | `(TerrelSource(path=terrain/srtm3/N26E117.hgt, input_type='SRTM3', input_datum='WGS-96'), TerrelSource(path=terrain/…datum='WGS-96'), … (42 items))` |
+| `terrain_files` | 选定的地形文件路径；相对 SRTM 瓦片名会在 srtm_dir 内解析。 | `Sequence[str \| Path]` | `()` | `[data/terrain/srtm3/N26E117.hgt, data/terrain/srtm3/N26E118.hgt, … (42 items)]` |
+| `terrain_sources` | 地形源记录 `(路径, 输入类型, 输入基准)`；输入类型选择 DEM 读取器，例如 SRTM1/3、GTOPO30、CDED、GEN 或 GEOTIFF。 | `Sequence[TerrelSource]` | `()` | `(TerrelSource(path=data/terrain/srtm3/N26E117.hgt, input_type='SRTM3', input_datum='WGS-96'), TerrelSource(path=dat…datum='WGS-96'), … (42 items))` |
 | `void_fill` | 是否用邻近有效格点填补空白地形输出格点，最大搜索距离为 cell_radius_km。 | `bool` | `False` | `False` |
 | `cell_radius_km` | 启用 void_fill 时查找有效邻格的最大半径，单位 km；应至少为一个网格间距。 | `float` | `0.0` | `5.0` |
 | `model` | TERREL 输出模型：CALMET (1)、MESOPAC (2)、ISC 极坐标 (3)、ISC 笛卡尔 (4)、NUATMOS (5) 或通用格式 (6)；同时决定输出格点平均高程还是峰值高程。 | `int` | `1` | `1` |
@@ -302,12 +304,12 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 
 | 参数 | 含义 | Python 类型 | Python 默认值 | 浙江示例值 |
 | --- | --- | --- | --- | --- |
-| `landuse_files` | CTGPROC 读取的土地利用数据库文件路径。 | `Sequence[str \| Path] \| None` | `必填` | `[examples/zhejiang/landuse/zhejiang_generic.landuse]` |
+| `landuse_files` | CTGPROC 读取的土地利用数据库文件路径。 | `Sequence[str \| Path] \| None` | `必填` | `[data/landuse/usgs-glcc/EAUSGS1.IMG]` |
 | `output` | 主输出文件路径。 | `str \| Path \| None` | `必填` | `output/zhejiang/landuse.nc` |
 | `category_map` | 分箱后应用的源土地利用类别到目标类别映射；映射到同一目标的命中数会相加。 | `dict[int, int] \| None` | `{}` | `{}` |
-| `input_type` | 土地利用数据库读取器名称/代码，例如 CTG、GEN、NLCD、CORINE、GLC2K、UMDGLC 或 MODIS。 | `str` | `'CTG'` | `'GEN'` |
-| `mesh_density` | 每个输入土地利用单元在每条边上的细分数，共生成 mesh_density² 个采样点；不得小于 1。 | `int` | `1` | `12` |
-| `input_datum` | 土地利用格式未携带可用 datum/CRS 元数据时使用的源坐标基准；可自描述的 GENERIC 文件和受支持的 GeoTIFF 会改从文件中读取。 | `str` | `'NAS-C'` | `'WGS-84'` |
+| `input_type` | 土地利用数据库读取器名称/代码；GLAZAS 指定固定的 13000 × 12000 亚洲区 USGS Global/GLCC 风格 LAEA 栅格，其他读取器包括 CTG、GEN、NLCD、CORINE、GLC2K、UMDGLC 和 MODIS。 | `str` | `'CTG'` | `'GLAZAS'` |
+| `mesh_density` | 每个输入土地利用单元在每条边上的细分数，共生成 mesh_density² 个采样点；对于 GLAZ 输入即 MESHGLAZ 控制，且不得小于 1。 | `int` | `1` | `12` |
+| `input_datum` | 土地利用格式未携带可用 datum/CRS 元数据时使用的源坐标基准；无文件头的 GLAZAS 数据必须显式指定源基准。 | `str` | `'NAS-C'` | `'ESR-S'` |
 | `output_format` | 输出编码：按文件名判断 (auto)、传统 CTGPROC 格式 (legacy)，或 NetCDF。 | `str` | `'auto'` | `'auto'` |
 | `coastline_file` | 处理后的 BLN 岸线输入；提供 gshhs_file 时，该路径接收生成的 BLN 数据。 | `str \| Path \| None` | `None` | `None` |
 | `gshhs_file` | 用于生成处理后 BLN 岸线的原始 GSHHS 岸线数据库。 | `str \| Path \| None` | `None` | `None` |
@@ -318,7 +320,7 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 | `ocean_category` | 赋给海洋格点的土地利用类别。 | `int` | `55` | `55` |
 | `previous_landuse` | 用于继续多轮土地利用累计的先前 CTGPROC 整数命中数输出。 | `str \| Path \| None` | `None` | `None` |
 | `final_output` | CTGPROC 处理阶段：为真时写出供 MAKEGEO 使用的土地利用比例；为假时写出整数命中数，供 previous_landuse 继续处理。 | `bool` | `True` | `True` |
-| `landuse_sources` | 土地利用源记录 `(路径, 输入类型, 输入基准, 网格细分密度)`。 | `Sequence[CtgprocSource]` | `()` | `(CtgprocSource(path=examples/zhejiang/landuse/zhejiang_generic.landuse, input_type='GEN', input_datum='WGS-84', mesh_density=12))` |
+| `landuse_sources` | 土地利用源记录 `(路径, 输入类型, 输入基准, 网格细分密度)`。 | `Sequence[CtgprocSource]` | `()` | `(CtgprocSource(path=data/landuse/usgs-glcc/EAUSGS1.IMG, input_type='GLAZAS', input_datum='ESR-S', mesh_density=12))` |
 | `snow_processing` | 启用相应阶段的积雪流程：CTGPROC 写出 SNODAS 参考记录；MAKEGEO 生成逐日积雪修正 GEO 文件。 | `bool` | `False` | `False` |
 | `qa_cell_output` | 是否写出 CTGPROC 原始及细分输入点的质检坐标文件；输出可能很大。 | `bool` | `False` | `False` |
 | `qa_hit_threshold_percent` | 标记采样数低于区域平均命中数这一百分比（0–100）的格点。 | `int` | `75` | `75` |
@@ -629,13 +631,15 @@ TEMP3D 行为，以支持结果复现。
 
 ## 浙江示例
 
-仓库内置三个连续 WRF 时次、42 个原始 SRTM3 `.hgt` 瓦片和分类土地利用点数据。
-示例会重新生成地形、土地利用和地理场，不依赖预先做好的 `geo.nc`。从仓库根目录
-运行完整的五阶段流水线：
+仓库内置三个连续 WRF 时次、42 个原始 SRTM3 `.hgt` 瓦片和原始
+`EAUSGS1.IMG` 土地利用栅格。示例会重新生成地形、土地利用和地理场，不依赖预先
+做好的 `geo.nc`。从仓库根目录运行完整的五阶段流水线：
 
 ```bash
+git lfs pull
 sha256sum -c examples/zhejiang/SHA256SUMS
-cd terrain/srtm3 && sha256sum -c SHA256SUMS && cd ../..
+cd data/terrain/srtm3 && sha256sum -c SHA256SUMS && cd ../../..
+cd data/landuse/usgs-glcc && sha256sum -c SHA256SUMS && cd ../../..
 
 ./examples/zhejiang/run.sh
 ```
@@ -649,7 +653,8 @@ cd terrain/srtm3 && sha256sum -c SHA256SUMS && cd ../..
 src/pycalmet/          Python 软件包和可选 legacy 命名空间
 tests/                 单元测试和集成测试
 examples/zhejiang/     可运行的真实数据示例及控制文件
-terrain/srtm3/         浙江区域使用的 SRTM3 瓦片
+data/terrain/srtm3/    浙江区域使用的原始 SRTM3 瓦片
+data/landuse/usgs-glcc/ 原始 USGS Global/GLCC 风格土地利用栅格
 fortran/               仅供参考的 Fortran 源码，运行时不使用
 tools/                 维护工具
 ```
@@ -660,8 +665,10 @@ tools/                 维护工具
 ## 数据和输出约定
 
 规范输出统一由 `netCDF4.Dataset` 创建和读取，软件包不再依赖 xarray。只有在
-显式指定传统输出路径或兼容选项时，才会写出 CALMET 系列旧格式文件。大型用户
-输入应放在源码树之外；生成结果统一写入 Git 忽略的 `output/`。
+显式指定传统输出路径或兼容选项时，才会写出 CALMET 系列旧格式文件。仓库自带的
+原始数据统一放在 `data/terrain/` 和 `data/landuse/`；`EAUSGS1.IMG` 等大型二进制
+源文件通过 Git LFS 管理。浙江配置没有使用 `EAUSGS2.IMG`，因此仓库不纳入该文件。
+用户自己的大型输入通常应放在源码树之外；生成结果统一写入 Git 忽略的 `output/`。
 
 物理场和模型状态数组默认使用 32 位浮点数。时间坐标、整数类别与索引、投影坐标，
 以及少量涉及收敛判断或大规模归约的标量，会保留保证时间、空间与数值正确性所需的

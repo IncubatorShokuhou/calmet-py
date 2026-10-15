@@ -81,7 +81,7 @@ Subgroup (0b)
     (UMDGLC)  designates Univ. of Maryland Global Land Cover GeoTIFF
     (MODIS)   designates Boston Univ. Modis Global Land Cover
 
-1 !GEN = ../landuse/zhejiang_generic.landuse! !END!
+1 !GLAZAS = ../../../data/landuse/usgs-glcc/EAUSGS1.IMG! !END!
 
 --------------------------------------------------------------------------------
 

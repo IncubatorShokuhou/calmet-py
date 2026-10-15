@@ -532,14 +532,17 @@ def run_pipeline(
         ctgproc_category_map: CTGPROC stage. Post-binning map from source to target
                               land-use categories; hit counts mapped to the same target
                               are summed.
-        ctgproc_input_type: CTGPROC stage. Land-use database reader name/code, such as
-                            CTG, GEN, NLCD, CORINE, GLC2K, UMDGLC, or MODIS.
+        ctgproc_input_type: CTGPROC stage. Land-use database reader name/code; GLAZAS
+                            selects the fixed 13000 × 12000 Asia USGS Global/GLCC-style
+                            LAEA raster, while other readers include CTG, GEN, NLCD,
+                            CORINE, GLC2K, UMDGLC, and MODIS.
         ctgproc_mesh_density: CTGPROC stage. Per-side subdivision count for each input
-                              land-use cell, producing mesh_density² sample points; must
-                              be at least 1.
+                              land-use cell, producing mesh_density² sample points; this
+                              is the MESHGLAZ control for GLAZ inputs and must be at
+                              least 1.
         ctgproc_input_datum: CTGPROC stage. Source datum for land-use formats without
-                             usable datum/CRS metadata; self-describing GENERIC and
-                             supported GeoTIFF inputs read it from the file instead.
+                             usable datum/CRS metadata; headerless GLAZAS data therefore
+                             requires the explicit source datum.
         ctgproc_output_format: CTGPROC stage. Output encoding: choose from the filename
                                (auto), traditional CTGPROC format (legacy), or NetCDF.
         ctgproc_coastline_file: CTGPROC stage. Processed BLN coastline input; when

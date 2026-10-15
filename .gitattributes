@@ -1,3 +1,4 @@
 # Preserve byte-exact scientific inputs on every platform.
-terrain/srtm3/*.hgt -text
+data/terrain/srtm3/*.hgt -text
 examples/zhejiang/*.nc -text
+data/landuse/usgs-glcc/*.IMG filter=lfs diff=lfs merge=lfs -text

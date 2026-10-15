@@ -9,21 +9,28 @@ grid or read a traditional control file in its default runner.
 - Three WRF records for 2018-03-18 00:00, 01:00, and 02:00 UTC. The configured
   00:00–01:00 CALMET period uses the first two; the final record supports
   extending the example through the next interval.
-- 42 original SRTM3 tiles under `terrain/srtm3/`, covering N26–N31 and
+- 42 original SRTM3 tiles under `data/terrain/srtm3/`, covering N26–N31 and
   E117–E123. Each `.hgt` file is a 1201 × 1201 signed 16-bit elevation grid.
-- `landuse/zhejiang_generic.landuse`, a WGS-84 categorical point dataset with
-  one source record at each target-grid cell center. Its categories preserve
-  the validated Zhejiang example's dominant land use using the corresponding
-  USGS classes.
+- `data/landuse/usgs-glcc/EAUSGS1.IMG`, the original `13000 × 12000`
+  headerless `uint8` land-use raster. It uses the Asia-optimized USGS
+  Global/GLCC-style Lambert azimuthal equal-area grid. CTGPROC reads it as
+  `GLAZAS` with the `ESR-S` source datum and `MESHGLAZ=12` (the Python
+  `mesh_density=12`). The target CALMET grid remains `WGS-84`.
 - One control file per stage under `config/`, used by the separate
   `run_stages.py` example. Their relative paths form a complete processing
   chain.
 
+`EAUSGS1.IMG` is stored with Git LFS. The companion `EAUSGS2.IMG` is not used:
+the Zhejiang setup has one database (`NDBF=1`) and selects only the
+Asia-optimized raster, so the unused file is not included.
+
 Verify the source files from the repository root:
 
 ```bash
+git lfs pull
 sha256sum -c examples/zhejiang/SHA256SUMS
-cd terrain/srtm3 && sha256sum -c SHA256SUMS && cd ../..
+cd data/terrain/srtm3 && sha256sum -c SHA256SUMS && cd ../../..
+cd data/landuse/usgs-glcc && sha256sum -c SHA256SUMS && cd ../../..
 ```
 
 ## Run
@@ -36,8 +43,8 @@ python -m pip install -e .
 ```
 
 The default runner, [`run.py`](run.py), declares the WRF inputs, 42 SRTM
-sources, land-use input, datetimes, shared `GridConfig`, and active CALMET
-controls as typed Python values. It passes them to one
+sources, original GLAZAS land-use input, datetimes, shared `GridConfig`, and
+active CALMET controls as typed Python values. It passes them to one
 `pycalmet.run_pipeline(inp=None, ...)` call; no `.inp` file is read.
 
 `run_pipeline` creates the CALWRF, terrain, land-use, and geophysical NetCDF

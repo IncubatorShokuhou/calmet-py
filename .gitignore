@@ -41,5 +41,6 @@ wrfout*
 *.zip
 
 # Versioned scientific fixtures
-!terrain/srtm3/*.hgt
+!data/terrain/srtm3/*.hgt
+!data/landuse/usgs-glcc/EAUSGS1.IMG
 !examples/zhejiang/*.nc

@@ -40,8 +40,13 @@ def test_example_controls_form_a_complete_source_to_output_chain():
     assert all(Path(path).is_file() for path in calwrf.wrf_files)
     assert len(terrain.terrain_files) == 42
     assert all(Path(path).is_file() for path in terrain.terrain_files)
-    assert landuse.input_type == "GEN"
+    assert landuse.input_type == "GLAZAS"
+    assert landuse.input_datum == "ESR-S"
+    assert landuse.mesh_density == 12
     assert all(Path(path).is_file() for path in landuse.landuse_files)
+    assert [Path(path).stat().st_size for path in landuse.landuse_files] == [
+        156_000_000
+    ]
     assert geo.terrain == terrain.output
     assert geo.landuse == landuse.output
     assert calmet.geophysical == geo.output
@@ -105,6 +110,9 @@ def test_runner_calls_parameter_only_pipeline_once(tmp_path):
                             "terrel_sampling": kwargs["terrel_sampling"],
                             "ctgproc_input_type": kwargs[
                                 "ctgproc_input_type"
+                            ],
+                            "ctgproc_input_datum": kwargs[
+                                "ctgproc_input_datum"
                             ],
                             "ctgproc_mesh_density": kwargs[
                                 "ctgproc_mesh_density"
@@ -171,6 +179,7 @@ def test_runner_calls_parameter_only_pipeline_once(tmp_path):
         "terrel_grid",
         "ctgproc_landuse_files",
         "ctgproc_input_type",
+        "ctgproc_input_datum",
         "ctgproc_mesh_density",
         "ctgproc_grid",
         "makegeo_title",
@@ -205,7 +214,7 @@ def test_runner_calls_parameter_only_pipeline_once(tmp_path):
         for source in call["terrain_sources"]
     )
     assert call["landuse_files"] == [
-        str(EXAMPLE / "landuse" / "zhejiang_generic.landuse")
+        str(ROOT / "data" / "landuse" / "usgs-glcc" / "EAUSGS1.IMG")
     ]
     assert call["grid"] == {
         "nx": 610,
@@ -219,9 +228,10 @@ def test_runner_calls_parameter_only_pipeline_once(tmp_path):
     assert call["stage_controls"] == {
         "calwrf_create_surface": False,
         "calwrf_title": "Create CALWRF data for the Zhejiang example",
-        "terrel_srtm_dir": str(ROOT / "terrain" / "srtm3"),
+        "terrel_srtm_dir": str(ROOT / "data" / "terrain" / "srtm3"),
         "terrel_sampling": "bilinear",
-        "ctgproc_input_type": "GEN",
+        "ctgproc_input_type": "GLAZAS",
+        "ctgproc_input_datum": "ESR-S",
         "ctgproc_mesh_density": 12,
         "makegeo_title": "Demo Application",
     }

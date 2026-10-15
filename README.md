@@ -9,7 +9,7 @@ format and compatibility readers and writers for legacy CALPUFF files.
 
 The package is intended for reproducible research, automated data processing,
 and modernization of existing CALMET workflows. A complete Zhejiang example,
-the required SRTM3 terrain tiles, and the original Fortran sources used as
+its original terrain and land-use sources, and the Fortran sources used as
 numerical references are kept in separate, clearly scoped directories.
 
 ## Highlights
@@ -77,12 +77,13 @@ result = pycalmet.run_pipeline(
     ],
     calwrf_start=datetime(2018, 3, 18, 0),
     calwrf_end=datetime(2018, 3, 18, 2),
-    terrel_srtm_dir=Path("terrain/srtm3"),
+    terrel_srtm_dir=Path("data/terrain/srtm3"),
     terrel_grid=grid,
     terrel_sampling="bilinear",
-    ctgproc_landuse_files=[example / "landuse/zhejiang_generic.landuse"],
+    ctgproc_landuse_files=[Path("data/landuse/usgs-glcc/EAUSGS1.IMG")],
     ctgproc_grid=grid,
-    ctgproc_input_type="GEN",
+    ctgproc_input_type="GLAZAS",
+    ctgproc_input_datum="ESR-S",
     ctgproc_mesh_density=12,
     makegeo_grid=grid,
     calmet_start=datetime(2018, 3, 18, 0),
@@ -104,10 +105,12 @@ result = pycalmet.run_pipeline(
 )
 ```
 
-The Zhejiang `GENERIC.LANDUSE` file declares its `WGS-84` source datum in its
-header, so CTGPROC reads it directly. `ctgproc_input_datum` is needed only for
-land-use formats that do not carry usable datum or CRS metadata; it describes
-the source data and must not be inferred from the target `GridConfig.datum`.
+The Zhejiang land-use source is the original `EAUSGS1.IMG`: a `13000 × 12000`
+headerless unsigned 8-bit raster for the Asia-optimized USGS Global/GLCC-style
+Lambert azimuthal equal-area grid. `GLAZAS` selects that fixed raster geometry,
+`ESR-S` identifies its source datum, and `mesh_density=12` is the Python form of
+the traditional `MESHGLAZ=12` resampling control. The source datum is distinct
+from the target `GridConfig.datum="WGS-84"` and therefore remains explicit.
 
 Every field in the stage parameter reference below is available under its
 `calwrf_`, `terrel_`, `ctgproc_`, `makegeo_`, or `calmet_` prefix. For example,
@@ -271,8 +274,8 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 | `output` | Primary output file path. | `str \| Path \| None` | `required` | `output/zhejiang/terrain.nc` |
 | `datum` | Output-grid datum/region code; individual input sources specify their own input datum separately. | `str` | `'WGS-84'` | `'WGS-84'` |
 | `sampling` | Terrain coordinate conversion: `direct` transforms every DEM sample (more accurate); `bilinear`/`legacy` transforms sheet corners and interpolates interior coordinates. | `str` | `'bilinear'` | `'legacy'` |
-| `terrain_files` | Selected terrain-file paths; relative SRTM tile names are resolved inside srtm_dir. | `Sequence[str \| Path]` | `()` | `[terrain/srtm3/N26E117.hgt, terrain/srtm3/N26E118.hgt, … (42 items)]` |
-| `terrain_sources` | Terrain-source records `(path, input_type, input_datum)`; input_type selects the DEM reader (for example SRTM1/3, GTOPO30, CDED, GEN, or GEOTIFF). | `Sequence[TerrelSource]` | `()` | `(TerrelSource(path=terrain/srtm3/N26E117.hgt, input_type='SRTM3', input_datum='WGS-96'), TerrelSource(path=terrain/…datum='WGS-96'), … (42 items))` |
+| `terrain_files` | Selected terrain-file paths; relative SRTM tile names are resolved inside srtm_dir. | `Sequence[str \| Path]` | `()` | `[data/terrain/srtm3/N26E117.hgt, data/terrain/srtm3/N26E118.hgt, … (42 items)]` |
+| `terrain_sources` | Terrain-source records `(path, input_type, input_datum)`; input_type selects the DEM reader (for example SRTM1/3, GTOPO30, CDED, GEN, or GEOTIFF). | `Sequence[TerrelSource]` | `()` | `(TerrelSource(path=data/terrain/srtm3/N26E117.hgt, input_type='SRTM3', input_datum='WGS-96'), TerrelSource(path=dat…datum='WGS-96'), … (42 items))` |
 | `void_fill` | Fill empty output terrain cells from nearby valid cells, searching no farther than cell_radius_km. | `bool` | `False` | `False` |
 | `cell_radius_km` | Maximum search radius, in kilometres, used to find valid neighbours when void_fill is enabled; use at least one grid spacing. | `float` | `0.0` | `5.0` |
 | `model` | TERREL output model: CALMET (1), MESOPAC (2), ISC polar (3), ISC Cartesian (4), NUATMOS (5), or generic (6); this also selects cell-average versus peak elevations. | `int` | `1` | `1` |
@@ -324,12 +327,12 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 
 | Parameter | Meaning | Python type | Python default | Zhejiang value |
 | --- | --- | --- | --- | --- |
-| `landuse_files` | Input land-use database file paths consumed by CTGPROC. | `Sequence[str \| Path] \| None` | `required` | `[examples/zhejiang/landuse/zhejiang_generic.landuse]` |
+| `landuse_files` | Input land-use database file paths consumed by CTGPROC. | `Sequence[str \| Path] \| None` | `required` | `[data/landuse/usgs-glcc/EAUSGS1.IMG]` |
 | `output` | Primary output file path. | `str \| Path \| None` | `required` | `output/zhejiang/landuse.nc` |
 | `category_map` | Post-binning map from source to target land-use categories; hit counts mapped to the same target are summed. | `dict[int, int] \| None` | `{}` | `{}` |
-| `input_type` | Land-use database reader name/code, such as CTG, GEN, NLCD, CORINE, GLC2K, UMDGLC, or MODIS. | `str` | `'CTG'` | `'GEN'` |
-| `mesh_density` | Per-side subdivision count for each input land-use cell, producing mesh_density² sample points; must be at least 1. | `int` | `1` | `12` |
-| `input_datum` | Source datum for land-use formats without usable datum/CRS metadata; self-describing GENERIC and supported GeoTIFF inputs read it from the file instead. | `str` | `'NAS-C'` | `'WGS-84'` |
+| `input_type` | Land-use database reader name/code; GLAZAS selects the fixed 13000 × 12000 Asia USGS Global/GLCC-style LAEA raster, while other readers include CTG, GEN, NLCD, CORINE, GLC2K, UMDGLC, and MODIS. | `str` | `'CTG'` | `'GLAZAS'` |
+| `mesh_density` | Per-side subdivision count for each input land-use cell, producing mesh_density² sample points; this is the MESHGLAZ control for GLAZ inputs and must be at least 1. | `int` | `1` | `12` |
+| `input_datum` | Source datum for land-use formats without usable datum/CRS metadata; headerless GLAZAS data therefore requires the explicit source datum. | `str` | `'NAS-C'` | `'ESR-S'` |
 | `output_format` | Output encoding: choose from the filename (auto), traditional CTGPROC format (legacy), or NetCDF. | `str` | `'auto'` | `'auto'` |
 | `coastline_file` | Processed BLN coastline input; when gshhs_file is supplied, this path receives the generated BLN data. | `str \| Path \| None` | `None` | `None` |
 | `gshhs_file` | Raw GSHHS coastline database used to generate the processed BLN coastline. | `str \| Path \| None` | `None` | `None` |
@@ -340,7 +343,7 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 | `ocean_category` | Land-use category assigned to ocean cells. | `int` | `55` | `55` |
 | `previous_landuse` | Prior CTGPROC integer hit-count output to continue a multi-pass land-use accumulation. | `str \| Path \| None` | `None` | `None` |
 | `final_output` | CTGPROC pass type: true writes fractional land use for MAKEGEO; false writes integer hit counts for continuation by previous_landuse. | `bool` | `True` | `True` |
-| `landuse_sources` | Land-use-source records `(path, input_type, input_datum, mesh_density)`. | `Sequence[CtgprocSource]` | `()` | `(CtgprocSource(path=examples/zhejiang/landuse/zhejiang_generic.landuse, input_type='GEN', input_datum='WGS-84', mesh_density=12))` |
+| `landuse_sources` | Land-use-source records `(path, input_type, input_datum, mesh_density)`. | `Sequence[CtgprocSource]` | `()` | `(CtgprocSource(path=data/landuse/usgs-glcc/EAUSGS1.IMG, input_type='GLAZAS', input_datum='ESR-S', mesh_density=12))` |
 | `snow_processing` | Enable the stage's snow workflow: CTGPROC writes SNODAS reference records; MAKEGEO creates daily snow-adjusted GEO files. | `bool` | `False` | `False` |
 | `qa_cell_output` | Write CTGPROC QA coordinate files for original and meshed input points; output may be large. | `bool` | `False` | `False` |
 | `qa_hit_threshold_percent` | Flag cells whose sample count is below this percentage (0–100) of the domain-average hit count. | `int` | `75` | `75` |
@@ -660,13 +663,16 @@ frozen historical formulas and level-centre TEMP3D switch for reproducibility.
 ## Zhejiang example
 
 The bundled example contains three consecutive WRF records, 42 original SRTM3
-`.hgt` tiles, and a categorical land-use point dataset. It rebuilds terrain,
-land use, and the geophysical grid instead of using a prepared `geo.nc`.
+`.hgt` tiles, and the original `EAUSGS1.IMG` land-use raster. It rebuilds
+terrain, land use, and the geophysical grid instead of using a prepared
+`geo.nc`.
 Run the complete five-stage pipeline from the repository root:
 
 ```bash
+git lfs pull
 sha256sum -c examples/zhejiang/SHA256SUMS
-cd terrain/srtm3 && sha256sum -c SHA256SUMS && cd ../..
+cd data/terrain/srtm3 && sha256sum -c SHA256SUMS && cd ../../..
+cd data/landuse/usgs-glcc && sha256sum -c SHA256SUMS && cd ../../..
 
 ./examples/zhejiang/run.sh
 ```
@@ -680,7 +686,8 @@ input boundaries, source data, and generated products.
 src/pycalmet/          Python package and opt-in legacy namespace
 tests/                 Unit and integration tests
 examples/zhejiang/     Runnable real-data example and control files
-terrain/srtm3/         SRTM3 tiles used by the Zhejiang domain
+data/terrain/srtm3/    Original SRTM3 tiles used by the Zhejiang domain
+data/landuse/usgs-glcc/ Original USGS Global/GLCC-style land-use raster
 fortran/               Reference Fortran sources; not used at runtime
 tools/                 Maintainer utilities
 ```
@@ -694,8 +701,12 @@ products are intentionally excluded from the maintained library.
 Canonical outputs are NetCDF files created and read with `netCDF4.Dataset`.
 The package does not depend on xarray. Legacy formatted and unformatted
 CALMET-family files remain available when an output path or compatibility
-option explicitly requests them. Large inputs should be kept outside the
-source tree; generated files belong under `output/`, which is ignored by Git.
+option explicitly requests them. The bundled raw data is grouped under
+`data/terrain/` and `data/landuse/`; large binary sources such as
+`EAUSGS1.IMG` are tracked through Git LFS. `EAUSGS2.IMG` is not used by the
+Zhejiang configuration and is not included. User-supplied large inputs should
+normally stay outside the source tree, while generated files belong under
+`output/`, which is ignored by Git.
 
 Physical fields and model-state arrays use 32-bit floating point by default.
 Time coordinates, integer categories and indices, projection coordinates, and

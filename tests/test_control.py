@@ -430,7 +430,8 @@ def test_existing_component_controls_map_to_typed_configs():
     assert terrel.terrain_sources[0].input_datum=='WGS-96'
 
     ctg=ctgproc_config(ROOT/'examples/zhejiang/config/ctgproc.inp')
-    assert ctg.input_type=='GEN' and ctg.mesh_density==12 and ctg.input_datum=='WGS-84'
+    assert ctg.input_type=='GLAZAS' and ctg.mesh_density==12
+    assert ctg.input_datum=='ESR-S'
 
     geo=makegeo_config(ROOT/'examples/zhejiang/config/makegeo.inp')
     assert geo.title=='Demo Application'
@@ -614,7 +615,8 @@ def test_ctgproc_control_honors_lowercase_file_policy(tmp_path):
         '! LCOAST = F !','! LCOAST = T !')
     control=tmp_path/'ctgproc.inp'; control.write_text(text,encoding='ascii')
     config=ctgproc_config(control)
-    assert config.landuse_sources[0].path==tmp_path/'../landuse/zhejiang_generic.landuse'
+    assert config.landuse_sources[0].path==(
+        tmp_path/'../../../data/landuse/usgs-glcc/eausgs1.img')
     assert Path(config.output).name=='landuse.nc'
     assert config.previous_landuse==tmp_path/'previous.dat'
     assert config.gshhs_file==tmp_path/'gshhs_f.b'
@@ -705,11 +707,12 @@ def test_ctgproc_control_builds_mixed_sources_in_processing_order(tmp_path):
     text+='\n! CTG = extra.ctg !\n! CORINE = europe.tif !\n! DCORINE = WGS-84 !\n! MESHCORN = 3 !\n'
     control=tmp_path/'ctgproc.inp'; control.write_text(text,encoding='ascii')
     config=ctgproc_config(control)
-    assert [item.input_type for item in config.landuse_sources]==['CTG','CORINE','GEN']
+    assert [item.input_type for item in config.landuse_sources]==[
+        'CTG','GLAZAS','CORINE']
     assert config.landuse_sources[0].path==tmp_path/'extra.ctg'
     assert config.landuse_sources[0].input_datum=='NAS-C'
     assert config.landuse_sources[0].mesh_density==12
-    assert config.landuse_sources[1]==CtgprocSource(
+    assert config.landuse_sources[2]==CtgprocSource(
         tmp_path/'europe.tif','CORINE','WGS-84',3)
 
 
@@ -825,15 +828,15 @@ def test_ctgproc_file_override_rebuilds_control_sources(tmp_path):
     config=ctgproc_config(ROOT / "examples/zhejiang/config/ctgproc.inp",landuse_files=files)
     assert tuple(config.landuse_files)==files
     assert config.landuse_sources==(CtgprocSource(
-        files[0],"GEN","WGS-84",12),)
+        files[0],"GLAZAS","ESR-S",12),)
 
 
 def test_ctgproc_source_setting_overrides_rebuild_control_sources():
     config=ctgproc_config(ROOT / "examples/zhejiang/config/ctgproc.inp",mesh_density=3,
                           input_datum="WGS-84")
     assert config.landuse_sources==(CtgprocSource(
-        ROOT / "examples/zhejiang/config/../landuse/zhejiang_generic.landuse",
-        "GEN","WGS-84",3),)
+        ROOT / "examples/zhejiang/config/../../../data/landuse/usgs-glcc/EAUSGS1.IMG",
+        "GLAZAS","WGS-84",3),)
 
 
 def test_terrel_center_reference_is_normalized_to_cell_corner(tmp_path):
@@ -943,7 +946,8 @@ def test_terrel_control_honors_lowercase_file_policy(tmp_path):
     text+='! COASTBLN = Coast.BLN !\n! RAWECHO = Raw.DAT !\n'
     control=tmp_path/'terrel.inp'; control.write_text(text,encoding='ascii')
     config=terrel_config(control)
-    assert config.terrain_sources[0].path==tmp_path/'../../../terrain/srtm3/n26e117.hgt'
+    assert config.terrain_sources[0].path==(
+        tmp_path/'../../../data/terrain/srtm3/n26e117.hgt')
     assert Path(config.output).name=='terrain.nc'
     assert config.receptor_input==tmp_path/'receptors.inp'
     assert config.receptor_output==tmp_path/'receptors.out'

@@ -461,7 +461,7 @@ def test_readlst_component_override_accepts_ctrproc_spelling(tmp_path):
                        encoding="ascii")
     params = pycalmet.readlst(control, component="ctrproc")
     assert isinstance(params["grid"], pycalmet.GridConfig)
-    assert params["input_type"] == "GEN"
+    assert params["input_type"] == "GLAZAS"
 
 
 @pytest.mark.parametrize(("stage", "control", "engine", "config_type"), (
