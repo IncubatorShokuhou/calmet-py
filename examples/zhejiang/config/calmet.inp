@@ -1,7 +1,7 @@
 CALMET.INP      2.2             Hour Start and End Times with Seconds
-Example CALMET simulation (not intended as a guide to option selections)
-MM4 data, 5 surface met stations, 1 overwater station, - for CALMET V6.4
-3 upper air met and 16 precip stations- New parameter: ISTEPPGS
+Zhejiang WRF-only CALMET example driven by CALWRF output
+No surface, upper-air, overwater, or precipitation stations are enabled
+See the Python runners for the Zhejiang observation and fusion examples
 ---------------- Run title (3 lines) ------------------------------------------
 
                     CALMET MODEL CONTROL FILE

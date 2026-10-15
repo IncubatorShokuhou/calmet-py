@@ -438,7 +438,7 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 
 | Parameter | Meaning | Python type | Python default | Zhejiang value |
 | --- | --- | --- | --- | --- |
-| `meteorology` | Gridded prognostic meteorology input; iprog selects whether it supplies a Step-1 field, initial guess, or pseudo-observations. | `str \| Path \| Sequence[str \| Path] \| None` | `required` | `output/zhejiang/calwrf.nc` |
+| `meteorology` | Optional gridded prognostic meteorology input; iprog selects whether it supplies a Step-1 field, initial guess, or pseudo-observations. Omit it for a pure-observation IPROG=0 run driven by SURF.DAT and UP*.DAT. | `str \| Path \| Sequence[str \| Path] \| None` | `None` | `output/zhejiang/calwrf.nc` |
 | `geophysical` | GEO geophysical grid containing terrain, land use, roughness, albedo, Bowen ratio, soil/anthropogenic heat parameters, and leaf-area index. | `str \| Path \| None` | `required` | `output/zhejiang/geo.nc` |
 | `output` | Primary output file path. | `str \| Path \| None` | `required` | `output/zhejiang/calmet.nc` |
 | `start` | Inclusive lower boundary of the CALMET output interval `[start, end)`; meteorological boundary times are selected with `start < t <= end`, and each output timestamp is `t - timestep_seconds`. | `datetime \| str \| None` | `required` | `2018-03-18 00:00:00` |
@@ -660,13 +660,21 @@ calculations:
 These treatments belong to the default API. `pycalmet.legacy` retains the
 frozen historical formulas and level-centre TEMP3D switch for reproducibility.
 
-## Zhejiang example
+## Zhejiang examples
 
-The bundled example contains three consecutive WRF records, 42 original SRTM3
-`.hgt` tiles, and the original `EAUSGS1.IMG` land-use raster. It rebuilds
-terrain, land use, and the geophysical grid instead of using a prepared
-`geo.nc`.
-Run the complete five-stage pipeline from the repository root:
+Three runners cover the same 1 km Zhejiang grid and the same
+2018-03-18 00:00–01:00 UTC CALMET interval. They differ only in the
+meteorological information supplied to CALMET:
+
+| Runner | Meteorological inputs | Main controls | Final output |
+| --- | --- | --- | --- |
+| `examples/zhejiang/run.py` | WRF only | `NOOBS=2`, `IPROG=14` | `output/zhejiang/calmet.nc` |
+| `examples/zhejiang/run_observations.py` | Zhejiang and nearby surface (`SURF`) and upper-air (`UP`) observations | `NOOBS=0`, `IPROG=0`, `MCLOUD=1` | `output/zhejiang/calmet-observations.nc` |
+| `examples/zhejiang/run_wrf_observations.py` | WRF + the same `SURF` + `UP` observations | `NOOBS=0`, `IPROG=14`, `MCLOUD=4` | `output/zhejiang/calmet-wrf-observations.nc` |
+
+The examples rebuild terrain, land use, and the geophysical grid from 42
+original SRTM3 `.hgt` tiles and the original `EAUSGS1.IMG` raster; they do not
+read a prepared `geo.nc`. Pull and verify those repository inputs first:
 
 ```bash
 git lfs pull
@@ -677,8 +685,38 @@ cd data/landuse/usgs-glcc && sha256sum -c SHA256SUMS && cd ../../..
 ./examples/zhejiang/run.sh
 ```
 
-See [examples/zhejiang/README.md](examples/zhejiang/README.md) for provenance,
-input boundaries, source data, and generated products.
+The observation runners additionally require local NOAA/NCEI data. Fetch,
+verify, and convert the pinned official records before running either case:
+
+```bash
+python tools/fetch_zhejiang_observations.py
+```
+
+NCEI states that non-U.S. ISD data are subject to WMO Resolution 40 and cannot
+be redistributed to other users or customers. The repository therefore does
+not contain the Chinese observation bytes or the CALMET text files derived
+from them. It contains the official URLs, expected SHA-256 digests, station
+selection, and reproducible conversion code. The downloaded and converted
+files remain local and are ignored by Git. See
+[`data/observations/zhejiang-20180318/`](data/observations/zhejiang-20180318/)
+for the acquisition modes, data terms, and full provenance.
+
+The pure-observation runner uses the surface reports for cloud cover and
+ceiling (`MCLOUD=1`). The fusion runner uses WRF cloud condensate, including
+cloud water and ice, through the prognostic cloud path (`MCLOUD=4`). The modern
+runners read the 00:00 and 01:00 WRF boundary records. The retained 02:00
+record is used only by the official Fortran comparison, whose eager look-ahead
+reads one additional boundary time.
+
+This one-hour interval is a data-path and regression case. It starts at 08:00
+China Standard Time and does not include the preceding nocturnal-to-morning
+boundary-layer evolution. Production planetary-boundary-layer studies should
+start with enough WRF and observation history from the preceding night or
+before dawn to provide an appropriate spin-up.
+
+See [examples/zhejiang/README.md](examples/zhejiang/README.md) for commands,
+the ten surface stations, the four sounding stations, input boundaries, and
+generated products.
 
 ## Repository layout
 
@@ -688,6 +726,7 @@ tests/                 Unit and integration tests
 examples/zhejiang/     Runnable real-data example and control files
 data/terrain/srtm3/    Original SRTM3 tiles used by the Zhejiang domain
 data/landuse/usgs-glcc/ Original USGS Global/GLCC-style land-use rasters
+data/observations/      Tracked acquisition metadata; observations stay local
 fortran/               Reference Fortran sources; not used at runtime
 tools/                 Maintainer utilities
 ```
@@ -719,11 +758,11 @@ are delegated to PROJ through `pyproj`, coastline clipping uses Shapely, and
 nearest-neighbour searches use SciPy `cKDTree`. CALMET-specific parameterizations
 and uncommon historical input formats remain implemented in the package.
 
-The Zhejiang example uses an LCC grid with a 1 km spacing and a `610 × 499`
-domain. Its active runners pass the 00:00 and 01:00 UTC WRF boundary records
-needed for the configured `[00:00, 01:00)` CALMET interval. A bundled 02:00
-record is available for extending the run, but the current runners do not read
-it.
+The Zhejiang examples use an LCC grid with a 1 km spacing and a `610 × 499`
+domain. Their active runners pass the 00:00 and 01:00 UTC WRF boundary records
+needed for the configured `[00:00, 01:00)` CALMET interval. The retained 02:00
+record belongs to the official Fortran look-ahead comparison and is not read
+by the modern runners.
 
 ## Validation
 
@@ -737,7 +776,9 @@ The default suite checks numerical behavior and complete data flow without
 requiring a particular compiler or C math library. A focused legacy test keeps
 the compatibility namespace separate and verifies its historical
 single-precision path. Fortran sources under `fortran/` remain available for
-audit and are not an installation dependency.
+audit and are not an installation dependency. The Zhejiang guide documents
+the completed official CALMET 6.5 observation-only and WRF-plus-observation
+[field comparisons and reproduction command](examples/zhejiang/README.md#official-calmet-65-comparison).
 
 ## Contributing
 

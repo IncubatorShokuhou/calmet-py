@@ -161,7 +161,7 @@ MEANING_OVERRIDES.update({
     "snow_depth_minimum_m": ("Minimum snow depth required to apply snow properties.", "应用积雪地表属性所需的最小雪深。"),
     "image_mode": ("QA Surfer-grid coordinate convention: cell-centre bounds (0) or cell-edge bounds (1).", "质量检查 Surfer 网格的坐标约定：格点中心边界 (0) 或格点外缘边界 (1)。"),
     # General CALMET and meteorological-data controls.
-    "meteorology": ("Gridded prognostic meteorology input; iprog selects whether it supplies a Step-1 field, initial guess, or pseudo-observations.", "格点预报气象输入；iprog 决定其作为第一步风场、初始猜测场还是伪观测。"),
+    "meteorology": ("Optional gridded prognostic meteorology input; iprog selects whether it supplies a Step-1 field, initial guess, or pseudo-observations. Omit it for a pure-observation IPROG=0 run driven by SURF.DAT and UP*.DAT.", "可选的格点预报气象输入；iprog 决定其作为第一步风场、初始猜测场还是伪观测。仅由 SURF.DAT 和 UP*.DAT 驱动的纯观测 IPROG=0 运行可省略此项。"),
     "geophysical": ("GEO geophysical grid containing terrain, land use, roughness, albedo, Bowen ratio, soil/anthropogenic heat parameters, and leaf-area index.", "GEO 地理物理网格，包含地形、土地利用、粗糙度、反照率、Bowen 比、土壤/人为热参数和叶面积指数。"),
     "cloud_data": ("CLOUD.DAT path: input when cloud_method=2, or output destination when cloud_output=1.", "CLOUD.DAT 路径：cloud_method=2 时作为输入，cloud_output=1 时作为输出目标。"),
     "surface_data": ("Hourly SURF.DAT observations for NOOBS 0/1. DIAG.DAT may replace their winds; full meteorological runs still read SURF.DAT thermodynamic fields.", "NOOBS 为 0/1 时使用的逐小时 SURF.DAT 观测。DIAG.DAT 可替换其中的风；完整气象运行仍读取 SURF.DAT 热力字段。"),

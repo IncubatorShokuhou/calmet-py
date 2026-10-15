@@ -10,14 +10,18 @@ from pycalmet.legacy_io import FortranSequentialWriter,fixed_string
 import struct
 from types import SimpleNamespace
 from pyproj import Transformer
-from pycalmet._calmet import _noobs_step_transform,_surface_step_transform
+from pycalmet._calmet import (_noobs_step_transform,
+                              _observed_mixing_profiles,
+                              _surface_step_transform)
 from pycalmet.legacy._compat._calmet import (
     _surface_step_transform as _legacy_surface_step_transform,
 )
 from pycalmet.calmet_solver import Step1Fields,StepTransformContext
+from pycalmet.calmet_numerics import density_from_pressure_temperature
 from pycalmet.config import CalmetConfig,GridConfig
 from pycalmet.projections import geographic_crs,grid_crs
 from pycalmet.sea_data import GriddedSeaData
+from pycalmet.upper_air import Sounding
 
 
 def _dataset(records):
@@ -526,6 +530,137 @@ def test_noobs1_dispatches_iextrp4_by_station_landuse_and_temperature_mode(
         np.testing.assert_array_equal(captured[0][1][6],[expected_temperature])
 
 
+def test_observation_only_iextrp4_uses_observations_before_similarity(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    grid=GridConfig(1,1,1.,1.,projection='EM',lat0=0.,lon0=0.,lat1=0.,lat2=0.)
+    longitude,latitude=Transformer.from_crs(
+        grid_crs(grid,units='km'),geographic_crs('WGS-84'),
+        always_xy=True).transform(.5,.5)
+    surface_station=SimpleNamespace(
+        identifier=1,name='S',latitude=latitude,longitude=longitude,
+        anemometer_height_m=10.)
+    surface_record=SimpleNamespace(
+        begin=datetime(2018,1,1),end=datetime(2018,1,1,1),
+        wind_speed=np.array([5.]),wind_direction=np.array([270.]),
+        ceiling_hundreds_ft=np.array([70]),cloud_tenths=np.array([5]),
+        temperature_k=np.array([281.]),relative_humidity=np.array([60.]),
+        pressure_mb=np.array([1000.]),precipitation_code=np.array([0]))
+    surface=SimpleNamespace(
+        stations=(surface_station,),datum='WGS-84',timezone='UTC-0000',
+        at_begin=lambda when:surface_record)
+    upper_station=SimpleNamespace(
+        identifier=2,name='U',latitude=latitude,longitude=longitude,
+        elevation_m=0.)
+    upper_mixing_sounding=Sounding(
+        datetime(2018,1,1),np.ones(2),np.array([0.,1000.]),
+        np.array([281.,271.]),np.zeros(2),np.zeros(2),
+    )
+    upper=SimpleNamespace(
+        station=upper_station,datum='WGS-84',
+        temperature_faces_at=lambda when,faces:np.array(
+            [281.,279.],dtype=np.float32),
+        mixing_sounding_at=lambda when:upper_mixing_sounding,
+        layer_wind_at=lambda when,faces,angle:(
+            np.array([6.],dtype=np.float32),
+            np.array([1.],dtype=np.float32)))
+    sea_record=SimpleNamespace(
+        wind_speed_m_s=4.,wind_direction_deg=270.,anemometer_height_m=10.,
+        air_sensor_height_m=4.,water_sensor_depth_m=.6,
+        air_temperature_k=282.,air_water_delta_k=-2.,relative_humidity=80.,
+        mixing_height_m=9999.,gradient_below_k_m=-.0098,
+        gradient_above_k_m=-.0045,wave_period_s=-999.,wave_height_m=-999.)
+    sea=SimpleNamespace(
+        identifier=3,name='SEA',datum='WGS-84',
+        point=lambda selected_grid:np.array([.5,.5]),
+        longitude_latitude=lambda:(longitude,latitude),
+        at_begin=lambda when:sea_record)
+    config=CalmetConfig(
+        None,'geo','out','2018010100','2018010101',grid,
+        noobs=0,iprog=0,itprog=0,irhprog=0,cloud_method=1,
+        surface_data='surf',upper_air_files=('up',),
+        z_faces_m=(0.,20.),smoothing_passes=(0,),stations_per_level=(2,),
+        wind_extrapolation_factors=(1.,),wind_extrapolation=-4,
+        overwater_flux_method=10,precipitation_station_count=0,
+        ifradj=0,islope=0,ikine=0,iobr=0,iavet=0,iavezi=0)
+    one=np.ones((1,1),dtype=np.float32)
+    geo={
+        'roughness_length':one*.1,
+        'dominant_landuse':np.full((1,1),20),
+        'albedo':one*.2,'bowen_ratio':one,
+        'soil_heat_flux_parameter':one*.15,
+        'anthropogenic_heat_flux':one*0.,
+    }
+    transform,_=_surface_step_transform(
+        config,surface,geo,upper_air=(upper,),sea=(sea,))
+    poisoned_level=np.full((1,1,1),999.,dtype=np.float32)
+    poisoned=Step1Fields(
+        np.zeros_like(poisoned_level),np.zeros_like(poisoned_level),
+        poisoned_level.copy(),one*999.,one,one*99.,
+        np.full_like(poisoned_level,-77.),one*500.,one*0.,one*.1,
+        one*.99,one*999.,np.full((2,1,1),999.,dtype=np.float32),
+        np.array([[[0.]],[[10.]]],dtype=np.float32),
+        one*-77.,one*777.,one.astype(np.int32))
+    captured={}
+    heat_inputs=[]
+
+    def fake_land(*args,**kwargs):
+        captured['land']=(args,kwargs)
+        stations=np.asarray(args[0]).size
+        levels=np.asarray(args[14]).size
+        state=tuple(np.zeros(stations,dtype=np.float32) for _ in range(6))
+        return (np.zeros((levels,stations),dtype=np.float32),
+                np.zeros((levels,stations),dtype=np.float32),*state)
+
+    def fake_heat(*args,**kwargs):
+        heat_inputs.append((np.asarray(args[1]).copy(),
+                            np.asarray(args[2]).copy()))
+        shape=np.asarray(args[2]).shape
+        return (np.zeros(shape,dtype=np.float32),
+                np.zeros(shape,dtype=np.float32))
+
+    def fake_longwave(*args,**kwargs):
+        captured['longwave']=tuple(np.asarray(value).copy() for value in args)
+        return np.zeros(np.asarray(args[0]).shape,dtype=np.float32)
+
+    def fake_coare(*args,**kwargs):
+        captured['coare']=(args,kwargs)
+        stations=np.asarray(args[0]).size
+        return (np.zeros((1,stations),dtype=np.float32),
+                np.zeros((1,stations),dtype=np.float32))
+
+    monkeypatch.setattr('pycalmet._calmet.land_station_similarity_theory',fake_land)
+    monkeypatch.setattr('pycalmet._calmet.heat_flux',fake_heat)
+    monkeypatch.setattr('pycalmet._calmet.downward_longwave',fake_longwave)
+    monkeypatch.setattr('pycalmet._calmet.coare_water_station_profiles',fake_coare)
+    context=StepTransformContext(
+        one*.5,one*50.,one*75.,one*.2,one*1.e-4,gmt_hour=1)
+    result=transform(poisoned,datetime(2018,1,1),context)
+
+    land_args,_=captured['land']
+    expected_density=density_from_pressure_temperature(
+        np.array([1000.],dtype=np.float32),
+        np.array([281.],dtype=np.float32))
+    np.testing.assert_allclose(land_args[5],expected_density)
+    np.testing.assert_array_equal(land_args[6],[281.])
+    np.testing.assert_array_equal(land_args[7],[.5])
+    np.testing.assert_array_equal(land_args[9][:,0],[281.,271.])
+    np.testing.assert_array_equal(land_args[10][:,0],[0.,1000.])
+    assert len(heat_inputs)==2
+    for cloud,temperature in heat_inputs:
+        np.testing.assert_array_equal(cloud,[.5])
+        np.testing.assert_array_equal(temperature,[281.])
+    longwave=captured['longwave']
+    np.testing.assert_array_equal(longwave[0],[281.])
+    np.testing.assert_array_equal(longwave[1],[60.])
+    np.testing.assert_array_equal(longwave[2],[.5])
+    np.testing.assert_allclose(longwave[3],[70.*30.48],rtol=0.,atol=2.e-4)
+    _,coare_kwargs=captured['coare']
+    np.testing.assert_array_equal(coare_kwargs['rainfall_mm_h'],[0.])
+    np.testing.assert_array_equal(result.surface_temperature,[[281.]])
+    np.testing.assert_array_equal(result.surface_relative_humidity,[[60.]])
+    np.testing.assert_array_equal(result.precipitation_rate,[[0.]])
+
+
 @pytest.mark.parametrize('water_temperature_mode',[0,1,2])
 def test_water2_imixh1_uses_independent_temperature_jump_per_station(
         monkeypatch,water_temperature_mode):
@@ -655,9 +790,14 @@ def test_full_run_diagnostic_winds_retain_observed_thermodynamics():
         at_begin=lambda when:surface_record)
     upper_station=SimpleNamespace(identifier=2,name='UPR',latitude=lat,
                                   longitude=lon,elevation_m=0.)
+    upper_mixing_sounding=Sounding(
+        datetime(2018,1,1),np.ones(2),np.array([0.,1000.]),
+        np.array([282.,270.]),np.zeros(2),np.zeros(2),
+    )
     upper=SimpleNamespace(station=upper_station,datum='WGS-84',
         layer_wind_at=lambda *args:(np.array([1.]),np.array([0.])),
-        temperature_faces_at=lambda *args:np.array([282.,270.]))
+        temperature_faces_at=lambda *args:np.array([282.,270.]),
+        mixing_sounding_at=lambda when:upper_mixing_sounding)
     diagnostic_record=SimpleNamespace(initial_u_m_s=None,initial_v_m_s=None,
         surface_temperature_k=None,lapse_rate_k_m=None,
         surface_u_m_s=np.array([4.]),surface_v_m_s=np.array([0.]),
@@ -841,6 +981,61 @@ def test_noobs1_transform_honours_precipitation_station_mode(npsta,station_code,
     assert transform(step,datetime(2018,1,1)).precipitation_code.item()==expected
 
 
+def test_observed_mixht_iupt_minus_one_selects_nearest_raw_sounding():
+    grid=GridConfig(
+        2,1,1.,1.,projection='EM',lat0=0.,lon0=0.,lat1=0.,lat2=0.,
+    )
+    when=datetime(2018,1,1,1)
+    first=Sounding(
+        datetime(2018,1,1),np.ones(2),np.array([10.,1010.]),
+        np.array([290.,280.]),np.zeros(2),np.zeros(2),
+    )
+    second=Sounding(
+        datetime(2018,1,1),np.ones(3),np.array([20.,520.,1520.]),
+        np.array([300.,295.,285.]),np.zeros(3),np.zeros(3),
+    )
+    data=(
+        SimpleNamespace(mixing_sounding_at=lambda timestamp:first),
+        SimpleNamespace(mixing_sounding_at=lambda timestamp:second),
+    )
+
+    temperature,height=_observed_mixing_profiles(
+        data,np.array([[.5,.5],[1.5,.5]]),grid,when,-1,
+    )
+
+    assert temperature.dtype==np.float32 and height.dtype==np.float32
+    np.testing.assert_array_equal(temperature[:,0,0],[290.,280.,280.])
+    np.testing.assert_array_equal(height[:,0,0],[0.,1000.,1000.])
+    np.testing.assert_array_equal(temperature[:,0,1],[300.,295.,285.])
+    np.testing.assert_array_equal(height[:,0,1],[0.,500.,1500.])
+
+
+def test_observed_mixht_positive_iupt_uses_fixed_station_domainwide():
+    grid=GridConfig(
+        2,1,1.,1.,projection='EM',lat0=0.,lon0=0.,lat1=0.,lat2=0.,
+    )
+    when=datetime(2018,1,1,1)
+    first=Sounding(
+        datetime(2018,1,1),np.ones(2),np.array([10.,1010.]),
+        np.array([290.,280.]),np.zeros(2),np.zeros(2),
+    )
+    second=Sounding(
+        datetime(2018,1,1),np.ones(2),np.array([20.,1020.]),
+        np.array([300.,285.]),np.zeros(2),np.zeros(2),
+    )
+    data=(
+        SimpleNamespace(mixing_sounding_at=lambda timestamp:first),
+        SimpleNamespace(mixing_sounding_at=lambda timestamp:second),
+    )
+
+    temperature,height=_observed_mixing_profiles(
+        data,np.array([[.5,.5],[1.5,.5]]),grid,when,2,
+    )
+
+    np.testing.assert_array_equal(temperature[:,0,:],[[300.,300.],[285.,285.]])
+    np.testing.assert_array_equal(height[:,0,:],[[0.,0.],[1000.,1000.]])
+
+
 def test_noobs0_transform_combines_surface_and_upper_air_profiles():
     grid=GridConfig(1,1,1.,1.,projection='EM',lat0=0.,lon0=0.,lat1=0.,lat2=0.)
     lon,lat=Transformer.from_crs(grid_crs(grid,units='km'),geographic_crs('WGS-84'),always_xy=True).transform(.5,.5)
@@ -851,9 +1046,14 @@ def test_noobs0_transform_combines_surface_and_upper_air_profiles():
         pressure_mb=np.array([1000.]),precipitation_code=np.array([0]))
     surface=SimpleNamespace(stations=(station,),datum='WGS-84',at_begin=lambda when:record)
     upper_station=SimpleNamespace(identifier=2,name='UPR',latitude=lat,longitude=lon,elevation_m=0.)
+    mixing_sounding=Sounding(
+        datetime(2018,1,1),np.ones(3),np.array([0.,1000.,2000.]),
+        np.array([281.,271.,261.]),np.zeros(3),np.zeros(3),
+    )
     upper=SimpleNamespace(station=upper_station,datum='WGS-84',
         layer_wind_at=lambda when,faces,angle:(np.array([10.,10.]),np.array([0.,0.])),
-        temperature_faces_at=lambda when,faces:np.linspace(280.,278.,len(faces)))
+        temperature_faces_at=lambda when,faces:np.linspace(280.,278.,len(faces)),
+        mixing_sounding_at=lambda when:mixing_sounding)
     config=CalmetConfig('met','geo','out','2018010100','2018010101',grid,noobs=0,
         surface_data='surf',upper_air_files=('up',),itprog=0,surface_temperature_option=1,
         upper_temperature_option=1,
@@ -881,4 +1081,10 @@ def test_noobs0_transform_combines_surface_and_upper_air_profiles():
     assert result.surface_pressure_mb.dtype==np.float32
     assert result.profile_height.dtype==np.float32
     assert result.profile_temperature.dtype==np.float32
+    np.testing.assert_array_equal(
+        result.mixing_profile_temperature[:,0,0],[281.,271.,261.],
+    )
+    np.testing.assert_array_equal(
+        result.mixing_profile_height[:,0,0],[0.,1000.,2000.],
+    )
     assert result.prognostic_temperature is prognostic

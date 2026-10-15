@@ -64,7 +64,7 @@ def test_station_observation_fields_default_to_float32():
     wind=_wind_components([5.],[270.])
     sounding=Sounding(
         datetime(2018,1,1),np.array([1000.,900.]),np.array([100.,200.]),
-        np.array([20.,15.]),np.array([270.,270.]),np.array([5.,6.]))
+        np.array([293.15,288.15]),np.array([270.,270.]),np.array([5.,6.]))
     converted=sounding.converted()
     assert sea.dtype==np.float32
     assert wind[0].dtype==wind[1].dtype==np.float32

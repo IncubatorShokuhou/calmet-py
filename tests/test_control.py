@@ -22,6 +22,25 @@ def test_assignment_reader_ignores_inactive_asterisk_fields(tmp_path):
     assert assignments(control)=={'NX':['4','5']}
 
 
+def test_assignment_reader_accepts_multiline_array_values(tmp_path):
+    control=tmp_path/'sample.inp'
+    control.write_text(
+        '! NSMTH =\n 2, 4, 4 !\n* NINTR2 =\n 99, 99, 99 *\n',
+        encoding='ascii',
+    )
+    assert assignments(control)=={'NSMTH':['2, 4, 4']}
+
+
+def test_assignment_reader_ignores_unmatched_prose_bang(tmp_path):
+    control=tmp_path/'sample.inp'
+    control.write_text(
+        '! ordinary comment without a closing delimiter\n'
+        '! NX = 4 !\n! NY = 5 !\n',
+        encoding='ascii',
+    )
+    assert assignments(control)=={'NX':['4'],'NY':['5']}
+
+
 def test_directional_angles_accept_legacy_prefix_and_wrap_longitude():
     assert _angle('N 27')==27.
     assert _angle('243E')==-117.
@@ -1059,6 +1078,39 @@ def test_calmet_control_supports_pre_multiple_file_mm4dat(tmp_path):
     source+='\n! MM4DAT = legacy.mm4 !\n'
     control=tmp_path/'calmet.inp'; control.write_text(source,encoding='ascii')
     assert calmet_config(control).meteorology==tmp_path/'legacy.mm4'
+
+
+def test_calmet_control_allows_observation_only_iprog_zero(tmp_path):
+    source=CALMET_CONTROL.read_text(encoding='ascii')
+    replacements={
+        '! NM3D =  1  !':'! NM3D =  0  !',
+        '! NOOBS =  2   !':'! NOOBS =  0   !',
+        '! IPROG =  14  !':'! IPROG =  0  !',
+        '! MCLOUD =  4  !':'! MCLOUD =  1  !',
+        '! IRHPROG =  1   !':'! IRHPROG =  0   !',
+        '! ITPROG =  2   !':'! ITPROG =  0   !',
+    }
+    for old,new in replacements.items():
+        assert old in source
+        source=source.replace(old,new,1)
+    control=tmp_path/'calmet.inp'
+    control.write_text(source,encoding='ascii')
+
+    config=calmet_config(control)
+
+    assert config.meteorology is None
+    assert (config.iprog,config.noobs,config.itprog,config.irhprog,
+            config.cloud_method)==(0,0,0,0,1)
+
+
+def test_calmet_control_still_requires_meteorology_for_prognostic_mode(tmp_path):
+    source=CALMET_CONTROL.read_text(encoding='ascii')
+    source=source.replace('! NM3D =  1  !','! NM3D =  0  !',1)
+    control=tmp_path/'calmet.inp'
+    control.write_text(source,encoding='ascii')
+
+    with pytest.raises(ValueError,match='prognostic mode requires positive NM3D'):
+        calmet_config(control)
 
 
 def test_public_api_accepts_control_path_and_path_overrides(monkeypatch,tmp_path):

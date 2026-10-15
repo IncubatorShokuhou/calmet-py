@@ -91,9 +91,11 @@ def format_upper_air_input_debug(station_number,sounding,convergence_degrees,
         "  STA  PRES   HEIGHT    TEMP      U       V",
         "       (mb)   (m LGL)   (K)     (m/s)   (m/s)",
     ]
+    # READ62 stores UP.DAT temperatures in kelvin despite the stale Celsius
+    # wording in one legacy source comment.  The compatibility calculation
+    # already consumes these values directly; the debug listing must do the
+    # same rather than applying a second Celsius-to-kelvin conversion.
     temperature=np.asarray(sounding.temperature_c,dtype=np.float32)
-    temperature=np.where(temperature<np.float32(999.89),
-                         temperature+np.float32(273.15),temperature)
     for pressure,z,temp,u_value,v_value in zip(
             sounding.pressure_mb,height,temperature,u,v):
         lines.append(f" {int(station_number):3d}  {pressure:6.1f}  {z:7.1f}  "
@@ -302,7 +304,7 @@ class CalmetListingWriter:
                     _,soundings,convergence,layer_u,layer_v=item
                     for sounding in soundings:
                         face_temperature=(temperature_faces(
-                            sounding,self.config.z_faces_m)+np.float32(273.15)
+                            sounding,self.config.z_faces_m)
                             if self.config.include_w_temperature else None)
                         self.stream.write(format_upper_air_input_debug(
                             station_number,sounding,convergence,layer_u,layer_v,

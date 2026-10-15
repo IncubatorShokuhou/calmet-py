@@ -72,7 +72,9 @@ class SurfaceRecord:
             degrees from north.
         ceiling_hundreds_ft: Int32 ``(station,)`` ceiling height in hundreds
             of feet.
-        cloud_tenths: Int32 ``(station,)`` total cloud cover in tenths.
+        cloud_tenths: Int32 ``(station,)`` CALMET ``ICC`` opaque sky cover in
+            tenths. Observation converters may fall back to total sky cover
+            when opaque cover is unavailable.
         temperature_k: Float32 ``(station,)`` air temperature in kelvin.
         relative_humidity: Int32 ``(station,)`` relative humidity in percent.
         pressure_mb: Float32 ``(station,)`` station pressure in millibars.

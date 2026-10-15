@@ -716,7 +716,15 @@ def froude_adjustment(u: ArrayLike, v: ArrayLike, terrain_m: ArrayLike, maximum_
     v=np.where(active,tangent_v*speed,v)
     return _model_array(u),_model_array(v)
 
-def profile_temperature_layer(temperature_k: ArrayLike, height_m: ArrayLike, bottom_m: ArrayLike, depth_m: float=200., *, minimum_lapse: float=.001) -> tuple[Float32Array, Float32Array, Float32Array]:
+def profile_temperature_layer(
+    temperature_k: ArrayLike,
+    height_m: ArrayLike,
+    bottom_m: ArrayLike,
+    depth_m: float=200.,
+    *,
+    minimum_lapse: float=.001,
+    active_mask: ArrayLike | None=None,
+) -> tuple[Float32Array, Float32Array, Float32Array]:
     """Interpolate MIXDT2 layer temperatures and potential lapse.
 
     Args:
@@ -725,6 +733,9 @@ def profile_temperature_layer(temperature_k: ArrayLike, height_m: ArrayLike, bot
         bottom_m: Cellwise ``(y, x)`` bottom height in metres.
         depth_m: Layer depth above ``bottom_m`` in metres.
         minimum_lapse: Minimum potential-temperature lapse in K m-1.
+        active_mask: Optional boolean ``(y, x)`` mask. Only true columns are
+            interpolated and validated; false columns return ``NaN``. This
+            lets land-only MIXHT calculations skip water profiles.
 
     Returns:
         Tuple ``(lower, upper, lapse)`` of float32 ``(y, x)`` arrays. The first
@@ -733,14 +744,21 @@ def profile_temperature_layer(temperature_k: ArrayLike, height_m: ArrayLike, bot
         dry-adiabatic conversion.
 
     Raises:
-        ValueError: If profile shapes disagree, requested heights are not
-            bracketed, or profile heights do not increase strictly.
+        ValueError: If profile or mask shapes disagree, requested heights are
+            not bracketed in an active column, or active profile heights do
+            not increase strictly.
     """
     temperature=np.asarray(temperature_k,dtype=MODEL_DTYPE)
     height=np.asarray(height_m,dtype=MODEL_DTYPE)
     bottom=np.asarray(bottom_m,dtype=MODEL_DTYPE)
     if temperature.shape!=height.shape or temperature.ndim!=3 or temperature.shape[1:]!=bottom.shape: raise ValueError('profiles must be (z,y,x) and bottom must match their grid')
-    flat_t=temperature.reshape(temperature.shape[0],-1); flat_z=height.reshape(height.shape[0],-1); columns=np.arange(flat_t.shape[1])
+    active=(np.ones(bottom.shape,dtype=bool) if active_mask is None else
+            np.asarray(active_mask,dtype=bool))
+    if active.shape!=bottom.shape:
+        raise ValueError('active temperature-profile mask must match the grid')
+    flat_t=temperature.reshape(temperature.shape[0],-1)
+    flat_z=height.reshape(height.shape[0],-1)
+    active_columns=np.flatnonzero(active.ravel())
     def interpolate(target: ArrayLike) -> Float32Array:
         """Interpolate all flattened temperature columns at target heights.
 
@@ -755,13 +773,24 @@ def profile_temperature_layer(temperature_k: ArrayLike, height_m: ArrayLike, bot
                 heights fail to increase.
         """
         target=np.asarray(target,dtype=MODEL_DTYPE).ravel()
-        upper=np.sum(flat_z<=target[None,:],axis=0)
+        output=np.full(target.shape,np.nan,dtype=MODEL_DTYPE)
+        if active_columns.size==0:
+            return output.reshape(bottom.shape)
+        selected_target=target[active_columns]
+        selected_height=flat_z[:,active_columns]
+        upper=np.sum(selected_height<=selected_target[None,:],axis=0)
         if np.any(upper==0) or np.any(upper>=flat_z.shape[0]): raise ValueError('temperature profile does not bracket mixing-height layer')
-        lower=upper-1; zl=flat_z[lower,columns]; zu=flat_z[upper,columns]
+        lower=upper-1
+        zl=selected_height[lower,np.arange(active_columns.size)]
+        zu=selected_height[upper,np.arange(active_columns.size)]
         if np.any(zu<=zl): raise ValueError('temperature profile heights must increase strictly')
-        value=(flat_t[upper,columns]-
-               (flat_t[upper,columns]-flat_t[lower,columns])*(zu-target)/(zu-zl))
-        return _model_array(value.reshape(bottom.shape))
+        selected_temperature=flat_t[:,active_columns]
+        column=np.arange(active_columns.size)
+        value=(selected_temperature[upper,column]-
+               (selected_temperature[upper,column]-selected_temperature[lower,column])*
+               (zu-selected_target)/(zu-zl))
+        output[active_columns]=value
+        return _model_array(output.reshape(bottom.shape))
     lower=interpolate(bottom); upper=interpolate(bottom+depth_m)
     lapse=np.maximum((upper-lower)/depth_m+.0098,minimum_lapse)
     return cast(FloatTriple,tuple(_model_array(value) for value in (lower,upper,lapse)))
@@ -807,12 +836,23 @@ def mixing_height_maul_carson(temperature_profile_k: ArrayLike, profile_height_m
             inconsistent.
     """
     old=np.asarray(previous_convective_height_m,dtype=MODEL_DTYPE)
+    land: NDArray[np.bool_] | None=(
+        None if land_mask is None else np.asarray(land_mask,dtype=bool)
+    )
+    if land is not None and land.shape!=old.shape:
+        raise ValueError('land mask must match the mixing-height grid')
     jump=np.asarray(temperature_jump_k,dtype=MODEL_DTYPE)
     ustar=np.asarray(friction_velocity,dtype=MODEL_DTYPE)
     length=np.asarray(monin_obukhov_m,dtype=MODEL_DTYPE)
     qh=np.asarray(sensible_heat_flux,dtype=MODEL_DTYPE)
     rho=np.asarray(density,dtype=MODEL_DTYPE); f=np.asarray(coriolis,dtype=MODEL_DTYPE)
-    tht,thtp,gamma=profile_temperature_layer(temperature_profile_k,profile_height_m,old,depth_m,minimum_lapse=minimum_lapse)
+    active_profile=np.broadcast_to(qh>=0.,old.shape)
+    if land is not None:
+        active_profile=active_profile&land
+    tht,thtp,gamma=profile_temperature_layer(
+        temperature_profile_k,profile_height_m,old,depth_m,
+        minimum_lapse=minimum_lapse,active_mask=active_profile,
+    )
     daytime=qh>=0.
     wt=qh/(rho*996.)
     wto=threshold_flux_per_m*old/(1.2*996.)
@@ -843,8 +883,8 @@ def mixing_height_maul_carson(temperature_profile_k: ArrayLike, profile_height_m
     total=np.where(daytime,total,np.clip(np.minimum(stable1,stable2),minimum_height_m,maximum_height_m))
     convective=np.where(daytime,convective,0.)
     next_jump=np.where(daytime,next_jump,0.)
-    if land_mask is not None:
-        land=np.asarray(land_mask,dtype=bool); total=np.where(land,total,np.nan); convective=np.where(land,convective,np.nan); next_jump=np.where(land,next_jump,np.nan)
+    if land is not None:
+        total=np.where(land,total,np.nan); convective=np.where(land,convective,np.nan); next_jump=np.where(land,next_jump,np.nan)
     return cast(FloatTriple,tuple(_model_array(value) for value in (total,convective,next_jump)))
 
 
@@ -1079,6 +1119,11 @@ def mixing_height_batchvarova_gryning(temperature_profile_k: ArrayLike, profile_
         iterations without a horizontal Python loop.
     """
     old=np.asarray(previous_convective_height_m,dtype=np.float64)
+    land: NDArray[np.bool_] | None=(
+        None if land_mask is None else np.asarray(land_mask,dtype=bool)
+    )
+    if land is not None and land.shape!=old.shape:
+        raise ValueError('land mask must match the mixing-height grid')
     jump=np.asarray(temperature_jump_k,dtype=np.float64)
     ustar=np.asarray(friction_velocity,dtype=np.float64)
     length=np.asarray(monin_obukhov_m,dtype=np.float64)
@@ -1087,7 +1132,13 @@ def mixing_height_batchvarova_gryning(temperature_profile_k: ArrayLike, profile_
     f=np.asarray(coriolis,dtype=np.float64)
     tk=np.asarray(surface_temperature_k,dtype=np.float64)
     h0=np.maximum(old,np.float64(minimum_height_m))
-    tht,thtp,gamma=profile_temperature_layer(temperature_profile_k,profile_height_m,h0,depth_m,minimum_lapse=minimum_lapse)
+    active_profile=np.broadcast_to(qh>=np.float64(0.),old.shape)
+    if land is not None:
+        active_profile=active_profile&land
+    tht,thtp,gamma=profile_temperature_layer(
+        temperature_profile_k,profile_height_m,h0,depth_m,
+        minimum_lapse=minimum_lapse,active_mask=active_profile,
+    )
     wt=np.asarray(qh/(rho_field*np.float64(996.)),dtype=np.float64)
     convective=convective_height_batchvarova_gryning(
         h0,wt,gamma,ustar,length,tk,timestep_s=timestep_s,
@@ -1112,9 +1163,9 @@ def mixing_height_batchvarova_gryning(temperature_profile_k: ArrayLike, profile_
     total=np.where(daytime,total,np.clip(np.minimum(stable1,stable2),
         np.float64(minimum_height_m),np.float64(maximum_height_m))).astype(np.float64)
     convective=np.where(daytime,convective,np.float64(0.)).astype(np.float64)
-    if land_mask is not None:
-        land=np.asarray(land_mask,dtype=bool)
+    if land is not None:
         total=np.where(land,total,np.nan); convective=np.where(land,convective,np.nan)
+        jump=np.where(land,jump,np.nan)
     return cast(FloatTriple,tuple(_model_array(value) for value in (total,convective,jump)))
 
 def hosker_roughness(speed_m_s: ArrayLike) -> Float32Array:

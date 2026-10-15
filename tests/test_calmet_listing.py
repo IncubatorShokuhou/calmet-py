@@ -11,6 +11,10 @@ from pycalmet.calmet_listing import (CalmetListingWriter, format_grid,
                                      format_surface_input_debug,
                                      format_upper_air_input_debug)
 from pycalmet.upper_air import Sounding
+from pycalmet.legacy._compat.calmet_listing import (
+    format_upper_air_input_debug as format_legacy_upper_air_input_debug,
+)
+from pycalmet.legacy._compat.upper_air import Sounding as LegacySounding
 
 
 def test_line_printer_scales_signs_and_reverses_y_rows():
@@ -66,7 +70,7 @@ def test_no_upper_prepdi_debug_reproduces_domain_and_station_winds():
 def test_upper_air_input_debug_reproduces_raw_and_layer_profiles():
     sounding=Sounding(datetime(2018,3,18),
         np.array([1000.,900.]),np.array([100.,1100.]),
-        np.array([15.,8.]),np.array([270.,180.]),np.array([5.,10.]))
+        np.array([288.15,281.15]),np.array([270.,180.]),np.array([5.,10.]))
     text=format_upper_air_input_debug(2,sounding,0.,
         np.array([4.5,6.]),np.array([-.5,1.]),
         np.array([288.15,285.,281.]))
@@ -75,6 +79,21 @@ def test_upper_air_input_debug_reproduces_raw_and_layer_profiles():
     assert 'U -- cell averaged' in text and '     4.500' in text
     assert 'V -- cell averaged' in text and '    -0.500' in text
     assert 'T -- cell face' in text and '   288.150' in text
+
+
+def test_legacy_upper_air_listing_does_not_convert_kelvin_twice():
+    sounding=LegacySounding(
+        datetime(2018,3,18),np.array([1000.,900.]),np.array([100.,1100.]),
+        np.array([288.15,281.15]),np.array([270.,180.]),np.array([5.,10.]),
+    )
+
+    text=format_legacy_upper_air_input_debug(
+        2,sounding,0.,np.array([4.5,6.]),np.array([-.5,1.]),
+        np.array([288.15,285.,281.]),
+    )
+
+    assert '   2  1000.0      0.0  288.15' in text
+    assert '561.30' not in text
 
 
 def test_full_prepdi_debug_reproduces_domain_and_upper_station_fields():

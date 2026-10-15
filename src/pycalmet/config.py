@@ -528,8 +528,11 @@ class CalmetConfig:
     """Configuration for the CALMET diagnostic meteorological model.
 
     Attributes:
-        meteorology: Gridded prognostic meteorology input; iprog selects whether it supplies
-                     a Step-1 field, initial guess, or pseudo-observations. Required.
+        meteorology: Optional gridded prognostic meteorology input; ``iprog``
+                     selects whether it supplies a Step-1 field, initial
+                     guess, or pseudo-observations. ``None`` is valid only
+                     for the pure-observation ``IPROG=0`` path, where
+                     ``SURF.DAT`` and ``UP*.DAT`` supply the meteorology.
         geophysical: GEO geophysical grid containing terrain, land use, roughness, albedo,
                      Bowen ratio, soil/anthropogenic heat parameters, and leaf-area index.
                      Required.
@@ -941,7 +944,7 @@ class CalmetConfig:
                            variables. Defaults to ``None``, which uses ``test.prt`` beside
                            the primary output.
     """
-    meteorology: str | Path | Sequence[str | Path]
+    meteorology: str | Path | Sequence[str | Path] | None
     geophysical: str | Path
     output: str | Path
     start: datetime

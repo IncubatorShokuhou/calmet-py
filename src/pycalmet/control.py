@@ -15,7 +15,10 @@ from .datetime_utils import (exact_integer,format_timezone_label,parse_calendar,
                              parse_date,parse_timestamp,parse_timezone_label)
 
 _ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
-    r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$"
+    r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$", re.DOTALL
+)
+_ACTIVE_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
+    r"!(?=\s*[A-Za-z][A-Za-z0-9_]*\s*=)(.*?)!", re.DOTALL
 )
 
 
@@ -35,12 +38,15 @@ def assignments(path: str | Path) -> dict[str, list[str]]:
     """
     text=Path(path).read_text(encoding="ascii",errors="replace")
     found: defaultdict[str,list[str]]=defaultdict(list)
-    for line in text.splitlines():
-        pieces=line.split("!")
-        for piece in pieces[1::2]:
-            match=_ASSIGNMENT.match(piece)
-            if match and match.group(1).upper()!="END":
-                found[match.group(1).upper()].append(match.group(2).strip())
+    # Start a delimited block only when the opening bang is followed by an
+    # assignment.  CALMET templates and listings sometimes contain ordinary
+    # prose introduced by a lone ``!``; pairing that marker with the next bang
+    # would otherwise consume a valid assignment and desynchronise the rest of
+    # the file.
+    for delimited in _ACTIVE_ASSIGNMENT.finditer(text):
+        match=_ASSIGNMENT.match(delimited.group(1))
+        if match and match.group(1).upper()!="END":
+            found[match.group(1).upper()].append(match.group(2).strip())
     return dict(found)
 
 
@@ -1220,9 +1226,15 @@ def calmet_config(path: str | Path, **overrides: Any) -> CalmetConfig:
             # READFN preserves the pre-multiple-file protocol by promoting
             # MM4DAT to M3DDAT(1) and resetting NM3D to one.
             meteorology_files=(calmet_path(legacy_mm4),)
+        elif declared_meteorology==0:
+            # A diagnostic CALMET run can be driven entirely by SURF.DAT and
+            # UP*.DAT.  Legacy control templates may still contain an active
+            # M3DDAT label, but READFN consumes no filenames when NM3D is zero.
+            if iprog!=0:
+                raise ValueError('CALMET prognostic mode requires positive NM3D')
+            meteorology_files=()
         else:
             meteorology_files=numbered_files('M3DDAT',declared_meteorology,'mm5')
-        if not meteorology_files: raise ValueError('CALMET control file requires positive NM3D')
     declared_initial_guess=int(_number(_one(values,'NIGF','0')))
     initial_guess_files=numbered_files('IGFDAT',declared_initial_guess,'igf')
     if version=='2.2':
@@ -1245,7 +1257,8 @@ def calmet_config(path: str | Path, **overrides: Any) -> CalmetConfig:
     if prognostic_step_seconds==0:
         prognostic_step_seconds=3600*_integer_number(
             _one(values,'ISTEPPG','1'),'ISTEPPG')
-    data: dict[str, Any] = dict(meteorology=(meteorology_files[0] if len(meteorology_files)==1 else meteorology_files),
+    data: dict[str, Any] = dict(meteorology=(None if not meteorology_files else
+              meteorology_files[0] if len(meteorology_files)==1 else meteorology_files),
               geophysical=calmet_path(_one(values,"GEODAT","GEO.DAT")),
               output=calmet_path(_one(values,"METDAT","CALMET.DAT")),
               start=start,end=end,grid=grid,z_faces_m=faces,

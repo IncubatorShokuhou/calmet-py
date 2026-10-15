@@ -8,7 +8,10 @@ from __future__ import annotations
 from collections.abc import Iterable,Mapping,Sequence
 from pathlib import Path
 from datetime import datetime,timedelta
+import os
 from os import PathLike
+import secrets
+import stat
 import struct
 from types import TracebackType
 from typing import TYPE_CHECKING,Any,Literal,TypeAlias,cast
@@ -33,6 +36,55 @@ IntegerScalar: TypeAlias=int | np.integer
 RealScalar: TypeAlias=int | float | np.integer | np.floating
 CompressionLevel: TypeAlias=Literal[0,1,2,3,4,5,6,7,8,9]
 NetCDFDType: TypeAlias=Literal['f8','f4','i2','i1']
+
+
+def _create_staging_file(path: Path) -> Path:
+    """Create an empty same-directory staging file using the process umask.
+
+    Args:
+        path: Final destination path used to derive the staging filename.
+
+    Returns:
+        Unique staging path opened with mode ``0o666`` filtered by the current
+        process umask.
+
+    Raises:
+        OSError: If a unique staging file cannot be created or its descriptor
+            cannot be closed.
+    """
+    flags=os.O_WRONLY|os.O_CREAT|os.O_EXCL
+    for _ in range(128):
+        temporary=path.with_name(f'{path.name}.{secrets.token_hex(8)}.tmp')
+        try:
+            descriptor=os.open(temporary,flags,0o666)
+        except FileExistsError:
+            continue
+        try:
+            os.close(descriptor)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        return temporary
+    raise FileExistsError(f'could not create a unique staging file for {path}')
+
+
+def _regular_file_mode(path: Path) -> int | None:
+    """Read permission bits from an existing regular destination.
+
+    Args:
+        path: Destination to inspect without following symbolic links.
+
+    Returns:
+        The regular file's permission bits, or ``None`` when ``path`` is
+        absent or is not a regular file.
+    """
+    try:
+        status=path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(status.st_mode):
+        return None
+    return stat.S_IMODE(status.st_mode)
 
 
 def _array_data(
@@ -113,6 +165,7 @@ class CalmetNetCDFWriter:
         dataset: Open :class:`netCDF4.Dataset`, or ``None`` after closing.
         water_range: Inclusive land-use category range treated as water.
         run_type: CALMET run type; zero writes only horizontal winds.
+        _temporary_path: Same-directory staging path until successful close.
     """
 
     path: Path
@@ -120,6 +173,7 @@ class CalmetNetCDFWriter:
     water_range: tuple[int,int]
     run_type: int
     _index: int
+    _temporary_path: Path | None
 
     def __init__(
         self,
@@ -152,14 +206,46 @@ class CalmetNetCDFWriter:
                 NetCDF compression inputs are invalid.
 
         Notes:
-            Construction creates and opens ``path`` immediately and writes all
-            static coordinate and geophysical variables.
+            Construction creates a unique staging file beside ``path`` and
+            writes all static coordinate and geophysical variables there. The
+            destination is replaced atomically only after a successful close.
         """
         self.path=Path(path); self.path.parent.mkdir(parents=True,exist_ok=True); self._index=0
-        self.dataset=Dataset(self.path,'w',format='NETCDF4')
+        self.dataset=None; self._temporary_path=None
         self.water_range=cast(tuple[int,int],tuple(water_range))
         self.run_type=int(run_type)
+        self._temporary_path=_create_staging_file(self.path)
+        try:
+            self.dataset=Dataset(self._temporary_path,'w',format='NETCDF4')
+            self._initialize(grid,z_faces_m,geophysical,compression)
+        except BaseException:
+            self._discard()
+            raise
+
+    def _initialize(
+        self,
+        grid: GridConfig,
+        z_faces_m: npt.ArrayLike,
+        geophysical: GeophysicalSource,
+        compression: int,
+    ) -> None:
+        """Create the schema and write static fields to the staging dataset.
+
+        Args:
+            grid: Horizontal CALMET grid definition.
+            z_faces_m: Layer-face heights in metres.
+            geophysical: Terrain and dominant-land-use fields on ``grid``.
+            compression: NetCDF4 deflate level passed as ``complevel``.
+
+        Raises:
+            ValueError: If a dimension, coordinate, field, or compression value
+                cannot be represented by the configured NetCDF schema.
+            RuntimeError: If the staging dataset is not open or cannot be
+                written.
+        """
         ds=self.dataset
+        if ds is None:
+            raise RuntimeError('CALMET NetCDF staging dataset is not open')
         faces: npt.NDArray[np.float32]=np.asarray(z_faces_m,dtype=np.float32)
         centers: npt.NDArray[np.float32]=np.float32(.5)*(faces[:-1]+faces[1:])
         ds.createDimension('time',None); ds.createDimension('level',centers.size); ds.createDimension('face',faces.size); ds.createDimension('y',grid.ny); ds.createDimension('x',grid.nx)
@@ -206,6 +292,12 @@ class CalmetNetCDFWriter:
             variable=ds.createVariable(
                 name,dtype,dims,zlib=True,complevel=compression_level)
             variable.units=units
+            if name=='relative_humidity':
+                variable.comment=(
+                    'Layer relative humidity. In pure-observation runs, the '
+                    'lowest layer contains interpolated SURF.DAT humidity and '
+                    'unobserved upper layers contain NaN.'
+                )
 
     def append(
         self,
@@ -262,9 +354,54 @@ class CalmetNetCDFWriter:
         )
         ds.sync(); self._index+=1
 
+    def _discard(self) -> None:
+        """Close and delete an unpublished staging dataset.
+
+        Returns:
+            None. Repeated calls have no effect.
+
+        Raises:
+            OSError: If the dataset cannot be closed or the staging file cannot
+                be deleted.
+            RuntimeError: If the NetCDF backend cannot close the dataset.
+        """
+        dataset=self.dataset; self.dataset=None
+        temporary=self._temporary_path; self._temporary_path=None
+        try:
+            if dataset is not None:
+                dataset.close()
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
     def close(self) -> None:
-        """Flush and close the NetCDF dataset; repeated calls are harmless."""
-        if self.dataset is not None: self.dataset.close(); self.dataset=None
+        """Close and atomically publish the completed NetCDF dataset.
+
+        Returns:
+            None. Repeated calls after publication or discard have no effect.
+
+        Raises:
+            OSError: If the staging dataset cannot be closed or atomically
+                replace the destination. A failed publication leaves any
+                existing destination unchanged and removes the staging file.
+            RuntimeError: If the staging state is unavailable or the NetCDF
+                backend cannot close the dataset.
+        """
+        dataset=self.dataset
+        if dataset is None:
+            return
+        temporary=self._temporary_path
+        if temporary is None:
+            raise RuntimeError('CALMET NetCDF staging path is unavailable')
+        self.dataset=None; self._temporary_path=None
+        try:
+            dataset.close()
+            destination_mode=_regular_file_mode(self.path)
+            if destination_mode is not None:
+                os.chmod(temporary,destination_mode)
+            os.replace(temporary,self.path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def __enter__(self) -> CalmetNetCDFWriter:
         """Return this open writer for context-manager use.
@@ -280,7 +417,7 @@ class CalmetNetCDFWriter:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Close the dataset on context-manager exit.
+        """Publish a successful dataset or discard a failed write.
 
         Args:
             exc_type: Exception class supplied by the context manager protocol.
@@ -292,7 +429,26 @@ class CalmetNetCDFWriter:
         Returns:
             ``None``; exceptions are not suppressed.
         """
-        self.close()
+        if exc_type is None:
+            self.close()
+        else:
+            try:
+                self._discard()
+            except Exception:
+                # Preserve the exception that caused the model write to fail.
+                pass
+
+    def __del__(self) -> None:
+        """Discard an unpublished staging dataset during finalization.
+
+        Returns:
+            None. Cleanup failures are ignored because finalizers cannot report
+            them reliably; an incomplete file is never published.
+        """
+        try:
+            self._discard()
+        except Exception:
+            pass
 
 
 class MesopacWriter:

@@ -1,7 +1,9 @@
 import numpy as np
 import netCDF4 as nc
+import os
 import pytest
 import shutil
+import stat
 import struct
 import subprocess
 import textwrap
@@ -444,6 +446,41 @@ def test_mixdt2_profile_lapse_and_maul_carson_day_night():
     assert convective[0,1]==0. and jump[0,1]==0. and 50.<=total[0,1]<=2500.
 
 
+@pytest.mark.parametrize('method',[1,2])
+def test_land_mixht_skips_shallow_water_and_nighttime_profiles(method):
+    temperature=np.array([
+        [[290.,290.,290.]],
+        [[280.,289.,289.]],
+        [[270.,288.,288.]],
+    ],dtype=np.float32)
+    height=np.array([
+        [[0.,0.,0.]],
+        [[1000.,100.,100.]],
+        [[2000.,200.,200.]],
+    ],dtype=np.float32)
+    shape=(1,3)
+    common=(temperature,height,
+        np.full(shape,50.,dtype=np.float32),
+        np.zeros(shape,dtype=np.float32),
+        np.full(shape,.2,dtype=np.float32),
+        np.full(shape,-100.,dtype=np.float32),
+        np.array([[10.,10.,-10.]],dtype=np.float32),
+        np.ones(shape,dtype=np.float32),
+        np.full(shape,1.e-4,dtype=np.float32))
+    options={'surface_temperature_k':np.full(shape,290.,dtype=np.float32)} if method==2 else {}
+    function=(mixing_height_maul_carson if method==1 else
+              mixing_height_batchvarova_gryning)
+
+    total,convective,jump=function(
+        *common,land_mask=np.array([[True,False,True]]),**options)
+
+    for field in (total,convective,jump):
+        assert np.isfinite(field[0,0])
+        assert np.isnan(field[0,1])
+        assert np.isfinite(field[0,2])
+    assert convective[0,2]==0.
+
+
 
 
 
@@ -531,6 +568,46 @@ def test_surface_fields_combine_land_and_no_station_water():
     assert np.isfinite(result.mixing_height).all()
     custom=build_surface_fields(step,np.array([[7,42]]),np.full(shape,.25),np.full(shape,.15),np.ones(shape),np.full(shape,.15),np.zeros(shape),np.array([[.8,.8]]),np.full(shape,1.e-4),np.zeros(shape),np.zeros(shape),water_range=(42,42))
     assert custom.sensible_heat_flux[0,0]>0. and custom.sensible_heat_flux[0,1]==0.
+
+
+def test_surface_fields_use_dedicated_observed_mixht_profile(monkeypatch):
+    shape=(1,1)
+    ordinary_temperature=np.array([290.,289.,287.],dtype=np.float32)[:,None,None]
+    ordinary_height=np.array([0.,100.,300.],dtype=np.float32)[:,None,None]
+    mixing_temperature=np.array([295.,285.,275.],dtype=np.float32)[:,None,None]
+    mixing_height=np.array([0.,500.,1500.],dtype=np.float32)[:,None,None]
+    level=np.ones((1,1,1),dtype=np.float32)
+    step=Step1Fields(
+        level,np.zeros_like(level),np.full_like(level,289.),
+        np.full(shape,290.,dtype=np.float32),
+        np.full(shape,1000.,dtype=np.float32),
+        np.full(shape,1.2,dtype=np.float32),
+        np.full_like(level,50.),np.zeros(shape,dtype=np.float32),
+        np.zeros(shape,dtype=np.float32),np.full(shape,.1,dtype=np.float32),
+        np.zeros(shape,dtype=np.float32),np.zeros(shape,dtype=np.float32),
+        ordinary_temperature,ordinary_height,
+        np.full(shape,50.,dtype=np.float32),np.zeros(shape,dtype=np.float32),
+        np.zeros(shape,dtype=np.int32),
+        mixing_profile_temperature=mixing_temperature,
+        mixing_profile_height=mixing_height,
+    )
+    captured={}
+
+    def fake_mixht(temperature,height,*args,**kwargs):
+        captured['temperature']=temperature
+        captured['height']=height
+        zero=np.zeros(shape,dtype=np.float32)
+        return zero,zero,zero
+
+    monkeypatch.setattr(calmet_solver,'mixing_height_maul_carson',fake_mixht)
+    build_surface_fields(
+        step,np.array([[20]]),np.full(shape,.25),np.full(shape,.15),
+        np.ones(shape),np.full(shape,.15),np.zeros(shape),np.array([[.8]]),
+        np.full(shape,1.e-4),np.zeros(shape),np.zeros(shape),
+    )
+
+    np.testing.assert_array_equal(captured['temperature'],mixing_temperature)
+    np.testing.assert_array_equal(captured['height'],mixing_height)
 
 
 
@@ -829,6 +906,91 @@ def test_streaming_calmet_netcdf_writer(tmp_path):
     with nc.Dataset(wind_only) as ds:
         assert 'wind_u' in ds.variables and 'wind_v' in ds.variables
         assert 'temperature' not in ds.variables and 'mixing_height' not in ds.variables
+
+
+def test_calmet_netcdf_writer_atomically_replaces_existing_output(tmp_path):
+    path=tmp_path/'calmet.nc'; previous=b'previous CALMET output'
+    path.write_bytes(previous)
+    shape=(1,1)
+    geo={'terrain_height':np.zeros(shape),'dominant_landuse':np.full(shape,20)}
+
+    with CalmetNetCDFWriter(
+            path,GridConfig(1,1,1.,1.),[0.,20.],geo) as writer:
+        assert path.read_bytes()==previous
+        assert writer.dataset is not None
+        assert len(list(tmp_path.glob('calmet.nc.*.tmp')))==1
+
+    assert not list(tmp_path.glob('calmet.nc.*.tmp'))
+    with nc.Dataset(path) as dataset:
+        assert dataset.source=='PyCALMET NumPy solver'
+        assert dataset.dimensions['time'].size==0
+
+
+def test_calmet_netcdf_writer_new_output_honors_process_umask(tmp_path):
+    path=tmp_path/'calmet.nc'
+    shape=(1,1)
+    geo={'terrain_height':np.zeros(shape),'dominant_landuse':np.full(shape,20)}
+    previous_umask=os.umask(0o027)
+    try:
+        with CalmetNetCDFWriter(
+                path,GridConfig(1,1,1.,1.),[0.,20.],geo):
+            pass
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE(path.stat().st_mode)==0o640
+
+
+def test_calmet_netcdf_writer_replacement_preserves_existing_mode(tmp_path):
+    path=tmp_path/'calmet.nc'
+    path.write_bytes(b'previous CALMET output')
+    path.chmod(0o604)
+    shape=(1,1)
+    geo={'terrain_height':np.zeros(shape),'dominant_landuse':np.full(shape,20)}
+
+    with CalmetNetCDFWriter(
+            path,GridConfig(1,1,1.,1.),[0.,20.],geo):
+        pass
+
+    assert stat.S_IMODE(path.stat().st_mode)==0o604
+
+
+def test_calmet_netcdf_writer_replace_failure_keeps_existing_output(
+        tmp_path,monkeypatch):
+    path=tmp_path/'calmet.nc'; previous=b'valid existing CALMET output'
+    path.write_bytes(previous)
+    shape=(1,1)
+    geo={'terrain_height':np.zeros(shape),'dominant_landuse':np.full(shape,20)}
+
+    def fail_replace(source,destination):
+        raise OSError('synthetic replace failure')
+
+    monkeypatch.setattr('pycalmet.calmet_output.os.replace',fail_replace)
+    with pytest.raises(OSError,match='synthetic replace failure'):
+        with CalmetNetCDFWriter(
+                path,GridConfig(1,1,1.,1.),[0.,20.],geo):
+            pass
+
+    assert path.read_bytes()==previous
+    assert not list(tmp_path.glob('calmet.nc.*.tmp'))
+
+
+def test_calmet_netcdf_writer_discards_failed_output_and_keeps_existing_file(
+        tmp_path):
+    path=tmp_path/'calmet.nc'; previous=b'valid existing CALMET output'
+    path.write_bytes(previous)
+    shape=(1,1)
+    geo={'terrain_height':np.zeros(shape),'dominant_landuse':np.full(shape,20)}
+
+    with pytest.raises(RuntimeError,match='synthetic write failure'):
+        with CalmetNetCDFWriter(
+                path,GridConfig(1,1,1.,1.),[0.,20.],geo):
+            assert path.read_bytes()==previous
+            raise RuntimeError('synthetic write failure')
+
+    assert path.read_bytes()==previous
+    assert not list(tmp_path.glob('calmet.nc.*.tmp'))
+
 
 def test_streaming_writer_preserves_pre_average_water_wstar(tmp_path):
     shape=(1,1); three=np.ones((3,1,1))

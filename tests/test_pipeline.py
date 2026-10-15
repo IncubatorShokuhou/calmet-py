@@ -128,6 +128,12 @@ def test_run_pipeline_is_public():
     assert "PipelineConfig" in pycalmet.__all__
 
 
+def test_run_pipeline_documents_managed_calwrf_meteorology() -> None:
+    documentation=' '.join((inspect.getdoc(pycalmet.run_pipeline) or '').split())
+    assert 'always runs CALWRF and replaces this value' in documentation
+    assert 'call pycalmet.calmet(meteorology=None, ...) directly' in documentation
+
+
 def test_run_pipeline_discovers_the_five_control_files(monkeypatch, tmp_path):
     calls = _install_recording_runners(monkeypatch)
     config_directory = Path(__file__).parents[1] / "examples" / "zhejiang" / "config"

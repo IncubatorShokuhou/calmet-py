@@ -55,6 +55,14 @@ STAGE_DYNAMIC_DEFAULTS: Final[dict[tuple[str, str], str]] = {
     ("ctgproc", "fill_empty_ocean"): "None → coastline_file is not None",
 }
 
+# Public function defaults can intentionally be broader than the dataclass
+# constructor.  CALMET permits no gridded meteorology only for the explicit
+# pure-observation ``IPROG=0`` path, while direct ``CalmetConfig`` construction
+# still keeps field ordering compatible with its required output/grid fields.
+PUBLIC_DEFAULT_OVERRIDES: Final[dict[tuple[str, str], Any]] = {
+    ("calmet", "meteorology"): None,
+}
+
 ZH_WORDS: Final[dict[str, str]] = {
     "minimum": "最小", "maximum": "最大", "surface": "地面", "upper": "高空",
     "water": "水体", "temperature": "温度", "wind": "风场", "cloud": "云量",
@@ -223,7 +231,11 @@ def _table(label: str, function_name: str, config_type: type[Any], loader: Any,
                 actual = _value(getattr(example.grid, name), name=name)
             else:
                 actual = _value(getattr(example, name), name=name)
-        if (function_name, name) in STAGE_DYNAMIC_DEFAULTS:
+        if (function_name, name) in PUBLIC_DEFAULT_OVERRIDES:
+            default_text = _value(
+                PUBLIC_DEFAULT_OVERRIDES[function_name, name], name=name
+            )
+        elif (function_name, name) in STAGE_DYNAMIC_DEFAULTS:
             default_text = STAGE_DYNAMIC_DEFAULTS[function_name, name]
         elif function_name == "calmet" and name in CALMET_DYNAMIC_DEFAULTS:
             default_text = CALMET_DYNAMIC_DEFAULTS[name]

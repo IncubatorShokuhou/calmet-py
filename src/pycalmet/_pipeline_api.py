@@ -759,9 +759,10 @@ def run_pipeline(
                                   halfway between rays.
         makegeo_ttm_scale: MAKEGEO stage. Scale factor on the central meridian for TTM
                            projection.
-        calmet_meteorology: CALMET stage. Gridded prognostic meteorology input; iprog
-                            selects whether it supplies a Step-1 field, initial guess,
-                            or pseudo-observations.
+        calmet_meteorology: CALMET stage. The complete pipeline always runs CALWRF and
+                            replaces this value with CALWRF's private NetCDF output. For
+                            a pure-observation IPROG=0 run, call
+                            pycalmet.calmet(meteorology=None, ...) directly.
         calmet_geophysical: CALMET stage. GEO geophysical grid containing terrain, land
                             use, roughness, albedo, Bowen ratio, soil/anthropogenic heat
                             parameters, and leaf-area index.

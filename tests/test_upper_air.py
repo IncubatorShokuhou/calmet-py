@@ -33,9 +33,9 @@ UTC+0000
 2018 1 0 0 2018 2 0 0 100 3 2
 T T T T
 1234 2018 1 1 0 2
-1000 15 20 270 5 900 1015 10 180 10
+1000 15 293.15 270 5 900 1015 283.15 180 10
 1234 2018 1 2 0 2
-1000 15 20 270 5 900 1015 10 180 10
+1000 15 293.15 270 5 900 1015 283.15 180 10
 """,encoding='ascii')
     station=UpperAirStation(1234,'ABC',30.,120.,0.)
     data=UpperAirData(path,station_metadata=station,datum='WGS-84')
@@ -45,12 +45,12 @@ T T T T
 
 def test_upper_air_rejects_bad_station_and_time_order(tmp_path):
     bad=tmp_path/'bad.dat'
-    bad.write_text(_text('9 2018 1 1 0 1\n1000 15 20 270 5\n'),encoding='ascii')
+    bad.write_text(_text('9 2018 1 1 0 1\n1000 15 293 270 5\n'),encoding='ascii')
     with pytest.raises(ValueError,match='station ID'): UpperAirData(bad)
     order=tmp_path/'order.dat'
     order.write_text(_text(
-        '1234 2018 1 2 0 1\n1000 15 20 270 5\n'
-        '1234 2018 1 1 0 1\n1000 15 20 270 5\n'),encoding='ascii')
+        '1234 2018 1 2 0 1\n1000 15 293 270 5\n'
+        '1234 2018 1 1 0 1\n1000 15 293 270 5\n'),encoding='ascii')
     with pytest.raises(ValueError,match='chronological'): UpperAirData(order)
 
 
@@ -58,7 +58,7 @@ def test_upper_air_rejects_bad_station_and_time_order(tmp_path):
 def test_upper_air_normalizes_zero_utc_timezone(tmp_path,wire_timezone):
     path=tmp_path/'utc.dat'
     path.write_text(_text(
-        '1234 2018 1 1 0 1\n1000 15 20 270 5\n'
+        '1234 2018 1 1 0 1\n1000 15 293 270 5\n'
     ).replace('UTC+0000',wire_timezone,1),encoding='ascii')
 
     data=UpperAirData(path)
@@ -70,7 +70,7 @@ def test_upper_air_normalizes_zero_utc_timezone(tmp_path,wire_timezone):
 def test_upper_air_rejects_invalid_or_nonzero_timezone(tmp_path,wire_timezone):
     path=tmp_path/'bad-timezone.dat'
     path.write_text(_text(
-        '1234 2018 1 1 0 1\n1000 15 20 270 5\n'
+        '1234 2018 1 1 0 1\n1000 15 293 270 5\n'
     ).replace('UTC+0000',wire_timezone,1),encoding='ascii')
 
     with pytest.raises(ValueError,match=r'must use UTC\+0000'):
@@ -99,6 +99,36 @@ def test_upper_air_layer_average_uses_direct_piecewise_linear_integration():
     assert u.dtype==np.float32 and v.dtype==np.float32
 
 
+def test_upper_air_high_altitudes_are_not_missing_height_codes():
+    sounding=Sounding(
+        datetime(2018,1,1),np.array([1000.,100.,10.]),
+        np.array([9.,16450.,30750.]),np.array([285.,202.,225.]),
+        np.array([180.,270.,250.]),np.array([2.,20.,6.]),
+    )
+
+    height,u,v=sounding.converted()
+
+    np.testing.assert_allclose(height,[0.,16441.,30741.])
+    assert np.isfinite(u).all() and np.isfinite(v).all()
+    np.testing.assert_allclose(
+        temperature_faces(sounding,[0.,3000.]),
+        [285.,285.+(202.-285.)*3000./16441.],
+    )
+
+
+def test_upper_air_exact_missing_height_code_is_rejected():
+    sounding=Sounding(
+        datetime(2018,1,1),np.array([1000.,900.]),
+        np.array([10.,9999.]),np.array([285.,280.]),
+        np.array([180.,180.]),np.array([2.,3.]),
+    )
+
+    with pytest.raises(ValueError,match='missing heights'):
+        sounding.converted()
+    with pytest.raises(ValueError,match='missing heights'):
+        temperature_faces(sounding,[0.,100.])
+
+
 def test_upper_air_time_interpolation_has_fp32_output_boundary():
     result=_prepdi_time_interpolate(
         np.array([1.,3.],dtype=np.float64),
@@ -121,10 +151,50 @@ DEG
 2018 1 0 2018 2 0 100 3 2
 T T T T
 1234 ABC 30N 120E 15
-"""+fixed+'\n1000 15 20 270 5 900 1015 10 180 10\n',encoding='ascii')
+"""+fixed+'\n1000 15 293 270 5 900 1015 283 180 10\n',encoding='ascii')
     data=UpperAirData(path)
     assert data.version==version and data.soundings[0].timestamp==datetime(2018,1,1)
     assert data.soundings[0].pressure_mb.size==2
+
+
+def test_upper_air_read62_legacy_header_ignores_skipped_codes(tmp_path):
+    path=tmp_path/'up-read62-old.dat'
+    path.write_text("""UP.DAT          2.0             READ62 fixed-column data
+0
+NONE
+1990 1 0 1990 15 12 500 2 1
+F F F F
+   6201     14764   1990 1 1 0     49                               2
+1004 20 277.5 180 6 900 1000 270 190 11
+""",encoding='ascii')
+    station=UpperAirStation(14764,'PWM',43.65,-70.3,20.)
+
+    data=UpperAirData(path,station_metadata=station,datum='WGS-84')
+
+    assert data.station==station
+    assert data.soundings[0].timestamp==datetime(1990,1,1)
+    assert data.soundings[0].pressure_mb.tolist()==[1004.,900.]
+
+
+def test_upper_air_read62_21_header_ignores_skipped_codes(tmp_path):
+    path=tmp_path/'up-read62-21.dat'
+    path.write_text("""UP.DAT          2.1             READ62 fixed-column data
+0
+NONE
+UTC+0000
+2016 1 0 0 2016 1 1 0 500 2 2
+F F F F
+   6201     14684    2016   1  1  0    0    2016   1  1  0    0  112       2
+1014 16 279.4 315 9.3 900 1000 270 300 12
+""",encoding='ascii')
+    station=UpperAirStation(14684,'CHH',41.67,-69.97,16.)
+
+    data=UpperAirData(path,station_metadata=station,datum='WGS-84')
+
+    assert data.station==station
+    assert data.soundings[0].timestamp==datetime(2016,1,1)
+    assert data.soundings[0].pressure_mb.tolist()==[1014.,900.]
+    np.testing.assert_allclose(data.soundings[0].temperature_k,[279.4,270.])
 
 
 def test_upper_air_22_snapshot_has_explicit_seconds(tmp_path):
@@ -139,7 +209,7 @@ UTC+0000
 T T T T
 1234 ABC 30N 120E 15
 1234 2018 1 1 0 1800 2018 1 1 0 1800 2
-1000 15 20 270 5 900 1015 10 180 10
+1000 15 293 270 5 900 1015 283 180 10
 """,encoding='ascii')
     data=UpperAirData(path)
     assert data.soundings[0].timestamp==datetime(2018,1,1,0,30)
@@ -157,7 +227,7 @@ UTC+0000
 T T T T
 1234 ABC 30N 120E 15
 1234 2018 1 1 0 900 2018 1 1 0 1800 2
-1000 15 20 270 5 900 1015 10 180 10
+1000 15 293 270 5 900 1015 283 180 10
 """,encoding='ascii')
     data=UpperAirData(path)
     sounding=data.soundings[0]
@@ -184,14 +254,14 @@ UTC+0000
 T T T T
 1234 ABC 30N 120E 15
 1234 2018 1 1 {hour} {seconds} 2018 1 1 1 0 1
-1000 15 20 270 5
+1000 15 293 270 5
 """,encoding='ascii')
 
     with pytest.raises(ValueError):
         UpperAirData(path)
 
 
-def _sounding(timestamp,temperature=(20.,10.)):
+def _sounding(timestamp,temperature=(293.,283.)):
     return Sounding(
         timestamp,
         np.array([1000.,900.]),
@@ -225,19 +295,57 @@ def test_upper_air_subsecond_interpolation_preserves_timedelta_precision():
     start=datetime(2020,1,1)
     data=object.__new__(UpperAirData)
     data.soundings=(
-        _sounding(start,(20.,10.)),
-        _sounding(start+timedelta(microseconds=500000),(22.,12.)))
+        _sounding(start,(293.,283.)),
+        _sounding(start+timedelta(microseconds=500000),(295.,285.)))
     result=data.temperature_faces_at(
         start+timedelta(microseconds=250000),(0.,1000.))
-    np.testing.assert_allclose(result,[21.,11.],rtol=0.,atol=1.e-6)
+    np.testing.assert_allclose(result,[294.,284.],rtol=0.,atol=1.e-6)
+
+
+def test_upper_air_mixing_sounding_uses_latest_snapshot_at_or_before_end():
+    start=datetime(2020,1,1)
+    first=_sounding(start,(293.,283.))
+    middle=_sounding(start+timedelta(hours=12),(305.,295.))
+    last=_sounding(start+timedelta(hours=24),(307.,297.))
+    data=object.__new__(UpperAirData)
+    data.soundings=(first,middle,last)
+
+    assert data.mixing_sounding_at(start) is first
+    assert data.mixing_sounding_at(start+timedelta(hours=6)) is first
+    assert data.mixing_sounding_at(start+timedelta(hours=12)) is middle
+    with pytest.raises(ValueError,match='does not extend beyond'):
+        data.mixing_sounding_at(start+timedelta(hours=24))
+    with pytest.raises(ValueError,match='does not extend beyond'):
+        data.mixing_sounding_at(start+timedelta(hours=30))
+    np.testing.assert_allclose(
+        data.temperature_faces_at(
+            start+timedelta(hours=6),(0.,1000.),
+        ),
+        [299.,289.],
+    )
+
+
+def test_upper_air_mixing_sounding_uses_covering_average():
+    start=datetime(2020,1,1)
+    averaged=Sounding(
+        start,np.array([1000.,900.]),np.array([0.,1000.]),
+        np.array([293.,283.]),np.array([270.,270.]),np.array([5.,5.]),
+        end_timestamp=start+timedelta(hours=1),
+    )
+    data=object.__new__(UpperAirData)
+    data.soundings=(averaged,)
+
+    assert data.mixing_sounding_at(start+timedelta(hours=1)) is averaged
+    with pytest.raises(ValueError,match='do not cover'):
+        data.mixing_sounding_at(start)
 
 
 def test_upper_air_convective_lapse_handles_subsecond_boundaries():
     start=datetime(2020,1,1)
     data=object.__new__(UpperAirData)
     data.soundings=(
-        _sounding(start,(20.,10.)),
-        _sounding(start+timedelta(seconds=1),(22.,12.)))
+        _sounding(start,(293.,283.)),
+        _sounding(start+timedelta(seconds=1),(295.,285.)))
     result=data.lapse_rate_at(
         start+timedelta(microseconds=750000),1000.,
         last_convective_time=start+timedelta(microseconds=500000))

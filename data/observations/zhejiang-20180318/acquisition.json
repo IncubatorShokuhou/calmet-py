@@ -1,0 +1,203 @@
+{
+  "schema_version": 1,
+  "case": {
+    "name": "Zhejiang, China",
+    "calmet_period_utc": {
+      "start_inclusive": "2018-03-18T00:00:00Z",
+      "end_exclusive": "2018-03-18T01:00:00Z"
+    },
+    "surface_selection_date_utc": "2018-03-18",
+    "upper_air_selection_utc": [
+      "2018-03-18T00:00:00Z",
+      "2018-03-18T12:00:00Z"
+    ]
+  },
+  "redistribution": {
+    "bundled_observation_bytes": false,
+    "isd_terms_url": "https://www.ncei.noaa.gov/pub/data/noaa/readme.txt",
+    "isd_terms_quote": "The non-U.S. data in ISD are subject to WMO Resolution 40 restrictions, and cannot be redistributed to other users or customers.",
+    "policy": "Download every Chinese surface and upper-air observation directly from NCEI for local use. Do not commit raw archives, extracted records, or derived CALMET observation files."
+  },
+  "surface": {
+    "dataset": "NOAA NCEI Integrated Surface Database (ISD)",
+    "format": "annual gzip-compressed ISD fixed-width records",
+    "directory_url": "https://www.ncei.noaa.gov/pub/data/noaa/2018/",
+    "readme_url": "https://www.ncei.noaa.gov/pub/data/noaa/readme.txt",
+    "format_url": "https://www.ncei.noaa.gov/pub/data/noaa/isd-format-document.pdf",
+    "why_annual_fixed_width": "The date-service CSV normalizes station 584570 to Xiaoshan metadata. The annual fixed-width archive preserves both the Hangzhou FM-12 site and the Xiaoshan FM-15 site so preprocessing can select the intended physical station.",
+    "archives": [
+      {
+        "station": "582390",
+        "name": "LISHE",
+        "filename": "582390-99999-2018.gz",
+        "url": "https://www.ncei.noaa.gov/pub/data/noaa/2018/582390-99999-2018.gz",
+        "size_bytes": 213626,
+        "sha256": "780dd554b1204df3b0dfebd59c6c16bc0406c2c0d6c73906ebca5aa9c12784fd"
+      },
+      {
+        "station": "583670",
+        "name": "HONGQIAO INTERNATIONAL",
+        "filename": "583670-99999-2018.gz",
+        "url": "https://www.ncei.noaa.gov/pub/data/noaa/2018/583670-99999-2018.gz",
+        "size_bytes": 363795,
+        "sha256": "721df51fe64c12bdaede856fab342c003a8912c0e3dc8ea0f17a4b8254f974e8"
+      },
+      {
+        "station": "584570",
+        "name": "HANGZHOU / XIAOSHAN",
+        "selected_name": "HANGZHOU",
+        "filename": "584570-99999-2018.gz",
+        "url": "https://www.ncei.noaa.gov/pub/data/noaa/2018/584570-99999-2018.gz",
+        "size_bytes": 544427,
+        "sha256": "5973f915b6644bca1f1e0ac67288d826913a33a23dece51096c9243544cbdeea"
+      },
+      {
+        "station": "584770",
+        "name": "DINGHAI",
+        "filename": "584770-99999-2018.gz",
+        "url": "https://www.ncei.noaa.gov/pub/data/noaa/2018/584770-99999-2018.gz",
+        "size_bytes": 119031,
+        "sha256": "f1735adb425034f82156f24940b971eadb0da7b20514c2a09335165bce6e7fe3"
+      },
+      {
+        "station": "585560",
+        "name": "SHENGXIAN",
+        "filename": "585560-99999-2018.gz",
+        "url": "https://www.ncei.noaa.gov/pub/data/noaa/2018/585560-99999-2018.gz",
+        "size_bytes": 103612,
+        "sha256": "f818b19dcbfdb972f859d2078b7e6ce2e981452aa63d4f9aa0a44a7fb1a48195"
+      },
+      {
+        "station": "585690",
+        "name": "SHIPU",
+        "filename": "585690-99999-2018.gz",
+        "url": "https://www.ncei.noaa.gov/pub/data/noaa/2018/585690-99999-2018.gz",
+        "size_bytes": 106193,
+        "sha256": "e027723db4dc0431ce21b1929c1019c4eae96ab5f2cc61d2f55084c154ba3fc2"
+      },
+      {
+        "station": "586330",
+        "name": "QU XIAN",
+        "filename": "586330-99999-2018.gz",
+        "url": "https://www.ncei.noaa.gov/pub/data/noaa/2018/586330-99999-2018.gz",
+        "size_bytes": 74493,
+        "sha256": "57048dac01aaea971e4c7b96ea2aca3f01ad1fdc6243d2cf542530c9f7debf74"
+      },
+      {
+        "station": "586460",
+        "name": "LISHUI",
+        "filename": "586460-99999-2018.gz",
+        "url": "https://www.ncei.noaa.gov/pub/data/noaa/2018/586460-99999-2018.gz",
+        "size_bytes": 99265,
+        "sha256": "4d58c6cbf803841f6f686644bf8ce142d2d44cdd1daafa2513dbd275e57866bd"
+      },
+      {
+        "station": "586660",
+        "name": "DACHEN DAO",
+        "filename": "586660-99999-2018.gz",
+        "url": "https://www.ncei.noaa.gov/pub/data/noaa/2018/586660-99999-2018.gz",
+        "size_bytes": 120802,
+        "sha256": "749d200ac7658cd8cc5fdd84dbf9b8c92c020415dc30af09c500d995611383b7"
+      },
+      {
+        "station": "587520",
+        "name": "RUIAN",
+        "filename": "587520-99999-2018.gz",
+        "url": "https://www.ncei.noaa.gov/pub/data/noaa/2018/587520-99999-2018.gz",
+        "size_bytes": 117648,
+        "sha256": "5ac9db168e547fa98dd149eb41441c354b904aca79cd4910c56f4b60a0958248"
+      }
+    ]
+  },
+  "upper_air": {
+    "dataset": "NOAA NCEI Integrated Global Radiosonde Archive (IGRA) v2.2",
+    "readme_url": "https://www.ncei.noaa.gov/pub/data/igra/igra2-readme.txt",
+    "format_url": "https://www.ncei.noaa.gov/pub/data/igra/data/igra2-data-format.txt",
+    "archive_policy": "NCEI period-of-record ZIP files are refreshed as later profiles arrive. A full-archive reference digest is recorded for provenance, while reproducibility is enforced on the exact 2018-03-18 00/12 UTC profile slice.",
+    "station_list": {
+      "filename": "igra2-station-list.txt",
+      "url": "https://www.ncei.noaa.gov/pub/data/igra/igra2-station-list.txt",
+      "reference_size_bytes": 260950,
+      "reference_sha256": "2f19a7fc416e9b78ea3031280c9eff561f0f0cd4122969ad28171c503061a929",
+      "elevation_catalog": {
+        "filename": "igra2-station-list-frozen-f9b7fd27.txt",
+        "url": "https://raw.githubusercontent.com/Matthieu-Lacroix/igra2_interactivemap/f9b7fd27adc6c9cee0ba1aa653cf4c99caf91ce6/igra2-station-list.txt",
+        "repository": "https://github.com/Matthieu-Lacroix/igra2_interactivemap",
+        "commit": "f9b7fd27adc6c9cee0ba1aa653cf4c99caf91ce6",
+        "size_bytes": 260147,
+        "sha256": "d1deb3396f6b8b5d8d49c8338d2ac62a842fed1c7d06fd7723890a6f5ce669c5",
+        "reason": "This frozen mirror of the NCEI IGRA station catalog records elevations 9.0, 43.0, 82.9 and 4.6 m for the four selected stations. The current live NCEI list reports -999.9 for the first three."
+      }
+    },
+    "archives": [
+      {
+        "station": "CHM00058362",
+        "name": "SHANGHAI (BAOSHAN)",
+        "latitude": 31.4167,
+        "longitude": 121.45,
+        "elevation_override_m": 9.0,
+        "role": "nearby station about 1.6 km north of the grid, retained to constrain the northern edge",
+        "filename": "CHM00058362-data.txt.zip",
+        "url": "https://www.ncei.noaa.gov/pub/data/igra/data/data-por/CHM00058362-data.txt.zip",
+        "reference_archive_size_bytes": 31760454,
+        "reference_archive_sha256": "33a650675ce719d0a8b4d6b6ebf68fe1d266ed3c4a0d2bc64fee432cd7bffdef",
+        "slice_filename": "CHM00058362-20180318-00-12Z.txt",
+        "slice_size_bytes": 6239,
+        "slice_sha256": "554fff21adabac78cdf380d89b7e9c84ea0d8bbb5d18e88e651fc5476447eb12",
+        "profiles": 2,
+        "levels": 115
+      },
+      {
+        "station": "CHM00058457",
+        "name": "HANGZHOU",
+        "latitude": 30.2333,
+        "longitude": 120.1667,
+        "elevation_override_m": 43.0,
+        "role": "in-domain station",
+        "filename": "CHM00058457-data.txt.zip",
+        "url": "https://www.ncei.noaa.gov/pub/data/igra/data/data-por/CHM00058457-data.txt.zip",
+        "reference_archive_size_bytes": 28178608,
+        "reference_archive_sha256": "2c719551602eb0dcb0cf291bdf220e3682199c03133f51fab39f71d10c9c11b2",
+        "slice_filename": "CHM00058457-20180318-00-12Z.txt",
+        "slice_size_bytes": 2582,
+        "slice_sha256": "06bfe5a02a691370c8f8a5f28efd0b2d36cdf7dc20762410ae2babce5d35e5ad",
+        "profiles": 2,
+        "levels": 46
+      },
+      {
+        "station": "CHM00058633",
+        "name": "QU XIAN",
+        "latitude": 28.9667,
+        "longitude": 118.8667,
+        "elevation_override_m": 82.9,
+        "role": "in-domain station",
+        "filename": "CHM00058633-data.txt.zip",
+        "url": "https://www.ncei.noaa.gov/pub/data/igra/data/data-por/CHM00058633-data.txt.zip",
+        "reference_archive_size_bytes": 23135340,
+        "reference_archive_sha256": "a0e4abf998cac2a48ad75c9958b940891068c0800be344185a37e8e13550d955",
+        "slice_filename": "CHM00058633-20180318-00-12Z.txt",
+        "slice_size_bytes": 1946,
+        "slice_sha256": "f77a15a5b96fb73984c442f60c558135813471dae49e681acff846c70042b761",
+        "profiles": 2,
+        "levels": 34
+      },
+      {
+        "station": "CHM00058665",
+        "name": "HONGJIA",
+        "latitude": 28.6167,
+        "longitude": 121.4167,
+        "elevation_override_m": 4.6,
+        "role": "in-domain station",
+        "filename": "CHM00058665-data.txt.zip",
+        "url": "https://www.ncei.noaa.gov/pub/data/igra/data/data-por/CHM00058665-data.txt.zip",
+        "reference_archive_size_bytes": 20302785,
+        "reference_archive_sha256": "5a571097b9e6e3384d8754479a2fd559ae23b9dbc10d0f4f1368cf3e6ddcc83b",
+        "slice_filename": "CHM00058665-20180318-00-12Z.txt",
+        "slice_size_bytes": 2105,
+        "slice_sha256": "6400722e91d6b074f0c745214ee6ef97bb30d021438174711d7f15e185c9255b",
+        "profiles": 2,
+        "levels": 37
+      }
+    ]
+  }
+}

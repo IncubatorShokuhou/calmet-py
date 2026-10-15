@@ -676,7 +676,9 @@ class Step1Fields:
             in K.
         surface_pressure_mb: Surface pressure in millibars.
         surface_density: Near-surface dry-air density in kg/m3.
-        relative_humidity: Relative humidity by CALMET layer, in percent.
+        relative_humidity: Relative humidity by CALMET layer, in percent. In
+            a pure-observation run, SURF.DAT defines only the lowest-layer
+            value; unobserved upper layers are ``NaN``.
         pbl_height: Prognostic planetary-boundary-layer height in metres AGL.
         sensible_heat_flux: Upward sensible heat flux in W/m2.
         friction_velocity: Surface friction velocity in m/s.
@@ -697,6 +699,13 @@ class Step1Fields:
             mixing ratio in g/kg; the historical field name is retained.
         observed_temperature_faces: Optional observed temperatures on CALMET
             layer faces, in K, shaped ``(face, y, x)``.
+        mixing_profile_temperature: Optional raw upper-air temperatures used
+            only by the observed ``MIXHT`` calculation, in K, shaped
+            ``(source_level, y, x)``.
+        mixing_profile_height: Heights matching
+            ``mixing_profile_temperature``, in metres AGL. Each grid cell
+            carries the latest-past sounding from its selected upper-air
+            station.
         water_gradient_below: Optional overwater temperature gradient below
             mixing height, in K/m.
         water_gradient_above: Optional overwater temperature gradient above
@@ -792,6 +801,8 @@ class Step1Fields:
     debug_domain_u: float | None = None
     debug_domain_v: float | None = None
     debug_upper_data: tuple[object, ...] = ()
+    mixing_profile_temperature: Float32Array | None = None
+    mixing_profile_height: Float32Array | None = None
 
 
 @dataclass(slots=True)
@@ -2014,12 +2025,27 @@ def build_surface_fields(
         threshold_flux_per_m=threshold_flux_per_m,constb=constb,constn=constn,
         relaxation=relaxation,relaxation_time_s=relaxation_time_s,land_mask=land,
         timestep_s=timestep_s)
+    mixing_temperature: Float32Array
+    mixing_height: Float32Array
+    if ((step.mixing_profile_temperature is None)!=
+            (step.mixing_profile_height is None)):
+        raise ValueError(
+            'MIXHT temperature and height profiles must be supplied together'
+        )
+    if step.mixing_profile_temperature is None:
+        mixing_temperature=np.asarray(step.profile_temperature,dtype=MODEL_DTYPE)
+        mixing_height=np.asarray(step.profile_height,dtype=MODEL_DTYPE)
+    else:
+        mixing_temperature=np.asarray(
+            step.mixing_profile_temperature,dtype=MODEL_DTYPE,
+        )
+        mixing_height=np.asarray(step.mixing_profile_height,dtype=MODEL_DTYPE)
     if abs(mixing_method)==1:
-        zi,zic,jump=mixing_height_maul_carson(step.profile_temperature,step.profile_height,
+        zi,zic,jump=mixing_height_maul_carson(mixing_temperature,mixing_height,
             previous_convective_height,previous_temperature_jump,ustar,length,qh,density,coriolis,
             conste=conste,**common)
     elif abs(mixing_method)==2:
-        zi,zic,jump=mixing_height_batchvarova_gryning(step.profile_temperature,step.profile_height,
+        zi,zic,jump=mixing_height_batchvarova_gryning(mixing_temperature,mixing_height,
             previous_convective_height,previous_temperature_jump,ustar,length,qh,density,coriolis,
             surface_temperature_k=temp,**common)
     else:

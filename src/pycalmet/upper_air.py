@@ -1,7 +1,7 @@
 """Formatted CALMET UP.DAT sounding reader."""
 from __future__ import annotations
 
-from bisect import bisect_left
+from bisect import bisect_left,bisect_right
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +21,27 @@ Float32Array: TypeAlias = NDArray[np.float32]
 Float64Array: TypeAlias = NDArray[np.float64]
 
 DRY_ADIABATIC_LAPSE_RATE: np.float32=COMPUTE_DTYPE(.0098)
+UPPER_AIR_MISSING_HEIGHT_M: np.float32=COMPUTE_DTYPE(9999.)
+
+
+def _missing_height(values: ArrayLike) -> NDArray[np.bool_]:
+    """Identify the exact UP.DAT missing-height code and nonfinite values.
+
+    Args:
+        values: Sounding heights in metres MSL.
+
+    Returns:
+        Boolean array with ``True`` only for the reserved 9999 m code (within
+        text-format precision) or a nonfinite value. Valid heights above
+        10 km remain usable.
+    """
+    height: Float32Array=np.asarray(values,dtype=COMPUTE_DTYPE)
+    return np.asarray(
+        np.isclose(
+            height,UPPER_AIR_MISSING_HEIGHT_M,rtol=0.,atol=.01,
+        ) | ~np.isfinite(height),
+        dtype=np.bool_,
+    )
 
 
 def _instant(
@@ -61,12 +82,20 @@ def _sounding_header(line: str) -> tuple[int,str,str,str,str,int]:
     Raises:
         ValueError: If integer fields cannot be decoded.
     """
-    fields=line.replace(',',' ').split()
+    fields: list[str]=line.replace(',',' ').split()
+    padded: str=line.ljust(70)
+    fixed: bool=(len(line)>=70 and
+           re.fullmatch(r'[+-]?\d+',padded[9:17].strip()) is not None and
+           re.fullmatch(r'[+-]?\d+',padded[65:70].strip()) is not None)
     try:
-        if len(fields)>=6:
+        # Hand-written free-format files contain exactly the six values read by
+        # RDUP.  READ62 writes the same values in CALMET's fixed columns, but
+        # also places source and record codes in columns that the Fortran
+        # FORMAT statement skips.  Those extra visible tokens must therefore
+        # select the fixed-column decoder rather than shift the timestamp.
+        if len(fields)==6 and not fixed:
             return (int(fields[0]),fields[1],fields[2],fields[3],fields[4],
                     int(fields[5]))
-        padded=line.ljust(70)
         return (int(padded[9:17]),padded[22:24],padded[24:26],
                 padded[26:28],padded[28:30],int(padded[65:70]))
     except ValueError as error: raise ValueError('invalid fixed-column UP.DAT sounding header') from error
@@ -87,13 +116,21 @@ def _sounding_header22(
     Raises:
         ValueError: If integer fields cannot be decoded.
     """
-    fields=line.replace(',',' ').split()
+    fields: list[str]=line.replace(',',' ').split()
+    padded: str=line.ljust(76)
+    fixed: bool=(len(line)>=76 and
+           re.fullmatch(r'[+-]?\d+',padded[9:17].strip()) is not None and
+           re.fullmatch(r'[+-]?\d+',padded[71:76].strip()) is not None)
     try:
-        if len(fields)>=12:
+        # The free-format compatibility layout has exactly twelve values.
+        # READ62's fixed-column layout also exposes a source code in the first
+        # nine skipped columns and may expose a record code in the eight
+        # skipped columns before NLEV.  Decode such lines by column so neither
+        # code is mistaken for station or time metadata.
+        if len(fields)==12 and not fixed:
             return (int(fields[0]),fields[1],fields[2],fields[3],fields[4],
                     fields[5],fields[6],fields[7],fields[8],fields[9],
                     fields[10],int(fields[11]))
-        padded=line.ljust(76)
         return (int(padded[9:17]),padded[21:25],padded[25:29],padded[29:32],
                 padded[32:35],padded[35:40],padded[44:48],padded[48:52],
                 padded[52:55],padded[55:58],padded[58:63],int(padded[71:76]))
@@ -153,8 +190,8 @@ class Sounding:
         pressure_mb: Float32 ``(source_level,)`` pressure in millibars.
         height_msl: Float32 ``(source_level,)`` height in metres above mean sea
             level.
-        temperature_c: Float32 ``(source_level,)`` temperature in degrees
-            Celsius.
+        temperature_k: Float32 ``(source_level,)`` absolute temperature in
+            kelvin, as stored by READ62 in UP.DAT.
         wind_direction: Float32 ``(source_level,)`` meteorological wind
             direction in degrees from north.
         wind_speed: Float32 ``(source_level,)`` wind speed in metres per second.
@@ -164,7 +201,7 @@ class Sounding:
     timestamp: datetime
     pressure_mb: Float32Array
     height_msl: Float32Array
-    temperature_c: Float32Array
+    temperature_k: Float32Array
     wind_direction: Float32Array
     wind_speed: Float32Array
     end_timestamp: datetime | None = None
@@ -188,7 +225,12 @@ class Sounding:
             ValueError: If the sounding is empty or contains missing heights.
         """
         if self.height_msl.size==0: raise ValueError('cannot convert an empty upper-air sounding')
-        if np.any(self.height_msl>=9998.): raise ValueError('upper-air sounding contains missing heights')
+        # UP.DAT reserves the exact value 9999 m as its missing-height code.
+        # Geopotential heights above about 10 km are ordinary radiosonde data,
+        # so a threshold comparison would incorrectly reject the upper
+        # troposphere and stratosphere.
+        if np.any(_missing_height(self.height_msl)):
+            raise ValueError('upper-air sounding contains missing heights')
         height=np.asarray(self.height_msl,dtype=COMPUTE_DTYPE)
         height=height-height[0]
         direction=np.asarray(self.wind_direction,dtype=COMPUTE_DTYPE)
@@ -267,7 +309,7 @@ def layer_average(
 
 
 def temperature_faces(sounding: Sounding,z_faces_m: ArrayLike) -> Float32Array:
-    """Interpolate sounding temperatures at CALMET layer faces.
+    """Interpolate absolute sounding temperatures at CALMET layer faces.
 
     Args:
         sounding: :class:`Sounding` containing height and temperature profiles.
@@ -275,19 +317,22 @@ def temperature_faces(sounding: Sounding,z_faces_m: ArrayLike) -> Float32Array:
             sounding level, beginning at zero.
 
     Returns:
-        Float32 array of shape ``(face,)`` containing temperatures in degrees
-        Celsius at the requested faces.
+        Float32 array of shape ``(face,)`` containing temperatures in kelvin
+        at the requested faces.
 
     Raises:
-        ValueError: If faces are invalid, a face lies above the top valid
-            temperature, or a valid bracketing value is unavailable.
+        ValueError: If faces are invalid, the sounding has a missing height,
+            a face lies above the top valid temperature, or a valid
+            bracketing value is unavailable.
     """
     faces=np.asarray(z_faces_m,dtype=COMPUTE_DTYPE)
     if faces.ndim!=1 or faces.size<2 or faces[0]!=0. or np.any(np.diff(faces)<=0.):
         raise ValueError('upper-air temperature faces must increase strictly from zero')
     raw_height=np.asarray(sounding.height_msl,dtype=COMPUTE_DTYPE)
+    if raw_height.size==0 or np.any(_missing_height(raw_height)):
+        raise ValueError('upper-air sounding contains missing heights')
     height=raw_height-raw_height[0]
-    temperature=np.asarray(sounding.temperature_c,dtype=COMPUTE_DTYPE)
+    temperature=np.asarray(sounding.temperature_k,dtype=COMPUTE_DTYPE)
     output: Float32Array=np.empty(faces.size,dtype=COMPUTE_DTYPE)
     for index,face in enumerate(faces):
         upper: int | None
@@ -307,6 +352,61 @@ def temperature_faces(sounding: Sounding,z_faces_m: ArrayLike) -> Float32Array:
     return output
 
 
+def mixing_temperature_profile(
+    sounding: Sounding,
+) -> tuple[Float32Array,Float32Array]:
+    """Return the raw temperature profile consumed by ``MIXHT/MIXDT``.
+
+    Args:
+        sounding: Snapshot or averaged upper-air sounding selected for the
+            current CALMET interval.
+
+    Returns:
+        Tuple ``(temperature, height)`` of float32 one-dimensional arrays.
+        Heights are metres above the first sounding level. Levels carrying
+        CALMET's missing-temperature code are omitted without otherwise
+        resampling the observed profile.
+
+    Raises:
+        ValueError: If heights are missing or non-monotonic, the surface
+            temperature is missing, or fewer than two valid temperatures
+            remain.
+
+    Notes:
+        This is intentionally a raw-profile operation. ``TEMP3D`` uses
+        :func:`temperature_faces` followed by temporal and horizontal
+        interpolation; ``MIXDT`` instead interpolates within one selected
+        past sounding at each grid cell.
+    """
+    raw_height: Float32Array=np.asarray(
+        sounding.height_msl,dtype=COMPUTE_DTYPE,
+    )
+    if raw_height.size==0 or np.any(_missing_height(raw_height)):
+        raise ValueError('upper-air sounding contains missing heights')
+    temperature: Float32Array=np.asarray(
+        sounding.temperature_k,dtype=COMPUTE_DTYPE,
+    )
+    if temperature.shape!=raw_height.shape:
+        raise ValueError('upper-air temperature and height profiles do not match')
+    height: Float32Array=raw_height-raw_height[0]
+    valid: NDArray[np.bool_]=np.asarray(
+        np.isfinite(temperature)&(temperature<COMPUTE_DTYPE(999.89)),
+        dtype=np.bool_,
+    )
+    height=height[valid]
+    temperature=temperature[valid]
+    if height.size<2:
+        raise ValueError('upper-air mixing profile needs two valid temperatures')
+    if height[0]!=COMPUTE_DTYPE(0.):
+        raise ValueError('bottom of upper-air mixing temperature profile is missing')
+    if np.any(np.diff(height)<=COMPUTE_DTYPE(0.)):
+        raise ValueError('upper-air mixing profile heights must increase strictly')
+    return (
+        temperature.astype(COMPUTE_DTYPE,copy=False),
+        height.astype(COMPUTE_DTYPE,copy=False),
+    )
+
+
 def grid_temperature_faces(
     station_faces: ArrayLike,
     station_xy: ArrayLike,
@@ -318,7 +418,7 @@ def grid_temperature_faces(
 
     Args:
         station_faces: Float-like array of shape ``(station, face)`` containing
-            temperature in degrees Celsius.
+            absolute temperature in kelvin.
         station_xy: Float-like array of shape ``(station, 2)`` containing
             projected coordinates in kilometres.
         grid: Target CALMET grid configuration.
@@ -328,7 +428,7 @@ def grid_temperature_faces(
 
     Returns:
         Float32 array of shape ``(face, grid.ny, grid.nx)`` containing
-        temperatures in degrees Celsius.
+        absolute temperatures in kelvin.
 
     Raises:
         ValueError: If station arrays do not match or ``power`` is not 1 or 2.
@@ -401,8 +501,11 @@ class UpperAirData:
         top_pressure_mb: Header top-pressure threshold in millibars.
         source_type: CALMET upper-air source-type code.
         record_format: Sounding record-format selector, 1 or 2.
-        required_fields: Four booleans selecting pressure, height, temperature,
-            and wind fields.
+        required_fields: Four booleans corresponding to CALMET's ``LHT``,
+            ``LTEMP``, ``LWD``, and ``LWS`` header flags. A true value records
+            that preprocessing eliminated a sounding level when its height,
+            temperature, wind direction, or wind speed, respectively, was
+            missing.
         station: :class:`UpperAirStation` described in the file or supplied by
             the control file.
         soundings: Strictly chronological tuple of :class:`Sounding` objects.
@@ -505,7 +608,7 @@ class UpperAirData:
             # 2.1 files use the older six-field snapshot header, so retain
             # that representation when the field count identifies it.
             explicit_record=(self.version=='2.2' or
-                             (self.version=='2.1' and len(header_fields)==12))
+                             (self.version=='2.1' and len(header_fields)>=12))
             if explicit_record:
                 header_values=_sounding_header22(lines[index])
                 identifier=header_values[0]
@@ -586,6 +689,56 @@ class UpperAirData:
             if left<0: raise ValueError('UP.DAT does not begin before requested time')
         return self.soundings[left],self.soundings[right]
 
+    def mixing_sounding_at(self,timestamp: datetime) -> Sounding:
+        """Select the sounding used by observed-mode ``MIXHT/MIXDT``.
+
+        Args:
+            timestamp: Interval-ending UTC time at which CALMET diagnoses the
+                mixing height.
+
+        Returns:
+            For snapshot data, the most recent sounding at or before
+            ``timestamp``, provided a later snapshot also exists. For version
+            2.2 averaged data, the sounding whose interval satisfies
+            ``begin < timestamp <= end``.
+
+        Raises:
+            ValueError: If no snapshot exists at or before ``timestamp``, or
+                snapshots do not extend strictly beyond it, or no averaged
+                sounding covers it.
+
+        Notes:
+            This deliberately differs from :meth:`temperature_faces_at`.
+            ``TEMP3D`` interpolates snapshot temperatures in time, whereas the
+            official CALMET 6.5 ``MIXHT`` routine passes the latest raw
+            sounding available at the interval-ending time to ``MIXDT``.
+            Keeping the selection separate prevents the three-dimensional
+            temperature analysis from changing the lapse rate used for
+            mixing-height growth.
+        """
+        if self.soundings[0].end_timestamp is not None:
+            sounding: Sounding | None=next((
+                item for item in self.soundings
+                if item.timestamp<timestamp<=cast(datetime,item.end_timestamp)
+            ),None)
+            if sounding is None:
+                raise ValueError(
+                    'UP.DAT averaged records do not cover requested time'
+                )
+            return sounding
+        times: tuple[datetime,...]=tuple(
+            item.timestamp for item in self.soundings
+        )
+        next_index: int=bisect_right(times,timestamp)
+        if next_index>=len(self.soundings):
+            raise ValueError('UP.DAT does not extend beyond requested time')
+        index: int=next_index-1
+        if index<0:
+            raise ValueError(
+                'UP.DAT has no sounding at or before requested time'
+            )
+        return self.soundings[index]
+
     def layer_wind_at(
         self,
         timestamp: datetime,
@@ -639,7 +792,7 @@ class UpperAirData:
                 beginning at zero.
 
         Returns:
-            Float32 ``(face,)`` temperature array in degrees Celsius. Version
+            Float32 ``(face,)`` temperature array in kelvin. Version
             2.2 averaged soundings are returned unchanged within their interval.
 
         Raises:

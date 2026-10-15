@@ -162,7 +162,7 @@ def format_upper_air_input_debug(
     height,u,v=sounding.converted(convergence_degrees)
     count: int = len(height)
     fields: tuple[npt.NDArray[np.generic], ...] = (
-        sounding.pressure_mb,sounding.temperature_c,u,v)
+        sounding.pressure_mb,sounding.temperature_k,u,v)
     if any(np.asarray(values).shape!=(count,) for values in fields):
         raise ValueError('upper-air debug sounding fields do not match')
     timestamp=sounding.timestamp
@@ -174,9 +174,7 @@ def format_upper_air_input_debug(
         "       (mb)   (m LGL)   (K)     (m/s)   (m/s)",
     ]
     temperature: npt.NDArray[np.float32] = np.asarray(
-        sounding.temperature_c,dtype=np.float32)
-    temperature=np.where(temperature<np.float32(999.89),
-                         temperature+np.float32(273.15),temperature)
+        sounding.temperature_k,dtype=np.float32)
     for pressure,z,temp,u_value,v_value in zip(
             sounding.pressure_mb,height,temperature,u,v):
         lines.append(f" {int(station_number):3d}  {pressure:6.1f}  {z:7.1f}  "
@@ -565,7 +563,7 @@ class CalmetListingWriter:
                     for sounding in soundings:
                         face_temperature: npt.NDArray[np.float32] | None = (
                             temperature_faces(
-                                sounding,self.config.z_faces_m)+np.float32(273.15)
+                                sounding,self.config.z_faces_m)
                             if self.config.include_w_temperature else None)
                         stream.write(format_upper_air_input_debug(
                             station_number,sounding,convergence,layer_u,layer_v,

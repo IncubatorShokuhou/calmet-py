@@ -22,6 +22,13 @@ STAGES: Final[tuple[str, ...]] = (
     "calwrf", "terrel", "ctgproc", "makegeo", "calmet"
 )
 _SOURCE_PACKAGE: Final[str] = "_pycalmet_pipeline_api_codegen"
+_PIPELINE_PARAMETER_OVERRIDES: Final[dict[tuple[str, str], str]] = {
+    ("calmet", "meteorology"): (
+        "The complete pipeline always runs CALWRF and replaces this value with "
+        "CALWRF's private NetCDF output. For a pure-observation IPROG=0 run, "
+        "call pycalmet.calmet(meteorology=None, ...) directly."
+    ),
+}
 
 
 def _annotation(parameter: inspect.Parameter) -> str:
@@ -215,8 +222,9 @@ def render() -> str:
         lines.extend(_doc_entry(name, description))
     for stage in STAGES:
         for parameter in parameters[stage]:
-            description = parameter_docs.parameter_meaning(
-                stage, parameter.name, "en"
+            description = _PIPELINE_PARAMETER_OVERRIDES.get(
+                (stage, parameter.name),
+                parameter_docs.parameter_meaning(stage, parameter.name, "en"),
             )
             lines.extend(_doc_entry(
                 f"{stage}_{parameter.name}",

@@ -269,6 +269,26 @@ def test_parameter_only_calmet_accepts_datetime_and_flat_grid(monkeypatch, tmp_p
     assert config.timestep_seconds == 3600
 
 
+def test_parameter_only_calmet_allows_pure_observation_mode_without_meteorology(
+        monkeypatch,tmp_path):
+    captured=[]
+    monkeypatch.setattr(
+        'pycalmet._calmet.run',
+        lambda config: captured.append(config) or Path(config.output),
+    )
+
+    result=pycalmet.calmet(
+        geophysical=tmp_path/'geo.nc',output=tmp_path/'calmet.nc',
+        start=datetime(2018,3,18),end=datetime(2018,3,18,1),
+        nx=1,ny=1,dx_km=1.,dy_km=1.,iprog=0,noobs=0,
+        itprog=0,irhprog=0,cloud_method=1,
+        surface_data=tmp_path/'surf.dat',upper_air_files=(tmp_path/'up.dat',),
+    )
+
+    assert result==tmp_path/'calmet.nc'
+    assert captured[0].meteorology is None
+
+
 def test_control_file_honours_explicit_overrides_equal_to_python_defaults(monkeypatch):
     captured = []
     monkeypatch.setattr("pycalmet._calmet.run",

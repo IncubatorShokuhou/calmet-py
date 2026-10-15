@@ -45,3 +45,13 @@ wrfout*
 !data/landuse/usgs-glcc/EAUSGS1.IMG
 !data/landuse/usgs-glcc/EAUSGS2.IMG
 !examples/zhejiang/*.nc
+
+# Locally acquired/reformatted Zhejiang observations (redistribution restricted)
+data/observations/zhejiang-20180318/raw/
+data/observations/zhejiang-20180318/calmet/
+data/observations/zhejiang-20180318/.zhejiang-*/
+data/observations/zhejiang-20180318/.raw.previous-*/
+data/observations/zhejiang-20180318/.calmet.previous-*/
+
+# Interrupted atomic NetCDF publications
+*.nc.*.tmp

@@ -415,7 +415,7 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 
 | 参数 | 含义 | Python 类型 | Python 默认值 | 浙江示例值 |
 | --- | --- | --- | --- | --- |
-| `meteorology` | 格点预报气象输入；iprog 决定其作为第一步风场、初始猜测场还是伪观测。 | `str \| Path \| Sequence[str \| Path] \| None` | `必填` | `output/zhejiang/calwrf.nc` |
+| `meteorology` | 可选的格点预报气象输入；iprog 决定其作为第一步风场、初始猜测场还是伪观测。仅由 SURF.DAT 和 UP*.DAT 驱动的纯观测 IPROG=0 运行可省略此项。 | `str \| Path \| Sequence[str \| Path] \| None` | `None` | `output/zhejiang/calwrf.nc` |
 | `geophysical` | GEO 地理物理网格，包含地形、土地利用、粗糙度、反照率、Bowen 比、土壤/人为热参数和叶面积指数。 | `str \| Path \| None` | `必填` | `output/zhejiang/geo.nc` |
 | `output` | 主输出文件路径。 | `str \| Path \| None` | `必填` | `output/zhejiang/calmet.nc` |
 | `start` | CALMET 输出区间 `[start, end)` 的闭合下界；实现选择满足 `start < t <= end` 的气象边界时刻，并将输出时间戳记为 `t - timestep_seconds`。 | `datetime \| str \| None` | `必填` | `2018-03-18 00:00:00` |
@@ -631,9 +631,18 @@ TEMP3D 行为，以支持结果复现。
 
 ## 浙江示例
 
-仓库内置三个连续 WRF 时次、42 个原始 SRTM3 `.hgt` 瓦片和原始
-`EAUSGS1.IMG` 土地利用栅格。示例会重新生成地形、土地利用和地理场，不依赖预先
-做好的 `geo.nc`。从仓库根目录运行完整的五阶段流水线：
+下面三个脚本使用同一个 1 km 浙江网格和同一个 2018-03-18 00:00–01:00 UTC
+CALMET 时段，仅 CALMET 接收的气象资料不同：
+
+| 脚本 | 气象输入 | 主要控制项 | 最终输出 |
+| --- | --- | --- | --- |
+| `examples/zhejiang/run.py` | 仅 WRF | `NOOBS=2`、`IPROG=14` | `output/zhejiang/calmet.nc` |
+| `examples/zhejiang/run_observations.py` | 浙江及周边地面（`SURF`）与探空（`UP`）观测 | `NOOBS=0`、`IPROG=0`、`MCLOUD=1` | `output/zhejiang/calmet-observations.nc` |
+| `examples/zhejiang/run_wrf_observations.py` | WRF + 同一组 `SURF` + `UP` 观测 | `NOOBS=0`、`IPROG=14`、`MCLOUD=4` | `output/zhejiang/calmet-wrf-observations.nc` |
+
+三个案例都会从 42 个原始 SRTM3 `.hgt` 瓦片和原始 `EAUSGS1.IMG` 土地利用
+栅格重新生成地形、土地利用和地理场，不读取预先做好的 `geo.nc`。先拉取并校验
+仓库数据：
 
 ```bash
 git lfs pull
@@ -644,7 +653,29 @@ cd data/landuse/usgs-glcc && sha256sum -c SHA256SUMS && cd ../../..
 ./examples/zhejiang/run.sh
 ```
 
-数据来源、时间边界和生成结果见
+两个观测案例还需要从 NOAA/NCEI 获取本地数据。运行前先下载、校验并转换已经固定
+来源和校验值的官方记录：
+
+```bash
+python tools/fetch_zhejiang_observations.py
+```
+
+NCEI 明确说明：非美国 ISD 数据受 WMO Resolution 40 限制，不能再分发给其他
+用户或客户。因此仓库不包含中国观测的原始字节，也不包含由其转换得到的 CALMET
+文本文件；仓库只保存官方 URL、预期 SHA-256、站点选择和可复现的转换代码。下载和
+转换结果仅保存在本地并由 Git 忽略。获取模式、数据条款和完整来源见
+[`data/observations/zhejiang-20180318/`](data/observations/zhejiang-20180318/)。
+
+纯观测案例使用地面报告中的云量和云底高（`MCLOUD=1`）；融合案例通过预报云场路径
+使用 WRF 云凝结物，包括云水和云冰（`MCLOUD=4`）。现代脚本只读取 00:00 和
+01:00 两个 WRF 边界时次。保留的 02:00 文件仅用于官方 Fortran 对比，因为原程序
+会前视读取下一个边界时次。
+
+这个一小时案例用于检查数据链路和结果回归。它从北京时间 08:00 开始，没有覆盖前一
+夜到清晨的边界层演变。面向生产的行星边界层研究应加入前夜或黎明前开始的 WRF 与
+观测历史，为边界层计算提供足够的 spin-up。
+
+运行命令、10 个地面站、4 个探空站、输入边界和生成结果见
 [examples/zhejiang/README.md](examples/zhejiang/README.md)。
 
 ## 仓库结构
@@ -655,6 +686,7 @@ tests/                 单元测试和集成测试
 examples/zhejiang/     可运行的真实数据示例及控制文件
 data/terrain/srtm3/    浙江区域使用的原始 SRTM3 瓦片
 data/landuse/usgs-glcc/ 原始 USGS Global/GLCC 风格土地利用栅格
+data/observations/      受版本控制的获取元数据；观测文件仅保存在本地
 fortran/               仅供参考的 Fortran 源码，运行时不使用
 tools/                 维护工具
 ```
@@ -679,9 +711,9 @@ tools/                 维护工具
 PROJ，海岸线裁剪使用 Shapely，最近邻搜索使用 SciPy `cKDTree`。CALMET 专有物理
 参数化和少见的历史输入格式仍由软件包实现。
 
-浙江示例采用 LCC 投影、1 km 网格距和 `610 × 499` 网格。当前运行脚本只传入
+浙江示例采用 LCC 投影、1 km 网格距和 `610 × 499` 网格。现代运行脚本只传入
 00:00 和 01:00 UTC 两个 WRF 边界场，用于配置的 `[00:00, 01:00)` CALMET
-时段。仓库仍提供 02:00 记录以便扩展运行，但当前脚本不会读取它。
+时段。保留的 02:00 记录属于官方 Fortran 前视对比，现代脚本不会读取它。
 
 ## 验证
 
@@ -693,7 +725,8 @@ python -m pytest -q
 
 默认测试检查数值行为和完整数据流，不绑定特定编译器或 C 数学库。单独的 legacy
 测试用于确认兼容命名空间与默认实现隔离，并验证其旧单精度路径。`fortran/` 中的
-源码仅用于审计，不是安装依赖。
+源码仅用于审计，不是安装依赖。浙江指南还记录了纯观测和 WRF + 观测两套案例与
+官方 CALMET 6.5 的[逐场对比结果及复现命令](examples/zhejiang/README.md#official-calmet-65-comparison)。
 
 ## 参与贡献
 
