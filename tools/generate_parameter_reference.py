@@ -155,7 +155,7 @@ MEANING_OVERRIDES.update({
     "qa_hit_threshold_percent": ("Flag cells whose sample count is below this percentage (0–100) of the domain-average hit count.", "标记采样数低于区域平均命中数这一百分比（0–100）的格点。"),
     "mesh_density": ("Per-side subdivision count for each input land-use cell, producing mesh_density² sample points; must be at least 1.", "每个输入土地利用单元在每条边上的细分数，共生成 mesh_density² 个采样点；不得小于 1。"),
     "input_type": ("Land-use database reader name/code, such as CTG, GEN, NLCD, CORINE, GLC2K, UMDGLC, or MODIS.", "土地利用数据库读取器名称/代码，例如 CTG、GEN、NLCD、CORINE、GLC2K、UMDGLC 或 MODIS。"),
-    "input_datum": ("Datum of the input land-use coordinates.", "输入土地利用坐标采用的大地基准。"),
+    "input_datum": ("Source datum for land-use formats without usable datum/CRS metadata; self-describing GENERIC and supported GeoTIFF inputs read it from the file instead.", "土地利用格式未携带可用 datum/CRS 元数据时使用的源坐标基准；可自描述的 GENERIC 文件和受支持的 GeoTIFF 会改从文件中读取。"),
     "output_format": ("Output encoding: choose from the filename (auto), traditional CTGPROC format (legacy), or NetCDF.", "输出编码：按文件名判断 (auto)、传统 CTGPROC 格式 (legacy)，或 NetCDF。"),
     "coastline_swap": ("While reading samples, replace each point lying offshore of the supplied coastline with ocean_category.", "读取样本时，把位于所给岸线外海侧的点替换为 ocean_category。"),
     "fill_empty_ocean": ("On the final pass, fill zero-hit cells whose centre lies offshore with ocean_category; None follows the Fortran default and enables this only when coastline_file is supplied.", "最终处理时，把中心位于海上且命中数为零的格点填为 ocean_category；None 沿用 Fortran 默认逻辑，仅在提供 coastline_file 时启用。"),

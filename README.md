@@ -83,7 +83,6 @@ result = pycalmet.run_pipeline(
     ctgproc_landuse_files=[example / "landuse/zhejiang_generic.landuse"],
     ctgproc_grid=grid,
     ctgproc_input_type="GEN",
-    ctgproc_input_datum="WGS-84",
     ctgproc_mesh_density=12,
     makegeo_grid=grid,
     calmet_start=datetime(2018, 3, 18, 0),
@@ -98,6 +97,11 @@ result = pycalmet.run_pipeline(
     output=Path("output/zhejiang/calmet.nc"),
 )
 ```
+
+The Zhejiang `GENERIC.LANDUSE` file declares its `WGS-84` source datum in its
+header, so CTGPROC reads it directly. `ctgproc_input_datum` is needed only for
+land-use formats that do not carry usable datum or CRS metadata; it describes
+the source data and must not be inferred from the target `GridConfig.datum`.
 
 Every field in the stage parameter reference below is available under its
 `calwrf_`, `terrel_`, `ctgproc_`, `makegeo_`, or `calmet_` prefix. For example,
@@ -316,7 +320,7 @@ with `python tools/generate_parameter_reference.py`; use `--check` in CI.
 | `category_map` | Post-binning map from source to target land-use categories; hit counts mapped to the same target are summed. | `dict[int, int] \| None` | `{}` | `{}` |
 | `input_type` | Land-use database reader name/code, such as CTG, GEN, NLCD, CORINE, GLC2K, UMDGLC, or MODIS. | `str` | `'CTG'` | `'GEN'` |
 | `mesh_density` | Per-side subdivision count for each input land-use cell, producing mesh_density² sample points; must be at least 1. | `int` | `1` | `12` |
-| `input_datum` | Datum of the input land-use coordinates. | `str` | `'NAS-C'` | `'WGS-84'` |
+| `input_datum` | Source datum for land-use formats without usable datum/CRS metadata; self-describing GENERIC and supported GeoTIFF inputs read it from the file instead. | `str` | `'NAS-C'` | `'WGS-84'` |
 | `output_format` | Output encoding: choose from the filename (auto), traditional CTGPROC format (legacy), or NetCDF. | `str` | `'auto'` | `'auto'` |
 | `coastline_file` | Processed BLN coastline input; when gshhs_file is supplied, this path receives the generated BLN data. | `str \| Path \| None` | `None` | `None` |
 | `gshhs_file` | Raw GSHHS coastline database used to generate the processed BLN coastline. | `str \| Path \| None` | `None` | `None` |

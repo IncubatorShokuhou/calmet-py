@@ -79,7 +79,6 @@ result = pycalmet.run_pipeline(
     ctgproc_landuse_files=[example / "landuse/zhejiang_generic.landuse"],
     ctgproc_grid=grid,
     ctgproc_input_type="GEN",
-    ctgproc_input_datum="WGS-84",
     ctgproc_mesh_density=12,
     makegeo_grid=grid,
     calmet_start=datetime(2018, 3, 18, 0),
@@ -94,6 +93,11 @@ result = pycalmet.run_pipeline(
     output=Path("output/zhejiang/calmet.nc"),
 )
 ```
+
+浙江 `GENERIC.LANDUSE` 文件已在文件头声明其源坐标基准为 `WGS-84`，CTGPROC
+会直接读取，因此无需再传 `ctgproc_input_datum`。只有土地利用格式未携带可用的
+datum 或 CRS 元数据时才需要该参数；它描述源数据，不能从目标
+`GridConfig.datum` 推断。
 
 下方各阶段参数表中的每个字段，都可分别加上 `calwrf_`、`terrel_`、`ctgproc_`、
 `makegeo_` 或 `calmet_` 前缀后直接传入。例如 CALMET 的 `z_faces_m` 对应
@@ -294,7 +298,7 @@ Meteorological Model (Version 5)*（2000 年 1 月），尤其是第 2 章及 4.
 | `category_map` | 分箱后应用的源土地利用类别到目标类别映射；映射到同一目标的命中数会相加。 | `dict[int, int] \| None` | `{}` | `{}` |
 | `input_type` | 土地利用数据库读取器名称/代码，例如 CTG、GEN、NLCD、CORINE、GLC2K、UMDGLC 或 MODIS。 | `str` | `'CTG'` | `'GEN'` |
 | `mesh_density` | 每个输入土地利用单元在每条边上的细分数，共生成 mesh_density² 个采样点；不得小于 1。 | `int` | `1` | `12` |
-| `input_datum` | 输入土地利用坐标采用的大地基准。 | `str` | `'NAS-C'` | `'WGS-84'` |
+| `input_datum` | 土地利用格式未携带可用 datum/CRS 元数据时使用的源坐标基准；可自描述的 GENERIC 文件和受支持的 GeoTIFF 会改从文件中读取。 | `str` | `'NAS-C'` | `'WGS-84'` |
 | `output_format` | 输出编码：按文件名判断 (auto)、传统 CTGPROC 格式 (legacy)，或 NetCDF。 | `str` | `'auto'` | `'auto'` |
 | `coastline_file` | 处理后的 BLN 岸线输入；提供 gshhs_file 时，该路径接收生成的 BLN 数据。 | `str \| Path \| None` | `None` | `None` |
 | `gshhs_file` | 用于生成处理后 BLN 岸线的原始 GSHHS 岸线数据库。 | `str \| Path \| None` | `None` | `None` |
