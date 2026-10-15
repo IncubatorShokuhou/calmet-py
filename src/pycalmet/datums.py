@@ -23,7 +23,15 @@ NIMA_DATABASE_DATE = '02-21-2003'
 
 
 class DatumDefinition(NamedTuple):
-    """Ellipsoid and datum-to-WGS84 translation used by COORDLIB."""
+    """Store a COORDLIB ellipsoid and its translation to WGS 84.
+
+    Attributes:
+        radius: Ellipsoid semi-major axis, or spherical radius, in metres.
+        inv_f: Inverse flattening; values at least ``1e20`` denote a sphere.
+        dx: Geocentric x translation to WGS 84, in metres.
+        dy: Geocentric y translation to WGS 84, in metres.
+        dz: Geocentric z translation to WGS 84, in metres.
+    """
 
     radius: float
     inv_f: float
@@ -269,7 +277,15 @@ DATUMS: dict[str, DatumDefinition] = {
 
 
 def normalize_datum(datum: str) -> str:
-    """Normalize accepted CALPUFF spelling variants to a NIMA datum ID."""
+    """Normalize an accepted CALPUFF spelling to a NIMA datum identifier.
+
+    Args:
+        datum: CALPUFF datum name or supported spelling variant.
+
+    Returns:
+        Uppercase identifier with underscores converted to hyphens and known
+        WGS/ESRI aliases converted to their canonical table keys.
+    """
     normalized = datum.strip().upper().replace("_", "-")
     aliases = {"WGS84": "WGS-84", "WGS96": "WGS-96", "WGS72": "WGS-72",
                "ESR-R": "ESR-S"}
@@ -277,7 +293,17 @@ def normalize_datum(datum: str) -> str:
 
 
 def datum_definition(datum: str) -> DatumDefinition:
-    """Return a datum definition, raising a useful error for unknown IDs."""
+    """Look up the ellipsoid and WGS 84 translation for a CALPUFF datum.
+
+    Args:
+        datum: CALPUFF datum name or supported spelling variant.
+
+    Returns:
+        Datum definition from the embedded NIMA/COORDLIB table.
+
+    Raises:
+        ValueError: If ``datum`` is not present in the table.
+    """
     normalized = normalize_datum(datum)
     try:
         return DATUMS[normalized]
@@ -291,6 +317,16 @@ def datum_proj4_parameters(datum: str) -> str:
     CALPUFF's WGS-72 correction is the standard legacy WGS-72 to WGS-84
     seven-parameter operation.  PROJ expresses rotations in arc-seconds and
     scale in parts per million, matching the NIMA definition used here.
+
+    Args:
+        datum: CALPUFF datum name or supported spelling variant.
+
+    Returns:
+        PROJ parameter fragment describing the datum's sphere or ellipsoid
+        and its transformation to WGS 84. Linear values are in metres.
+
+    Raises:
+        ValueError: If ``datum`` is unknown.
     """
     normalized = normalize_datum(datum)
     definition = datum_definition(normalized)
@@ -305,7 +341,19 @@ def datum_proj4_parameters(datum: str) -> str:
 
 @lru_cache(maxsize=None)
 def _transformation_crs(datum: str) -> CRS:
-    """Build a three-dimensional CRS used only for datum transformations."""
+    """Build a cached three-dimensional geographic transformation CRS.
+
+    Args:
+        datum: Canonical or aliased CALPUFF datum identifier.
+
+    Returns:
+        Three-dimensional pyproj geographic CRS. Spherical CALPUFF datums use
+        WGS 84 geodetic coordinates because their spheres define projection
+        geometry rather than a separate geodetic transformation.
+
+    Raises:
+        ValueError: If ``datum`` is unknown.
+    """
     normalized = normalize_datum(datum)
     definition = datum_definition(normalized)
     # CALPUFF's spherical earth choices define projection geometry.  They do
@@ -319,6 +367,21 @@ def _transformation_crs(datum: str) -> CRS:
 
 @lru_cache(maxsize=None)
 def _datum_transformer(source: str, target: str) -> Transformer:
+    """Build a cached strict transformer between two CALPUFF datums.
+
+    Args:
+        source: Source CALPUFF datum identifier.
+        target: Target CALPUFF datum identifier.
+
+    Returns:
+        Three-dimensional pyproj transformer with longitude-first axis order
+        and ballpark transformations disabled.
+
+    Raises:
+        ValueError: If either datum identifier is unknown.
+        pyproj.exceptions.ProjError: If PROJ cannot construct the requested
+            transformation.
+    """
     return Transformer.from_crs(
         _transformation_crs(source),
         _transformation_crs(target),
@@ -328,7 +391,26 @@ def _datum_transformer(source: str, target: str) -> Transformer:
 
 
 def datum_shift(longitude, latitude, height=0.0, *, source="WGS-84", target="WGS-84"):
-    """Transform CALPUFF datum coordinates with PROJ in float64 precision."""
+    """Transform geodetic coordinates between CALPUFF datums.
+
+    Args:
+        longitude: Scalar or array-like longitude in degrees east.
+        latitude: Scalar or array-like latitude in degrees north.
+        height: Scalar or array-like ellipsoidal height in metres. Inputs are
+            broadcast with longitude and latitude.
+        source: Source CALPUFF datum identifier.
+        target: Target CALPUFF datum identifier.
+
+    Returns:
+        Tuple of longitude, latitude, and ellipsoidal-height ``float64``
+        arrays with the broadcast input shape. Longitudes retain the input
+        branch across the antimeridian.
+
+    Raises:
+        ValueError: If either datum identifier is unknown or the input arrays
+            cannot be broadcast together.
+        pyproj.exceptions.ProjError: If PROJ cannot transform a coordinate.
+    """
     source_name, target_name = normalize_datum(source), normalize_datum(target)
     datum_definition(source_name)
     datum_definition(target_name)

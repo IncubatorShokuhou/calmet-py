@@ -5,12 +5,12 @@ import pytest
 import rasterio
 import tifffile
 from netCDF4 import Dataset
-from pyproj import CRS,Transformer
+from pyproj import Transformer
 from rasterio.transform import from_origin
 
 from pycalmet._ctgproc import (CORINE_TO_USGS,GLAZ_SPECS,GLAZ_TO_USGS,NZ_TO_USGS,USGS38,
                                QA_FILENAMES,SnowGridInfo,
-                               CoastPolygon,_coastline_types,_corine_indices,_geotiff_geometry,_polygon_membership,_read_coastline_bln,
+                               CoastPolygon,_coastline_types,_corine_indices,_polygon_membership,_read_coastline_bln,
                                _fractions_from_counts,_grid_centers_1d,_grid_indices,_low_hit_threshold,_merge_global_counts,_mesh_coordinates,_mesh_offsets,_read_categorical_raster,_select_glaz_markers,_snow_grid_indices,_source_centers,
                                _swap_coastline_categories,_window,_write_legacy,run)
 from pycalmet.config import CtgprocConfig,CtgprocSource,GridConfig
@@ -45,13 +45,6 @@ def test_grid_indices_use_floor_at_and_below_negative_boundaries():
     expected=np.array([-1,-1,-1,0,0,0,1])
     np.testing.assert_array_equal(ix,expected)
     np.testing.assert_array_equal(iy,expected)
-
-
-def test_geotiff_orientation_four_uses_bottom_to_top_rows():
-    x0,y0,dx,dy,_=_geotiff_geometry(
-        (30.,30.,0.),(0.,0.,0.,500000.,4000000.,0.),1,
-        CRS.from_epsg(32650),orientation=4)
-    np.testing.assert_allclose([x0,y0,dx,dy],[500.015,4000.015,.03,.03])
 
 
 def test_shapely_polygon_membership_uses_standard_boundary_states():

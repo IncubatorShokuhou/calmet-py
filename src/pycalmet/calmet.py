@@ -10,16 +10,17 @@ from .config import CalmetConfig
 def run(config: CalmetConfig) -> Path:
     """Run the diagnostic meteorological model.
 
-    Parameters
-    ----------
-    config
-        Meteorological and geophysical inputs, model controls, target grid,
-        and output settings.
+    Args:
+        config: Meteorological and geophysical inputs, model controls, target
+            grid, and output settings.
 
-    Returns
-    -------
-    pathlib.Path
-        Path to the generated CALMET product.
+    Returns:
+        Path to the generated CALMET product selected by ``config``.
+
+    Raises:
+        TypeError: If an input does not match its configured data protocol.
+        ValueError: If configuration values, input metadata, time coverage,
+            grid geometry, or meteorological fields are invalid.
     """
     from ._calmet import run as _run
 

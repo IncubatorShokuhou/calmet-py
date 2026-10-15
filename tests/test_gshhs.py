@@ -9,8 +9,8 @@ from shapely.geometry import Polygon
 
 from pycalmet._ctgproc import _read_coastline_bln,run
 from pycalmet.config import CtgprocConfig,GridConfig
-from pycalmet.gshhs import (GshhsHeader,GshhsPolygon,boundary_side,
-                            clip_coast_polygon,extract_gshhs,iter_gshhs)
+from pycalmet.gshhs import (GshhsHeader,GshhsPolygon,clip_coast_polygon,
+                            extract_gshhs,iter_gshhs)
 from pycalmet.projections import geographic_crs,grid_crs
 
 
@@ -65,13 +65,6 @@ def test_rejects_truncated_points_and_inconsistent_following_version(tmp_path):
     mixed.write_bytes(first+second)
     with pytest.raises(ValueError,match='inconsistent GSHHS v2'):
         list(iter_gshhs(mixed))
-
-
-def test_boundary_side_matches_iside_ties_and_inside_rules():
-    x=np.array([-2.,.5,2.,.5,.1,.9,-1.,2.])
-    y=np.array([.5,2.,.5,-2.,.5,.5,2.,2.])
-    np.testing.assert_array_equal(boundary_side(x,y,1.,0.,1.,0.),
-                                  [1,2,3,4,1,3,2,2])
 
 
 def test_clip_coast_polygon_matches_shapely_box_intersection():

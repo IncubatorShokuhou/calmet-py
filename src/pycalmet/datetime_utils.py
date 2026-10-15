@@ -11,6 +11,19 @@ def exact_integer(value: object, label: str = "value") -> int:
 
     Decimal parsing accepts the exponent notation used by Fortran controls
     while preserving whether the supplied value has a fractional part.
+
+    Args:
+        value: Boolean, number, or numeric text to convert. Fortran ``D`` and
+            ``d`` exponent markers are accepted.
+        label: Human-readable field name included in validation errors.
+
+    Returns:
+        The exact integer represented by ``value``. Boolean values map to
+        ``0`` or ``1``.
+
+    Raises:
+        ValueError: If ``value`` is non-numeric, non-finite, or has a
+            fractional part.
     """
     if isinstance(value, bool):
         return int(value)
@@ -28,6 +41,18 @@ def expand_year(value: int | str) -> int:
 
     Two-digit years intentionally follow ``strptime(..., "%y")`` instead of
     maintaining a separate project-specific century pivot.
+
+    Args:
+        value: Two- or four-digit calendar year. Numeric strings and exactly
+            integral numeric values are accepted.
+
+    Returns:
+        A four-digit year. Two-digit values use Python's ``%y`` pivot
+        (1969--2068).
+
+    Raises:
+        ValueError: If ``value`` is not an integer or cannot be represented as
+            a valid year by :class:`datetime.datetime`.
     """
     year = exact_integer(value, "year")
     pattern = "%y" if 0 <= year <= 99 else "%Y"
@@ -42,6 +67,22 @@ def parse_calendar(year: int | str, month: int | str, day: int | str,
     CALMET files sometimes represent the following boundary as hour 24 or as
     3600 seconds.  :class:`datetime` validates the calendar date and
     :class:`timedelta` performs that boundary normalization.
+
+    Args:
+        year: Two- or four-digit calendar year.
+        month: Calendar month in the range 1--12.
+        day: Day of the month.
+        hour: Clock hour in the inclusive range 0--24. Hour 24 advances to
+            midnight on the following day.
+        seconds: Seconds after ``hour`` in the inclusive range 0--3600.
+            A value of 3600 advances by one hour.
+
+    Returns:
+        A timezone-naive datetime with normalized hour and second boundaries.
+
+    Raises:
+        ValueError: If a field is not exactly integral, the date is invalid,
+            or ``hour`` or ``seconds`` is outside its accepted range.
     """
     calendar_year = expand_year(year)
     calendar_month = exact_integer(month, "month")
@@ -64,7 +105,25 @@ def parse_calendar(year: int | str, month: int | str, day: int | str,
 
 def parse_naive_datetime(value: datetime | str,
                          label: str = "timestamp") -> datetime:
-    """Return a second-resolution, timezone-naive :class:`datetime`."""
+    """Parse a timezone-naive timestamp with whole-second precision.
+
+    Accepted text formats are ``YYYY-MM-DD_HH:MM:SS``,
+    ``YYYY-MM-DD HH:MM:SS``, ``YYYY-MM-DDTHH:MM:SS``, and ``YYYYMMDDHH``.
+    Trailing spaces and NUL bytes from fixed-width control fields are ignored.
+
+    Args:
+        value: Existing datetime or timestamp text in one of the accepted
+            formats.
+        label: Human-readable field name included in validation errors.
+
+    Returns:
+        The parsed timezone-naive :class:`datetime.datetime`.
+
+    Raises:
+        TypeError: If ``value`` is neither a datetime nor a string.
+        ValueError: If the text is invalid, a timezone is present, or the
+            datetime contains microseconds.
+    """
     if isinstance(value, datetime):
         result = value
     elif isinstance(value, str):
@@ -92,7 +151,21 @@ def parse_naive_datetime(value: datetime | str,
 
 
 def parse_date(value: date | datetime | str, label: str = "date") -> date:
-    """Parse an unambiguous calendar date without discarding a time part."""
+    """Parse an unambiguous calendar date without discarding a time part.
+
+    Args:
+        value: Date, naive-midnight datetime, or text in ``YYYY-MM-DD`` or
+            ``YYYYMMDD`` format.
+        label: Human-readable field name included in validation errors.
+
+    Returns:
+        The parsed :class:`datetime.date`.
+
+    Raises:
+        TypeError: If ``value`` is not a date, datetime, or string.
+        ValueError: If a datetime is timezone-aware or not midnight, or if
+            date text is invalid or non-canonical.
+    """
     if isinstance(value, datetime):
         if (value.tzinfo is not None or value.utcoffset() is not None or
                 value.time() != datetime.min.time()):
@@ -114,7 +187,22 @@ def parse_date(value: date | datetime | str, label: str = "date") -> date:
 
 
 def parse_timezone_label(value: str) -> tuple[int, str]:
-    """Return CALMET's positive-west offset and a canonical ``UTC+HHMM`` label."""
+    """Parse a UTC label into CALMET's positive-west offset convention.
+
+    Args:
+        value: Offset text in ``UTC+HHMM`` or ``UTC-HHMM`` form. CALMET only
+            supports whole-hour offsets.
+
+    Returns:
+        A pair containing hours west of UTC and the canonical offset label.
+        Consequently, ``UTC-0800`` maps to ``(8, "UTC-0800")`` and
+        ``UTC+0800`` maps to ``(-8, "UTC+0800")``.
+
+    Raises:
+        TypeError: If ``value`` is not a string.
+        ValueError: If the label is malformed, outside datetime's supported
+            offset range, or contains a non-whole-hour offset.
+    """
     if not isinstance(value, str):
         raise TypeError("timezone must be a UTC offset string")
     text = value.strip()
@@ -136,7 +224,19 @@ def parse_timezone_label(value: str) -> tuple[int, str]:
 
 
 def format_timezone_label(hours_west: object) -> str:
-    """Format CALMET positive-west whole hours as a canonical UTC label."""
+    """Format CALMET positive-west whole hours as a canonical UTC label.
+
+    Args:
+        hours_west: Exactly integral UTC offset in CALMET's positive-west
+            convention. Accepted values range from -12 through 12.
+
+    Returns:
+        A label such as ``UTC-0800`` for 8 hours west of UTC.
+
+    Raises:
+        ValueError: If ``hours_west`` is not exactly integral or lies outside
+            the supported range.
+    """
     hours=exact_integer(hours_west,"CALMET timezone hours")
     if not -12<=hours<=12:
         raise ValueError("CALMET timezone hours must be between -12 and 12")
@@ -146,6 +246,25 @@ def format_timezone_label(hours_west: object) -> str:
 
 def parse_ordinal(year: int | str, day: int | str, hour: int | str,
                   seconds: int | str = 0) -> datetime:
+    """Build a datetime from CALMET year, Julian-day, and clock fields.
+
+    Here "Julian day" means the one-based ordinal day within the calendar
+    year, not a Julian-date astronomical timestamp. Legacy boundary values
+    ``hour=24`` and ``seconds=3600`` advance into the next clock interval.
+
+    Args:
+        year: Two- or four-digit calendar year.
+        day: One-based ordinal day within ``year``.
+        hour: Clock hour in the inclusive range 0--24.
+        seconds: Seconds after ``hour`` in the inclusive range 0--3600.
+
+    Returns:
+        A timezone-naive datetime with boundary values normalized.
+
+    Raises:
+        ValueError: If a field is not exactly integral, the ordinal day is
+            invalid, or ``hour`` or ``seconds`` is outside its accepted range.
+    """
     ordinal_day = exact_integer(day, "ordinal day")
     clock_hour = exact_integer(hour, "hour")
     clock_seconds = exact_integer(seconds, "seconds")
@@ -161,6 +280,24 @@ def parse_ordinal(year: int | str, day: int | str, hour: int | str,
 
 
 def parse_ordinal_code(code: int | str, seconds: int | str = 0) -> datetime:
+    """Parse a compact CALMET ``YYDDDHH`` or ``YYYYDDDHH`` timestamp.
+
+    Integer two-digit-year codes for years 2000--2009 may lose their leading
+    zero; it is restored before parsing. An hour suffix of ``24`` advances to
+    midnight on the next day.
+
+    Args:
+        code: Seven-character ``YYDDDHH`` or nine-character ``YYYYDDDHH``
+            code, supplied as decimal text or an integer.
+        seconds: Additional seconds in the inclusive range 0--3600.
+
+    Returns:
+        The decoded timezone-naive datetime.
+
+    Raises:
+        ValueError: If the code is non-decimal, has the wrong width, contains
+            an invalid date/hour, or ``seconds`` is invalid.
+    """
     text = str(code).strip()
     if not text.isdecimal():
         raise ValueError(f"invalid CALMET coded time {code!r}")
@@ -187,8 +324,32 @@ def parse_ordinal_code(code: int | str, seconds: int | str = 0) -> datetime:
 
 
 def format_ordinal_code(value: datetime) -> int:
+    """Format a datetime as an integer ``YYYYDDDHH`` CALMET code.
+
+    Minutes, seconds, microseconds, and timezone information are not encoded.
+
+    Args:
+        value: Datetime whose calendar year, ordinal day, and hour to encode.
+
+    Returns:
+        Integer timestamp in ``YYYYDDDHH`` layout.
+    """
     return int(value.strftime("%Y%j%H"))
 
 
 def parse_timestamp(value: str) -> datetime:
+    """Parse public timestamp text using :func:`parse_naive_datetime`.
+
+    Args:
+        value: Timestamp text in a format accepted by
+            :func:`parse_naive_datetime`.
+
+    Returns:
+        A timezone-naive datetime with whole-second precision.
+
+    Raises:
+        TypeError: If ``value`` is not a string or datetime-compatible input.
+        ValueError: If ``value`` is malformed, timezone-aware, or has
+            subsecond precision.
+    """
     return parse_naive_datetime(value)

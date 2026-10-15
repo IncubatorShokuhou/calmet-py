@@ -8,7 +8,15 @@ import warnings
 
 
 def configure_proj_data() -> None:
-    """Honor Conda's PROJ data directory when pyproj's bundled copy is stale."""
+    """Select an explicitly configured, usable PROJ database directory.
+
+    ``PROJ_DATA`` takes precedence over the legacy ``PROJ_LIB`` variable. The
+    configured directory is applied only when it contains ``proj.db``; an
+    absent or incomplete setting leaves pyproj's default search path intact.
+
+    Returns:
+        None.
+    """
     configured = os.environ.get("PROJ_DATA") or os.environ.get("PROJ_LIB")
     if configured is None or not (Path(configured) / "proj.db").is_file():
         return

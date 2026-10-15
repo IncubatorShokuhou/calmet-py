@@ -8,6 +8,16 @@ from typing import Sequence
 
 
 def _format_time(value: datetime) -> str:
+    """Format a listing timestamp with second precision.
+
+    Args:
+        value: Datetime to render. Any timezone information is preserved by
+            :meth:`datetime.datetime.isoformat`.
+
+    Returns:
+        ISO 8601 text using a space between date and time and including whole
+        seconds.
+    """
     return value.isoformat(sep=" ", timespec="seconds")
 
 
@@ -26,7 +36,31 @@ def write_calwrf_listing(
     ny: int,
     nz: int,
 ) -> Path:
-    """Write a UTF-8 CALWRF listing after all requested products succeed."""
+    """Write a human-readable completion listing for a successful CALWRF run.
+
+    Args:
+        path: Destination UTF-8 text path. Missing parent directories are
+            created and an existing file is replaced.
+        title: User-supplied CALWRF run title.
+        wrf_files: Ordered WRF NetCDF input paths.
+        requested_start: Inclusive requested start datetime.
+        requested_end: Inclusive requested end datetime.
+        output: Canonical CALWRF NetCDF output path.
+        legacy_output: Optional legacy M3D output path.
+        surface_output: Optional legacy M2D surface output path.
+        written_times: Chronological datetimes actually written. At least one
+            time is required.
+        nx: Output grid size along the west-east axis.
+        ny: Output grid size along the south-north axis.
+        nz: Number of output mass levels.
+
+    Returns:
+        Path to the completed listing file.
+
+    Raises:
+        IndexError: If ``written_times`` is empty.
+        OSError: If the destination directory or listing cannot be written.
+    """
     target = Path(path)
     lines = [
         "PYCALMET CALWRF RUN LISTING",

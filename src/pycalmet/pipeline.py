@@ -37,6 +37,19 @@ _CONTROL_FILES = {
 
 
 def _directory_specs(path: str | Path) -> dict[str, Path]:
+    """Resolve the five conventional control files in a directory.
+
+    Args:
+        path: Directory expected to contain one ``.inp`` file for every
+            pipeline stage.
+
+    Returns:
+        A mapping from canonical stage name to its control-file path.
+
+    Raises:
+        NotADirectoryError: If ``path`` is not a directory.
+        FileNotFoundError: If any required control file is absent.
+    """
     directory = Path(path)
     if not directory.is_dir():
         raise NotADirectoryError(
@@ -55,6 +68,17 @@ def _directory_specs(path: str | Path) -> dict[str, Path]:
 
 
 def _mapping_specs(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and copy a stage-specification mapping.
+
+    Args:
+        value: Mapping containing exactly the five canonical stage names.
+
+    Returns:
+        A plain dictionary preserving each supplied stage specification.
+
+    Raises:
+        TypeError: If a stage is missing or an unknown key is present.
+    """
     unknown = set(value) - set(_CONTROL_FILES)
     if unknown:
         names = ", ".join(sorted(str(name) for name in unknown))
@@ -67,7 +91,24 @@ def _mapping_specs(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _mapping_defaults(cls: Any, value: Any, **defaults: Any) -> Any:
-    """Supply fields whose paths are managed by the pipeline."""
+    """Supply pipeline-managed paths that a mapping does not define.
+
+    Legacy field names are normalized before the defaults are added, so an
+    alias such as ``OUTFIL`` suppresses the corresponding ``output`` default.
+
+    Args:
+        cls: Configuration dataclass used to normalize field names.
+        value: Stage specification to copy, or a non-mapping value to return
+            unchanged.
+        **defaults: Canonical field names and their pipeline-managed values.
+
+    Returns:
+        A copied mapping with missing defaults, or ``value`` unchanged when it
+        is not a mapping.
+
+    Raises:
+        TypeError: If ``value`` contains invalid or duplicate parameter names.
+    """
     if not isinstance(value, Mapping):
         return value
     result = dict(value)
@@ -83,6 +124,12 @@ def _mapping_defaults(cls: Any, value: Any, **defaults: Any) -> Any:
 
 
 def _annotate_error(error: Exception, stage: str) -> None:
+    """Attach the failing pipeline stage to an exception.
+
+    Args:
+        error: Exception raised while configuring or running a stage.
+        stage: Human-readable stage name, such as ``"CALWRF"``.
+    """
     message = f"pycalmet.run_pipeline stage: {stage}"
     if hasattr(error, "add_note"):
         error.add_note(message)
@@ -99,6 +146,22 @@ def _resolve_stage(
     loader: Any,
     parameters: Mapping[str, Any] | None = None,
 ) -> Any:
+    """Build one stage configuration and label configuration failures.
+
+    Args:
+        name: Human-readable stage name used in exception notes.
+        cls: Configuration dataclass to construct.
+        value: Dataclass, mapping, control-file path, or ``None``.
+        loader: Function that reads the stage's traditional control file.
+        parameters: Explicit values that override the selected source.
+
+    Returns:
+        A validated instance of ``cls``.
+
+    Raises:
+        Exception: Re-raises the configuration error after adding the stage
+            name as diagnostic context.
+    """
     try:
         return _config(cls, value, dict(parameters or {}), loader)
     except Exception as error:
@@ -117,6 +180,29 @@ def _resolve_config(
     output: str | Path | None,
     stage_parameters: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> PipelineConfig:
+    """Resolve all supported pipeline input forms to one configuration.
+
+    Args:
+        inp: Complete pipeline configuration, five-stage mapping, control-file
+            directory, or ``None`` when named stages or flattened parameters
+            are used.
+        calwrf: CALWRF configuration or control-file specification.
+        terrel: TERREL configuration or control-file specification.
+        ctgproc: CTGPROC configuration or control-file specification.
+        makegeo: MAKEGEO configuration or control-file specification.
+        calmet: CALMET configuration or control-file specification.
+        output: Optional override for the final CALMET product path.
+        stage_parameters: Explicit keyword parameters grouped by stage.
+
+    Returns:
+        A fully resolved configuration for all five stages.
+
+    Raises:
+        TypeError: If input modes are mixed, a stage is missing, or ``inp``
+            has an unsupported type.
+        OSError: If a control directory or file cannot be read.
+        ValueError: If a stage control or explicit parameter is invalid.
+    """
     parameters = {
         name: dict((stage_parameters or {}).get(name, {}))
         for name in _CONTROL_FILES
@@ -223,7 +309,21 @@ def _select_stage_parameters(
     *,
     parameter_only: bool,
 ) -> dict[str, Any]:
-    """Select one stage's arguments from the generated flattened wrapper."""
+    """Select one stage's arguments from the flattened public wrapper.
+
+    Args:
+        stage: Lowercase stage name used as the parameter prefix.
+        values: Local values captured by the generated wrapper.
+        supplied: Full prefixed names explicitly provided by the caller.
+        names: Unprefixed parameters accepted by the stage function.
+        omitted: Parameters whose ``None`` sentinel must be omitted so the
+            configuration dataclass can derive its default.
+        parameter_only: Whether all stages are being built solely from
+            flattened keyword parameters.
+
+    Returns:
+        Unprefixed keyword arguments for the selected stage.
+    """
     prefix = f"{stage}_"
     if not parameter_only:
         return {
@@ -253,6 +353,19 @@ def _select_stage_parameters(
 
 
 def _run_stage(name: str, runner: Any, config: Any) -> Path:
+    """Run one configured stage and label failures with its name.
+
+    Args:
+        name: Human-readable stage name used in exception notes.
+        runner: Component function accepting the stage configuration.
+        config: Resolved configuration passed to ``runner``.
+
+    Returns:
+        Path to the stage's primary product.
+
+    Raises:
+        Exception: Re-raises a component failure after adding stage context.
+    """
     try:
         return Path(runner(config))
     except Exception as error:
@@ -261,6 +374,15 @@ def _run_stage(name: str, runner: Any, config: Any) -> Path:
 
 
 def _effective_output(config: CalmetConfig, output: str | Path | None) -> Path:
+    """Determine the final file produced by the configured CALMET mode.
+
+    Args:
+        config: Resolved CALMET configuration.
+        output: Explicit pipeline-level output override, if supplied.
+
+    Returns:
+        The NetCDF, CALMET.DAT, or MESOPAC output path returned to the caller.
+    """
     if output is not None:
         return Path(output)
     if config.legacy_output_format == 2 and config.mesopac_output is not None:
@@ -291,6 +413,30 @@ def _run_pipeline(
     legacy M3D/M2D, and debug outputs are disabled.  CALMET writes its normal
     configured final format (a legacy CALMET file can also require its ``.aux``
     companion).
+
+    Args:
+        inp: Complete pipeline configuration, mapping of all five stage
+            specifications, directory containing the five conventional
+            control files, or ``None`` for named/flattened input.
+        calwrf: CALWRF dataclass, mapping, or control-file path.
+        terrel: TERREL dataclass, mapping, or control-file path.
+        ctgproc: CTGPROC dataclass, mapping, or control-file path.
+        makegeo: MAKEGEO dataclass, mapping, or control-file path.
+        calmet: CALMET dataclass, mapping, or control-file path.
+        output: Optional override for the sole retained final product.
+        stage_parameters: Explicit stage parameters keyed by stage name. This
+            internal argument is populated by the generated public wrapper.
+
+    Returns:
+        Path to the final CALMET product.
+
+    Raises:
+        TypeError: If input modes are mixed or any stage is missing.
+        ValueError: If a configuration is invalid, MAKEGEO snow processing is
+            requested, CALMET output is disabled, or CALMET is not in its
+            supported full-run test mode.
+        OSError: If an input cannot be read or the final output cannot be
+            written.
     """
     config = _resolve_config(
         inp,

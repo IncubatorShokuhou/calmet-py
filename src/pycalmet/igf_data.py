@@ -20,11 +20,40 @@ MODEL_DTYPE=np.float32
 
 
 def _coded_time(code: int, seconds: int) -> datetime:
+    """Decode a CALMET ordinal timestamp and label parse failures.
+
+    Args:
+        code: Integer ``YYYYJJJHH`` ordinal date/hour code.
+        seconds: Additional seconds within the encoded hour.
+
+    Returns:
+        Naive decoded timestamp.
+
+    Raises:
+        ValueError: If the code and seconds do not represent a valid time.
+    """
     try: return parse_ordinal_code(code,seconds)
     except ValueError as error: raise ValueError(f'invalid CALMET.DAT timestamp {code}/{seconds}') from error
 
 
 def _field(payload: bytes, size: int, *, mtver=1, integer=False):
+    """Decode one CALMET.DAT labeled field record.
+
+    Args:
+        payload: Raw Fortran sequential-record payload.
+        size: Required number of grid or station values.
+        mtver: Whether to parse the CALMET 2.1 interval header.
+        integer: Whether field values are signed 32-bit integers instead of
+            32-bit floats.
+
+    Returns:
+        Tuple containing label, begin date/seconds, end date/seconds, and a
+        writable one-dimensional value array.
+
+    Raises:
+        UnicodeError: If the field label is not ASCII.
+        ValueError: If the payload has the wrong byte length.
+    """
     prefix=24 if mtver else 12
     if len(payload)!=prefix+4*size: raise ValueError('CALMET.DAT field record has wrong size')
     label=payload[:8].decode('ascii').rstrip()
@@ -39,18 +68,57 @@ def _field(payload: bytes, size: int, *, mtver=1, integer=False):
 
 
 def _run_control_time(year,month,day,hour,seconds=0):
+    """Decode a calendar timestamp from a CALMET run-control record.
+
+    Args:
+        year: Four-digit calendar year.
+        month: Calendar month.
+        day: Day of month.
+        hour: Hour of day.
+        seconds: Additional seconds within the hour.
+
+    Returns:
+        Naive decoded timestamp.
+
+    Raises:
+        ValueError: If the fields do not represent a valid timestamp.
+    """
     try: return parse_calendar(year,month,day,hour,seconds)
     except ValueError as error:
         raise ValueError('invalid CALMET.DAT run-control timestamp') from error
 
 
 def _run_control_timezone(value):
+    """Normalize a CALMET run-control timezone to hours west of UTC.
+
+    Args:
+        value: CALMET timezone label or numeric representation.
+
+    Returns:
+        Integer or float timezone offset in hours west of UTC.
+
+    Raises:
+        ValueError: If the timezone label is unsupported.
+    """
     try: return parse_timezone_label(value)[1]
     except (TypeError,ValueError) as error:
         raise ValueError('invalid CALMET.DAT run-control timezone') from error
 
 
 def _covering_record(records,when,label):
+    """Find the wind interval satisfying ``begin < when <= end``.
+
+    Args:
+        records: Mapping from interval end to ``(begin, u, v)`` record.
+        when: Requested timestamp.
+        label: Data-source name included in validation errors.
+
+    Returns:
+        The uniquely covering wind record.
+
+    Raises:
+        ValueError: If no record covers ``when`` or intervals overlap there.
+    """
     if when in records: return records[when]
     matches=[record for end,record in records.items()
              if record[0]<when<end]
@@ -60,10 +128,58 @@ def _covering_record(records,when,label):
 
 
 class InitialGuessCalmetData:
-    """Read declared CALMET.DAT static metadata and hourly U/V fields."""
+    """Read declared CALMET.DAT static metadata and hourly U/V fields.
+
+    Attributes:
+        path: Source CALMET.DAT path.
+        version: Declared file-format version.
+        start: Beginning of the modeled time period.
+        end: End of the modeled time period.
+        timezone: Normalized CALMET timezone label.
+        grid: Source horizontal grid.
+        duration_hours: Declared run duration in hours.
+        run_type: CALMET run type stored in the source header.
+        iwfcod: Source diagnostic-wind formulation code.
+        surface_station_count: Number of surface stations declared by the
+            source file.
+        upper_station_count: Number of upper-air stations.
+        precipitation_station_count: Number of precipitation stations.
+        sea_station_count: Number of overwater stations.
+        landuse_category_count: Number of land-use categories.
+        water_category_min: First water category code in the inclusive range.
+        water_category_max: Last water category code in the inclusive range.
+        includes_w_temperature: Whether vertical velocity and layer
+            temperature fields are present.
+        z_faces_m: Vertical cell-face heights in metres.
+        roughness_m: Surface roughness in metres on ``(ny, nx)``.
+        landuse: Integer land-use categories on ``(ny, nx)``.
+        terrain_m: Terrain elevation in metres on ``(ny, nx)``.
+        leaf_area_index: Leaf-area index on ``(ny, nx)``.
+        nearest_surface_station: Optional integer nearest-station field on
+            ``(ny, nx)``, or ``None`` when no surface stations are declared.
+        records: Wind records keyed by ending timestamp.
+        fields: Optionally retained complete periods keyed by ending timestamp.
+    """
 
     def __init__(self,path,*,retain_fields=False,field_endings=None,
                  record_endings=None):
+        """Read and validate one CALMET.DAT initial-guess file.
+
+        Args:
+            path: Sequential-unformatted CALMET.DAT path.
+            retain_fields: Keep every field for selected periods in addition
+                to the U/V records required by IGFMET.
+            field_endings: Optional ending times whose complete fields are
+                retained; ``None`` retains all when enabled.
+            record_endings: Optional ending times whose U/V records are kept;
+                ``None`` keeps all.
+
+        Raises:
+            OSError: If the file cannot be opened or read.
+            UnicodeError: If fixed-width text fields are not ASCII.
+            ValueError: If metadata, record sizes/order, timestamps, or wind
+                level coverage are invalid.
+        """
         self.path=Path(path)
         selected_field_endings=(None if field_endings is None else
                                 frozenset(field_endings))
@@ -167,6 +283,20 @@ class InitialGuessCalmetData:
             count=nx*ny
 
             def take(label,size,integer=False):
+                """Read and validate the next labeled static field.
+
+                Args:
+                    label: Expected eight-character CALMET field label.
+                    size: Required scalar value count.
+                    integer: Whether values use the integer field encoding.
+
+                Returns:
+                    One-dimensional decoded value array.
+
+                Raises:
+                    ValueError: If the file ends, label differs, or record size
+                        is invalid.
+                """
                 payload=reader.read_record()
                 if payload is None: raise ValueError(f'CALMET.DAT ends before {label}')
                 actual,*_,values=_field(payload,size,mtver=mtver,integer=integer)
@@ -258,29 +388,89 @@ class InitialGuessCalmetData:
 
     @property
     def z_centers_m(self):
+        """Return vertical cell-centre heights.
+
+        Returns:
+            One-dimensional ``float32`` heights in metres.
+        """
         return np.asarray(.5*(self.z_faces_m[:-1]+self.z_faces_m[1:]),
                           dtype=MODEL_DTYPE)
 
     def at_end(self,when):
+        """Return the wind record with an exact ending timestamp.
+
+        Args:
+            when: Requested interval end.
+
+        Returns:
+            Tuple ``(begin, u, v)`` with wind arrays on ``(level, y, x)``.
+
+        Raises:
+            ValueError: If the file has no record ending at ``when``.
+        """
         try: return self.records[when]
         except KeyError as error: raise ValueError(f'CALMET.DAT has no wind record ending at {when}') from error
 
     def fields_at_end(self,when):
-        """Return ``(begin, fields)`` for one complete output period."""
+        """Return all retained fields for one complete output period.
+
+        Args:
+            when: Requested interval end.
+
+        Returns:
+            Tuple containing interval begin and a label-to-array mapping.
+
+        Raises:
+            ValueError: If the period was not retained or is unavailable.
+        """
         try: return self.fields[when]
         except KeyError as error: raise ValueError(
             f'CALMET.DAT has no field record ending at {when}') from error
 
     def at_covering(self,when):
-        """Return the RDMET2 period satisfying ``begin < when <= end``."""
+        """Return the RDMET2 period satisfying ``begin < when <= end``.
+
+        Args:
+            when: Timestamp within the requested wind interval.
+
+        Returns:
+            Tuple ``(begin, u, v)`` for the unique covering period.
+
+        Raises:
+            ValueError: If no period covers the time or periods overlap.
+        """
         return _covering_record(self.records,when,'CALMET.DAT')
 
 
 class InitialGuessCalmetSeries:
-    """Present consecutive compatible IGFDAT files as one time-indexed source."""
+    """Present consecutive compatible IGFDAT files as one time-indexed source.
+
+    Attributes:
+        files: Ordered source-file readers.
+        grid: Common source horizontal grid.
+        z_faces_m: Common vertical cell-face heights in metres.
+        roughness_m: Common surface roughness array in metres.
+        timezone: Common CALMET timezone label.
+        includes_w_temperature: Whether every file includes W and temperature.
+        records: Combined non-overlapping wind periods by ending time.
+        fields: Combined retained complete periods by ending time.
+    """
 
     def __init__(self,paths,*,retain_fields=False,field_endings=None,
                  record_endings=None):
+        """Load a compatible, non-overlapping sequence of CALMET.DAT files.
+
+        Args:
+            paths: One or more CALMET.DAT paths in any order.
+            retain_fields: Keep complete fields as well as winds.
+            field_endings: Optional ending times whose complete fields are
+                retained.
+            record_endings: Optional ending times whose wind records are kept.
+
+        Raises:
+            ValueError: If no path is supplied, files use incompatible grids,
+                layers, timezones, or roughness, or their periods overlap.
+        """
         files=tuple(InitialGuessCalmetData(
                         path,retain_fields=retain_fields,
                         field_endings=field_endings,
@@ -310,25 +500,76 @@ class InitialGuessCalmetSeries:
 
     @property
     def z_centers_m(self):
+        """Return common vertical cell-centre heights.
+
+        Returns:
+            One-dimensional ``float32`` heights in metres.
+        """
         return np.asarray(.5*(self.z_faces_m[:-1]+self.z_faces_m[1:]),
                           dtype=MODEL_DTYPE)
 
     def at_end(self,when):
+        """Return the series wind record with an exact ending timestamp.
+
+        Args:
+            when: Requested interval end.
+
+        Returns:
+            Tuple ``(begin, u, v)`` with wind arrays on ``(level, y, x)``.
+
+        Raises:
+            ValueError: If the series has no record ending at ``when``.
+        """
         try: return self.records[when]
         except KeyError as error: raise ValueError(f'IGFDAT series has no wind record ending at {when}') from error
 
     def fields_at_end(self,when):
+        """Return retained complete fields for an exact ending timestamp.
+
+        Args:
+            when: Requested interval end.
+
+        Returns:
+            Tuple containing interval begin and a label-to-array mapping.
+
+        Raises:
+            ValueError: If the period was not retained or is unavailable.
+        """
         try: return self.fields[when]
         except KeyError as error: raise ValueError(
             f'IGFDAT series has no field record ending at {when}') from error
 
     def at_covering(self,when):
-        """Return the RDMET2 period satisfying ``begin < when <= end``."""
+        """Return the RDMET2 period satisfying ``begin < when <= end``.
+
+        Args:
+            when: Timestamp within the requested wind interval.
+
+        Returns:
+            Tuple ``(begin, u, v)`` for the unique covering period.
+
+        Raises:
+            ValueError: If no period covers the time or periods overlap.
+        """
         return _covering_record(self.records,when,'IGFDAT series')
 
 
 def _r2interpi_four(source_points,target_points,values,*,block_size=32768):
-    """Interpolate from the four nearest cells with inverse-square weights."""
+    """Interpolate from the four nearest cells with inverse-square weights.
+
+    Args:
+        source_points: Source coordinates with shape ``(source, 2)``.
+        target_points: Target coordinates with shape ``(target, 2)``.
+        values: Source data with shape ``(field, source)``.
+        block_size: Number of targets queried from the spatial tree per block.
+
+    Returns:
+        ``float32`` array with shape ``(field, target)``.
+
+    Raises:
+        ValueError: If coordinate/value shapes are inconsistent or fewer than
+            four source cells are available.
+    """
     source=np.asarray(source_points,dtype=np.float64)
     targets=np.asarray(target_points,dtype=np.float64)
     fields=np.asarray(values,dtype=MODEL_DTYPE)
@@ -352,7 +593,25 @@ def _r2interpi_four(source_points,target_points,values,*,block_size=32768):
 
 
 def _rdcalmet_vertical(values,source_centers_m,target_centers_m,roughness_m):
-    """RDCALMET vertical persistence/interpolation in default floating-point."""
+    """Apply RDCALMET vertical persistence and interpolation.
+
+    Below the first source level the routine applies logarithmic wind-profile
+    scaling with local roughness. Above the top source level it persists the
+    top value; interior targets use linear height interpolation.
+
+    Args:
+        values: Source field with shape ``(source_level, y, x)``.
+        source_centers_m: Strictly increasing source heights in metres.
+        target_centers_m: Positive target heights in metres.
+        roughness_m: Surface roughness array in metres with shape ``(y, x)``.
+
+    Returns:
+        ``float32`` array with shape ``(target_level, y, x)``.
+
+    Raises:
+        ValueError: If shapes differ, heights are invalid, or roughness cannot
+            support logarithmic extrapolation.
+    """
     field=np.asarray(values,dtype=MODEL_DTYPE)
     source=np.asarray(source_centers_m,dtype=MODEL_DTYPE)
     target=np.asarray(target_centers_m,dtype=MODEL_DTYPE)
@@ -388,7 +647,18 @@ def _rdcalmet_vertical(values,source_centers_m,target_centers_m,roughness_m):
 
 
 def _rdcalmet_rotate(u,v,direction_adjustment_degrees):
-    """Rotate winds by a direction adjustment in degrees."""
+    """Rotate horizontal winds by a grid-direction adjustment.
+
+    Args:
+        u: Eastward wind component in metres per second.
+        v: Northward wind component in metres per second.
+        direction_adjustment_degrees: Broadcast-compatible clockwise direction
+            adjustment in degrees.
+
+    Returns:
+        Tuple of rotated eastward and northward ``float32`` components with the
+        common broadcast shape.
+    """
     east,north,adjustment=np.broadcast_arrays(
         np.asarray(u,dtype=MODEL_DTYPE),np.asarray(v,dtype=MODEL_DTYPE),
         np.asarray(direction_adjustment_degrees,dtype=MODEL_DTYPE))
@@ -404,7 +674,23 @@ def _rdcalmet_rotate(u,v,direction_adjustment_degrees):
 
 def interpolate_initial_guess(data, when: datetime,
                               target_grid: GridConfig, target_centers_m):
-    """Apply RDCALMET rotation, vertical interpolation, and R2INTERPI."""
+    """Apply RDCALMET rotation, vertical interpolation, and R2INTERPI.
+
+    Args:
+        data: Single CALMET.DAT reader or compatible series exposing grid,
+            layers, roughness, and wind lookup methods.
+        when: Target timestamp covered by the requested source period.
+        target_grid: CALMET grid receiving the nested initial guess.
+        target_centers_m: Target layer-centre heights in metres.
+
+    Returns:
+        Tuple of eastward and northward ``float32`` winds in metres per second,
+        each with shape ``(target_level, ny, nx)``.
+
+    Raises:
+        ValueError: If the time is unavailable or source geometry cannot
+            support vertical or four-neighbour interpolation.
+    """
     lookup=getattr(data,'at_covering',data.at_end)
     _,source_u,source_v=lookup(when)
     source_grid=data.grid

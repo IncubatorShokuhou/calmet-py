@@ -18,11 +18,38 @@ DRY_ADIABATIC_LAPSE_RATE=COMPUTE_DTYPE(.0098)
 
 
 def _instant(year,day,hour,seconds=0):
+    """Build an UP.DAT datetime from ordinal-date components.
+
+    Args:
+        year: Four- or two-digit year accepted by the CALMET parser.
+        day: One-based day of year.
+        hour: Hour of day.
+        seconds: Seconds after the hour.
+
+    Returns:
+        Decoded naive :class:`datetime`.
+
+    Raises:
+        ValueError: If the ordinal timestamp is invalid.
+    """
     try: return parse_ordinal(year,day,hour,seconds)
     except ValueError as error: raise ValueError('invalid UP.DAT timestamp') from error
 
 
 def _sounding_header(line):
+    """Decode a snapshot sounding header in delimited or fixed-column form.
+
+    Args:
+        line: UP.DAT sounding-header text.
+
+    Returns:
+        Tuple ``(station_id, year, month, day, hour, levels)``. Calendar fields
+        retain their input strings for the shared datetime parser; the station
+        identifier and level count are integers.
+
+    Raises:
+        ValueError: If integer fields cannot be decoded.
+    """
     fields=line.replace(',',' ').split()
     try:
         if len(fields)>=6:
@@ -34,6 +61,18 @@ def _sounding_header(line):
 
 
 def _sounding_header22(line):
+    """Decode an UP.DAT 2.2 interval sounding header.
+
+    Args:
+        line: Delimited or fixed-column header text.
+
+    Returns:
+        Twelve-value tuple containing station ID, five begin-time fields, five
+        end-time fields, and the integer level count.
+
+    Raises:
+        ValueError: If integer fields cannot be decoded.
+    """
     fields=line.replace(',',' ').split()
     try:
         if len(fields)>=12:
@@ -46,12 +85,36 @@ def _sounding_header22(line):
 
 
 def _calendar_instant(year,month,day,hour,seconds=0):
+    """Build an UP.DAT datetime from calendar components.
+
+    Args:
+        year: Calendar year.
+        month: Calendar month.
+        day: Day of month.
+        hour: Hour of day.
+        seconds: Seconds after the hour.
+
+    Returns:
+        Decoded naive :class:`datetime`.
+
+    Raises:
+        ValueError: If the calendar timestamp is invalid.
+    """
     try: return parse_calendar(year,month,day,hour,seconds)
     except ValueError as error: raise ValueError('invalid UP.DAT calendar timestamp') from error
 
 
 @dataclass(frozen=True,slots=True)
 class UpperAirStation:
+    """Upper-air station metadata.
+
+    Attributes:
+        identifier: Integer station identifier used in sounding headers.
+        name: Station name.
+        latitude: Geographic latitude in decimal degrees north.
+        longitude: Geographic longitude in decimal degrees east.
+        elevation_m: Station elevation in metres above mean sea level.
+    """
     identifier: int
     name: str
     latitude: float
@@ -61,6 +124,21 @@ class UpperAirStation:
 
 @dataclass(frozen=True,slots=True)
 class Sounding:
+    """One vertical upper-air profile.
+
+    Attributes:
+        timestamp: Snapshot time or beginning of an averaged interval.
+        pressure_mb: Float32 ``(source_level,)`` pressure in millibars.
+        height_msl: Float32 ``(source_level,)`` height in metres above mean sea
+            level.
+        temperature_c: Float32 ``(source_level,)`` temperature in degrees
+            Celsius.
+        wind_direction: Float32 ``(source_level,)`` meteorological wind
+            direction in degrees from north.
+        wind_speed: Float32 ``(source_level,)`` wind speed in metres per second.
+        end_timestamp: End of a version 2.2 averaged interval, or ``None`` for
+            an instantaneous sounding.
+    """
     timestamp: datetime
     pressure_mb: np.ndarray
     height_msl: np.ndarray
@@ -70,7 +148,20 @@ class Sounding:
     end_timestamp: datetime | None = None
 
     def converted(self,convergence_degrees=0.):
-        """Convert MSL height and meteorological wind to LGL height and U/V."""
+        """Convert MSL heights and meteorological winds to local U/V profiles.
+
+        Args:
+            convergence_degrees: Scalar or ``(source_level,)`` map convergence
+                in degrees, subtracted from valid meteorological directions.
+
+        Returns:
+            Tuple ``(height, u, v)`` of float32 arrays with shape
+            ``(source_level,)``. Height is metres above the first sounding
+            level; U and V are metres per second and use 999 for missing winds.
+
+        Raises:
+            ValueError: If the sounding is empty or contains missing heights.
+        """
         if self.height_msl.size==0: raise ValueError('cannot convert an empty upper-air sounding')
         if np.any(self.height_msl>=9998.): raise ValueError('upper-air sounding contains missing heights')
         height=np.asarray(self.height_msl,dtype=COMPUTE_DTYPE)
@@ -93,7 +184,23 @@ class Sounding:
 
 
 def layer_average(sounding,z_faces_m,convergence_degrees=0.):
-    """Integrate a piecewise-linear wind profile over model layers."""
+    """Integrate a piecewise-linear sounding wind over model layers.
+
+    Args:
+        sounding: :class:`Sounding` to convert and vertically average.
+        z_faces_m: Strictly increasing layer-face heights in metres, beginning
+            at zero, with shape ``(model_level + 1,)``.
+        convergence_degrees: Scalar or source-level map convergence in degrees.
+
+    Returns:
+        Tuple ``(u, v)`` of float32 layer-mean wind arrays with shape
+        ``(model_level,)`` and units of metres per second.
+
+    Raises:
+        ValueError: If faces are invalid, fewer than two valid wind levels
+            remain, sounding heights are not strictly increasing, or the model
+            layer range extends beyond valid sounding winds.
+    """
     faces=np.asarray(z_faces_m,dtype=COMPUTE_DTYPE)
     if faces.ndim!=1 or faces.size<2 or faces[0]!=0. or np.any(np.diff(faces)<=0.):
         raise ValueError('upper-air layer faces must increase strictly from zero')
@@ -131,7 +238,21 @@ def layer_average(sounding,z_faces_m,convergence_degrees=0.):
 
 
 def temperature_faces(sounding,z_faces_m):
-    """Interpolate sounding temperatures at CALMET layer faces."""
+    """Interpolate sounding temperatures at CALMET layer faces.
+
+    Args:
+        sounding: :class:`Sounding` containing height and temperature profiles.
+        z_faces_m: Strictly increasing face heights in metres above the first
+            sounding level, beginning at zero.
+
+    Returns:
+        Float32 array of shape ``(face,)`` containing temperatures in degrees
+        Celsius at the requested faces.
+
+    Raises:
+        ValueError: If faces are invalid, a face lies above the top valid
+            temperature, or a valid bracketing value is unavailable.
+    """
     faces=np.asarray(z_faces_m,dtype=COMPUTE_DTYPE)
     if faces.ndim!=1 or faces.size<2 or faces[0]!=0. or np.any(np.diff(faces)<=0.):
         raise ValueError('upper-air temperature faces must increase strictly from zero')
@@ -156,7 +277,25 @@ def temperature_faces(sounding,z_faces_m):
 
 
 def grid_temperature_faces(station_faces,station_xy,grid,power=1,block_size=65536):
-    """Horizontally interpolate TEMP3D upper-air faces from every station."""
+    """Horizontally interpolate TEMP3D face temperatures from stations.
+
+    Args:
+        station_faces: Float-like array of shape ``(station, face)`` containing
+            temperature in degrees Celsius.
+        station_xy: Float-like array of shape ``(station, 2)`` containing
+            projected coordinates in kilometres.
+        grid: Target CALMET grid configuration.
+        power: Inverse-distance exponent, either 1 or 2. Distances are measured
+            in grid-cell units and floored at one cell.
+        block_size: Maximum grid cells processed in one interpolation block.
+
+    Returns:
+        Float32 array of shape ``(face, grid.ny, grid.nx)`` containing
+        temperatures in degrees Celsius.
+
+    Raises:
+        ValueError: If station arrays do not match or ``power`` is not 1 or 2.
+    """
     values=np.asarray(station_faces,dtype=COMPUTE_DTYPE)
     points=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
     if values.ndim!=2 or points.shape!=(values.shape[0],2) or values.shape[0]<1:
@@ -185,7 +324,22 @@ def grid_temperature_faces(station_faces,station_xy,grid,power=1,block_size=6553
 
 
 def _prepdi_time_interpolate(left,right,seconds_to_right,total_seconds):
-    """Linearly interpolate fields between two sounding timestamps."""
+    """Linearly interpolate fields between two sounding timestamps.
+
+    Args:
+        left: Value or array at the earlier sounding time.
+        right: Value or array at the later sounding time.
+        seconds_to_right: Seconds from the requested time to ``right``.
+        total_seconds: Seconds from ``left`` to ``right``.
+
+    Returns:
+        Float32 array broadcast from ``left`` and ``right`` in their original
+        physical units.
+
+    Raises:
+        ValueError: If the input arrays cannot be broadcast together.
+        ZeroDivisionError: If ``total_seconds`` is zero.
+    """
     first=np.asarray(left,dtype=COMPUTE_DTYPE)
     second=np.asarray(right,dtype=COMPUTE_DTYPE)
     fraction=float(seconds_to_right)/float(total_seconds)
@@ -193,8 +347,42 @@ def _prepdi_time_interpolate(left,right,seconds_to_right,total_seconds):
 
 
 class UpperAirData:
-    """Read one modern formatted UP.DAT station file (RDHDU/RDUP)."""
+    """Read one formatted UP.DAT station file using RDHDU/RDUP semantics.
+
+    Attributes:
+        path: Source UP.DAT path.
+        version: File-format version string.
+        datum: Datum identifier for the station coordinates.
+        timezone: Normalized time-zone label. Modern files must use UTC+0000.
+        start: Declared beginning of the sounding period.
+        end: Declared end of the sounding period.
+        top_pressure_mb: Header top-pressure threshold in millibars.
+        source_type: CALMET upper-air source-type code.
+        record_format: Sounding record-format selector, 1 or 2.
+        required_fields: Four booleans selecting pressure, height, temperature,
+            and wind fields.
+        station: :class:`UpperAirStation` described in the file or supplied by
+            the control file.
+        soundings: Strictly chronological tuple of :class:`Sounding` objects.
+    """
+
     def __init__(self,path,*,station_metadata=None,datum=None):
+        """Parse and validate a formatted UP.DAT station file.
+
+        Args:
+            path: Path to formatted UP.DAT.
+            station_metadata: Control-file :class:`UpperAirStation` required
+                when the file declares projection ``NONE``. Must be ``None``
+                when the file embeds station coordinates.
+            datum: Control-file datum required with projection ``NONE``.
+
+        Raises:
+            FileNotFoundError: If ``path`` does not exist.
+            UnicodeDecodeError: If the file is not ASCII.
+            ValueError: If header fields, station metadata, time-zone rules,
+                sounding rows, level counts, time ranges, or chronology are
+                invalid.
+        """
         self.path=Path(path)
         if not self.path.is_file(): raise FileNotFoundError(self.path)
         lines=self.path.read_text(encoding='ascii',errors='strict').splitlines()
@@ -291,12 +479,36 @@ class UpperAirData:
         self.soundings=tuple(soundings)
 
     def at(self,timestamp):
+        """Return the sounding at an exact stored timestamp.
+
+        Args:
+            timestamp: Snapshot time or averaged-interval beginning.
+
+        Returns:
+            Matching :class:`Sounding`.
+
+        Raises:
+            ValueError: If no sounding starts at ``timestamp``.
+        """
         matches=[item for item in self.soundings if item.timestamp==timestamp]
         if not matches: raise ValueError(f'UP.DAT has no sounding at {timestamp!s}')
         return matches[0]
 
     def bracket(self,timestamp):
-        """Return RDUP's two soundings bracketing an ending timestamp."""
+        """Return RDUP's two snapshot soundings bracketing a timestamp.
+
+        Args:
+            timestamp: Requested interpolation time.
+
+        Returns:
+            Tuple ``(left, right)`` of consecutive :class:`Sounding` objects.
+            If ``timestamp`` exactly equals ``right.timestamp``, ``left`` is
+            still the preceding sounding.
+
+        Raises:
+            ValueError: If the file has no sounding strictly before the request
+                or does not extend to the requested time.
+        """
         times=tuple(item.timestamp for item in self.soundings)
         right=bisect_left(times,timestamp)
         if right>=len(self.soundings): raise ValueError('UP.DAT does not extend beyond requested time')
@@ -309,7 +521,24 @@ class UpperAirData:
         return self.soundings[left],self.soundings[right]
 
     def layer_wind_at(self,timestamp,z_faces_m,convergence_degrees=0.):
-        """VERTAV each bracketing profile and apply PREPDI time interpolation."""
+        """VERTAV bracketing profiles and interpolate winds in time.
+
+        Args:
+            timestamp: Requested model time.
+            z_faces_m: Strictly increasing model-layer faces in metres,
+                beginning at zero.
+            convergence_degrees: Scalar or source-level map convergence in
+                degrees.
+
+        Returns:
+            Tuple of float32 U and V arrays with shape ``(model_level,)`` and
+            units of metres per second. Version 2.2 averaged soundings are
+            returned unchanged for times inside their interval.
+
+        Raises:
+            ValueError: If averaged records do not cover the time, snapshot
+                soundings do not bracket it, or vertical averaging fails.
+        """
         if self.soundings[0].end_timestamp is not None:
             # RDUPN2 exposes an averaged profile unchanged at both interval
             # endpoints; at a shared boundary the earlier record is BB.
@@ -326,7 +555,21 @@ class UpperAirData:
                 _prepdi_time_interpolate(va,vb,remaining,total))
 
     def temperature_faces_at(self,timestamp,z_faces_m):
-        """FACET each bracketing profile and apply TEMP3D time interpolation."""
+        """FACET bracketing profiles and interpolate temperatures in time.
+
+        Args:
+            timestamp: Requested model time.
+            z_faces_m: Strictly increasing layer-face heights in metres,
+                beginning at zero.
+
+        Returns:
+            Float32 ``(face,)`` temperature array in degrees Celsius. Version
+            2.2 averaged soundings are returned unchanged within their interval.
+
+        Raises:
+            ValueError: If averaged records do not cover the time, snapshot
+                soundings do not bracket it, or face interpolation fails.
+        """
         if self.soundings[0].end_timestamp is not None:
             sounding=next((item for item in self.soundings
                            if item.timestamp<timestamp<=item.end_timestamp),None)
@@ -339,7 +582,24 @@ class UpperAirData:
         return _prepdi_time_interpolate(first,second,remaining,total)
 
     def lapse_rate_at(self,timestamp,height_m,last_convective_time=None):
-        """CGAMMA lapse rate, including its saved last-convective-hour correction."""
+        """Compute the CGAMMA lapse rate with the convective-hour correction.
+
+        Args:
+            timestamp: Requested model time.
+            height_m: Positive height above the surface at which to evaluate
+                the temperature difference, in metres.
+            last_convective_time: Optional saved time of the most recent
+                convective transition. When it lies between the left sounding
+                and ``timestamp``, the upper temperature follows a dry-adiabatic
+                transition before relaxing toward the right sounding.
+
+        Returns:
+            Temperature lapse rate in kelvin per metre as a Python ``float``.
+
+        Raises:
+            ValueError: If ``height_m`` is not positive, soundings do not cover
+                ``timestamp``, or temperatures cannot be interpolated.
+        """
         height=COMPUTE_DTYPE(height_m)
         if height<=0.: raise ValueError('CGAMMA height must be positive')
         current=self.temperature_faces_at(timestamp,(0.,height))

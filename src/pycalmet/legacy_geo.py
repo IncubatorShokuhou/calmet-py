@@ -24,6 +24,37 @@ _DEFAULT_FIELDS=(
 
 @dataclass(frozen=True,slots=True)
 class GeoData:
+    """Decoded CALMET GEO.DAT grid and geophysical fields.
+
+    Attributes:
+        projection: CALMET projection code, such as ``UTM`` or ``LCC``.
+        datum: Uppercase CALMET datum identifier.
+        nx: Number of west-to-east grid cells.
+        ny: Number of south-to-north grid cells.
+        x_origin_km: Grid southwest-corner easting in km.
+        y_origin_km: Grid southwest-corner northing in km.
+        dx_km: West-to-east grid spacing in km.
+        dy_km: South-to-north grid spacing in km.
+        latitude_origin: Projection latitude of origin in degrees north.
+        longitude_origin: Projection longitude of origin in degrees east.
+        standard_parallel_1: First standard parallel in degrees north.
+        standard_parallel_2: Second standard parallel in degrees north.
+        false_easting_km: Projection false easting in km.
+        false_northing_km: Projection false northing in km.
+        utm_zone: UTM zone, or zero for a non-UTM projection.
+        hemisphere: UTM hemisphere code, ``N`` or ``S``.
+        water_min: Lowest land-use category treated as water.
+        water_max: Highest land-use category treated as water.
+        categories: One-dimensional ``int16`` array of declared land-use
+            categories.
+        terrain: ``float32`` terrain elevation in metres with shape
+            ``(ny, nx)``.
+        fields: Seven ``(ny, nx)`` arrays in this order: dominant land-use
+            category (``int16``), roughness length in metres, albedo fraction,
+            Bowen ratio, soil heat-flux parameter, anthropogenic heat flux in
+            W/m2, and dimensionless leaf-area index. Physical fields are
+            ``float32``.
+    """
     projection: str
     datum: str
     nx: int
@@ -48,10 +79,32 @@ class GeoData:
 
 
 def _numbers(line):
+    """Extract Fortran-style real numbers from one text record.
+
+    Args:
+        line: Text record that may contain decimal or exponent-form numbers.
+            Both ``D`` and ``E`` exponent markers are accepted.
+
+    Returns:
+        A list of Python ``float`` values in lexical order. Non-numeric text is
+        ignored.
+    """
     return [float(value.replace('D','E').replace('d','e')) for value in _NUMBER.findall(line)]
 
 
 def _angle(text):
+    """Parse a CALMET angle with an optional cardinal suffix.
+
+    Args:
+        text: Numeric angle optionally ending in ``N``, ``S``, ``E``, or
+            ``W``. Empty text denotes zero.
+
+    Returns:
+        Signed decimal degrees, with south and west represented as negative.
+
+    Raises:
+        ValueError: If the nonempty numeric portion is not a valid float.
+    """
     token=text.strip().upper()
     if not token: return 0.
     sign=-1. if token[-1:] in {'S','W'} else 1.
@@ -59,6 +112,20 @@ def _angle(text):
 
 
 def _values(stream,count):
+    """Read exactly ``count`` numeric values from consecutive text records.
+
+    Args:
+        stream: Open GEO.DAT text stream positioned at the first numeric row.
+        count: Required number of values.
+
+    Returns:
+        A list of exactly ``count`` Python ``float`` values.
+
+    Raises:
+        EOFError: If the stream ends before enough values are available.
+        ValueError: If the final record causes the result to exceed ``count``.
+        OSError: If the input stream cannot be read.
+    """
     values=[]
     while len(values)<count:
         line=stream.readline()
@@ -69,14 +136,60 @@ def _values(stream,count):
 
 
 def _grid(stream,nx,ny,dtype=float):
+    """Read one south-up CALMET grid and convert it to NumPy row order.
+
+    Args:
+        stream: Open GEO.DAT text stream positioned at the grid values.
+        nx: Number of values in each formatted row.
+        ny: Number of formatted rows.
+        dtype: NumPy-compatible output data type.
+
+    Returns:
+        An array with shape ``(ny, nx)``. GEO.DAT's north-to-south records are
+        reversed so index zero is the southern row used by PyCALMET.
+
+    Raises:
+        EOFError: If a grid row is truncated.
+        ValueError: If a numeric row contains too many values or cannot be
+            converted to ``dtype``.
+        OSError: If the input stream cannot be read.
+    """
     rows=[_values(stream,nx) for _ in range(ny)]
     return np.asarray(rows[::-1],dtype=dtype)
 
 
 class GeoReader:
-    def __init__(self,path): self.path=Path(path)
+    """Read formatted CALMET GEO.DAT 2.1 files.
+
+    Attributes:
+        path: Path to the formatted GEO.DAT input.
+    """
+
+    def __init__(self,path):
+        """Create a reader for one formatted geophysical file.
+
+        Args:
+            path: Path-like GEO.DAT input location. The file is opened only
+                when :meth:`read` or :meth:`to_netcdf` is called.
+        """
+        self.path=Path(path)
 
     def read(self):
+        """Decode the GEO.DAT header, terrain, land use, and physical fields.
+
+        Returns:
+            A :class:`GeoData` instance. Grids have shape ``(ny, nx)``;
+            terrain and continuous physical fields use ``float32``, while
+            land-use categories use ``int16``.
+
+        Raises:
+            OSError: If the input file cannot be opened or read.
+            UnicodeError: If the file is not strict ASCII text.
+            EOFError: If a numeric grid or category table ends prematurely.
+            ValueError: If the dataset identifier, projection metadata,
+                horizontal units, land-use declaration, category table, or
+                geophysical option records are invalid or unsupported.
+        """
         with self.path.open('r',encoding='ascii',errors='strict') as stream:
             if stream.readline()[:16].strip().upper()!='GEO.DAT':
                 raise ValueError('geophysical input is not a GEO.DAT file')
@@ -145,6 +258,28 @@ class GeoReader:
                        (np.asarray(landuse,dtype=np.int16),*outputs))
 
     def to_netcdf(self,path,*,compression=1):
+        """Convert the formatted GEO.DAT input to canonical NetCDF.
+
+        Args:
+            path: Destination NetCDF path. Parent directories are created when
+                needed.
+            compression: NetCDF4 deflate level applied to each two-dimensional
+                output variable; zero disables compression.
+
+        Returns:
+            The destination as a :class:`pathlib.Path`.
+
+        Raises:
+            OSError: If the GEO.DAT input cannot be read or the destination
+                cannot be created or written. A failure after creation can
+                leave a partial NetCDF file.
+            UnicodeError: If the input is not strict ASCII text.
+            EOFError: If a numeric input record is truncated.
+            ValueError: If GEO.DAT contents are malformed or unsupported.
+            RuntimeError: If the NetCDF4 backend rejects an output definition
+                or write operation, including an unsupported compression
+                setting.
+        """
         data=self.read(); output=Path(path); output.parent.mkdir(parents=True,exist_ok=True)
         names=('dominant_landuse','roughness_length','albedo','bowen_ratio',
                'soil_heat_flux_parameter','anthropogenic_heat_flux','leaf_area_index')

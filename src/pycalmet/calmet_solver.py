@@ -9,7 +9,7 @@ from .datetime_utils import parse_timestamp
 from .config import GridConfig
 from .coare import (advance_warm_layer,distance_to_coast,downward_longwave,
                     initial_warm_layer_state,surface_flux,update_warm_layer_fluxes)
-from .projections import (grid_convergence,grid_crs,project_geographic,
+from .projections import (grid_convergence,project_geographic,
                           unproject_geographic)
 from .calmet_numerics import (cloud_cover_mm5,cloud_fraction,cloud_liquid_water_profile,coriolis_parameter,density_from_pressure_temperature,heat_flux,mixing_height_batchvarova_gryning,mixing_height_maul_carson,
     convective_height_batchvarova_gryning,convective_height_maul_carson,
@@ -27,11 +27,32 @@ COORDINATE_DTYPE = np.float64
 
 
 def _model_array(value):
-    """Return a physical field or model-state array in default precision."""
+    """Convert a physical field or model state to solver precision.
+
+    Args:
+        value: Scalar or array-like numerical data.
+
+    Returns:
+        A NumPy array with the input shape and ``float32`` model dtype.
+    """
     return np.asarray(value,dtype=MODEL_DTYPE)
 
 def solar_at_step_midpoint(begin,timestep_seconds,base_timezone,latitude,longitude):
-    """Interpolate half-hour solar samples at the true model-step midpoint."""
+    """Interpolate half-hour solar samples at a model-step midpoint.
+
+    Args:
+        begin: Naive local datetime at the beginning of the model step.
+        timestep_seconds: Step duration in seconds.
+        base_timezone: CALMET hours west of UTC.
+        latitude: Cell-centre latitude array in degrees north.
+        longitude: Cell-centre longitude array in degrees east, matching
+            ``latitude``.
+
+    Returns:
+        ``float32`` array matching the coordinate shape and containing the
+        sine of solar elevation at the midpoint, clipped by the solar model
+        to nonnegative daylight values.
+    """
     midpoint=begin+timedelta(seconds=timestep_seconds/2)
     samples=_model_array(solar_sine(
         midpoint.timetuple().tm_yday,base_timezone,latitude,longitude))
@@ -50,22 +71,52 @@ def _prognostic_record_solar(record_time,base_timezone,latitude,longitude):
     ``solar_sine`` index zero represents 23:30 on the preceding day, so an
     ending record maps directly to ``record_time.hour`` in the table for that
     record's actual local date.
+
+    Args:
+        record_time: Naive local datetime of the interval-ending record.
+        base_timezone: CALMET hours west of UTC.
+        latitude: Source-grid latitude array in degrees north.
+        longitude: Source-grid longitude array in degrees east.
+
+    Returns:
+        Array matching the source grid with the sine of solar elevation at
+        the record's representative half-hour.
     """
     samples=solar_sine(record_time.timetuple().tm_yday,base_timezone,
                        latitude,longitude)
     return samples[record_time.hour]
 
 def _coare_ending_gmt_hour(ending,base_timezone):
-    """Return the UTC decimal hour, with CALMET's west-positive IBTZ."""
+    """Convert a local interval ending to a UTC decimal hour.
+
+    Args:
+        ending: Naive datetime in the CALMET base timezone.
+        base_timezone: CALMET hours west of UTC.
+
+    Returns:
+        UTC hour in the continuous range 0 through just under 24, including
+        minute, second, and microsecond fractions.
+    """
     utc=ending+timedelta(hours=base_timezone)
     return (utc.hour+utc.minute/60.+utc.second/3600.+
             utc.microsecond/3_600_000_000.)
 
-def _output_crs(g: GridConfig):
-    return grid_crs(g,units='km')
-
 def _nearest_indices(source,target,count):
-    """Return the nearest source indices for each target point."""
+    """Find nearest source points for each target coordinate.
+
+    Args:
+        source: ``(source_point, 2)`` x/y coordinates.
+        target: ``(target_point, 2)`` x/y coordinates in the same units.
+        count: Number of nearest source points required per target.
+
+    Returns:
+        Integer array with shape ``(target_point, count)``. A singleton
+        neighbour dimension is retained when ``count`` is one.
+
+    Raises:
+        ValueError: If coordinates do not have two columns, ``count`` is
+            below one, or fewer than ``count`` source points are available.
+    """
     source=np.asarray(source,dtype=np.float64)
     target=np.asarray(target,dtype=np.float64)
     if source.ndim!=2 or target.ndim!=2 or source.shape[1:]!=(2,) or target.shape[1:]!=(2,):
@@ -79,7 +130,21 @@ def _nearest_indices(source,target,count):
 
 @dataclass(frozen=True,slots=True)
 class PrognosticMapper:
-    """CALMET RDHD4/R2INTERP four-neighbour horizontal mapper."""
+    """CALMET RDHD4/R2INTERP horizontal mapper.
+
+    Attributes:
+        source_shape: ``(source_y, source_x)`` shape of prognostic fields.
+        indices: ``(target_point, neighbour)`` flattened source indices.
+        weights: Matching inverse-distance weights retained for mapper
+            metadata; interpolation recomputes distances in coordinate space.
+        target_shape: ``(target_y, target_x)`` CALMET grid shape.
+        source_coordinates: ``(source_point, 2)`` projected x/y positions in
+            kilometres, stored as ``float64``.
+        target_coordinates: ``(target_point, 2)`` CALMET cell centres in
+            kilometres, stored as ``float64``.
+        grid_origin: Projected CALMET southwest origin in kilometres, used to
+            create local metric coordinates for precipitation mapping.
+    """
     source_shape: tuple[int,int]
     indices: np.ndarray
     weights: np.ndarray
@@ -89,7 +154,11 @@ class PrognosticMapper:
     grid_origin: tuple[float,float]=(0.,0.)
 
     def __post_init__(self):
-        """Normalize geometry independently from model-field precision."""
+        """Normalize coordinate arrays to double precision.
+
+        The frozen dataclass is updated with ``object.__setattr__``; field
+        values and interpolation indices otherwise remain unchanged.
+        """
         object.__setattr__(self,'source_coordinates',np.asarray(
             self.source_coordinates,dtype=COORDINATE_DTYPE))
         object.__setattr__(self,'target_coordinates',np.asarray(
@@ -97,6 +166,24 @@ class PrognosticMapper:
 
     @classmethod
     def build(cls,latitude,longitude,grid: GridConfig,*,validate_domain=False):
+        """Construct four-neighbour mapping geometry from a source grid.
+
+        Args:
+            latitude: ``(source_y, source_x)`` latitude in degrees north.
+            longitude: Matching longitude in degrees east.
+            grid: Target CALMET grid definition.
+            validate_domain: Check that all four target-grid corners lie
+                inside the full projected source boundary.
+
+        Returns:
+            Mapper containing projected ``float64`` coordinates and the four
+            nearest source indices and weights for each target cell.
+
+        Raises:
+            ValueError: If latitude and longitude shapes differ, fewer than
+                four source points exist, or validation finds a target corner
+                outside the prognostic domain.
+        """
         lat=np.asarray(latitude); lon=np.asarray(longitude)
         if lat.shape!=lon.shape: raise ValueError('latitude/longitude shape mismatch')
         sx,sy=project_geographic(lon,lat,grid,'WGS-84',units='km')
@@ -146,7 +233,23 @@ class PrognosticMapper:
                    (grid.x_origin_km,grid.y_origin_km))
 
     def interpolate(self,field,*,ignore_zero=False):
-        """Map ``(..., source_y, source_x)`` to ``(..., target_y, target_x)``."""
+        """Map a source-grid field with four-neighbour inverse-distance weights.
+
+        Args:
+            field: Array shaped ``(..., source_y, source_x)``. Leading axes
+                and physical units are preserved.
+            ignore_zero: Exclude source values below ``1e-6`` from weighting;
+                used for nonzero cloud-ceiling interpolation.
+
+        Returns:
+            ``float32`` array shaped ``(..., target_y, target_x)`` in the
+            input field's physical units. Targets with no retained weight are
+            zero.
+
+        Raises:
+            ValueError: If the trailing source-grid dimensions do not match
+                ``source_shape``.
+        """
         data=np.asarray(field)
         if data.shape[-2:]!=self.source_shape: raise ValueError('source field shape mismatch')
         leading=data.shape[:-2]; flat=np.reshape(np.swapaxes(data,-1,-2),leading+(-1,))
@@ -164,7 +267,28 @@ class PrognosticMapper:
         return _model_array(mapped.reshape(leading+self.target_shape))
 
     def interpolate_observations(self,field,rmin_km,*,barriers=(),barrier_top_level=0):
-        """Map four MM5 neighbours and retain INTERP's unnormalised 1/R² sum."""
+        """Map prognostic pseudo-observations and retain their weight strength.
+
+        Args:
+            field: ``(..., source_y, source_x)`` values, normally level-first
+                U or V wind in m/s.
+            rmin_km: Positive minimum distance in kilometres used in ``1/R²``
+                weights.
+            barriers: ``(barrier, 4)`` local-kilometre line segments that
+                block source-to-target influence.
+            barrier_top_level: Number of lowest vertical levels to which
+                barriers apply.
+
+        Returns:
+            Pair ``(mapped, strength)``. ``mapped`` is ``float32`` with shape
+            ``(..., target_y, target_x)`` and input units; ``strength`` is the
+            unnormalised ``1/km²`` weight sum, with a level axis when barriers
+            make availability level dependent.
+
+        Raises:
+            ValueError: If source dimensions mismatch, ``rmin_km`` is not
+                positive, or barriers are requested for a non-3-D field.
+        """
         data=np.asarray(field,dtype=MODEL_DTYPE)
         if data.shape[-2:]!=self.source_shape: raise ValueError('prognostic observation field shape mismatch')
         if rmin_km<=0.: raise ValueError('prognostic observation RMIN must be positive')
@@ -199,7 +323,18 @@ class PrognosticMapper:
         return _model_array(mapped),_model_array(strength.reshape(self.target_shape))
 
     def nearest(self,field):
-        """Map with RDMM5's closest prognostic cell (mixing-height profiles)."""
+        """Map a field with RDMM5's closest prognostic cell.
+
+        Args:
+            field: Array shaped ``(..., source_y, source_x)``.
+
+        Returns:
+            ``float32`` array shaped ``(..., target_y, target_x)`` with the
+            input physical units.
+
+        Raises:
+            ValueError: If the source-grid dimensions do not match.
+        """
         data=np.asarray(field)
         if data.shape[-2:]!=self.source_shape: raise ValueError('source field shape mismatch')
         leading=data.shape[:-2]; flat=np.reshape(np.swapaxes(data,-1,-2),leading+(-1,))
@@ -211,6 +346,18 @@ class PrognosticMapper:
 
         Physical fields use the model dtype by default.  Callers mapping a
         coordinate can request ``COORDINATE_DTYPE`` explicitly.
+
+        Args:
+            field: Array shaped ``(..., source_y, source_x)``.
+            source_mask: Boolean ``(source_y, source_x)`` availability mask.
+            dtype: Output NumPy dtype; defaults to model ``float32``.
+
+        Returns:
+            Array shaped ``(..., target_y, target_x)`` filled from the nearest
+            available source cell and cast to ``dtype``.
+
+        Raises:
+            ValueError: If shapes mismatch or the mask selects no source cell.
         """
         data=np.asarray(field)
         mask=np.asarray(source_mask,dtype=bool)
@@ -237,6 +384,22 @@ class PrognosticMapper:
         For exponential mapping with an automatic scale, the Gaussian sigma
         is half the closest wet-to-dry source distance.  The legacy API keeps
         the historical INTERPQR assignment bug that used the unhalved value.
+
+        Args:
+            field: One ``(source_y, source_x)`` precipitation field in mm/h.
+            radius_km: Search radius in kilometres for methods 1 and 2, or
+                Gaussian sigma for method 3; zero requests automatic sigma
+                only for method 3.
+            cutoff: Values below this precipitation rate in mm/h are set to
+                zero when interpolation supplied a result.
+            method: ``1`` inverse distance, ``2`` inverse squared distance,
+                or ``3`` Gaussian-decayed inverse squared distance.
+
+        Returns:
+            ``float32 (target_y, target_x)`` precipitation rate in mm/h.
+
+        Raises:
+            ValueError: If the field shape, method, or radius is invalid.
         """
         data=np.asarray(field,dtype=np.float64)
         if data.shape!=self.source_shape: raise ValueError('radius interpolation expects one source 2-D field')
@@ -327,12 +490,99 @@ class PrognosticMapper:
 
 @dataclass(frozen=True,slots=True)
 class SourceThermalState:
-    """RDMM5 potential temperatures retained from the last daylight hour."""
+    """RDMM5 potential temperatures retained from the last daylight hour.
+
+    Attributes:
+        pt20: ``float32 (source_y, source_x)`` lower reference-level potential
+            temperature in kelvins.
+        pt30: ``float32 (source_y, source_x)`` upper reference-level potential
+            temperature in kelvins.
+    """
     pt20: np.ndarray
     pt30: np.ndarray
 
 @dataclass(frozen=True,slots=True)
 class Step1Fields:
+    """Meteorological fields entering one CALMET diagnostic step.
+
+    Unless stated otherwise, arrays use ``float32``; horizontal fields have
+    shape ``(y, x)`` and three-dimensional fields ``(level, y, x)``.
+
+    Attributes:
+        u: Grid-east wind by CALMET layer, in m/s.
+        v: Grid-north wind by CALMET layer, in m/s.
+        temperature: Air temperature by CALMET layer, in K.
+        surface_temperature: Two-metre or diagnosed surface air temperature,
+            in K.
+        surface_pressure_mb: Surface pressure in millibars.
+        surface_density: Near-surface dry-air density in kg/m3.
+        relative_humidity: Relative humidity by CALMET layer, in percent.
+        pbl_height: Prognostic planetary-boundary-layer height in metres AGL.
+        sensible_heat_flux: Upward sensible heat flux in W/m2.
+        friction_velocity: Surface friction velocity in m/s.
+        cloud_fraction: Total cloud fraction from zero to one.
+        ceiling_height: Cloud ceiling in metres AGL; zero denotes no ceiling.
+        profile_temperature: Temperature profile including a surface row, in
+            K, shaped ``(profile_level, y, x)``.
+        profile_height: Matching profile heights in metres AGL.
+        surface_relative_humidity: Surface relative humidity in percent.
+        precipitation_rate: Precipitation rate in mm/h.
+        precipitation_code: ``int32`` weather code grid: 0 none, 10 rain, or
+            20 snow.
+        thermal_state: Optional source-grid daylight reference state carried
+            between RDMM5 records.
+        cloud_relative_humidity_850: Optional mapped 850-mb relative humidity
+            in percent for cloud method 3.
+        integrated_cloud_water: Optional per-column maximum ``QCLOUD+QICE``
+            mixing ratio in g/kg; the historical field name is retained.
+        observed_temperature_faces: Optional observed temperatures on CALMET
+            layer faces, in K, shaped ``(face, y, x)``.
+        water_gradient_below: Optional overwater temperature gradient below
+            mixing height, in K/m.
+        water_gradient_above: Optional overwater temperature gradient above
+            mixing height, in K/m.
+        water_mixing_gradient_above: Optional gradient used by the overwater
+            mixing-height calculation, in K/m.
+        observed_water_mixing_height: Optional observed water mixing height in
+            metres AGL.
+        diagnostic_surface_temperature: Optional observation-derived surface
+            temperature in K.
+        diagnostic_lapse_rate: Optional observation-derived lapse rate in K/m.
+        diagnostic_lapse_station_index: Optional ``(y, x)`` grid index of the
+            selected lapse-rate station.
+        diagnostic_lapse_data: Optional data provider used to refresh an
+            observation-derived lapse rate.
+        diagnostic_lapse_timestamp: Timestamp of the selected lapse-rate
+            observation.
+        prognostic_observation_u: Optional mapped pseudo-observation U wind in
+            m/s, shaped ``(level, y, x)``.
+        prognostic_observation_v: Optional mapped pseudo-observation V wind in
+            m/s.
+        prognostic_observation_strength: Optional unnormalised pseudo-
+            observation weight sum in 1/km2.
+        roughness_override: Optional dynamic surface roughness in metres.
+        overwater_data: Optional gridded SEA-like observations and SST state.
+        prognostic_temperature: Optional unmodified prognostic temperature in
+            K used by selected diagnostic paths.
+        cloud_liquid_water_3d: Optional layer-mean cloud liquid-water mixing
+            ratio in g/kg, shaped ``(level, y, x)``.
+        cloud_liquid_water_above: Optional mean cloud liquid water above the
+            CALMET top, in g/kg.
+        cloud_liquid_water_above_bottom: Bottom of that above-model cloud
+            layer in metres AGL.
+        cloud_liquid_water_above_top: Top of that above-model cloud layer in
+            metres AGL.
+        debug_surface_record: Optional raw surface record retained for listing
+            diagnostics.
+        debug_surface_stations: Surface stations retained for diagnostics.
+        debug_station_names: Station names corresponding to debug wind arrays.
+        debug_station_u: Optional station U wind in m/s.
+        debug_station_v: Optional station V wind in m/s.
+        debug_domain_temperature: Optional domain-mean temperature in K.
+        debug_domain_u: Optional domain-mean U wind in m/s.
+        debug_domain_v: Optional domain-mean V wind in m/s.
+        debug_upper_data: Upper-air diagnostic records retained for listings.
+    """
     u: np.ndarray
     v: np.ndarray
     temperature: np.ndarray
@@ -386,7 +636,19 @@ class Step1Fields:
 
 @dataclass(slots=True)
 class StepTransformContext:
-    """Runtime state needed by DIAGNO station physics before interpolation."""
+    """Mutable runtime state supplied to physical Step-1 transformations.
+
+    Attributes:
+        solar_elevation_sine: ``float32 (y, x)`` sine of midpoint solar
+            elevation.
+        previous_convective_height: Previous convective height in metres AGL.
+        previous_mixing_height: Previous total mixing height in metres AGL.
+        previous_temperature_jump: Previous inversion jump in K.
+        coriolis: Coriolis parameter in 1/s.
+        warm_layer_state: Optional mutable COARE warm-layer state; a transform
+            may replace it in place on this context.
+        gmt_hour: Optional interval-ending UTC decimal hour.
+    """
     solar_elevation_sine: np.ndarray
     previous_convective_height: np.ndarray
     previous_mixing_height: np.ndarray
@@ -397,12 +659,29 @@ class StepTransformContext:
 
 
 def _domain_mean(field):
-    """Return a stable double-precision mean for domain-scale diagnostics."""
+    """Calculate a stable mean for a domain-scale diagnostic.
+
+    Args:
+        field: Numerical array in any physical units.
+
+    Returns:
+        ``float64`` scalar mean in the same units as ``field``.
+    """
     return np.mean(np.asarray(field,dtype=ACCUMULATION_DTYPE),
                    dtype=ACCUMULATION_DTYPE)
 
 def _interpolate_ceiling(left,right,fraction):
-    """Interpolate ceiling height while retaining nonzero observations."""
+    """Interpolate cloud ceiling while retaining a lone nonzero endpoint.
+
+    Args:
+        left: Earlier ceiling-height array in metres AGL; zero means absent.
+        right: Later ceiling-height array with the same shape and units.
+        fraction: Temporal fraction from ``left`` to ``right``.
+
+    Returns:
+        ``float32`` ceiling array. Cells with two nonzero endpoints are
+        linearly interpolated; cells with only one use that nonzero height.
+    """
     f=MODEL_DTYPE(fraction)
     left=np.asarray(left,dtype=MODEL_DTYPE); right=np.asarray(right,dtype=MODEL_DTYPE)
     interpolated=left+f*(right-left)
@@ -411,10 +690,39 @@ def _interpolate_ceiling(left,right,fraction):
 
 def interpolate_step1_fields(left: Step1Fields,right: Step1Fields,fraction,*,cloud_method=4,
                              cloud_condensate_threshold_g_kg=.005):
-    """Interpolate between two actual prognostic records."""
+    """Interpolate model fields between two prognostic endpoint records.
+
+    Args:
+        left: Earlier Step-1 endpoint.
+        right: Later Step-1 endpoint. Discrete carried state is taken from
+            this endpoint.
+        fraction: Fraction from zero at ``left`` to one at ``right``.
+        cloud_method: Prognostic cloud method 3 (850-mb RH) or 4 (all-level
+            diagnosed cloud).
+        cloud_condensate_threshold_g_kg: Minimum interpolated column-maximum
+            ``QCLOUD+QICE`` in g/kg required to retain cloud and ceiling.
+
+    Returns:
+        New :class:`Step1Fields` whose continuous arrays are linearly
+        interpolated in ``float32``; precipitation code is rediagnosed from
+        rate and lowest-layer temperature.
+
+    Raises:
+        ValueError: If ``fraction`` is outside [0, 1], ``cloud_method`` is
+            unsupported, or method 3 lacks endpoint 850-mb humidity.
+    """
     f=MODEL_DTYPE(fraction)
     if not 0.<=f<=1.: raise ValueError('prognostic interpolation fraction must be between zero and one')
     def lerp(a,b):
+        """Linearly interpolate one same-shaped model field.
+
+        Args:
+            a: Earlier scalar or array.
+            b: Later scalar or array with compatible shape.
+
+        Returns:
+            ``float32`` value with the broadcast shape and input units.
+        """
         a=np.asarray(a,dtype=MODEL_DTYPE); b=np.asarray(b,dtype=MODEL_DTYPE)
         return _model_array(a+f*(b-a))
     if cloud_method==4:
@@ -474,7 +782,31 @@ def interpolate_step1_fields(left: Step1Fields,right: Step1Fields,fraction,*,clo
 def observed_temperature_3d(surface_temperature,face_temperature,convective_height,z_faces_m,
                             *,landuse=None,water_range=(55,55),mixing_height=None,
                             water_gradient_below=None,water_gradient_above=None):
-    """Vectorized land branch of TEMP3D for ITPROG=0."""
+    """Construct observed-mode layer-mean temperatures with continuous overlap.
+
+    Args:
+        surface_temperature: ``(y, x)`` surface temperature in K.
+        face_temperature: ``(face, y, x)`` observed temperature at CALMET
+            layer faces in K.
+        convective_height: Land convective mixing height in metres AGL.
+        z_faces_m: ``(face,)`` CALMET layer boundaries in metres AGL.
+        landuse: Optional ``(y, x)`` dominant land-use categories.
+        water_range: Inclusive category range treated as water.
+        mixing_height: Optional overwater mixing height in metres AGL.
+        water_gradient_below: Optional overwater temperature gradient below
+            mixing height in K/m.
+        water_gradient_above: Optional overwater gradient above mixing height
+            in K/m.
+
+    Returns:
+        ``float32 (level, y, x)`` layer-mean temperature in K. Layers crossed
+        by a mixing-height surface are weighted continuously by overlapped
+        thickness.
+
+    Raises:
+        ValueError: If face-temperature dimensions do not match the vertical
+            faces and horizontal surface grid.
+    """
     surface=np.asarray(surface_temperature,dtype=MODEL_DTYPE)
     faces=np.asarray(face_temperature,dtype=MODEL_DTYPE)
     z=np.asarray(z_faces_m,dtype=MODEL_DTYPE)
@@ -512,7 +844,22 @@ def observed_temperature_3d(surface_temperature,face_temperature,convective_heig
     return _model_array(result)
 
 def map_prognostic_cloud(source_cloud,source_rh850,mapper,cloud_method):
-    """Apply RDMM5's method-specific horizontal interpolation order."""
+    """Apply RDMM5's method-specific cloud interpolation order.
+
+    Args:
+        source_cloud: ``(source_y, source_x)`` cloud fraction for method 4.
+        source_rh850: Source 850-mb relative humidity in percent for method 3.
+        mapper: Prognostic-to-CALMET horizontal mapper.
+        cloud_method: ``3`` to map RH before diagnosing cloud fraction or
+            ``4`` to map source-diagnosed cloud directly.
+
+    Returns:
+        Pair ``(cloud_fraction, mapped_rh850)`` on ``(target_y, target_x)``.
+        The second item is ``None`` for method 4; arrays use ``float32``.
+
+    Raises:
+        ValueError: If ``cloud_method`` is neither 3 nor 4.
+    """
     if cloud_method==4: return mapper.interpolate(source_cloud),None
     if cloud_method==3:
         mapped_rh850=mapper.interpolate(source_rh850)
@@ -521,6 +868,31 @@ def map_prognostic_cloud(source_cloud,source_rh850,mapper,cloud_method):
 
 @dataclass(frozen=True,slots=True)
 class SurfaceFields:
+    """Surface-layer and mixing-height results for one model step.
+
+    Horizontal arrays have shape ``(y, x)`` and normally use ``float32``.
+
+    Attributes:
+        roughness: Effective aerodynamic roughness length in metres.
+        density: Surface air density in kg/m3.
+        shortwave_flux: Downward shortwave flux in W/m2.
+        sensible_heat_flux: Upward sensible heat flux in W/m2.
+        friction_velocity: Friction velocity in m/s.
+        monin_obukhov_length: Monin-Obukhov length in metres.
+        mixing_height: Final total mixing height in metres AGL.
+        convective_mixing_height: Convective mixing-height state in metres.
+        temperature_jump: Potential-temperature jump at the boundary-layer
+            top in K.
+        warm_layer_state: Optional updated COARE warm-layer state.
+        water_convective_velocity_scale: Optional overwater convective
+            velocity scale in m/s, zero over land.
+        water_convective_height_state: Optional unaveraged overwater
+            convective-height state in metres.
+        unaveraged_mixing_height: Optional mixing height before upwind spatial
+            averaging, retained for diagnostics.
+        unaveraged_convective_mixing_height: Optional convective height before
+            upwind spatial averaging.
+    """
     roughness: np.ndarray
     density: np.ndarray
     shortwave_flux: np.ndarray
@@ -538,6 +910,26 @@ class SurfaceFields:
 
 @dataclass(frozen=True,slots=True)
 class DiagnosticWindFields:
+    """Final diagnostic wind and optional intermediate stages.
+
+    Attributes:
+        u: ``float32 (level, y, x)`` grid-east wind in m/s.
+        v: ``float32 (level, y, x)`` grid-north wind in m/s.
+        w: ``float32 (face, y, x)`` vertical velocity in m/s.
+        divergence: ``float32 (level, y, x)`` horizontal divergence in 1/s.
+        lapse_rate: ``float32 (y, x)`` environmental lapse rate in K/m.
+        preliminary_heat_flux: ``float32 (y, x)`` preliminary sensible heat
+            flux in W/m2 used by slope flow.
+        kinematic_stage: Optional ``(u, v, w)`` snapshots after kinematic
+            adjustment.
+        froude_stage: Optional ``(u, v, w)`` snapshots after Froude adjustment.
+        slope_stage: Optional ``(u, v, w)`` snapshots after slope flow.
+        interpolated_stage: Optional ``(u, v)`` Step-1 wind snapshot.
+        terrain_adjusted_stage: Optional ``(u, v)`` surface-terrain adjustment
+            snapshot.
+        initial_stage: Optional ``(u, v, w, divergence)`` snapshot before
+            divergence minimisation.
+    """
     u: np.ndarray
     v: np.ndarray
     w: np.ndarray
@@ -553,6 +945,20 @@ class DiagnosticWindFields:
 
 @dataclass(frozen=True,slots=True)
 class HourFields:
+    """Complete CALMET output and carried state for one interval.
+
+    Attributes:
+        timestamp: Naive local datetime at the beginning of the output
+            interval.
+        step1: Final Step-1 fields, with diagnostic U/V winds substituted.
+        wind: Diagnostic wind, vertical velocity, divergence, and debug stages.
+        surface: Surface-layer and mixing-height results.
+        temperature: ``float32 (level, y, x)`` final 3-D temperature in K.
+        selected_lapse_convective_time: Optional timestamp carried by the
+            observed lapse-rate selection logic.
+        source_step: Optional Step-1 state before final diagnostic wind
+            substitution, retained for diagnostics.
+    """
     timestamp: datetime
     step1: Step1Fields
     wind: DiagnosticWindFields
@@ -562,7 +968,15 @@ class HourFields:
     source_step: Step1Fields | None = None
 
 def target_latitude_longitude(grid: GridConfig):
-    """Latitude/longitude at CALMET cell centres (MICROI grid geometry)."""
+    """Calculate geographic coordinates at CALMET cell centres.
+
+    Args:
+        grid: Target projection, origin, spacing, and dimensions.
+
+    Returns:
+        Pair ``(latitude, longitude)`` of ``float64 (y, x)`` arrays in decimal
+        degrees using WGS-84.
+    """
     ix=np.arange(grid.nx,dtype=COORDINATE_DTYPE)+.5
     iy=np.arange(grid.ny,dtype=COORDINATE_DTYPE)+.5
     x=float(grid.x_origin_km)+ix*float(grid.dx_km)
@@ -572,7 +986,22 @@ def target_latitude_longitude(grid: GridConfig):
     return np.asarray(latitude),np.asarray(longitude)
 
 def _vertical_centers(field,height,centers,*,wind=False):
-    """Interpolate vertical profiles, including the low-level wind log law."""
+    """Interpolate source columns to CALMET layer-centre heights.
+
+    Args:
+        field: ``float-like (source_level, y, x)`` physical field.
+        height: Matching source-level height in metres AGL.
+        centers: One-dimensional target heights in metres AGL.
+        wind: Extrapolate targets below the first source level with RDMM5's
+            logarithmic wind profile; other fields hold the first value.
+
+    Returns:
+        ``float32 (target_level, y, x)`` array in the field's input units.
+
+    Raises:
+        ValueError: If field and height shapes differ or are not three-
+            dimensional.
+    """
     data=np.asarray(field,dtype=MODEL_DTYPE)
     z=np.asarray(height,dtype=MODEL_DTYPE)
     if data.shape!=z.shape or data.ndim!=3: raise ValueError('vertical fields must have shape (level,y,x)')
@@ -594,7 +1023,19 @@ def _vertical_centers(field,height,centers,*,wind=False):
     return _model_array(np.stack(out))
 
 def _prognostic_wind_components(speed,direction,convergence):
-    """Rotate true-north meteorological wind into grid components."""
+    """Rotate meteorological wind from true north into grid components.
+
+    Args:
+        speed: Wind speed array in m/s.
+        direction: Meteorological direction in degrees clockwise from true
+            north, matching ``speed``.
+        convergence: Grid convergence in degrees, broadcast-compatible with
+            the wind fields.
+
+    Returns:
+        Pair of ``float32`` arrays ``(u, v)`` in m/s, positive toward grid east
+        and grid north.
+    """
     velocity=np.asarray(speed,dtype=MODEL_DTYPE)
     grid_direction=(np.asarray(direction,dtype=MODEL_DTYPE)-
                     np.asarray(convergence,dtype=MODEL_DTYPE))%360.
@@ -608,6 +1049,16 @@ def _relative_humidity(qvapor,pressure_hpa,temperature_k):
     ``QVAPOR`` is the mass ratio of water vapour to dry air.  Convert it to
     vapour pressure with ``e = p r / (epsilon + r)`` before comparing it with
     saturation vapour pressure.  The legacy API retains CALWRF's approximation.
+
+    Args:
+        qvapor: Water-vapour mixing ratio relative to dry air, in kg/kg.
+        pressure_hpa: Atmospheric pressure in hPa.
+        temperature_k: Air temperature in K; arrays must be broadcast-
+            compatible.
+
+    Returns:
+        ``float32`` relative humidity in percent, clipped to [0, 100], with
+        the broadcast input shape.
     """
     temperature=np.asarray(temperature_k,dtype=MODEL_DTYPE)
     pressure=np.asarray(pressure_hpa,dtype=MODEL_DTYPE)
@@ -618,13 +1069,33 @@ def _relative_humidity(qvapor,pressure_hpa,temperature_k):
     return _model_array(np.clip(100.*vapor_pressure/es,0.,100.))
 
 def _cloud_water_g_kg(values):
-    """Convert canonical cloud condensate from kg/kg to nonnegative g/kg."""
+    """Convert canonical cloud condensate to nonnegative g/kg.
+
+    Args:
+        values: Cloud mixing ratio in kg/kg, scalar or array-like.
+
+    Returns:
+        ``float32`` array with the input shape in g/kg; negative values become
+        zero.
+    """
     values=np.asarray(values,dtype=MODEL_DTYPE)
     return _model_array(np.maximum(values,0.)*1000.)
 
 
 def _source_relative_humidity(dataset,time_index,qvapor,pressure,temperature):
-    """Read canonical relative humidity, with a diagnostic schema fallback."""
+    """Read source relative humidity or diagnose it from thermodynamics.
+
+    Args:
+        dataset: NetCDF-like canonical meteorology dataset.
+        time_index: Record index along the time axis.
+        qvapor: Source ``(level, y, x)`` water-vapour mixing ratio in kg/kg.
+        pressure: Matching pressure in hPa.
+        temperature: Matching temperature in K.
+
+    Returns:
+        ``float32 (level, y, x)`` relative humidity in percent, clipped to
+        [0, 100].
+    """
     if 'relative_humidity' in dataset.variables:
         values=np.asarray(dataset['relative_humidity'][time_index],dtype=MODEL_DTYPE)
     else:
@@ -633,7 +1104,20 @@ def _source_relative_humidity(dataset,time_index,qvapor,pressure,temperature):
 
 
 def _rdmm5_surface_density(pressure_mb,temperature_k,height_agl_m):
-    """RDMM5 RHOP from the first prognostic level at/above ground."""
+    """Calculate RDMM5 surface density from the first above-ground level.
+
+    Args:
+        pressure_mb: ``(source_level, y, x)`` pressure in millibars.
+        temperature_k: Matching air temperature in K.
+        height_agl_m: Matching height in metres AGL.
+
+    Returns:
+        ``float32 (y, x)`` dry-air density in kg/m3.
+
+    Raises:
+        ValueError: If input shapes differ, are not three-dimensional, or any
+            column has no level at or above ground.
+    """
     pressure=np.asarray(pressure_mb,dtype=MODEL_DTYPE)
     temperature=np.asarray(temperature_k,dtype=MODEL_DTYPE)
     height=np.asarray(height_agl_m,dtype=MODEL_DTYPE)
@@ -648,7 +1132,22 @@ def _rdmm5_surface_density(pressure_mb,temperature_k,height_agl_m):
 
 
 def _rdmm5_above_ground_profiles(height_agl_m,*fields):
-    """Pack RDMM5 levels from per-column INDPX through the model top."""
+    """Pack each RDMM5 column from its first above-ground level upward.
+
+    Args:
+        height_agl_m: ``(source_level, y, x)`` heights in metres AGL.
+        *fields: Fields with the identical source shape and arbitrary physical
+            units.
+
+    Returns:
+        Tuple containing packed ``float32`` height followed by each packed
+        field. Shapes remain ``(source_level, y, x)``; short columns repeat
+        their highest available level.
+
+    Raises:
+        ValueError: If shapes differ, height is not three-dimensional, or a
+            column has no level at or above ground.
+    """
     height=np.asarray(height_agl_m,dtype=MODEL_DTYPE)
     values=(height,*(np.asarray(field,dtype=MODEL_DTYPE) for field in fields))
     if height.ndim!=3 or any(value.shape!=height.shape for value in values):
@@ -664,7 +1163,19 @@ def _rdmm5_above_ground_profiles(height_agl_m,*fields):
 
 
 def _rdmm5_sst_profile(centers_m,lowest_height_m,lowest_temperature_k,sst_k,ocean):
-    """RDMM5 ITWPROG=2 actual-temperature interpolation below INDPX."""
+    """Interpolate ocean temperature from SST to the lowest source level.
+
+    Args:
+        centers_m: One-dimensional CALMET layer-centre heights in metres AGL.
+        lowest_height_m: ``(y, x)`` lowest above-ground source height in m.
+        lowest_temperature_k: Temperature at that source level in K.
+        sst_k: Sea-surface temperature in K.
+        ocean: Boolean source-grid ocean mask.
+
+    Returns:
+        Pair ``(profile, use)``. ``profile`` is ``float32 (level, y, x)`` in K;
+        Boolean ``use`` marks ocean layers below the lowest source level.
+    """
     centers=np.asarray(centers_m,dtype=MODEL_DTYPE)
     height=np.asarray(lowest_height_m,dtype=MODEL_DTYPE)
     temperature=np.asarray(lowest_temperature_k,dtype=MODEL_DTYPE)
@@ -677,7 +1188,21 @@ def _rdmm5_sst_profile(centers_m,lowest_height_m,lowest_temperature_k,sst_k,ocea
     return _model_array(profile),use
 
 def _stull_temperature(theta2,z2,theta3,z3,theta20,theta30,z1):
-    """STULL nighttime potential-temperature extrapolation."""
+    """Apply STULL nighttime potential-temperature extrapolation.
+
+    Args:
+        theta2: Lower current potential temperature in K.
+        z2: Lower reference height in metres AGL.
+        theta3: Upper current potential temperature in K.
+        z3: Upper reference height in metres AGL.
+        theta20: Lower daylight reference potential temperature in K.
+        theta30: Upper daylight reference potential temperature in K.
+        z1: Target height in metres AGL, scalar or broadcast-compatible.
+
+    Returns:
+        ``float32`` potential temperature in K with the broadcast horizontal
+        shape.
+    """
     t2=np.asarray(theta2,dtype=MODEL_DTYPE); t3=np.asarray(theta3,dtype=MODEL_DTYPE)
     t20=np.asarray(theta20,dtype=MODEL_DTYPE); t30=np.asarray(theta30,dtype=MODEL_DTYPE)
     height2=np.asarray(z2,dtype=MODEL_DTYPE); height3=np.asarray(z3,dtype=MODEL_DTYPE)
@@ -704,7 +1229,48 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
                        precipitation_interpolation=2,precipitation_radius_km=50.,
                        precipitation_cutoff=.01,prognostic_observation_rmin_km=None,
                        prognostic_observation_barriers=(),prognostic_observation_barrier_top_level=0):
-    """Read one canonical CALWRF time and construct Step-1 model fields."""
+    """Read one canonical CALWRF record and construct Step-1 fields.
+
+    Args:
+        dataset: Open NetCDF-like CALWRF dataset with canonical variables.
+        time_index: Source time-record index.
+        grid: Target CALMET grid.
+        z_faces_m: One-dimensional CALMET layer faces in metres AGL.
+        timestamp: Optional local ending timestamp used for daytime/nighttime
+            low-level temperature treatment.
+        base_timezone: CALMET hours west of UTC used by the solar calculation.
+        thermal_state: Optional daylight potential-temperature state carried
+            from the preceding source record.
+        mapper: Reusable source-to-target mapper; ``None`` builds and validates
+            one from dataset coordinates.
+        prognostic_ocean_category: Source land-use category treated as ocean.
+        water_temperature_mode: ``2`` enables prognostic SST interpolation
+            below the first source level.
+        cloud_method: ``3`` diagnoses cloud from mapped 850-mb RH; ``4`` maps
+            all-level prognostic cloud.
+        cloud_condensate_threshold_g_kg: Minimum layer ``QCLOUD+QICE`` in g/kg
+            used to retain cloud and diagnose condensate ceiling.
+        precipitation_interpolation: Radius mapper method 1, 2, or 3.
+        precipitation_radius_km: Precipitation interpolation radius or method-3
+            Gaussian sigma in kilometres.
+        precipitation_cutoff: Mapped rates below this mm/h threshold become
+            zero.
+        prognostic_observation_rmin_km: Optional minimum pseudo-observation
+            wind distance in kilometres; ``None`` skips those fields.
+        prognostic_observation_barriers: Wind-interpolation barrier segments in
+            local kilometres.
+        prognostic_observation_barrier_top_level: Number of lowest levels to
+            which barriers apply.
+
+    Returns:
+        :class:`Step1Fields` on the target grid. Physical arrays are
+        ``float32``; winds and temperatures have shape ``(level, y, x)`` and
+        surface diagnostics ``(y, x)``.
+
+    Raises:
+        ValueError: If source geometry, vertical profiles, cloud method, SST,
+            precipitation controls, or target-domain coverage is invalid.
+    """
     lat=np.asarray(dataset['latitude'][:]); lon=np.asarray(dataset['longitude'][:])
     if mapper is None:
         mapper=PrognosticMapper.build(lat,lon,grid,validate_domain=True)
@@ -921,7 +1487,21 @@ def build_step1_fields(dataset,time_index,grid: GridConfig,z_faces_m,*,timestamp
 
 
 def build_prog_step_fields(prog_data,ending_hour,grid: GridConfig,z_faces_m,*,record=None):
-    """Create the wind-only Step-1 scaffold used by legacy ``PROG.DAT``."""
+    """Create the wind-only Step-1 scaffold used by legacy ``PROG.DAT``.
+
+    Args:
+        prog_data: Parsed prognostic wind data with interpolation methods.
+        ending_hour: Decimal ``HH.MM`` ending-time label used to select a PROG
+            record.
+        grid: Target CALMET grid.
+        z_faces_m: CALMET layer faces in metres AGL.
+        record: Optional already-selected PROG record; ``None`` lets the data
+            object select by ``ending_hour``.
+
+    Returns:
+        :class:`Step1Fields` with interpolated ``float32 (level, y, x)`` U/V
+        winds in m/s and neutral placeholder thermodynamic fields.
+    """
     faces=np.asarray(z_faces_m,dtype=MODEL_DTYPE)
     centers=.5*(faces[:-1]+faces[1:])
     u,v=(prog_data.interpolate(ending_hour,grid,centers) if record is None else
@@ -952,7 +1532,37 @@ def build_mm4_step_fields(mm4_data,record,grid: GridConfig,z_faces_m,*,cloud_met
                           prognostic_observation_barriers=(),
                           prognostic_observation_barrier_top_level=0,
                           prognostic_ocean_category=16):
-    """Create the complete Step-1 scaffold produced by native ``RDMM4``."""
+    """Create Step-1 fields from a native MM4 meteorological record.
+
+    Args:
+        mm4_data: Parsed MM4 data object supporting record interpolation.
+        record: Selected MM4 record.
+        grid: Target CALMET grid.
+        z_faces_m: CALMET layer faces in metres AGL.
+        cloud_method: Prognostic cloud method 3 or 4.
+        precipitation_interpolation: Radius mapper method 1, 2, or 3.
+        precipitation_radius_km: Precipitation interpolation radius or
+            Gaussian sigma in kilometres.
+        precipitation_cutoff: Mapped precipitation below this mm/h value is
+            zeroed.
+        base_timezone: CALMET hours west of UTC.
+        thermal_state: Optional RDMM4 daylight thermal state from the previous
+            record.
+        prognostic_observation_rmin_km: Optional minimum pseudo-observation
+            wind distance in kilometres.
+        prognostic_observation_barriers: Wind barrier segments in local km.
+        prognostic_observation_barrier_top_level: Number of lowest levels to
+            which barriers apply.
+        prognostic_ocean_category: MM4 land-use category treated as ocean.
+
+    Returns:
+        Complete :class:`Step1Fields` on ``(grid.ny, grid.nx)`` with
+        ``float32`` level-first meteorology and ``int32`` precipitation codes.
+
+    Raises:
+        ValueError: If MM4 interpolation controls, source data, or target
+            geometry are invalid.
+    """
     faces=np.asarray(z_faces_m,dtype=MODEL_DTYPE)
     centers=.5*(faces[:-1]+faces[1:])
     fields=mm4_data.interpolate_record(record,grid,centers,cloud_method=cloud_method,
@@ -1004,7 +1614,80 @@ def build_surface_fields(step: Step1Fields, landuse, roughness, albedo,
                          observed_water_mixing_height=None,
                          previous_water_convective_height=None,
                          previous_water_mixing_height=None):
-    """Compose COMP's current NOOBS land and no-SEA.DAT water pathways."""
+    """Calculate COMP surface similarity and mixing-height fields.
+
+    Args:
+        step: Step-1 meteorology for the current interval.
+        landuse: ``(y, x)`` dominant land-use category.
+        roughness: Aerodynamic roughness length in metres.
+        albedo: Surface albedo fraction.
+        bowen_ratio: Bowen ratio used in land heat-flux partitioning.
+        soil_heat_flux_parameter: Fraction controlling soil heat storage.
+        anthropogenic_heat_flux: Anthropogenic heat flux in W/m2.
+        solar_elevation_sine: Sine of midpoint solar elevation.
+        coriolis: Coriolis parameter in 1/s.
+        previous_convective_height: Previous land convective height in metres.
+        previous_temperature_jump: Previous inversion jump in K.
+        first_level_height_m: Height of the lowest CALMET layer centre in m.
+        minimum_height_m: Minimum overland mixing height in metres.
+        maximum_height_m: Maximum overland mixing height in metres.
+        minimum_water_height_m: Minimum overwater mixing height in metres.
+        maximum_water_height_m: Maximum overwater mixing height in metres.
+        water_range: Inclusive land-use category range treated as water.
+        turbidity_coefficient_1: First empirical clear-sky turbidity
+            coefficient.
+        turbidity_coefficient_2: Second clear-sky turbidity coefficient.
+        cloudiness_coefficient_1: First cloud attenuation coefficient.
+        cloudiness_coefficient_2: Second cloud attenuation coefficient.
+        net_radiation_coefficient_1: First net longwave-radiation coefficient.
+        net_radiation_coefficient_2: Second net-radiation coefficient.
+        net_radiation_coefficient_3: Third net-radiation coefficient.
+        mixing_method: ``1`` or ``-1`` for Maul-Carson, ``2`` or ``-2`` for
+            Batchvarova-Gryning; negative values select the alternate water
+            pathway.
+        minimum_lapse: Minimum potential-temperature lapse rate in K/m.
+        lapse_depth_m: Near-surface depth used to diagnose lapse rate, in m.
+        threshold_flux_per_m: Land heat-flux-per-height threshold in W/m3.
+        constb: Maul-Carson mechanical-height coefficient.
+        conste: Batchvarova-Gryning entrainment coefficient.
+        constn: Batchvarova-Gryning neutral boundary-layer constant in m.
+        constw: Overwater mechanical-height coefficient.
+        relaxation: Relax convective height during weak positive heat flux.
+        relaxation_time_s: Convective-height relaxation e-folding time in s.
+        timestep_s: Model timestep in seconds.
+        surface_temperature: Optional final ``(y, x)`` temperature in K;
+            ``None`` uses the lowest Step-1 layer.
+        overwater_flux_method: ``0`` for OCD or an absolute COARE method code
+            of 10 through 12.
+        coastal_shelf_length_km: COARE nearshore roughness scale in km.
+        cool_skin: Enable the COARE cool-skin correction.
+        dx_km: Horizontal x spacing in kilometres.
+        dy_km: Horizontal y spacing in kilometres.
+        water_flux_threshold: Water heat-flux-per-height threshold in W/m3.
+        water_temperature_mode: Select observed or prognostic overwater
+            temperature gradients.
+        default_water_gradient_above: Fallback gradient above the water
+            mixing height in K/m.
+        warm_layer: Enable the COARE warm-layer correction.
+        warm_layer_state: Optional COARE state carried from the prior step.
+        longitude: Optional ``(y, x)`` longitude in degrees east for COARE.
+        gmt_hour: Interval-ending UTC decimal hour for COARE state updates.
+        observed_water_mixing_height: Optional observed water mixing height in
+            metres.
+        previous_water_convective_height: Optional prior water convective-
+            height state in metres.
+        previous_water_mixing_height: Optional prior total water mixing height
+            in metres.
+
+    Returns:
+        :class:`SurfaceFields` containing ``float32 (y, x)`` fluxes,
+        similarity parameters, and mixing-height states in their documented
+        physical units. A supplied warm-layer state may be advanced.
+
+    Raises:
+        ValueError: If ``mixing_method`` is unsupported or an observed or
+            carried overwater state does not match the horizontal grid.
+    """
     landuse=np.asarray(landuse); water=(landuse>=water_range[0])&(landuse<=water_range[1]); land=~water
     temp=np.asarray(step.temperature[0] if surface_temperature is None else
                     surface_temperature,dtype=MODEL_DTYPE)
@@ -1233,7 +1916,62 @@ def build_diagnostic_wind(step: Step1Fields, terrain_m, landuse, roughness,
                           divergence_limit=5.e-6,divergence_iterations=50,
                           smoothing_passes=(2,4,4,4,4,4,4,4,4,4),
                           retain_debug_stages=False):
-    """Current Zhejiang DIAGNO path (IKINE=0, IFRADJ=1, ISLOPE=1)."""
+    """Apply CALMET diagnostic terrain effects to a Step-1 wind field.
+
+    Args:
+        step: Step-1 wind and thermodynamic fields.
+        terrain_m: ``(y, x)`` terrain elevation in metres MSL.
+        landuse: Dominant land-use category grid.
+        roughness: Surface roughness length in metres.
+        albedo: Surface albedo fraction.
+        bowen_ratio: Surface Bowen ratio.
+        soil_heat_flux_parameter: Soil heat-storage parameter.
+        anthropogenic_heat_flux: Anthropogenic heat flux in W/m2.
+        solar_elevation_sine: Sine of midpoint solar elevation.
+        previous_convective_height: Prior convective height in metres AGL.
+        z_faces_m: CALMET layer faces in metres AGL.
+        dx_m: Horizontal x spacing in metres.
+        dy_m: Horizontal y spacing in metres.
+        terrain_radius_km: Radius in kilometres for terrain extrema.
+        terrain_context: Optional precomputed ``(highest, lowest,
+            distance_high, distance_low)`` terrain arrays in metres.
+        lapse_height_m: Depth in metres used for lapse-rate diagnosis.
+        spatial_lapse: Diagnose lapse rate per cell instead of from a domain
+            mean profile.
+        spatial_surface_temperature: Use spatial lowest-layer temperature in
+            preliminary heat-flux calculations.
+        temperature_mode: Temperature-source mode; value 2 retains
+            prognostic surface density in the slope pathway.
+        lapse_rate_override: Optional ``(y, x)`` lapse rate in K/m.
+        minimum_average_radius: Minimum upwind averaging radius in cells.
+        half_average_angle: Upwind cone half-angle in degrees.
+        water_range: Inclusive land-use category range treated as water.
+        turbidity_coefficient_1: First clear-sky turbidity coefficient.
+        turbidity_coefficient_2: Second clear-sky turbidity coefficient.
+        cloudiness_coefficient_1: First cloud attenuation coefficient.
+        cloudiness_coefficient_2: Second cloud attenuation coefficient.
+        net_radiation_coefficient_1: First net-radiation coefficient.
+        net_radiation_coefficient_2: Second net-radiation coefficient.
+        net_radiation_coefficient_3: Third net-radiation coefficient.
+        critical_froude: Critical Froude number for flow blocking.
+        use_froude: Apply thermodynamic terrain-flow blocking.
+        use_kinematic: Apply kinematic terrain vertical velocity and mass
+            consistency.
+        use_slope: Add parameterized slope flow.
+        use_obrien: Apply O'Brien top-boundary correction before divergence
+            minimisation.
+        kinematic_alpha: Kinematic terrain-effect multiplier.
+        timestep_s: Model timestep in seconds for upwind averaging.
+        divergence_limit: Convergence limit for divergence minimisation.
+        divergence_iterations: Maximum divergence-minimisation iterations.
+        smoothing_passes: Per-level horizontal wind smoothing counts.
+        retain_debug_stages: Copy intermediate wind stages into the result.
+
+    Returns:
+        :class:`DiagnosticWindFields` with ``float32 (level, y, x)`` U/V in
+        m/s, ``(face, y, x)`` W in m/s, divergence in 1/s, lapse rate in K/m,
+        preliminary heat flux in W/m2, and optional stage snapshots.
+    """
     terrain=np.asarray(terrain_m,dtype=MODEL_DTYPE)
     faces=np.asarray(z_faces_m,dtype=MODEL_DTYPE)
     centers=.5*(faces[:-1]+faces[1:])
@@ -1315,7 +2053,29 @@ def build_objective_wind(step: Step1Fields, terrain_m, previous_convective_heigh
                          divergence_iterations=50,
                          smoothing_passes=(2,4,4,4,4,4,4,4,4,4),
                          retain_debug_stages=False):
-    """IWFCOD=0 wind finalisation after INTERP objective analysis."""
+    """Finalize an IWFCOD=0 objective-analysis wind field.
+
+    Args:
+        step: Objectively analysed Step-1 wind and temperature fields.
+        terrain_m: ``(y, x)`` terrain elevation in metres MSL.
+        previous_convective_height: Prior convective height in metres AGL.
+        z_faces_m: CALMET layer faces in metres AGL.
+        dx_m: Horizontal x spacing in metres.
+        dy_m: Horizontal y spacing in metres.
+        lapse_height_m: Depth used for lapse-rate diagnosis in metres.
+        spatial_lapse: Diagnose lapse rate per cell when true.
+        lapse_rate_override: Optional ``(y, x)`` lapse rate in K/m.
+        use_obrien: Apply the O'Brien top-boundary vertical-wind correction.
+        divergence_limit: Convergence limit for divergence minimisation.
+        divergence_iterations: Maximum divergence-minimisation iterations.
+        smoothing_passes: Per-level horizontal smoothing counts.
+        retain_debug_stages: Retain copies before terrain adjustment and
+            divergence minimisation.
+
+    Returns:
+        :class:`DiagnosticWindFields` with ``float32`` U/V/W, divergence,
+        lapse rate, zero preliminary heat flux, and optional debug snapshots.
+    """
     gamma=(lapse_rate(step.temperature,previous_convective_height,
                       .5*(np.asarray(z_faces_m[:-1],dtype=MODEL_DTYPE)+
                           np.asarray(z_faces_m[1:],dtype=MODEL_DTYPE)),
@@ -1388,6 +2148,126 @@ def solve_hour(dataset, time_index, grid: GridConfig, z_faces_m, geophysical,
 
     ``timestamp`` is the beginning of the timestep in the CALMET base time
     zone. SOLAR is linearly interpolated to the timestep midpoint as in COMP.
+
+    Args:
+        dataset: Canonical prognostic dataset or adapter used for Step 1.
+        time_index: Interval-ending prognostic record index.
+        grid: Target CALMET grid.
+        z_faces_m: CALMET layer faces in metres AGL.
+        geophysical: Mapping containing terrain, land use, roughness, albedo,
+            Bowen ratio, soil heat parameter, and anthropogenic heat flux.
+        timestamp: Naive local datetime at the beginning of this output step.
+        previous_convective_height: Prior ``(y, x)`` convective height in m.
+        previous_temperature_jump: Prior ``(y, x)`` inversion jump in K.
+        base_timezone: CALMET hours west of UTC.
+        source_thermal_state: Optional RDMM5 daylight state from the previous
+            source record.
+        mapper: Optional reusable prognostic horizontal mapper.
+        terrain_context: Optional precomputed terrain extrema and distances.
+        target_coordinates: Optional ``(latitude, longitude)`` arrays in
+            degrees; ``None`` derives target cell-centre coordinates.
+        selected_lapse_convective_time: Optional carried timestamp used by
+            diagnostic lapse-rate selection.
+        terrain_radius_km: Terrain-extrema search radius in kilometres.
+        minimum_average_radius: Minimum upwind averaging radius in cells.
+        half_average_angle: Upwind averaging cone half-angle in degrees.
+        critical_froude: Critical Froude number for terrain blocking.
+        use_froude: Enable the Froude terrain-flow adjustment.
+        use_kinematic: Enable kinematic terrain adjustment.
+        use_slope: Enable slope-flow parameterization.
+        use_obrien: Enable O'Brien top-boundary vertical-wind correction.
+        kinematic_alpha: Kinematic terrain multiplier.
+        average_temperature: Apply upwind averaging to surface temperature.
+        average_mixing_height: Apply upwind averaging to mixing heights.
+        mixing_wind_level: One-based wind layer defining the averaging cone.
+        mixing_method: Land/water mixing-height method code ``-2``, ``-1``,
+            ``1``, or ``2``.
+        minimum_lapse: Minimum potential-temperature lapse rate in K/m.
+        lapse_depth_m: Near-surface lapse-rate depth in metres.
+        minimum_mixing_height_m: Minimum land mixing height in metres.
+        maximum_mixing_height_m: Maximum land mixing height in metres.
+        minimum_water_mixing_height_m: Minimum water mixing height in metres.
+        maximum_water_mixing_height_m: Maximum water mixing height in metres.
+        land_flux_threshold: Land heat-flux-per-height threshold in W/m3.
+        constb: Maul-Carson mechanical-height coefficient.
+        conste: Batchvarova-Gryning entrainment coefficient.
+        constn: Batchvarova-Gryning neutral-height constant in metres.
+        constw: Overwater mechanical-height coefficient.
+        coriolis_value: Absolute Coriolis parameter in 1/s; ``999`` derives it
+            from target latitude.
+        convective_relaxation: Enable weak-flux convective-height relaxation.
+        convective_relaxation_time_s: Relaxation e-folding time in seconds.
+        precipitation_interpolation: Precipitation mapper method 1, 2, or 3.
+        precipitation_radius_km: Precipitation radius or Gaussian sigma in km.
+        precipitation_cutoff: Minimum retained precipitation rate in mm/h.
+        turbidity_coefficient_1: First clear-sky turbidity coefficient.
+        turbidity_coefficient_2: Second clear-sky turbidity coefficient.
+        cloudiness_coefficient_1: First cloud attenuation coefficient.
+        cloudiness_coefficient_2: Second cloud attenuation coefficient.
+        net_radiation_coefficient_1: First net-radiation coefficient.
+        net_radiation_coefficient_2: Second net-radiation coefficient.
+        net_radiation_coefficient_3: Third net-radiation coefficient.
+        surface_temperature_option: ``-1`` retains spatial surface
+            temperature during diagnostic wind calculations.
+        upper_temperature_option: ``-1`` diagnoses spatial lapse rate.
+        lapse_height_m: Lapse-rate diagnosis depth in metres.
+        temperature_mode: Temperature pathway: observed profile or selected
+            prognostic surface/three-dimensional modes.
+        prognostic_observation_mode: Replace Step-1 U/V with mapped
+            prognostic pseudo-observations.
+        prognostic_observation_rmin_km: Minimum pseudo-observation distance in
+            kilometres.
+        prognostic_observation_barriers: Barrier segments in local km.
+        prognostic_observation_barrier_top_level: Number of lowest levels to
+            which barriers apply.
+        water_range: Inclusive land-use category range treated as water.
+        cloud_method: Cloud source method 1 through 4; methods 1/2 supply an
+            external override after prognostic Step-1 construction.
+        cloud_condensate_threshold_g_kg: Minimum ``QCLOUD+QICE`` in g/kg used
+            to retain prognostic cloud.
+        overwater_flux_method: OCD code 0 or COARE method code 10 through 12.
+        coastal_shelf_length_km: COARE nearshore roughness scale in km.
+        cool_skin: Enable COARE cool-skin correction.
+        water_flux_threshold: Water heat-flux-per-height threshold in W/m3.
+        water_temperature_mode: Select observed or prognostic water
+            temperature gradients and SST.
+        prognostic_ocean_category: Source land-use category treated as ocean.
+        default_water_gradient_above: Fallback water gradient in K/m.
+        warm_layer: Enable COARE warm-layer state updates.
+        warm_layer_state: Optional warm-layer state from the previous step.
+        previous_water_convective_height: Optional prior water convective
+            height in metres.
+        previous_water_mixing_height: Optional prior water mixing height in m.
+        diagnostic_wind: Use DIAGNO terrain effects; false finalizes an
+            objective-analysis wind.
+        wind_only: Skip surface micrometeorology and return placeholder state.
+        cloud_fraction_override: Optional ``(y, x)`` cloud fraction.
+        cloud_ceiling_override: Optional ``(y, x)`` ceiling in hundreds of
+            feet, converted internally to metres.
+        step_transform: Optional callable applied to Step-1 fields before
+            diagnostic calculations; physical transforms may accept a mutable
+            :class:`StepTransformContext`.
+        step_override: Optional fully prepared :class:`Step1Fields` replacing
+            dataset extraction.
+        step_provider: Optional callable receiving the interval-ending local
+            datetime and returning :class:`Step1Fields`.
+        timestep_s: Model timestep in seconds.
+        divergence_limit: Divergence-minimisation convergence limit.
+        divergence_iterations: Maximum divergence-minimisation iterations.
+        smoothing_passes: Per-level horizontal wind smoothing counts.
+        retain_debug_stages: Retain intermediate diagnostic wind copies.
+        retain_micrometeorology_debug: Retain mixing heights before spatial
+            averaging.
+
+    Returns:
+        :class:`HourFields` containing ``float32`` Step-1, diagnostic wind,
+        surface, and 3-D temperature fields plus state for the next interval.
+        A mutable transform context or warm-layer object may be updated.
+
+    Raises:
+        ValueError: If requested pseudo-observation fields are absent, an
+            override or dynamic roughness has the wrong grid shape, or a
+            delegated physical calculation receives invalid controls.
     """
     geo={name:(np.asarray(geophysical[name]) if name=='dominant_landuse' else
                np.asarray(geophysical[name],dtype=MODEL_DTYPE))
@@ -1513,7 +2393,19 @@ def solve_hour(dataset, time_index, grid: GridConfig, z_faces_m, geophysical,
                       selected_lapse_convective_time,step)
 
 def dataset_timestamp(dataset, time_index):
-    """Decode the canonical CALWRF ``time_text`` value."""
+    """Decode a canonical CALWRF ``time_text`` record.
+
+    Args:
+        dataset: NetCDF-like dataset containing ``time_text``.
+        time_index: Record index along its time axis.
+
+    Returns:
+        Naive, whole-second UTC :class:`datetime` represented by the byte,
+        Unicode, or integer character array.
+
+    Raises:
+        ValueError: If the assembled timestamp text is invalid.
+    """
     raw=np.asarray(dataset['time_text'][time_index])
     if raw.dtype.kind=='S': text=b''.join(raw.ravel().tolist()).decode('ascii')
     elif raw.dtype.kind=='U': text=''.join(raw.ravel().tolist())
@@ -1521,7 +2413,16 @@ def dataset_timestamp(dataset, time_index):
     return parse_timestamp(text)
 
 def _prognostic_local_timestamp(dataset,time_index,base_timezone):
-    """Convert a canonical CALWRF GMT record time to CALMET base time."""
+    """Convert a canonical CALWRF UTC record to CALMET local time.
+
+    Args:
+        dataset: NetCDF-like dataset containing ``time_text``.
+        time_index: Source record index.
+        base_timezone: CALMET hours west of UTC.
+
+    Returns:
+        Naive local :class:`datetime`, calculated as UTC minus hours west.
+    """
     return dataset_timestamp(dataset,time_index)-timedelta(hours=base_timezone)
 
 def iter_hours(dataset, grid: GridConfig, z_faces_m, geophysical, *,
@@ -1534,6 +2435,33 @@ def iter_hours(dataset, grid: GridConfig, z_faces_m, geophysical, *,
     (``01:00``).  Consequently ``time_indices`` denotes ending-time CALWRF
     indices.  By default index zero supplies the left boundary and output is
     produced from indices ``1..N-1``.
+
+    Args:
+        dataset: Canonical prognostic dataset or adapter.
+        grid: Target CALMET grid.
+        z_faces_m: CALMET layer faces in metres AGL.
+        geophysical: Mapping of target-grid terrain and surface properties.
+        time_indices: Optional ordered interval-ending source indices.
+        time_samples: Optional iterable of ``(left_index, right_index,
+            fraction, ending_datetime)`` samples for sub-record interpolation.
+        initial_convective_height: Optional ``float-like (y, x)`` convective
+            height in metres; ``None`` starts at zero.
+        initial_temperature_jump: Optional ``float-like (y, x)`` inversion
+            jump in K; ``None`` starts at zero.
+        **solver_options: Keyword controls forwarded to :func:`solve_hour`,
+            plus optional ``cloud_provider``, ``step_provider``, and initial
+            ``warm_layer_state``.
+
+    Yields:
+        :class:`HourFields` in chronological order. Each result contains
+        ``float32`` level-first wind/temperature arrays and horizontal surface
+        state; convective, water, thermal, warm-layer, and lapse-selection
+        state is carried into the next yielded interval.
+
+    Raises:
+        ValueError: If initial states mismatch ``(grid.ny, grid.nx)``, endpoint
+            requests are nonchronological, or delegated interpolation/solver
+            validation fails.
     """
     shape=(grid.ny,grid.nx)
     convective=(np.zeros(shape,dtype=MODEL_DTYPE) if initial_convective_height is None else
@@ -1550,12 +2478,35 @@ def iter_hours(dataset, grid: GridConfig, z_faces_m, geophysical, *,
     use_endpoints=(time_samples is not None or step_provider is None)
     base_timezone=solver_options.get('base_timezone',0)
     def timeline_timestamp(index):
+        """Return one endpoint timestamp on the active local timeline.
+
+        Args:
+            index: Source record index.
+
+        Returns:
+            Naive local :class:`datetime`. Native MM4/PROG adapters already
+            synthesize local timestamps; canonical CALWRF records are shifted
+            from UTC by ``base_timezone``.
+        """
         # Native MM4/PROG adapters synthesize an already-local timeline.
         return (dataset_timestamp(dataset,index) if step_provider is not None else
                 _prognostic_local_timestamp(dataset,index,base_timezone))
     if use_endpoints:
         endpoint_cache={}; endpoint_state=None; last_endpoint=-1
         def endpoint(index):
+            """Build and cache one chronological prognostic endpoint.
+
+            Args:
+                index: Source record index to materialize.
+
+            Returns:
+                :class:`Step1Fields` for ``index`` with thermal state advanced
+                through every preceding uncached record.
+
+            Raises:
+                ValueError: If an uncached endpoint is requested earlier than
+                    the most recently built endpoint.
+            """
             nonlocal endpoint_state,last_endpoint
             if index in endpoint_cache: return endpoint_cache[index]
             if index<=last_endpoint: raise ValueError('prognostic endpoint requests must be chronological')

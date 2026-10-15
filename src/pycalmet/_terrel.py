@@ -45,6 +45,22 @@ ACCUM_DTYPE = np.float64
 
 @dataclass(frozen=True, slots=True)
 class TerrainResult:
+    """Summary of a completed TERREL preprocessing run.
+
+    Attributes:
+        output: Path to the primary terrain product.
+        tiles: Number of terrain source files processed.
+        samples_inside_grid: Number of source elevation samples accepted
+            inside the target domain.
+        populated_cells: Number of target cells containing final terrain data.
+        minimum_m: Minimum valid terrain elevation in metres.
+        maximum_m: Maximum valid terrain elevation in metres.
+        average_hits: Integer mean source-sample count among non-empty cells.
+        low_hit_threshold: QA count below which a populated cell is sparse.
+        high_hit_threshold: QA count above which a cell is unusually dense.
+        low_hit_cells: Number of populated cells below ``low_hit_threshold``.
+        high_hit_cells: Number of cells above ``high_hit_threshold``.
+    """
     output: Path
     tiles: int
     samples_inside_grid: int
@@ -59,7 +75,21 @@ class TerrainResult:
 
 
 def _hit_statistics(counts, threshold_percent):
-    """Reproduce TERREL's integer QA summary for non-empty cells."""
+    """Calculate TERREL integer hit-count QA statistics.
+
+    Args:
+        counts: Per-cell source-sample counts in any shape.
+        threshold_percent: Symmetric QA percentage in the inclusive range
+            0 through 100. The low threshold is this percentage of the mean;
+            the high threshold is ``200 - threshold_percent`` percent.
+
+    Returns:
+        A tuple ``(average, low, high, low_cells, high_cells)``. All values are
+        integers; the mean excludes empty cells and uses integer division.
+
+    Raises:
+        ValueError: If ``threshold_percent`` lies outside 0 through 100.
+    """
     if not 0 <= threshold_percent <= 100:
         raise ValueError("TERREL ITHRES must be in the range 0..100")
     hits = np.asarray(counts, dtype=np.int64).ravel()
@@ -76,6 +106,16 @@ def _hit_statistics(counts, threshold_percent):
 
 @dataclass(frozen=True, slots=True)
 class UsgslaSpec:
+    """Geometry of a headerless USGS Lambert azimuthal terrain raster.
+
+    Attributes:
+        nx: Number of source columns.
+        ny: Number of source rows.
+        x_origin_km: Source-grid western origin in kilometres.
+        y_origin_km: Source-grid southern origin in kilometres.
+        latitude_origin: Projection latitude of origin in decimal degrees.
+        longitude_origin: Projection longitude of origin in decimal degrees.
+    """
     nx: int
     ny: int
     x_origin_km: float
@@ -86,6 +126,18 @@ class UsgslaSpec:
 
 @dataclass(frozen=True, slots=True)
 class DemHeader:
+    """Parsed USGS one-degree DEM type-A header.
+
+    Attributes:
+        codes: Four format-identification integers from the type-A record.
+        coordinate_unit: USGS code describing horizontal coordinate units.
+        elevation_unit: USGS code describing elevation units.
+        corners: Float64 ``(4, 2)`` array of source corner coordinates.
+        resolution: Horizontal x/y and vertical sample resolutions in the
+            source header's units.
+        profile_count: Number of profile rows and columns declared by the DEM.
+        horizontal_datum: USGS horizontal-datum code.
+    """
     codes: tuple[int, int, int, int]
     coordinate_unit: int
     elevation_unit: int
@@ -97,6 +149,23 @@ class DemHeader:
 
 @dataclass(slots=True)
 class _ReceptorState:
+    """Mutable terrain estimates for discrete receptors.
+
+    Attributes:
+        coordinates_km: Float64 ``(n, 2)`` receptor x/y coordinates in km.
+        heights_m: Float32 ``(n,)`` evolving terrain estimates in metres.
+        receptor_heights_m: Float32 ``(n,)`` receptor heights above terrain in
+            metres, copied through to the receptor output.
+        interpolate: Whether to interpolate from one nearest sample in each
+            quadrant instead of selecting the local maximum.
+        radius_km: Maximum search or interpolation distance in kilometres.
+        vertices_x: Float64 ``(4, n)`` x coordinates of interpolation samples
+            in kilometres.
+        vertices_y: Float64 ``(4, n)`` y coordinates of interpolation samples
+            in kilometres.
+        vertices_z: Float32 ``(4, n)`` sample elevations in metres.
+        distances: Float64 ``(4, n)`` receptor-to-sample distances in km.
+    """
     coordinates_km: np.ndarray
     heights_m: np.ndarray
     receptor_heights_m: np.ndarray
@@ -108,7 +177,20 @@ class _ReceptorState:
     distances: np.ndarray
 
     def add(self, x_m, y_m, elevation_m) -> None:
-        """Vectorised port of XYELEV, batched to bound temporary memory."""
+        """Accumulate terrain samples for every discrete receptor.
+
+        Args:
+            x_m: Source x coordinates in metres, in any shape.
+            y_m: Source y coordinates in metres with the same flattened length
+                as ``x_m``.
+            elevation_m: Source elevations in metres with the same flattened
+                length. Values below -32000 are ignored as missing.
+
+        Returns:
+            None. The receptor height or four interpolation vertices are
+            updated in place. Receptors are processed in batches to bound
+            temporary memory.
+        """
         x=np.asarray(x_m,dtype=COORD_DTYPE).ravel()*.001
         y=np.asarray(y_m,dtype=COORD_DTYPE).ravel()*.001
         z=np.asarray(elevation_m,dtype=COMPUTE_DTYPE).ravel()
@@ -150,6 +232,13 @@ class _ReceptorState:
                     self.distances[corner, target] = nearest[replace]
 
     def finish(self) -> np.ndarray:
+        """Finalize and return the receptor terrain elevations.
+
+        Returns:
+            The mutable float32 ``(n,)`` ``heights_m`` array in metres. In
+            interpolation mode, each receptor is first interpolated from its
+            four stored quadrant samples; unresolved values remain missing.
+        """
         if self.interpolate:
             for index, (x, y) in enumerate(self.coordinates_km):
                 self.heights_m[index] = _interp2d(
@@ -161,9 +250,26 @@ class _ReceptorState:
 
 
 class _RawEchoWriter:
-    """Bounded-memory RAWECHO stream with atomic publication."""
+    """Bounded-memory RAWECHO stream with atomic publication.
+
+    Attributes:
+        path: Final ``RAWECHO.DAT`` destination.
+        temporary: Temporary file published to ``path`` only by ``finish``.
+        stream: Open ASCII text stream, or ``None`` after successful finish.
+    """
 
     def __init__(self,path,grid,datum):
+        """Open a temporary raw-sample echo and write its legacy header.
+
+        Args:
+            path: Final ASCII output path.
+            grid: Target grid metadata written to the TERREL-style header.
+            datum: CALPUFF datum name written to the header.
+
+        Raises:
+            OSError: If the parent directory or temporary file cannot be
+                created or the header cannot be written.
+        """
         self.path=Path(path); self.path.parent.mkdir(parents=True,exist_ok=True)
         handle=tempfile.NamedTemporaryFile(
             dir=self.path.parent,prefix=self.path.name+".",delete=False,mode="w",
@@ -175,6 +281,21 @@ class _RawEchoWriter:
         )
 
     def write(self,x_m,y_m,elevation_m,selected):
+        """Append selected projected terrain samples to the echo stream.
+
+        Args:
+            x_m: Source x coordinates in metres, in any shape.
+            y_m: Source y coordinates in metres, matching ``x_m``.
+            elevation_m: Source elevations in metres, matching ``x_m``.
+            selected: Flat integer indices or a boolean mask selecting samples.
+
+        Returns:
+            None. Selected coordinates are written in kilometres and
+            elevations in metres.
+
+        Raises:
+            OSError: If the temporary stream cannot be written.
+        """
         x=np.asarray(x_m).ravel()[selected]*.001
         y=np.asarray(y_m).ravel()[selected]*.001
         z=np.asarray(elevation_m).ravel()[selected]
@@ -182,12 +303,27 @@ class _RawEchoWriter:
             self.stream.write(f"{x_value:11.3f}{y_value:11.3f}{z_value:12.3f}\n")
 
     def finish(self):
+        """Close and atomically publish the completed raw echo.
+
+        Returns:
+            None. Calling the method after completion has no effect.
+
+        Raises:
+            OSError: If the stream cannot be closed or the temporary file
+                cannot replace the final destination.
+        """
         if self.stream is None:
             return
         self.stream.close(); self.stream=None
         self.temporary.replace(self.path)
 
     def __del__(self):
+        """Close and discard an unpublished temporary raw echo.
+
+        Returns:
+            None. Cleanup errors can be reported by Python's finalizer
+            machinery and do not publish the partial file.
+        """
         stream=getattr(self,"stream",None)
         if stream is not None:
             stream.close()
@@ -198,6 +334,18 @@ class _RawEchoWriter:
 
 @dataclass(frozen=True, slots=True)
 class _TerrainFilter:
+    """Coastal terrain classification and replacement rules.
+
+    Attributes:
+        polygons: Parsed coastline polygons used to classify terrain points.
+        coastal: Whether coastline classification is enabled.
+        noise_replacement: Int8 replacement codes indexed by terrain type.
+        noise_minimum_m: Float32 minimum plausible elevations in metres by
+            terrain type.
+        missing_replacement: Int8 missing-value rules by terrain type.
+        default_elevation_m: Float32 replacement elevations in metres by type.
+        raw_echo: Optional writer receiving unfiltered in-domain samples.
+    """
     polygons: tuple
     coastal: bool
     noise_replacement: np.ndarray
@@ -207,11 +355,35 @@ class _TerrainFilter:
     raw_echo: _RawEchoWriter | None = None
 
     def types(self, x_km, y_km):
+        """Classify projected points into TERREL coastline types.
+
+        Args:
+            x_km: Projected x coordinates in kilometres.
+            y_km: Projected y coordinates in kilometres, broadcast-compatible
+                with ``x_km``.
+
+        Returns:
+            An int8 array with the broadcast coordinate shape. Non-coastal
+            processing returns type 1 for every point.
+        """
         if not self.coastal:
             return np.ones(np.asarray(x_km).shape, dtype=np.int8)
         return _coastline_types(x_km, y_km, self.polygons)
 
     def extracted(self, x_m, y_m, elevation_m, domain):
+        """Apply source-sample terrain replacement rules inside the domain.
+
+        Args:
+            x_m: Projected source x coordinates in metres.
+            y_m: Projected source y coordinates in metres, matching ``x_m``.
+            elevation_m: Source elevations in metres, matching ``x_m``.
+            domain: Boolean mask marking samples inside the target domain.
+
+        Returns:
+            A float32 elevation array in metres with the shape of
+            ``elevation_m``. Noise and missing rules affect in-domain samples;
+            raw samples are optionally echoed before replacement.
+        """
         elevation=np.asarray(elevation_m,dtype=COMPUTE_DTYPE).copy()
         selected=np.flatnonzero(domain)
         if not selected.size:
@@ -239,6 +411,16 @@ class _TerrainFilter:
         return elevation
 
     def output(self, values, kinds):
+        """Apply final cell-level replacement rules to gridded terrain.
+
+        Args:
+            values: Final terrain elevations in metres in any grid shape.
+            kinds: Integer coastline types with the same shape as ``values``.
+
+        Returns:
+            A float32 elevation array in metres with noise and missing-value
+            policies applied independently to each terrain type.
+        """
         result=np.asarray(values,dtype=COMPUTE_DTYPE).copy()
         kinds=np.asarray(kinds,dtype=np.int8)
         defaults=self.default_elevation_m[kinds]
@@ -258,6 +440,22 @@ class _TerrainFilter:
 
 
 def _read_receptors(config: TerrelConfig) -> _ReceptorState | None:
+    """Read TERREL discrete receptors and initialize interpolation state.
+
+    Args:
+        config: TERREL configuration containing receptor input layout,
+            interpolation mode, and search radius.
+
+    Returns:
+        Initialized receptor state, or ``None`` when no receptor input is
+        configured. Coordinates are interpreted as target-grid kilometres and
+        elevations as metres.
+
+    Raises:
+        OSError: If the receptor file cannot be read.
+        ValueError: If the text is not numeric or its column count differs
+            from ``config.receptor_columns``.
+    """
     if config.receptor_input is None:
         return None
     path = Path(config.receptor_input)
@@ -293,6 +491,20 @@ def _read_receptors(config: TerrelConfig) -> _ReceptorState | None:
 
 
 def _terrain_filter(config: TerrelConfig) -> _TerrainFilter:
+    """Build coastline classification and terrain replacement state.
+
+    Args:
+        config: TERREL configuration containing the target grid, optional
+            GSHHS/BLN paths, five terrain-type rule arrays, and raw echo path.
+
+    Returns:
+        An immutable terrain filter ready for sample and cell processing.
+
+    Raises:
+        ValueError: If GSHHS extraction lacks a BLN destination, a replacement
+            array does not contain five values, or coastline data is invalid.
+        OSError: If coastline or raw-echo files cannot be read or written.
+    """
     coast_grid=config.grid
     if config.grid.grid_type==3:
         radial,_=_polar_boundaries(config.grid)
@@ -333,13 +545,32 @@ def _terrain_filter(config: TerrelConfig) -> _TerrainFilter:
 
 
 def _domain_mask(x, y, grid):
+    """Test projected metre coordinates against the closed target domain.
+
+    Args:
+        x: Projected x coordinates in metres.
+        y: Projected y coordinates in metres, broadcast-compatible with ``x``.
+        grid: Cartesian or polar target grid definition.
+
+    Returns:
+        Boolean array with the broadcast coordinate shape. Boundary points are
+        included.
+    """
     x=np.asarray(x,dtype=np.float64); y=np.asarray(y,dtype=np.float64)
     x_lower,x_upper,y_lower,y_upper=_grid_domain_metres(grid)
     return ((x>=x_lower)&(x<=x_upper)&(y>=y_lower)&(y<=y_upper))
 
 
 def _grid_domain_metres(grid):
-    """Return the projected domain bounds in metres."""
+    """Return projected target-domain bounds in metres.
+
+    Args:
+        grid: Cartesian or polar target grid definition. A polar domain uses
+            its outer radial boundary around the configured origin.
+
+    Returns:
+        Float64 tuple ``(xmin, xmax, ymin, ymax)`` in metres.
+    """
     x_origin=float(grid.x_origin_km); y_origin=float(grid.y_origin_km)
     if grid.grid_type==3:
         radial,_=_polar_boundaries_km(grid)
@@ -356,6 +587,21 @@ def _grid_domain_metres(grid):
 
 def _write_receptors(path: Path, receptors: _ReceptorState,
                      terrain_filter: _TerrainFilter) -> None:
+    """Finalize and write TERREL discrete-receptor elevations.
+
+    Args:
+        path: Destination ASCII receptor path.
+        receptors: Accumulated receptor interpolation state.
+        terrain_filter: Cell-level coastline and replacement policy applied to
+            final receptor terrain elevations.
+
+    Returns:
+        None. Each output row contains x/y in kilometres, terrain elevation in
+        metres, and receptor height above ground in metres.
+
+    Raises:
+        OSError: If the output cannot be opened or written.
+    """
     elevation = receptors.finish()
     kinds=terrain_filter.types(receptors.coordinates_km[:,0],receptors.coordinates_km[:,1])
     elevation=terrain_filter.output(elevation,kinds)
@@ -367,6 +613,17 @@ def _write_receptors(path: Path, receptors: _ReceptorState,
 
 
 def _save_header(grid: GridConfig, receptor_count: int) -> np.ndarray:
+    """Build the seven-integer TERREL CELLOUT save-file header.
+
+    Args:
+        grid: Target grid definition.
+        receptor_count: Number of discrete receptors stored after the cell
+            arrays.
+
+    Returns:
+        Int32 array containing integer metre origins, UTM zone, x cell size in
+        metres, grid dimensions, and receptor count.
+    """
     x_lower,_,y_lower,_=_grid_domain_metres(grid)
     cell_metres=np.asarray(
         np.float64(grid.dx_km)*np.float64(1000.),dtype=np.float64)
@@ -378,7 +635,19 @@ def _save_header(grid: GridConfig, receptor_count: int) -> np.ndarray:
 
 
 def _fortran_records(path: Path) -> tuple[str, list[bytes]]:
-    """Read classic four-byte-marker sequential unformatted records."""
+    """Read classic four-byte-marker sequential unformatted records.
+
+    Args:
+        path: TERREL save-file path.
+
+    Returns:
+        A pair ``(endian, records)`` where ``endian`` is ``'<'`` or ``'>'``
+        and ``records`` contains marker-free record payloads as bytes.
+
+    Raises:
+        OSError: If the file cannot be read.
+        ValueError: If the file is truncated or has invalid record markers.
+    """
     raw = path.read_bytes()
     if len(raw) < 8:
         raise ValueError(f"TERREL save file is truncated: {path}")
@@ -407,6 +676,24 @@ def _fortran_records(path: Path) -> tuple[str, list[bytes]]:
 
 def _load_save(path: Path, grid: GridConfig, sums, counts, maxima,
                receptors: _ReceptorState | None) -> None:
+    """Restore CELLOUT terrain accumulators and receptor state.
+
+    Args:
+        path: Existing sequential-unformatted save-file path.
+        grid: Current grid, which must match the stored header.
+        sums: Writable flat float array receiving accumulated elevations in m.
+        counts: Writable flat integer array receiving sample counts.
+        maxima: Writable flat float array receiving maximum elevations in m.
+        receptors: Optional current receptor state receiving stored arrays.
+
+    Returns:
+        None. All supplied arrays are updated in place.
+
+    Raises:
+        OSError: If ``path`` cannot be read.
+        ValueError: If record markers, header, shapes, or record count do not
+            match the current run.
+    """
     endian, records = _fortran_records(path)
     receptor_count = 0 if receptors is None else receptors.coordinates_km.shape[0]
     expected_header = _save_header(grid, receptor_count)
@@ -418,6 +705,22 @@ def _load_save(path: Path, grid: GridConfig, sums, counts, maxima,
     cell_count = grid.nx * grid.ny
 
     def record(index, dtype, size, label):
+        """Decode and size-check one save-file numeric record.
+
+        Args:
+            index: Zero-based record index in the loaded payload list.
+            dtype: NumPy dtype code without the file byte-order prefix.
+            size: Required number of scalar values.
+            label: Human-readable record label for validation errors.
+
+        Returns:
+            A read-only one-dimensional NumPy view with the requested dtype
+            and the save file's byte order.
+
+        Raises:
+            IndexError: If ``index`` is absent.
+            ValueError: If the decoded record has the wrong element count.
+        """
         values = np.frombuffer(records[index], dtype=endian + dtype)
         if values.size != size:
             raise ValueError(f"TERREL save-file {label} record has the wrong size")
@@ -447,7 +750,22 @@ def _load_save(path: Path, grid: GridConfig, sums, counts, maxima,
 
 def _write_save(path: Path, grid: GridConfig, sums, counts, maxima,
                 receptors: _ReceptorState | None) -> None:
-    """Write CELLOUT's little-endian sequential-unformatted layout."""
+    """Write TERREL CELLOUT in little-endian sequential-unformatted layout.
+
+    Args:
+        path: Save-file destination. Missing parent directories are created.
+        grid: Target grid written to the compatibility header.
+        sums: Flat accumulated elevation sums in metres.
+        counts: Flat integer source-sample counts.
+        maxima: Flat maximum elevations in metres.
+        receptors: Optional receptor interpolation state to append.
+
+    Returns:
+        None. Numeric records use four-byte Fortran length markers.
+
+    Raises:
+        OSError: If the destination cannot be created or written.
+    """
     receptor_count = 0 if receptors is None else receptors.coordinates_km.shape[0]
     arrays = [
         _save_header(grid, receptor_count).astype("<i4", copy=False),
@@ -485,6 +803,17 @@ _USGSLA_SPECS = {
 
 
 def _tile_origin(path: Path) -> tuple[int, int]:
+    """Decode an SRTM tile's southwest integer-degree corner from its name.
+
+    Args:
+        path: Path whose basename follows ``N00E000.hgt`` conventions.
+
+    Returns:
+        Tuple ``(south_latitude, west_longitude)`` in signed integer degrees.
+
+    Raises:
+        ValueError: If the basename is not a standard SRTM HGT name.
+    """
     match = _HGT_NAME.match(path.name)
     if match is None:
         raise ValueError(f"not an SRTM HGT filename: {path.name}")
@@ -493,7 +822,19 @@ def _tile_origin(path: Path) -> tuple[int, int]:
 
 
 def _read_srtm_tile(path: Path) -> np.ndarray:
-    """Read a standard SRTM HGT tile through GDAL's SRTMHGT driver."""
+    """Read a standard SRTM HGT tile through GDAL's SRTMHGT driver.
+
+    Args:
+        path: Source ``.hgt`` path.
+
+    Returns:
+        Two-dimensional integer elevation array in metres, ordered from north
+        to south as stored by SRTM. Its dimensions are equal and at least two.
+
+    Raises:
+        ValueError: If GDAL cannot identify a single-band square integer HGT
+            raster or the file cannot be decoded.
+    """
     try:
         with rasterio.open(path) as source:
             if source.driver != "SRTMHGT" or source.count != 1:
@@ -509,6 +850,28 @@ def _read_srtm_tile(path: Path) -> np.ndarray:
 
 def _accumulate_tile(path, grid, sums, counts, input_datum='WGS-84', *, maxima=None,
                      peak=False, receptors=None, direct=False, terrain_filter=None) -> int:
+    """Accumulate one SRTM HGT tile into a TERREL target grid.
+
+    Args:
+        path: Standard one-degree SRTM HGT path.
+        grid: Target grid definition.
+        sums: Writable flat float64 elevation-sum array in metres.
+        counts: Writable flat integer sample-count array.
+        input_datum: CALPUFF datum of the SRTM longitude and latitude.
+        maxima: Optional writable flat maximum-elevation array in metres.
+        peak: Whether to extend each sample footprint into adjacent peak cells.
+        receptors: Optional receptor state updated from in-domain samples.
+        direct: If true, project every source sample; otherwise interpolate
+            projected coordinates between the tile corners.
+        terrain_filter: Optional coastline and replacement policy.
+
+    Returns:
+        Number of valid elevation samples accumulated inside the target grid.
+
+    Raises:
+        ValueError: If the filename or HGT raster is invalid.
+        OSError: If the source cannot be opened.
+    """
     path = Path(path)
     lat_s, lon_w = _tile_origin(path)
     raw = _read_srtm_tile(path)
@@ -551,7 +914,20 @@ def _accumulate_tile(path, grid, sums, counts, input_datum='WGS-84', *, maxima=N
 
 
 def _gtopo_spec(path: Path) -> tuple[int, int, int, int, int]:
-    """Return north, west, rows, columns and samples/degree for GTOPO30."""
+    """Derive canonical GTOPO30 geometry from a tile filename.
+
+    Args:
+        path: GTOPO30 path whose basename begins with a longitude and latitude
+            code such as ``W020N90``.
+
+    Returns:
+        Tuple ``(north, west, rows, columns, samples_per_degree)``. Geographic
+        bounds are signed integer degrees and canonical resolution is 120
+        samples per degree.
+
+    Raises:
+        ValueError: If the basename does not match a GTOPO30 region name.
+    """
     match = _GTOPO_NAME.match(path.name)
     if match is None:
         raise ValueError(f"not a GTOPO30 filename: {path.name}")
@@ -567,8 +943,28 @@ def _accumulate_gtopo30(path, grid, sums, counts, input_datum='WGS-84', *, spec=
                         terrain_filter=None) -> int:
     """Accumulate a headerless, north-to-south GTOPO30 DEM.
 
-    ``spec`` is an internal test seam for small synthetic rasters; production
-    files derive the canonical 120 samples/degree dimensions from their name.
+    Args:
+        path: Headerless big-endian signed-int16 GTOPO30 raster path.
+        grid: Target grid definition.
+        sums: Writable flat float64 elevation-sum array in metres.
+        counts: Writable flat integer sample-count array.
+        input_datum: CALPUFF datum of the source geographic coordinates.
+        spec: Optional ``(north, west, rows, columns, samples_per_degree)``
+            override used for small synthetic rasters. Production geometry is
+            derived from ``path``.
+        maxima: Optional writable flat maximum-elevation array in metres.
+        peak: Whether to extend sample footprints into adjacent peak cells.
+        receptors: Optional receptor state updated from in-domain samples.
+        direct: If true, project every sample rather than interpolating
+            between projected one-degree block corners.
+        terrain_filter: Optional coastline and replacement policy.
+
+    Returns:
+        Number of valid elevation samples accumulated inside the target grid.
+
+    Raises:
+        ValueError: If the name or byte size is inconsistent with the geometry.
+        OSError: If file metadata cannot be read.
     """
     north, west, rows, columns, samples = _gtopo_spec(path) if spec is None else spec
     if path.stat().st_size != rows * columns * 2:
@@ -612,7 +1008,21 @@ def _accumulate_gtopo30(path, grid, sums, counts, input_datum='WGS-84', *, spec=
 
 
 def _read_generic(path: Path) -> tuple[int, int, int, np.ndarray]:
-    """Read a TERREL Generic header and its three-column point records."""
+    """Read a TERREL Generic header and its scattered terrain records.
+
+    Args:
+        path: ASCII Generic terrain path.
+
+    Returns:
+        Tuple ``(coordinate_type, elevation_unit, utm_zone, points)``. Points
+        are a float64 ``(n, 3)`` array. Coordinate type 1 is UTM metres, 2 is
+        UTM kilometres, and 3 is ``(latitude, longitude)`` degrees. Elevation
+        unit 1 is metres and 2 is feet.
+
+    Raises:
+        OSError: If the file cannot be read.
+        ValueError: If the header codes, UTM zone, or point records are invalid.
+    """
     with path.open("r", encoding="ascii") as stream:
         header = stream.readline().split()
         if len(header) != 3:
@@ -637,6 +1047,19 @@ def _read_generic(path: Path) -> tuple[int, int, int, np.ndarray]:
 
 
 def _add_cell_samples(flat, elevation, sums, counts, maxima):
+    """Add already indexed elevation samples to flat cell accumulators.
+
+    Args:
+        flat: One-dimensional integer target-cell indices.
+        elevation: Elevations in metres corresponding to ``flat``.
+        sums: Writable flat elevation-sum array in metres.
+        counts: Writable flat integer sample-count array.
+        maxima: Optional writable flat maximum-elevation array in metres.
+
+    Returns:
+        None. ``sums``, ``counts``, and optional ``maxima`` are updated in
+        place, including repeated indices.
+    """
     np.add.at(sums, flat, np.asarray(elevation, dtype=sums.dtype))
     counts += np.bincount(flat, minlength=counts.size).astype(counts.dtype, copy=False)
     if maxima is not None:
@@ -644,11 +1067,20 @@ def _add_cell_samples(flat, elevation, sums, counts, maxima):
 
 
 def _peak_radius_from_points(x, y, grid) -> float | tuple[float, float]:
-    """Return a source footprint radius in the grid's native index units.
+    """Infer a source footprint radius from the first two projected points.
 
-    Polar accumulation works in projected metres.  Cartesian accumulation
-    works in cell coordinates, so its x and y radii must be scaled by the
-    corresponding cell spacing.
+    Args:
+        x: Projected source x coordinates in metres.
+        y: Projected source y coordinates in metres.
+        grid: Target Cartesian or polar grid.
+
+    Returns:
+        Half the first-point spacing. A polar grid returns a scalar radius in
+        metres. A Cartesian grid returns ``(x_radius, y_radius)`` in target
+        cell-index units.
+
+    Raises:
+        ValueError: If fewer than two source points are supplied.
     """
     x = np.asarray(x, dtype=np.float64).ravel()
     y = np.asarray(y, dtype=np.float64).ravel()
@@ -659,7 +1091,16 @@ def _peak_radius_from_points(x, y, grid) -> float | tuple[float, float]:
 
 
 def _fixed_peak_radius(radius_m, grid) -> float | tuple[float, float]:
-    """Convert a projected-metre radius for polar or Cartesian accumulation."""
+    """Convert a projected footprint radius into accumulation coordinates.
+
+    Args:
+        radius_m: Non-negative source footprint radius in metres.
+        grid: Target Cartesian or polar grid definition.
+
+    Returns:
+        Scalar metres for a polar grid, or ``(x_radius, y_radius)`` in
+        Cartesian cell-index units.
+    """
     radius_m = float(radius_m)
     if grid.grid_type == 3:
         return radius_m
@@ -670,6 +1111,21 @@ def _fixed_peak_radius(radius_m, grid) -> float | tuple[float, float]:
 
 
 def _polar_boundaries_km(grid):
+    """Calculate polar ring and relative ray boundaries.
+
+    Args:
+        grid: Polar grid whose ring centres are ``ring_distances_km`` and ray
+            bearings are ``ray_angles_deg``.
+
+    Returns:
+        Pair ``(radial, angular)`` of float64 arrays. Radial outer boundaries
+        are in kilometres; angular upper boundaries are degrees relative to
+        the first ray.
+
+    Raises:
+        ValueError: If ring/ray counts, ordering, first angle, or
+            ``polar_processing`` are invalid.
+    """
     rings = np.asarray(grid.ring_distances_km, dtype=np.float64)
     angles = np.asarray(grid.ray_angles_deg, dtype=np.float64)
     if rings.size != grid.nx or angles.size != grid.ny or rings.size < 2 or angles.size < 2:
@@ -692,13 +1148,43 @@ def _polar_boundaries_km(grid):
 
 
 def _polar_boundaries(grid):
+    """Calculate polar cell boundaries in accumulation units.
+
+    Args:
+        grid: Valid polar grid definition.
+
+    Returns:
+        Pair ``(radial, angular)`` of float64 arrays. Radial boundaries are in
+        metres and angular boundaries in degrees relative to the first ray.
+
+    Raises:
+        ValueError: If the polar grid definition is invalid.
+    """
     radial,angular=_polar_boundaries_km(grid)
     return np.asarray(radial*np.float64(1000.),dtype=np.float64),angular
 
 
 def _polar_cell_indices(dx,dy,radial_boundaries,angular_boundaries,
                         first_angle,radius=None):
-    """Return polar ring and ray indices for projected offsets."""
+    """Assign projected offsets to polar cells and optional peak neighbours.
+
+    Args:
+        dx: Eastward offsets from the polar origin in metres.
+        dy: Northward offsets from the polar origin in metres.
+        radial_boundaries: Ordered outer ring boundaries in metres.
+        angular_boundaries: Ordered ray boundaries in degrees relative to the
+            first ray.
+        first_angle: Bearing of the first ray in degrees clockwise from north.
+        radius: Optional source footprint radius in metres, scalar or
+            broadcast-compatible with ``dx``.
+
+    Returns:
+        Without ``radius``, tuple ``(distance, shifted_angle, ring, ray)``.
+        With ``radius``, four additional arrays describe a neighbouring peak
+        ring, neighbouring ray, distance to the upper ray edge, and angular
+        footprint radius. Distances are metres, angles are degrees, and cell
+        indices are zero based.
+    """
     dx=np.asarray(dx,dtype=COORD_DTYPE); dy=np.asarray(dy,dtype=COORD_DTYPE)
     radial=np.asarray(radial_boundaries,dtype=COORD_DTYPE)
     angular=np.asarray(angular_boundaries,dtype=COORD_DTYPE)
@@ -736,6 +1222,25 @@ def _polar_cell_indices(dx,dy,radial_boundaries,angular_boundaries,
 
 
 def _accumulate_polar_points(x, y, elevation, grid, sums, counts, maxima, radius_m):
+    """Accumulate projected samples into flat polar-grid cell arrays.
+
+    Args:
+        x: Projected source x coordinates in metres.
+        y: Projected source y coordinates in metres, matching ``x``.
+        elevation: Source elevations in metres, matching ``x``.
+        grid: Valid polar target grid.
+        sums: Writable flat elevation-sum array in metres.
+        counts: Writable flat integer sample-count array.
+        maxima: Optional writable flat maximum-elevation array in metres.
+        radius_m: Optional source footprint radius in metres used to populate
+            neighbouring peak cells.
+
+    Returns:
+        Number of non-missing samples whose primary ring lies inside the grid.
+
+    Raises:
+        ValueError: If the polar grid definition is invalid.
+    """
     radial_boundaries, angular_boundaries = _polar_boundaries(grid)
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
@@ -770,7 +1275,30 @@ def _accumulate_polar_points(x, y, elevation, grid, sums, counts, maxima, radius
 
 def _accumulate_points(x, y, elevation, grid, sums, counts, maxima=None,
                        peak_radius_grid=None, receptors=None, terrain_filter=None) -> int:
-    """Apply SAVEELEV's standard mean-grid path to projected metre points."""
+    """Apply TERREL SAVEELEV accumulation to projected terrain samples.
+
+    Args:
+        x: Projected source x coordinates in metres.
+        y: Projected source y coordinates in metres, matching ``x``.
+        elevation: Source elevations in metres, matching ``x``.
+        grid: Cartesian or polar target grid.
+        sums: Writable flat elevation-sum array in metres.
+        counts: Writable flat integer sample-count array.
+        maxima: Optional writable flat maximum-elevation array in metres.
+        peak_radius_grid: Optional footprint radius. Cartesian grids expect an
+            ``(x_radius, y_radius)`` pair in cell units; polar grids expect
+            metres.
+        receptors: Optional receptor state updated from in-domain samples.
+        terrain_filter: Optional coastline and replacement policy.
+
+    Returns:
+        Number of valid samples assigned to a primary target cell. Optional
+        peak-neighbour assignments do not increase this count.
+
+    Raises:
+        ValueError: If a polar grid definition is invalid or peak radius data
+            cannot be broadcast to the sample shape.
+    """
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
     elevation = np.asarray(elevation, dtype=COMPUTE_DTYPE)
@@ -836,7 +1364,27 @@ def _accumulate_points(x, y, elevation, grid, sums, counts, maxima=None,
 
 def _accumulate_generic(path, grid, sums, counts, input_datum="WGS-84", *, maxima=None,
                         peak=False, receptors=None, terrain_filter=None) -> int:
-    """Accumulate Generic scattered terrain points using LOADGNR semantics."""
+    """Accumulate TERREL Generic points using LOADGNR semantics.
+
+    Args:
+        path: ASCII Generic terrain file.
+        grid: Target grid definition.
+        sums: Writable flat elevation-sum array in metres.
+        counts: Writable flat integer sample-count array.
+        input_datum: CALPUFF datum of source coordinates.
+        maxima: Optional writable flat maximum-elevation array in metres.
+        peak: Whether to infer and apply a source footprint radius.
+        receptors: Optional receptor state updated from in-domain samples.
+        terrain_filter: Optional coastline and replacement policy.
+
+    Returns:
+        Number of valid points accumulated inside the target grid.
+
+    Raises:
+        OSError: If the source cannot be read.
+        ValueError: If its header, points, projection, or peak spacing is
+            invalid.
+    """
     coordinate_type, elevation_unit, utm_zone, points = _read_generic(Path(path))
     if coordinate_type == 3:
         latitude, longitude = points[:, 0], points[:, 1]
@@ -869,7 +1417,27 @@ def _accumulate_generic(path, grid, sums, counts, input_datum="WGS-84", *, maxim
 
 def _accumulate_nzgen(path, grid, sums, counts, input_datum="WGS-84", *, maxima=None,
                       peak=False, receptors=None, terrain_filter=None) -> int:
-    """Accumulate New Zealand Generic ``id elevation lon lat`` records."""
+    """Accumulate New Zealand Generic terrain point records.
+
+    Args:
+        path: ASCII file containing ``id elevation longitude latitude`` rows.
+        grid: Target grid definition.
+        sums: Writable flat elevation-sum array in metres.
+        counts: Writable flat integer sample-count array.
+        input_datum: CALPUFF datum of source longitude and latitude.
+        maxima: Optional writable flat maximum-elevation array in metres.
+        peak: Whether to infer and apply a source footprint radius.
+        receptors: Optional receptor state updated from in-domain samples.
+        terrain_filter: Optional coastline and replacement policy.
+
+    Returns:
+        Number of valid points accumulated inside the target grid.
+
+    Raises:
+        OSError: If the source cannot be read.
+        ValueError: If records do not contain four numeric columns or peak
+            processing lacks enough points.
+    """
     try:
         points = np.loadtxt(path, dtype=np.float64, ndmin=2)
     except ValueError as error:
@@ -887,6 +1455,17 @@ def _accumulate_nzgen(path, grid, sums, counts, input_datum="WGS-84", *, maxima=
 
 
 def _usgsla_spec(path: Path) -> UsgslaSpec:
+    """Select USGSLA continent geometry from a source basename.
+
+    Args:
+        path: USGS Global Lambert Azimuthal raster path.
+
+    Returns:
+        Canonical raster and projection geometry for the named continent.
+
+    Raises:
+        ValueError: If the basename does not encode a supported continent.
+    """
     name = path.name.upper()
     if name.startswith(("NA", "SA", "AP", "AF")):
         return _USGSLA_SPECS[name[:2]]
@@ -898,7 +1477,27 @@ def _usgsla_spec(path: Path) -> UsgslaSpec:
 def _accumulate_usgsla(path, grid, sums, counts, input_datum="ESR-S", *, spec=None,
                        maxima=None, peak=False, receptors=None,
                        terrain_filter=None) -> int:
-    """Accumulate a USGS Global Lambert Azimuthal two-byte DEM image."""
+    """Accumulate a USGS Global Lambert Azimuthal two-byte DEM image.
+
+    Args:
+        path: Headerless USGSLA raster path.
+        grid: Target grid definition.
+        sums: Writable flat elevation-sum array in metres.
+        counts: Writable flat integer sample-count array.
+        input_datum: CALPUFF datum of the source azimuthal projection.
+        spec: Optional source geometry override for synthetic test rasters.
+        maxima: Optional writable flat maximum-elevation array in metres.
+        peak: Whether to use the one-kilometre cell diagonal as a footprint.
+        receptors: Optional receptor state updated from in-domain samples.
+        terrain_filter: Optional coastline and replacement policy.
+
+    Returns:
+        Number of valid samples accumulated inside the target grid.
+
+    Raises:
+        ValueError: If the filename or raster byte size is invalid.
+        OSError: If file metadata cannot be read.
+    """
     path = Path(path)
     spec = _usgsla_spec(path) if spec is None else spec
     if path.stat().st_size != spec.nx * spec.ny * 2:
@@ -961,6 +1560,22 @@ def _accumulate_usgsla(path, grid, sums, counts, input_datum="ESR-S", *, spec=No
 
 
 def _fixed_width_integers(lines, width: int, count: int, label: str) -> tuple[np.ndarray, int]:
+    """Parse a requested number of fixed-width integers from text lines.
+
+    Args:
+        lines: Sequence of source text lines.
+        width: Character width of each integer field.
+        count: Exact number of integers required.
+        label: Format label included in parse and truncation errors.
+
+    Returns:
+        Pair ``(values, consumed_lines)``. ``values`` is a one-dimensional
+        int64 array of length ``count``.
+
+    Raises:
+        ValueError: If a non-blank field is not an integer or the lines end
+            before ``count`` values are found.
+    """
     values = []
     line_index = 0
     while len(values) < count and line_index < len(lines):
@@ -979,6 +1594,21 @@ def _fixed_width_integers(lines, width: int, count: int, label: str) -> tuple[np
 
 
 def _read_arm3(path: Path):
+    """Read an ARM3 panel index and packed 30-arc-second elevations.
+
+    Args:
+        path: ASCII ARM3 terrain path.
+
+    Returns:
+        Tuple ``(longitude_se, latitude_se, nx, ny, index, elevations)``.
+        Origins and panel dimensions are integers; ``index`` and
+        ``elevations`` are int64 arrays, with elevations in metres.
+
+    Raises:
+        OSError: If the source cannot be read.
+        ValueError: If fixed-width fields, dimensions, counts, or trailing
+            records are invalid.
+    """
     lines = path.read_text(encoding="ascii").splitlines()
     header, consumed = _fixed_width_integers(lines, 10, 5, "ARM3 header")
     _, longitude_se, latitude_se, nx, ny = header
@@ -997,7 +1627,28 @@ def _read_arm3(path: Path):
 def _accumulate_arm3(path, grid, sums, counts, input_datum="NAS-C", *, maxima=None,
                      peak=False, receptors=None, direct=False,
                      terrain_filter=None) -> int:
-    """Accumulate ARM3 30-arc-second panels using legacy sheet interpolation."""
+    """Accumulate ARM3 30-arc-second terrain panels.
+
+    Args:
+        path: ASCII ARM3 terrain path.
+        grid: Target grid definition.
+        sums: Writable flat elevation-sum array in metres.
+        counts: Writable flat integer sample-count array.
+        input_datum: CALPUFF datum of source longitude and latitude.
+        maxima: Optional writable flat maximum-elevation array in metres.
+        peak: Whether to extend source footprints into neighbouring cells.
+        receptors: Optional receptor state updated from in-domain samples.
+        direct: If true, project every source point; otherwise interpolate
+            coordinates between projected one-degree panel corners.
+        terrain_filter: Optional coastline and replacement policy.
+
+    Returns:
+        Number of valid samples accumulated inside the target grid.
+
+    Raises:
+        OSError: If the source cannot be read.
+        ValueError: If the ARM3 layout is invalid.
+    """
     longitude_se, latitude_se, nx, ny, index, elevations = _read_arm3(Path(path))
     offset = 0
     fractions = np.arange(120, dtype=np.float64) / np.float64(120.0)
@@ -1050,6 +1701,17 @@ def _accumulate_arm3(path, grid, sums, counts, input_datum="NAS-C", *, maxima=No
 
 
 def _3cd_origin(path: Path) -> tuple[int, int]:
+    """Decode a 3CD tile's latitude and west-longitude code.
+
+    Args:
+        path: Path whose basename ends in a five-digit ``.3cd`` tile code.
+
+    Returns:
+        Tuple ``(south_latitude, west_longitude_east_edge)`` in integer degrees.
+
+    Raises:
+        ValueError: If the basename is not a recognized 3CD tile name.
+    """
     match = _3CD_NAME.match(path.name)
     if match is None:
         raise ValueError(f"not a 3CD terrain filename: {path.name}")
@@ -1060,7 +1722,30 @@ def _3cd_origin(path: Path) -> tuple[int, int]:
 def _accumulate_3cd(path, grid, sums, counts, input_datum="WGS-72", *, samples=1201,
                     maxima=None, peak=False, receptors=None, direct=False,
                     terrain_filter=None) -> int:
-    """Accumulate a transparent-access 3CD little-endian int16 raster."""
+    """Accumulate a transparent-access 3CD little-endian int16 raster.
+
+    Args:
+        path: Headerless one-degree 3CD raster path.
+        grid: Target grid definition.
+        sums: Writable flat elevation-sum array in metres.
+        counts: Writable flat integer sample-count array.
+        input_datum: CALPUFF datum of source longitude and latitude.
+        samples: Number of rows and columns, including overlapping boundaries.
+        maxima: Optional writable flat maximum-elevation array in metres.
+        peak: Whether to extend source footprints into neighbouring cells.
+        receptors: Optional receptor state updated from in-domain samples.
+        direct: If true, project every source point; otherwise interpolate
+            coordinates between projected tile corners.
+        terrain_filter: Optional coastline and replacement policy.
+
+    Returns:
+        Number of valid samples accumulated inside the target grid.
+
+    Raises:
+        ValueError: If the filename, sample count, or raster byte size is
+            invalid.
+        OSError: If file metadata cannot be read.
+    """
     path = Path(path)
     latitude_south, west_longitude_east_edge = _3cd_origin(path)
     if samples < 2 or path.stat().st_size != samples * samples * 2:
@@ -1110,6 +1795,19 @@ def _accumulate_3cd(path, grid, sums, counts, input_datum="WGS-72", *, samples=1
 
 
 def _dmdf_point(record: str, second: bool = False) -> tuple[float, float, float]:
+    """Decode one point slot from a Canadian DMDF fixed-column record.
+
+    Args:
+        record: One DMDF logical record, padded to 80 characters as needed.
+        second: Whether to decode the second point slot instead of the first.
+
+    Returns:
+        Tuple ``(utm_x, utm_y, elevation)`` in metres. A million-metre x
+        prefix, when present, is retained for later UTM-zone selection.
+
+    Raises:
+        ValueError: If a required fixed-column field is not an integer.
+    """
     record = record.ljust(80)
     fields = ((45, 49, 49, 55, 56, 60, 60, 66, 67, 75) if second else
               (14, 18, 18, 24, 25, 29, 29, 35, 36, 44))
@@ -1129,6 +1827,19 @@ def _dmdf_point(record: str, second: bool = False) -> tuple[float, float, float]
 
 
 def _read_dmdf(path: Path) -> np.ndarray:
+    """Read terrain points from a Canadian DMDF transfer file.
+
+    Args:
+        path: ASCII DMDF source path.
+
+    Returns:
+        Float64 ``(n, 3)`` array containing UTM x, UTM y, and elevation in
+        metres.
+
+    Raises:
+        OSError: If the file cannot be read.
+        ValueError: If a point record is malformed or no points are present.
+    """
     points = []
     previous_type = ""
     for line in path.read_text(encoding="ascii").splitlines():
@@ -1159,7 +1870,26 @@ def _read_dmdf(path: Path) -> np.ndarray:
 
 def _accumulate_dmdf(path, grid, sums, counts, input_datum="NAS-C", *, maxima=None,
                      peak=False, receptors=None, terrain_filter=None) -> int:
-    """Accumulate Canadian DMDF fixed-column UTM point records."""
+    """Accumulate Canadian DMDF fixed-column UTM point records.
+
+    Args:
+        path: ASCII DMDF source path.
+        grid: Target grid definition.
+        sums: Writable flat elevation-sum array in metres.
+        counts: Writable flat integer sample-count array.
+        input_datum: CALPUFF datum of source UTM zones 11 and 12.
+        maxima: Optional writable flat maximum-elevation array in metres.
+        peak: Whether to use the 100-m cell diagonal as a source footprint.
+        receptors: Optional receptor state updated from in-domain samples.
+        terrain_filter: Optional coastline and replacement policy.
+
+    Returns:
+        Number of valid points accumulated inside the target grid.
+
+    Raises:
+        OSError: If the source cannot be read.
+        ValueError: If DMDF records or coordinate transformations are invalid.
+    """
     points = _read_dmdf(Path(path))
     x = points[:, 0].copy()
     y = points[:, 1]
@@ -1193,6 +1923,17 @@ def _accumulate_dmdf(path, grid, sums, counts, input_datum="NAS-C", *, maxima=No
 
 
 def _dem_float(field: str) -> float:
+    """Parse a USGS DEM floating-point field, including Fortran exponents.
+
+    Args:
+        field: Fixed-width numeric text using ``E`` or ``D`` exponent syntax.
+
+    Returns:
+        Parsed Python floating-point value.
+
+    Raises:
+        ValueError: If ``field`` is not a valid floating-point value.
+    """
     try:
         return float(field.replace("D", "E").replace("d", "e"))
     except ValueError as error:
@@ -1200,6 +1941,21 @@ def _dem_float(field: str) -> float:
 
 
 def _dem_records(path: Path) -> list[str]:
+    """Load USGS DEM logical records from line or fixed-block storage.
+
+    Args:
+        path: USGS DEM source path.
+
+    Returns:
+        ASCII records padded to at least 1024 characters. Line-oriented files
+        retain their logical line count; binary-style streams are split into
+        1024-byte records.
+
+    Raises:
+        OSError: If the source cannot be read.
+        UnicodeDecodeError: If the source is not ASCII.
+        ValueError: If a block stream is misaligned or the file is empty.
+    """
     raw = path.read_bytes()
     if b"\n" in raw or b"\r" in raw:
         records = raw.decode("ascii").splitlines()
@@ -1214,7 +1970,31 @@ def _dem_records(path: Path) -> list[str]:
 
 
 def _parse_dem_header(record: str) -> DemHeader:
+    """Parse a USGS DEM type-A header record.
+
+    Args:
+        record: Type-A logical record padded to 1024 characters.
+
+    Returns:
+        Structured header containing projection codes, units, source corners,
+        resolutions, profile counts, and horizontal datum code.
+
+    Raises:
+        ValueError: If a fixed-width integer or floating-point field is invalid.
+    """
     def integers(start, count):
+        """Decode consecutive six-character integers from the header.
+
+        Args:
+            start: Zero-based character offset of the first field.
+            count: Number of consecutive fields to decode.
+
+        Returns:
+            Tuple of ``count`` Python integers.
+
+        Raises:
+            ValueError: If any selected field is not an integer.
+        """
         try:
             return tuple(int(record[start + 6 * i:start + 6 * (i + 1)]) for i in range(count))
         except ValueError as error:
@@ -1233,6 +2013,21 @@ def _parse_dem_header(record: str) -> DemHeader:
 
 
 def _parse_dem_profiles(records: list[str], expected: int):
+    """Parse USGS DEM type-B elevation profiles.
+
+    Args:
+        records: Logical records including the type-A header at index zero.
+        expected: Exact number of sequential profile columns required.
+
+    Returns:
+        List of ``(row, origin, elevation_base, values)`` tuples. Origins and
+        bases use source units; each ``values`` member is an int64 array of raw
+        elevation offsets.
+
+    Raises:
+        ValueError: If profile headers, indices, elevations, record counts, or
+            trailing logical records are invalid.
+    """
     profiles = []
     record_index = 1
     for wanted in range(1, expected + 1):
@@ -1269,7 +2064,29 @@ def _parse_dem_profiles(records: list[str], expected: int):
 def _accumulate_usgs_degree_dem(path, grid, sums, counts, input_datum="WGS-72", *,
                                 maxima=None, peak=False, receptors=None,
                                 direct=False, terrain_filter=None) -> int:
-    """Accumulate USGS90/CDED geographic A/B-record DEM profiles."""
+    """Accumulate USGS90 or CDED geographic A/B-record DEM profiles.
+
+    Args:
+        path: USGS/CDED DEM source path.
+        grid: Target grid definition.
+        sums: Writable flat elevation-sum array in metres.
+        counts: Writable flat integer sample-count array.
+        input_datum: Fallback CALPUFF datum when the DEM code is unrecognized.
+        maxima: Optional writable flat maximum-elevation array in metres.
+        peak: Whether to infer a source footprint from adjacent profile points.
+        receptors: Optional receptor state updated from in-domain samples.
+        direct: If true, project each geographic point; otherwise interpolate
+            coordinates between projected DEM corners.
+        terrain_filter: Optional coastline and replacement policy.
+
+    Returns:
+        Number of valid elevations accumulated inside the target grid.
+
+    Raises:
+        OSError: If the source cannot be read.
+        ValueError: If the DEM records, coordinate system, or profiles are
+            invalid.
+    """
     records = _dem_records(Path(path))
     header = _parse_dem_header(records[0])
     if header.codes[2] != 0:
@@ -1323,7 +2140,27 @@ def _accumulate_usgs_degree_dem(path, grid, sums, counts, input_datum="WGS-72", 
 
 def _accumulate_usgs30(path, grid, sums, counts, input_datum="NAS-C", *, maxima=None,
                        peak=False, receptors=None, terrain_filter=None) -> int:
-    """Accumulate USGS 7.5-minute UTM A/B-record DEM profiles."""
+    """Accumulate USGS 7.5-minute UTM A/B-record DEM profiles.
+
+    Args:
+        path: USGS30 DEM source path.
+        grid: Target grid definition.
+        sums: Writable flat elevation-sum array in metres.
+        counts: Writable flat integer sample-count array.
+        input_datum: CALPUFF datum of the source UTM coordinates.
+        maxima: Optional writable flat maximum-elevation array in metres.
+        peak: Whether to apply half the profile spacing as a source footprint.
+        receptors: Optional receptor state updated from in-domain samples.
+        terrain_filter: Optional coastline and replacement policy.
+
+    Returns:
+        Number of valid elevations accumulated inside the target grid.
+
+    Raises:
+        OSError: If the source cannot be read.
+        ValueError: If the DEM is not UTM, its zone is invalid, or records are
+            malformed.
+    """
     records = _dem_records(Path(path))
     header = _parse_dem_header(records[0])
     if header.codes[2] != 1:
@@ -1369,7 +2206,23 @@ def _accumulate_usgs30(path, grid, sums, counts, input_datum="NAS-C", *, maxima=
 
 
 def _geotiff_geometry(path: Path):
-    """Read one standard GeoTIFF band, validity mask, and centre geometry."""
+    """Read one terrain GeoTIFF band, mask, CRS, and centre geometry.
+
+    Args:
+        path: Single-band terrain GeoTIFF path.
+
+    Returns:
+        Tuple ``(crs, x0, y0, dx, dy, elevation_scale, data, valid)``. ``x0``
+        and ``y0`` locate the first pixel centre in CRS units; ``dx`` and
+        ``dy`` are signed pixel spacings; ``data`` is the native 2-D numeric
+        band; and ``valid`` is its boolean mask. ``elevation_scale`` converts
+        declared feet to metres.
+
+    Raises:
+        ValueError: If the raster is unreadable, lacks a CRS, has multiple or
+            nonnumeric bands, uses rotation, invalid spacing, or unsupported
+            TIFF orientation.
+    """
     path = Path(path)
     try:
         with rasterio.open(path) as source:
@@ -1423,7 +2276,25 @@ def _geotiff_geometry(path: Path):
 
 def _accumulate_geotiff(path, grid, sums, counts, input_datum="WGS-84", *, maxima=None,
                         peak=False, receptors=None, terrain_filter=None) -> int:
-    """Accumulate GeoTIFF pixel values following LOADTIFF/SAVEELEV."""
+    """Accumulate terrain GeoTIFF pixels following LOADTIFF/SAVEELEV.
+
+    Args:
+        path: Single-band georeferenced terrain raster path.
+        grid: Target grid definition.
+        sums: Writable flat elevation-sum array in metres.
+        counts: Writable flat integer sample-count array.
+        input_datum: CALPUFF datum used when projecting geographic coordinates.
+        maxima: Optional writable flat maximum-elevation array in metres.
+        peak: Whether to infer a source footprint from raster corner spacing.
+        receptors: Optional receptor state updated from in-domain samples.
+        terrain_filter: Optional coastline and replacement policy.
+
+    Returns:
+        Number of valid pixels accumulated inside the target grid.
+
+    Raises:
+        ValueError: If GeoTIFF geometry or coordinate transformation is invalid.
+    """
     source_crs, x0, y0, dx, dy, elevation_scale, data, valid_data = _geotiff_geometry(
         Path(path)
     )
@@ -1463,6 +2334,23 @@ def _accumulate_geotiff(path, grid, sums, counts, input_datum="WGS-84", *, maxim
 
 
 def _write_netcdf(path, terrain, counts, grid, datum, *, peak=False) -> None:
+    """Write the canonical CF-style TERREL NetCDF product.
+
+    Args:
+        path: Destination path, whose parent must already exist.
+        terrain: Final ``(ny, nx)`` float terrain field in metres.
+        counts: Flat or ``(ny, nx)`` integer source-sample counts.
+        grid: Target Cartesian or polar grid metadata.
+        datum: CALPUFF datum name stored in global metadata.
+        peak: Whether ``terrain`` represents cell maxima instead of means.
+
+    Returns:
+        None. The dataset is closed before returning.
+
+    Raises:
+        OSError: If the NetCDF file cannot be created or written.
+        RuntimeError: If NetCDF dimensions or variables cannot be created.
+    """
     with Dataset(path, "w", format="NETCDF4") as ds:
         polar = grid.grid_type == 3
         y_dimension, x_dimension = (("ray", "ring") if polar else ("y", "x"))
@@ -1501,7 +2389,15 @@ def _write_netcdf(path, terrain, counts, grid, datum, *, peak=False) -> None:
 
 
 def _cell_type_coordinates(grid):
-    """Return projected cell-centre coordinates for terrain classification."""
+    """Calculate projected cell-centre coordinates for classification.
+
+    Args:
+        grid: Cartesian or polar target grid.
+
+    Returns:
+        Pair ``(x, y)`` of float64 arrays with shape ``(ny, nx)`` in
+        kilometres. Polar centres use configured ring distances and ray angles.
+    """
     x_origin=float(grid.x_origin_km); y_origin=float(grid.y_origin_km)
     if grid.grid_type==3:
         distances=np.asarray(grid.ring_distances_km,dtype=COORD_DTYPE)
@@ -1515,12 +2411,30 @@ def _cell_type_coordinates(grid):
 
 
 def _cell_types(grid, terrain_filter):
+    """Classify every target cell using the configured coastline polygons.
+
+    Args:
+        grid: Cartesian or polar target grid.
+        terrain_filter: Classification and replacement policy.
+
+    Returns:
+        Int8 ``(ny, nx)`` array of TERREL terrain-type codes.
+    """
     x,y=_cell_type_coordinates(grid)
     return terrain_filter.types(x,y)
 
 
 def _cell_averages(sums, counts):
-    """Finish high-precision terrain sums as the model's FP32 field."""
+    """Finish high-precision terrain sums as a model float32 field.
+
+    Args:
+        sums: Elevation sums in metres, in any shape.
+        counts: Integer sample counts with the same shape as ``sums``.
+
+    Returns:
+        Float32 mean elevations in metres with the input shape. Empty cells use
+        the TERREL missing value -999.
+    """
     totals=np.asarray(sums,dtype=ACCUM_DTYPE)
     hits=np.asarray(counts)
     denominator=np.asarray(hits,dtype=ACCUM_DTYPE)
@@ -1533,8 +2447,19 @@ def _fill_polar_angular_gaps(terrain, missing_threshold=-9999.0,
                              ray_angles_deg=None):
     """Fill each missing polar cell from the nearest populated ray.
 
-    Rays are circular and form the first dimension.  Ties choose the lower
-    original ray index, making the result independent of traversal order.
+    Args:
+        terrain: Two-dimensional ``(ray, ring)`` terrain array in metres.
+        missing_threshold: Values at or below this threshold are missing.
+        ray_angles_deg: Optional ``(ray,)`` bearings in degrees clockwise from
+            north. Uniformly spaced rays are assumed when omitted.
+
+    Returns:
+        Float32 ``(ray, ring)`` copy with angular gaps filled. Rays are
+        circular; exact nearest-ray ties choose the lower original ray index.
+
+    Raises:
+        ValueError: If ``terrain`` is not two dimensional, an entire ring is
+            missing, or ``ray_angles_deg`` has the wrong shape.
     """
     f32=COMPUTE_DTYPE
     values=np.asarray(terrain,dtype=f32).copy()
@@ -1576,6 +2501,24 @@ def _fill_polar_angular_gaps(terrain, missing_threshold=-9999.0,
 
 
 def _finalize_terrain(sums,counts,maxima,grid,peak,terrain_filter):
+    """Convert accumulators into the filtered final terrain grid.
+
+    Args:
+        sums: Flat high-precision elevation sums in metres.
+        counts: Writable flat integer sample counts.
+        maxima: Flat float32 maximum elevations in metres.
+        grid: Cartesian or polar target grid.
+        peak: Whether to output ``maxima`` rather than cell means.
+        terrain_filter: Cell classification and replacement policy.
+
+    Returns:
+        Float32 terrain array with shape ``(ny, nx)`` in metres. Missing polar
+        ray cells are filled angularly.
+
+    Raises:
+        ValueError: If a polar ring is wholly missing or its ray geometry is
+            inconsistent.
+    """
     average=_cell_averages(sums,counts)
     raw=maxima.copy() if peak else average
     kinds=_cell_types(grid,terrain_filter).ravel()
@@ -1591,7 +2534,20 @@ def _finalize_terrain(sums,counts,maxima,grid,peak,terrain_filter):
 
 
 def _write_surfer_grid(path,terrain,grid):
-    """Write PLTOUT's Surfer ASCII DSAA grid for a Cartesian domain."""
+    """Write PLTOUT's Surfer ASCII DSAA grid for a Cartesian domain.
+
+    Args:
+        path: Destination ASCII path. Missing parent directories are created.
+        terrain: ``(ny, nx)`` terrain elevations in metres.
+        grid: Cartesian target grid metadata in kilometres.
+
+    Returns:
+        None. Missing cells are included in the data but excluded from the
+        reported z range.
+
+    Raises:
+        OSError: If the destination cannot be created or written.
+    """
     valid=np.asarray(terrain)[np.asarray(terrain)>=-998.]
     if not valid.size:
         z_low,z_high=9999.,-9999.
@@ -1614,6 +2570,20 @@ def _write_surfer_grid(path,terrain,grid):
 
 
 def _write_plot_output(path,terrain,grid):
+    """Write TERREL plot output for the target grid type.
+
+    Args:
+        path: Destination plot path.
+        terrain: Final ``(ny, nx)`` terrain field in metres.
+        grid: Target grid definition.
+
+    Returns:
+        None. Cartesian grids receive a Surfer DSAA product; polar grids
+        receive the empty compatibility file produced by the current port.
+
+    Raises:
+        OSError: If the destination cannot be created or written.
+    """
     if grid.grid_type!=3:
         _write_surfer_grid(path,terrain,grid)
         return
@@ -1622,7 +2592,21 @@ def _write_plot_output(path,terrain,grid):
 
 
 def _interp2d(x_vertices, y_vertices, values, distances, x, y, distance_max):
-    """Interpolate a value from the nearest point in each quadrant."""
+    """Interpolate a receptor elevation from one point in each quadrant.
+
+    Args:
+        x_vertices: Four sample x coordinates in kilometres.
+        y_vertices: Four sample y coordinates in kilometres.
+        values: Four sample elevations in metres.
+        distances: Four receptor-to-sample distances in kilometres.
+        x: Receptor x coordinate in kilometres.
+        y: Receptor y coordinate in kilometres.
+        distance_max: Maximum acceptable vertex distance in kilometres.
+
+    Returns:
+        Float32 interpolated elevation in metres, or -999 when any quadrant is
+        unresolved or outside ``distance_max``.
+    """
     xo=np.asarray(x_vertices,dtype=COORD_DTYPE)
     yo=np.asarray(y_vertices,dtype=COORD_DTYPE)
     zo=np.asarray(values,dtype=COMPUTE_DTYPE)
@@ -1667,6 +2651,15 @@ def _interp2d(x_vertices, y_vertices, values, distances, x, y, distance_max):
         if perpendicular[edge]<1.e-3:
             return COMPUTE_DTYPE(edge_values[edge])
     def opposite(first,third):
+        """Blend values from one pair of opposite polygon edges.
+
+        Args:
+            first: Index of the first edge in ``edge_values``.
+            third: Index of the opposite edge.
+
+        Returns:
+            Distance-weighted elevation in metres at the receptor.
+        """
         numerator=(edge_values[first]*perpendicular[third]+
                    edge_values[third]*perpendicular[first])
         return numerator/(perpendicular[first]+perpendicular[third])
@@ -1678,13 +2671,23 @@ def _interp2d(x_vertices, y_vertices, values, distances, x, y, distance_max):
 
 
 def _fill_void_cells(sums, counts, grid, radius_km, maxima=None) -> int:
-    """Fill voids from the nearest original cell within a physical radius.
+    """Fill void cells from nearest original cells within a physical radius.
 
-    Coordinates are expressed in kilometres, so rectangular cells are handled
-    directly.  Every target is evaluated against the same immutable set of
-    populated cells; newly filled values never affect later targets.  Exact
-    nearest-neighbour ties are averaged (and peak ties take their maximum),
-    which also removes traversal-order dependence.
+    Args:
+        sums: Writable flat elevation-sum array in metres.
+        counts: Writable flat integer sample-count array.
+        grid: Cartesian target grid whose cell spacings are in kilometres.
+        radius_km: Positive finite maximum centre-to-centre fill distance in
+            kilometres.
+        maxima: Optional writable flat maximum-elevation array in metres.
+
+    Returns:
+        Number of previously empty cells filled. Newly filled cells receive a
+        count of one. Exact nearest-neighbour ties average mean terrain and use
+        the greatest tied peak.
+
+    Raises:
+        ValueError: If ``radius_km`` is not positive and finite.
     """
     radius_km = float(radius_km)
     if not np.isfinite(radius_km) or radius_km <= 0.0:
@@ -1754,7 +2757,23 @@ def _fill_void_cells(sums, counts, grid, radius_km, maxima=None) -> int:
 
 
 def _write_legacy_header(stream, grid, datum, *, dataset="TERREL.DAT", version="2.0") -> None:
-    """Write the common TERREL 2.0 header emitted by ``WRTHEAD``."""
+    """Write the common legacy TERREL header emitted by ``WRTHEAD``.
+
+    Args:
+        stream: Open writable ASCII text stream.
+        grid: Cartesian or polar target grid metadata.
+        datum: CALPUFF datum name.
+        dataset: Legacy dataset identifier occupying the first header field.
+        version: Legacy file-format version text.
+
+    Returns:
+        None. Projection parameters, datum metadata, grid dimensions, origins,
+        and units are appended to ``stream``.
+
+    Raises:
+        OSError: If the stream cannot be written.
+        ValueError: If a polar grid definition is invalid.
+    """
     stream.write(f"{dataset:<16}{version:<16}"
                  f"{'Header structure with coordinate parameters':<64}\n")
     stream.write(f"{2:4d}\n")
@@ -1790,6 +2809,23 @@ def _write_legacy_header(stream, grid, datum, *, dataset="TERREL.DAT", version="
 
 
 def _write_legacy(path, terrain, grid, datum, model=1) -> None:
+    """Write a legacy TERREL product for the selected CALPUFF model layout.
+
+    Args:
+        path: Destination ASCII path.
+        terrain: Final ``(ny, nx)`` terrain field in metres.
+        grid: Cartesian or polar target grid metadata.
+        datum: CALPUFF datum name written to the shared header.
+        model: TERREL ``IMODEL`` output layout from 1 through 6.
+
+    Returns:
+        None. Rows and receptor-style records follow the selected historical
+        model format.
+
+    Raises:
+        OSError: If the destination cannot be created or written.
+        ValueError: If required polar geometry is invalid.
+    """
     with path.open("w", encoding="ascii", newline="\n") as stream:
         _write_legacy_header(stream, grid, datum)
         if model == 3:
@@ -1850,6 +2886,29 @@ def _write_legacy(path, terrain, grid, datum, model=1) -> None:
 
 
 def run(config: TerrelConfig) -> TerrainResult:
+    """Generate a terrain product from SRTM tiles or configured source types.
+
+    Args:
+        config: TERREL configuration defining sources, target grid, averaging
+            or peak output, optional void fill/receptors/coastline QA, and
+            output paths.
+
+    Returns:
+        Summary containing the primary output path, processed source and
+        sample counts, valid elevation range in metres, and hit-count QA.
+
+    Raises:
+        FileNotFoundError: If the source directory, selected tiles, or explicit
+            terrain sources are missing.
+        ValueError: If model, polar processing, sampling, grid, duplicate
+            sources, input formats, or resulting terrain are invalid.
+        NotImplementedError: If an explicit source has an unsupported type.
+        OSError: If an input cannot be read or an output cannot be written.
+
+    Notes:
+        The primary output is published atomically. Optional save, raw echo,
+        plot, coastline, and receptor products are also written as configured.
+    """
     if config.model not in {1, 2, 3, 4, 5, 6}:
         raise ValueError("TERREL IMODEL must be in the range 1..6")
     processing_method=(config.grid.polar_processing if config.processing_method is None
@@ -1929,6 +2988,27 @@ def run(config: TerrelConfig) -> TerrainResult:
 
 
 def _run_sources(config: TerrelConfig, sources: list[TerrelSource]) -> TerrainResult:
+    """Run TERREL for an explicit ordered list of heterogeneous sources.
+
+    Args:
+        config: TERREL configuration supplying the target grid and all
+            processing and output options.
+        sources: Existing terrain sources with per-file type, datum, and path.
+
+    Returns:
+        Summary containing the primary output path, source/sample counts,
+        valid elevation range in metres, and hit-count QA.
+
+    Raises:
+        ValueError: If sampling, grid geometry, an input format, or resulting
+            terrain is invalid.
+        NotImplementedError: If a source ``input_type`` is not implemented.
+        OSError: If a source cannot be read or an output cannot be written.
+
+    Notes:
+        The primary output is published atomically. Optional compatibility,
+        QA, coastline, plot, and receptor outputs follow ``config``.
+    """
     if config.sampling.lower() not in {"bilinear", "legacy", "msheet0", "direct", "msheet1"}:
         raise ValueError("sampling must select MSHEET=0 interpolation or MSHEET=1 direct projection")
     direct=config.sampling.lower() in {"direct","msheet1"}

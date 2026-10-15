@@ -23,6 +23,13 @@ def assignments(path: str | Path) -> dict[str, list[str]]:
     Asterisks delimit inactive/default entries in these control files and are
     intentionally ignored.  List files contain an echoed copy of the same
     active records, so the same reader handles both formats.
+
+    Args:
+        path: Legacy control or listing file to scan as ASCII text.
+
+    Returns:
+        Uppercase variable names mapped to all active value strings in file
+        order.
     """
     text=Path(path).read_text(encoding="ascii",errors="replace")
     found: defaultdict[str,list[str]]=defaultdict(list)
@@ -36,6 +43,16 @@ def assignments(path: str | Path) -> dict[str, list[str]]:
 
 
 def _case_insensitive_child(parent: Path, name: str) -> Path | None:
+    """Find a file in one directory without requiring matching case.
+
+    Args:
+        parent: Directory to inspect.
+        name: Requested child filename.
+
+    Returns:
+        The exact or case-insensitively matched file, or ``None`` when the
+        directory or file does not exist.
+    """
     exact=parent/name
     if exact.is_file(): return exact
     if not parent.is_dir(): return None
@@ -44,7 +61,22 @@ def _case_insensitive_child(parent: Path, name: str) -> Path | None:
 
 
 def _control_source(path: str | Path) -> Path:
-    """Follow a processor list file back to the control file it records."""
+    """Resolve a control file directly or through a processor listing.
+
+    ``.lst`` and ``.log`` files are searched for their recorded ``.inp``
+    basename. A complete CALMET listing that embeds active assignments is
+    accepted as its own source.
+
+    Args:
+        path: Control file or processor list/log file.
+
+    Returns:
+        Path containing the complete control assignments to parse.
+
+    Raises:
+        ValueError: If a list is empty, records a failed partial run, or does
+            not identify or embed a usable control file.
+    """
     source=Path(path)
     if source.suffix.casefold() not in {'.lst','.log'}: return source
     text=source.read_text(encoding='ascii',errors='replace')
@@ -77,21 +109,67 @@ def _control_source(path: str | Path) -> Path:
 
 
 def _one(values: dict[str,list[str]], name: str, default: Any=None):
+    """Read the last active value for one case-insensitive control name.
+
+    Args:
+        values: Assignment mapping returned by :func:`assignments`.
+        name: Control variable name.
+        default: Value returned when the variable has no active assignment.
+
+    Returns:
+        The final assigned string or ``default``.
+    """
     items=values.get(name.upper())
     return default if not items else items[-1]
 
 
 def _number(value: str) -> int | float:
+    """Parse integer, real, or Fortran double-exponent text.
+
+    Args:
+        value: Numeric control-field text.
+
+    Returns:
+        An integer when the token has no decimal/exponent marker, otherwise a
+        floating-point value.
+
+    Raises:
+        ValueError: If ``value`` is not valid numeric text.
+    """
     token=value.strip().replace("D","E").replace("d","e")
     return float(token) if any(character in token for character in ".Ee") else int(token)
 
 
 def _integer_number(value: str, label: str) -> int:
-    """Parse an integer control field without truncating a decimal value."""
+    """Parse an integer control field without truncating a decimal value.
+
+    Args:
+        value: Numeric control-field value.
+        label: Variable name included in an invalid-value error.
+
+    Returns:
+        The exactly represented integer.
+
+    Raises:
+        ValueError: If ``value`` is nonnumeric, non-finite, or not an exact
+            integer.
+    """
     return exact_integer(value,label)
 
 
 def _logical(value: str) -> bool:
+    """Parse a Fortran logical token.
+
+    Args:
+        value: ``T``/``F``, ``.TRUE.``/``.FALSE.``, ``TRUE``/``FALSE``, or
+            zero/one text.
+
+    Returns:
+        The represented Boolean value.
+
+    Raises:
+        ValueError: If the token is not a recognized Fortran logical.
+    """
     token=value.strip().upper()
     if token in {'T','.TRUE.','TRUE','1'}: return True
     if token in {'F','.FALSE.','FALSE','0'}: return False
@@ -99,6 +177,19 @@ def _logical(value: str) -> bool:
 
 
 def _angle(value: str) -> float:
+    """Parse a signed angle with an optional compass direction.
+
+    Args:
+        value: Numeric text containing at most one ``N``, ``S``, ``E``, or
+            ``W`` suffix or marker.
+
+    Returns:
+        Signed decimal degrees; east/west values are wrapped once into the
+        conventional longitude range.
+
+    Raises:
+        ValueError: If the text is nonnumeric or has multiple directions.
+    """
     token=re.sub(r"\s+","",str(value))
     directions=re.findall(r"[NSEW]",token,re.I)
     if len(directions)>1:
@@ -117,6 +208,16 @@ def _angle(value: str) -> float:
 
 
 def _path(parent: Path, value: str | Path) -> Path:
+    """Resolve a control-file path and honor case-insensitive legacy names.
+
+    Args:
+        parent: Directory containing the control file.
+        value: Absolute path or path relative to ``parent``.
+
+    Returns:
+        The resolved candidate, with the actual on-disk filename substituted
+        when only its letter case differs.
+    """
     candidate=Path(str(value).strip())
     resolved=candidate if candidate.is_absolute() else parent/candidate
     if resolved.exists(): return resolved
@@ -125,7 +226,22 @@ def _path(parent: Path, value: str | Path) -> Path:
 
 
 def _station_rows(values, prefix, count, fields):
-    """Decode the optional Group 7/8/9 station table in index order."""
+    """Decode an optional CALMET Group 7, 8, or 9 station table.
+
+    Args:
+        values: Parsed control assignments.
+        prefix: Station-row prefix: ``SS``, ``US``, or ``PS``.
+        count: Declared number of indexed station rows.
+        fields: Required number of fields in each row.
+
+    Returns:
+        Station tuples in one-based index order, or an empty tuple when no
+        rows are present.
+
+    Raises:
+        ValueError: If row indices are incomplete, a row has the wrong width,
+            or a numeric field is invalid.
+    """
     present=[index for index in range(1,count+1) if values.get(f'{prefix}{index}')]
     if not present: return ()
     if present!=list(range(1,count+1)):
@@ -141,7 +257,19 @@ def _station_rows(values, prefix, count, fields):
 
 
 def grid_from_assignments(values: dict[str,list[str]]) -> GridConfig:
-    """Build a Cartesian grid from common TERREL/CTGPROC/MAKEGEO/CALMET keys."""
+    """Build a grid from common TERREL, CTGPROC, MAKEGEO, or CALMET keys.
+
+    Args:
+        values: Parsed active control assignments.
+
+    Returns:
+        Cartesian grid geometry with distances in kilometres and angles in
+        decimal degrees.
+
+    Raises:
+        ValueError: If ``NX``, ``NY``, or ``DGRIDKM`` is absent, or a grid
+            value is invalid.
+    """
     required=("NX","NY","DGRIDKM")
     missing=[name for name in required if _one(values,name) is None]
     if missing: raise ValueError("control file lacks grid fields: "+", ".join(missing))
@@ -164,7 +292,20 @@ def grid_from_assignments(values: dict[str,list[str]]) -> GridConfig:
 
 def _require_projection_grid(values,program,x_name,y_name,
                              latitude_1='RLAT1',latitude_2='RLAT2'):
-    """Apply the legacy control-file mandatory projection/grid fields."""
+    """Check the projection-dependent mandatory control fields.
+
+    Args:
+        values: Parsed control assignments, modified to include ``PMAP=UTM``
+            when the projection is omitted.
+        program: Program name used in validation errors.
+        x_name: Required x-origin variable name.
+        y_name: Required y-origin variable name.
+        latitude_1: First-standard-latitude variable for LCC or PS.
+        latitude_2: Second-standard-latitude variable for LCC.
+
+    Raises:
+        ValueError: If a field required by the selected projection is absent.
+    """
     values.setdefault('PMAP',['UTM'])
     projection=str(_one(values,'PMAP')).upper()
     required=[x_name,y_name]
@@ -180,7 +321,26 @@ def _require_projection_grid(values,program,x_name,y_name,
 
 
 def calwrf_config(path: str | Path, **overrides) -> CalwrfConfig:
-    """Read CALWRF's compact line-oriented input file."""
+    """Read CALWRF's compact line-oriented control file.
+
+    Negative or zero start/end selectors request the full timestamp range
+    available across the configured WRF files. Explicit keyword overrides are
+    applied after parsing; overriding the primary output disables inherited
+    side outputs unless those paths are also overridden.
+
+    Args:
+        path: CALWRF control file or a listing that identifies it.
+        **overrides: Canonical :class:`CalwrfConfig` fields replacing parsed
+            values.
+
+    Returns:
+        Validated CALWRF configuration with paths resolved relative to the
+        control file.
+
+    Raises:
+        ValueError: If the control is empty or truncated, its ranges or file
+            count are invalid, or requested WRF timestamps cannot be found.
+    """
     source=_control_source(path)
     raw_lines=source.read_text(encoding="ascii").splitlines()
     if not raw_lines:
@@ -209,7 +369,18 @@ def calwrf_config(path: str | Path, **overrides) -> CalwrfConfig:
                    else configured_output)
     bounds=[int(item.strip()) for item in lines[3].split(',')]
     if len(bounds)!=6: raise ValueError('CALWRF I/J/K selection must contain six integers')
-    def selected(first,last): return None if first<1 or last<1 else (first,last)
+    def selected(first,last):
+        """Convert a one-based inclusive bound pair to its optional form.
+
+        Args:
+            first: First selected one-based index.
+            last: Last selected one-based index.
+
+        Returns:
+            ``None`` when either bound is below one, otherwise ``(first,
+            last)``.
+        """
+        return None if first<1 or last<1 else (first,last)
     create_surface=True
     surface_output=configured_output.with_suffix('.m2d')
     if len(lines)>7+count:
@@ -223,6 +394,14 @@ def calwrf_config(path: str | Path, **overrides) -> CalwrfConfig:
     raw_start,raw_end=lines[4],lines[5]
 
     def all_available(token: str) -> bool:
+        """Return whether a CALWRF date token requests all available times.
+
+        Args:
+            token: Raw start or end date record.
+
+        Returns:
+            ``True`` only when the record is an integer below one.
+        """
         try:
             return int(token.strip())<1
         except ValueError:
@@ -262,10 +441,35 @@ def calwrf_config(path: str | Path, **overrides) -> CalwrfConfig:
 
 
 def terrel_config(path: str | Path, **overrides) -> TerrelConfig:
+    """Read a TERREL control file into typed terrain-processing settings.
+
+    Args:
+        path: TERREL control file or a listing that identifies it.
+        **overrides: Canonical :class:`TerrelConfig` fields replacing parsed
+            values.
+
+    Returns:
+        Validated TERREL configuration, including typed terrain sources,
+        projection grid, receptor settings, and optional QA outputs.
+
+    Raises:
+        ValueError: If required grid fields, declared source counts, polar
+            dimensions, receptor controls, replacement codes, or percentages
+            are invalid.
+    """
     source=_control_source(path); values=assignments(source)
     _require_projection_grid(values,'TERREL','XREFKM','YREFKM')
     lowercase_files=_logical(_one(values,'LCFILES','T'))
     def terrel_path(value: str) -> Path:
+        """Resolve a TERREL filename using its ``LCFILES`` case policy.
+
+        Args:
+            value: Filename from the control file.
+
+        Returns:
+            Path relative to the control directory, case-normalized according
+            to ``LCFILES`` and matched to an existing file when possible.
+        """
         spelling=str(value).lower() if lowercase_files else str(value).upper()
         return _path(source.parent,spelling)
     order=('USGS90','USGS30','ARM3','3CD','DMDF','CDED','SRTM1','SRTM3',
@@ -332,6 +536,22 @@ def terrel_config(path: str | Path, **overrides) -> TerrelConfig:
     if sheet_method not in {0,1}:
         raise ValueError('TERREL MSHEET must be 0 or 1')
     def pair(name,defaults,integer=False):
+        """Parse a two-value TERREL replacement record and add defaults.
+
+        Traditional controls specify the first two source classes; defaults
+        supply the remaining three classes used by the typed configuration.
+
+        Args:
+            name: Control variable to read.
+            defaults: Five-value fallback sequence.
+            integer: Convert all returned values to integers when true.
+
+        Returns:
+            Five integer or floating-point replacement values.
+
+        Raises:
+            ValueError: If the active record does not contain two values.
+        """
         raw=str(_one(values,name,','.join(str(value) for value in defaults[:2])))
         parsed=tuple(_number(token) for token in raw.replace(',', ' ').split())
         if len(parsed)!=2:
@@ -411,10 +631,34 @@ def terrel_config(path: str | Path, **overrides) -> TerrelConfig:
 
 
 def ctgproc_config(path: str | Path, **overrides) -> CtgprocConfig:
+    """Read a CTGPROC control file into typed land-use settings.
+
+    Args:
+        path: CTGPROC control file or a listing that identifies it.
+        **overrides: Canonical :class:`CtgprocConfig` fields replacing parsed
+            values.
+
+    Returns:
+        Validated CTGPROC configuration with source-specific datum and mesh
+        metadata.
+
+    Raises:
+        ValueError: If required grid fields, source selections, declared
+            counts, or legacy land-use type/region codes are invalid.
+    """
     source=_control_source(path); values=assignments(source)
     _require_projection_grid(values,'CTGPROC','XREFKM','YREFKM')
     lowercase_files=_logical(_one(values,'LCFILES','T'))
     def ctgproc_path(value: str) -> Path:
+        """Resolve a CTGPROC filename using its ``LCFILES`` case policy.
+
+        Args:
+            value: Filename from the control file.
+
+        Returns:
+            Path relative to the control directory, case-normalized according
+            to ``LCFILES`` and matched to an existing file when possible.
+        """
         spelling=str(value).lower() if lowercase_files else str(value).upper()
         return _path(source.parent,spelling)
     order=("GLC2K","UMDGLC","CTG","NZGEN","GLAZNA","GLAZSA","GLAZEU",
@@ -424,6 +668,14 @@ def ctgproc_config(path: str | Path, **overrides) -> CtgprocConfig:
         raise ValueError('CTGPROC NDBF cannot be negative')
     kinds=[name for name in order if name in values]
     def datum(kind):
+        """Return the configured or traditional datum for an input type.
+
+        Args:
+            kind: CTGPROC land-use source type.
+
+        Returns:
+            Datum code selected by the corresponding control variable.
+        """
         return (str(_one(values,'DCTG','NAS-C')) if kind=='CTG' else
                 str(_one(values,'DNZGEN','WGS-84')) if kind=='NZGEN' else
                 str(_one(values,'DNLCD','NAR-C')) if kind.startswith('NLCD') else
@@ -434,6 +686,14 @@ def ctgproc_config(path: str | Path, **overrides) -> CtgprocConfig:
                 str(_one(values,'DUSGSLA','ESR-S')) if kind.startswith('GLAZ') else
                 str(_one(values,'DATUM','WGS-84')))
     def mesh(kind):
+        """Return the mesh subdivision count for an input type.
+
+        Args:
+            kind: CTGPROC land-use source type.
+
+        Returns:
+            Integer CTG-, CORINE-, or general-source mesh density.
+        """
         return int(_number(_one(values,'MESHCTG','1') if kind=='CTG' else
                            _one(values,'MESHCORN','1') if kind=='CORINE' else
                            _one(values,'MESHGLAZ','1')))
@@ -507,6 +767,24 @@ def ctgproc_config(path: str | Path, **overrides) -> CtgprocConfig:
 
 
 def makegeo_config(path: str | Path, **overrides) -> MakegeoConfig:
+    """Read a MAKEGEO control file into typed geophysical settings.
+
+    Args:
+        path: MAKEGEO control file or a listing that identifies it.
+        **overrides: Canonical :class:`MakegeoConfig` fields replacing parsed
+            values.
+
+    Returns:
+        Validated MAKEGEO configuration with surface-property tables,
+        category mappings, optional snow controls, and resolved file paths.
+
+    Raises:
+        TypeError: If snow processing is enabled and a required snow date is
+            absent or has an unsupported type.
+        ValueError: If the control is empty, required grid fields or record
+            widths are invalid, declared category counts disagree, the output
+            format is unsupported, or snow tables are inconsistent.
+    """
     source=_control_source(path); values=assignments(source)
     lines=source.read_text(encoding='ascii',errors='replace').splitlines()
     if not lines: raise ValueError(f'MAKEGEO control file is empty: {source}')
@@ -517,6 +795,15 @@ def makegeo_config(path: str | Path, **overrides) -> MakegeoConfig:
     _require_projection_grid(values,'MAKEGEO','XREFKM','YREFKM')
     lowercase_files=_logical(_one(values,'LCFILES','T'))
     def makegeo_path(value: str) -> Path:
+        """Resolve a MAKEGEO filename using its ``LCFILES`` case policy.
+
+        Args:
+            value: Filename from the control file.
+
+        Returns:
+            Path relative to the control directory, case-normalized according
+            to ``LCFILES`` and matched to an existing file when possible.
+        """
         spelling=str(value).lower() if lowercase_files else str(value).upper()
         return _path(source.parent,spelling)
     properties={}
@@ -609,6 +896,21 @@ def makegeo_config(path: str | Path, **overrides) -> MakegeoConfig:
 
 
 def _date(values,prefix):
+    """Parse a CALMET begin or end timestamp from control assignments.
+
+    Args:
+        values: Parsed CALMET control assignments.
+        prefix: ``"IB"`` for the beginning or ``"IE"`` for the ending
+            component names.
+
+    Returns:
+        A naive, second-precision timestamp. CALMET's hour-24 boundary form is
+        normalized to the next calendar day.
+
+    Raises:
+        ValueError: If a required component is absent, is not an exact
+            integer, or produces an invalid calendar value.
+    """
     fields=[_integer_number(_one(values,prefix+suffix),prefix+suffix)
             for suffix in ("YR","MO","DY","HR")]
     seconds=_integer_number(_one(values,prefix+"SEC","0"),prefix+"SEC")
@@ -621,14 +923,42 @@ def _date(values,prefix):
 
 
 def _calmet_version(source: Path) -> str:
-    """Return the fixed-width CALMET control-file version field."""
+    """Read the fixed-width CALMET control-file version field.
+
+    Args:
+        source: CALMET control file.
+
+    Returns:
+        The stripped version stored in columns 17 through 32, or an empty
+        string when the header is shorter than 32 characters.
+
+    Raises:
+        ValueError: If the control file is empty.
+    """
     lines=source.read_text(encoding='ascii',errors='replace').splitlines()
     if not lines: raise ValueError(f'CALMET control file is empty: {source}')
     return lines[0][16:32].strip() if len(lines[0])>=32 else ''
 
 
 def _calmet_period(version: str, values: dict[str,list[str]]):
-    """Decode READCF's version-dependent run period and base time zone."""
+    """Decode CALMET's version-dependent run period and base time zone.
+
+    Version 2.1 and 2.2 controls contain explicit beginning and ending fields
+    plus ``ABTZ``. Older controls provide the first hour-ending timestamp,
+    duration ``IRLG``, and positive-west ``IBTZ``.
+
+    Args:
+        version: Fixed-width control-file version string.
+        values: Parsed CALMET assignments.
+
+    Returns:
+        ``(start, end, utc_offset_hours, timezone_label)`` using naive,
+        second-precision datetimes.
+
+    Raises:
+        ValueError: If required period fields are absent or dates, duration,
+            timezone, or version-specific fields are invalid.
+    """
     if version in {'2.1','2.2'}:
         if _one(values,'ABTZ') is None:
             raise ValueError(f'CALMET {version} control requires explicit ABTZ')
@@ -660,12 +990,56 @@ def _calmet_period(version: str, values: dict[str,list[str]]):
 
 
 def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
+    """Read a CALMET control file into the complete typed configuration.
+
+    The loader supports both current and pre-2.1/2.2 period and cloud-control
+    conventions, resolves input paths beside the control file, expands
+    numbered input series, and assembles station, barrier, and lake-breeze
+    records.
+
+    Args:
+        path: CALMET control file or a listing that identifies or embeds it.
+        **overrides: Canonical :class:`CalmetConfig` fields replacing parsed
+            values.
+
+    Returns:
+        Complete validated CALMET configuration.
+
+    Raises:
+        ValueError: If a required control value is absent, or grid geometry,
+            time controls, vertical arrays, declared
+            counts, station tables, barriers, lake-breeze data, or versioned
+            cloud settings are invalid or inconsistent.
+    """
     source=_control_source(path); values=assignments(source)
     lowercase_files=_logical(_one(values,'LCFILES','T'))
     def calmet_path(value: str) -> Path:
+        """Resolve a CALMET filename using its ``LCFILES`` case policy.
+
+        Args:
+            value: Filename from the control file.
+
+        Returns:
+            Path relative to the control directory, case-normalized according
+            to ``LCFILES`` and matched to an existing file when possible.
+        """
         spelling=str(value).lower() if lowercase_files else str(value).upper()
         return _path(source.parent,spelling)
     def numbered_files(key: str, count: int, stem: str) -> tuple[Path,...]:
+        """Resolve an explicitly named or default-numbered file series.
+
+        Args:
+            key: Repeated control variable containing explicit filenames.
+            count: Declared number of files.
+            stem: Default basename prefix for omitted filenames.
+
+        Returns:
+            Exactly ``count`` resolved paths, with missing trailing names
+            filled as ``<stem><index>.dat``.
+
+        Raises:
+            ValueError: If more explicit filenames are present than declared.
+        """
         explicit=list(values.get(key,()))
         if len(explicit)>count:
             raise ValueError(f'{key} provides more files than its declared count')
@@ -688,6 +1062,17 @@ def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
     wind_bias=[float(_number(item)) for item in re.split(
         r"\s*,\s*",_one(values,'BIAS',','.join(['0']*(len(faces)-1)))) if item]
     def integer_vector(name: str, count: int, default: int=0) -> tuple[int,...]:
+        """Read a comma/whitespace-delimited fixed-length integer vector.
+
+        Args:
+            name: CALMET control variable to read.
+            count: Number of repeated default values when the field is absent.
+            default: Default value repeated ``count`` times.
+
+        Returns:
+            Parsed integer values. Length validation is performed later with
+            the rest of the CALMET configuration.
+        """
         text=str(_one(values,name,','.join([str(default)]*count)))
         return tuple(int(_number(item)) for item in re.split(r'[\s,]+',text.strip()) if item)
     print_uv_levels=integer_vector('IUVOUT',len(faces)-1)
@@ -707,6 +1092,15 @@ def calmet_config(path: str | Path, **overrides) -> CalmetConfig:
     lake_enabled=_logical(_one(values,'LLBREZE','F'))
     lake_count=int(_number(_one(values,'NBOX','0')))
     def lake_values(name,integer=False):
+        """Collect repeated lake-breeze array assignments.
+
+        Args:
+            name: Lake-breeze control variable to collect.
+            integer: Return integers instead of floating-point values.
+
+        Returns:
+            Flattened numeric values from all active assignments.
+        """
         parsed=[_number(item) for value in values.get(name,())
                 for item in re.split(r'[\s,]+',value.strip()) if item]
         return [int(item) for item in parsed] if integer else [float(item) for item in parsed]
@@ -925,6 +1319,19 @@ def readlst(path: str | Path, component: str | None = None) -> dict[str, Any]:
     ``component`` is normally inferred from the recorded assignments or path;
     it can be one of ``calwrf``, ``terrel``, ``ctrproc``/``ctgproc``,
     ``makegeo``, or ``calmet`` when a generically named file is ambiguous.
+
+    Args:
+        path: Control file or processor listing to decode.
+        component: Optional workflow-stage name. ``None`` infers the stage
+            from assignments and the source path.
+
+    Returns:
+        Canonically named keyword arguments, including a resolved
+        :class:`GridConfig` where the selected stage uses one.
+
+    Raises:
+        ValueError: If the source control cannot be found, the component
+            cannot be inferred, or ``component`` is unknown.
     """
     source = _control_source(path)
     if component is None:

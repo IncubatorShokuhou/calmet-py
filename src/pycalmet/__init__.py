@@ -44,7 +44,18 @@ __version__ = "0.2.0"
 
 
 def __getattr__(name: str):
-    """Load the opt-in compatibility implementation only when requested."""
+    """Load the opt-in compatibility implementation only when requested.
+
+    Args:
+        name: Missing package attribute requested by Python's attribute
+            protocol.
+
+    Returns:
+        The lazily imported :mod:`pycalmet.legacy` package.
+
+    Raises:
+        AttributeError: If ``name`` is anything other than ``"legacy"``.
+    """
     if name == "legacy":
         module = import_module(".legacy", __name__)
         globals()[name] = module

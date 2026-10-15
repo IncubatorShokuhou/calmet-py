@@ -11,11 +11,36 @@ from .calmet_numerics import convective_velocity_scale, pgt_stability
 
 
 def _coded_time(value: datetime) -> int:
+    """Encode a listing timestamp as CALMET ``YYYYJJJHH``.
+
+    Args:
+        value: Datetime to encode.
+
+    Returns:
+        Integer ordinal-date code.
+
+    Raises:
+        ValueError: If ``value`` cannot be represented.
+    """
     return format_ordinal_code(value)
 
 
 def format_surface_input_debug(record,stations) -> str:
-    """Reproduce COMP formats 108/109 for one raw SURF.DAT record."""
+    """Reproduce COMP formats 108/109 for one raw SURF.DAT record.
+
+    Args:
+        record: Surface record whose eight station fields are one-dimensional.
+        stations: Station metadata in the same order as the record arrays.
+
+    Returns:
+        Newline-terminated listing text containing interval timestamps and one
+        row per station. Units are metres per second, degrees, hundreds of
+        feet, cloud tenths, kelvin, percent, and millibars as labeled.
+
+    Raises:
+        ValueError: If any observation vector does not have shape
+            ``(len(stations),)`` or a timestamp cannot be encoded.
+    """
     stations=tuple(stations)
     count=len(stations)
     fields=(record.wind_speed,record.wind_direction,record.ceiling_hundreds_ft,
@@ -47,7 +72,21 @@ def format_surface_input_debug(record,stations) -> str:
 
 
 def format_no_upper_prepdi_debug(step, ending: datetime) -> str:
-    """Format ``NOOBS=1`` PREPDI diagnostics, including unavailable data."""
+    """Format ``NOOBS=1`` PREPDI diagnostics, including unavailable data.
+
+    Args:
+        step: Step-one fields containing retained diagnostic station names,
+            U/V winds, and optional domain surface temperature.
+        ending: Ending datetime printed in the diagnostic heading.
+
+    Returns:
+        Newline-terminated listing block. Station winds are printed in metres
+        per second and temperature, when available, in kelvin.
+
+    Raises:
+        ValueError: If retained U/V station arrays do not match the number of
+            station names.
+    """
     names=tuple(step.debug_station_names)
     u=np.asarray(step.debug_station_u)
     v=np.asarray(step.debug_station_v)
@@ -80,7 +119,25 @@ def format_no_upper_prepdi_debug(step, ending: datetime) -> str:
 
 def format_upper_air_input_debug(station_number,sounding,convergence_degrees,
                                  layer_u,layer_v,temperature_faces=None) -> str:
-    """Reproduce COMP formats 133--136 for one raw UP.DAT sounding."""
+    """Reproduce COMP formats 133--136 for one raw UP.DAT sounding.
+
+    Args:
+        station_number: One-based station number printed in each source row.
+        sounding: Upper-air sounding containing pressure, height, temperature,
+            direction, and speed arrays.
+        convergence_degrees: Map convergence passed to ``sounding.converted``.
+        layer_u: Cell-averaged U wind by model layer, in metres per second.
+        layer_v: Cell-averaged V wind by model layer, in metres per second.
+        temperature_faces: Optional face temperature profile in kelvin.
+
+    Returns:
+        Newline-terminated listing block. Raw profile columns use millibars,
+        metres local ground level, kelvin, and metres per second.
+
+    Raises:
+        ValueError: If raw sounding arrays have inconsistent shapes or sounding
+            conversion fails.
+    """
     height,u,v=sounding.converted(convergence_degrees)
     count=len(height)
     fields=(sounding.pressure_mb,sounding.temperature_c,u,v)
@@ -102,6 +159,15 @@ def format_upper_air_input_debug(station_number,sounding,convergence_degrees,
         lines.append(f" {int(station_number):3d}  {pressure:6.1f}  {z:7.1f}  "
                      f"{temp:6.2f}  {u_value:6.2f}  {v_value:6.2f}")
     def profile(label,values):
+        """Format a labeled profile in chunks of ten values.
+
+        Args:
+            label: Text printed before the first profile row.
+            values: One-dimensional values formatted with three decimals.
+
+        Returns:
+            List of listing lines without trailing newline characters.
+        """
         values=np.asarray(values)
         chunks=[]
         for begin in range(0,values.size,10):
@@ -116,7 +182,24 @@ def format_upper_air_input_debug(station_number,sounding,convergence_degrees,
 
 
 def format_full_prepdi_debug(step,ending: datetime,lapse_rate) -> str:
-    """Reproduce COMP formats 152, 154--159 for ``NOOBS=0``."""
+    """Reproduce COMP formats 152 and 154--159 for ``NOOBS=0``.
+
+    Args:
+        step: Step-one fields containing retained domain, surface-station, and
+            upper-air diagnostics.
+        ending: Ending datetime printed in the diagnostic headings.
+        lapse_rate: Grid lapse-rate array in kelvin per metre; element ``[0, 0]``
+            is printed.
+
+    Returns:
+        Newline-terminated PREPDI listing block. Wind components use metres per
+        second and the optional domain temperature uses kelvin.
+
+    Raises:
+        ValueError: If required domain wind scalars are absent or retained
+            station wind arrays do not match their names.
+        IndexError: If ``lapse_rate`` has no ``[0, 0]`` element.
+    """
     if any(value is None for value in (step.debug_domain_u,step.debug_domain_v)):
         raise ValueError('complete PREPDI debug wind scalars are required')
     names=tuple(step.debug_station_names)
@@ -169,7 +252,26 @@ def format_grid(
     begin: datetime | None = None,
     timestep_seconds: int = 3600,
 ) -> str:
-    """Reproduce CALMET ``OUT/WRT/WRT2`` for one two-dimensional field."""
+    """Reproduce CALMET ``OUT/WRT/WRT2`` for one two-dimensional field.
+
+    Args:
+        values: Nonempty two-dimensional numeric field of shape ``(ny, nx)``.
+        message: Heading text, truncated to the listing's 70-character field.
+        significant_digits: Printed significant-digit mode from 1 through 5;
+            this also selects values per output row.
+        begin: Optional interval beginning printed above the grid.
+        timestep_seconds: Seconds added to ``begin`` for the printed interval
+            ending.
+
+    Returns:
+        Newline-terminated line-printer representation. Values are converted to
+        float32 for scaling and integer rounding. An all-zero field produces a
+        suppression message instead of grid rows.
+
+    Raises:
+        ValueError: If ``significant_digits`` is outside 1--5, ``values`` is not
+            two-dimensional, or the array is empty.
+    """
     if significant_digits not in range(1, 6):
         raise ValueError("significant_digits must be from 1 through 5")
     data=np.asarray(values)
@@ -211,6 +313,16 @@ def format_grid(
 
 
 def _period_line(begin: datetime, end: datetime) -> str:
+    """Format one CALMET listing interval line.
+
+    Args:
+        begin: Interval beginning datetime.
+        end: Interval ending datetime.
+
+    Returns:
+        Single line containing calendar date, hour, and seconds after the hour
+        for both bounds.
+    """
     return (f" FROM: year: {begin.year:4d}  month: {begin.month:2d}  day: {begin.day:2d}  "
             f"hour: {begin.hour:2d}  second: {begin.minute*60+begin.second:4d}  TO: year: "
             f"{end.year:4d}  month: {end.month:2d}  day: {end.day:2d}  hour: {end.hour:2d}  "
@@ -218,9 +330,33 @@ def _period_line(begin: datetime, end: datetime) -> str:
 
 
 class CalmetListingWriter:
-    """Append the Input Group 3 selected fields to a CALMET listing."""
+    """Append Input Group 3 selected fields to a CALMET listing.
+
+    Attributes:
+        stream: Open ASCII output stream, or ``None`` after closing.
+        config: CALMET configuration controlling print switches and cadence.
+        landuse: Integer-like land-use array with shape ``(ny, nx)``.
+        water_range: Inclusive land-use category range treated as water.
+        first_hour: First whole-hour timestamp seen, used to number simulation
+            hours, or ``None`` before the first append.
+    """
 
     def __init__(self, path, config, landuse, water_range):
+        """Open a listing destination and retain its print configuration.
+
+        Args:
+            path: Destination ASCII file; missing parent directories are
+                created.
+            config: CALMET configuration with listing and debug switches.
+            landuse: Integer-like ``(ny, nx)`` land-use categories.
+            water_range: Inclusive ``(minimum, maximum)`` water codes.
+
+        Raises:
+            OSError: If the destination directory or file cannot be created.
+
+        Notes:
+            Construction truncates an existing destination file.
+        """
         target=Path(path); target.parent.mkdir(parents=True,exist_ok=True)
         self.stream=target.open('w',encoding='ascii')
         self.config=config
@@ -229,6 +365,26 @@ class CalmetListingWriter:
         self.first_hour=None
 
     def append(self, hour, solar_elevation_sine):
+        """Append enabled debug and line-printer fields for one timestep.
+
+        Args:
+            hour: Solver fields for one timestamp. Printed grids have shape
+                ``(ny, nx)`` and retain the units named in their headings.
+            solar_elevation_sine: ``(ny, nx)`` sine of solar elevation used for
+                stability classification and point diagnostics.
+
+        Raises:
+            ValueError: If an enabled field is not two-dimensional or cannot be
+                formatted with its configured precision.
+            RuntimeError: If debug output requires retained source fields that
+                are absent.
+            OSError: If writing or flushing the listing fails.
+
+        Notes:
+            Micrometeorology diagnostics follow their own configured step
+            window. Ordinary grids are written only on whole hours satisfying
+            ``print_interval_hours``. The stream is flushed after output.
+        """
         config=self.config
         timestamp=hour.timestamp
         current_hour=timestamp.replace(minute=0,second=0,microsecond=0)
@@ -242,6 +398,21 @@ class CalmetListingWriter:
             return
         duration=config.timestep_seconds
         def write(values,message,digits=5):
+            """Format and write one grid using the current interval.
+
+            Args:
+                values: Two-dimensional grid values.
+                message: Listing heading including physical units.
+                digits: Significant-digit mode from 1 through 5.
+
+            Raises:
+                ValueError: If the grid or precision is invalid.
+                OSError: If writing to the listing fails.
+
+            Notes:
+                The current hour timestamp and configured timestep determine the
+                interval printed above the field.
+            """
             self.stream.write(format_grid(values,message,significant_digits=digits,
                                            begin=timestamp,
                                            timestep_seconds=duration))
@@ -280,7 +451,27 @@ class CalmetListingWriter:
         self.stream.flush()
 
     def _append_noobs_debug(self,hour,solar_elevation_sine):
-        """Write COMP's LDB diagnostics that apply in NOOBS=2 mode."""
+        """Write COMP LDB diagnostics for the configured observation mode.
+
+        Args:
+            hour: Solver fields with any retained SURF.DAT, UP.DAT, PREPDI, and
+                unaveraged micrometeorology diagnostics.
+            solar_elevation_sine: Grid sine of solar elevation; point ``[0, 0]``
+                is printed.
+
+        Raises:
+            RuntimeError: If an observation mode requires a retained surface
+                debug record that is absent.
+            ValueError: If retained station/profile fields are inconsistent or
+                a grid cannot be line-printer formatted.
+            IndexError: If required point or grid arrays are empty.
+            OSError: If writing or flushing the listing fails.
+
+        Notes:
+            The method writes no-observation placeholders for ``NOOBS=2``,
+            surface diagnostics for ``NOOBS=1``, and full upper-air/PREPDI
+            diagnostics for ``NOOBS=0`` before common surface parameters.
+        """
         timestamp=hour.timestamp
         surface=hour.surface
         sine=float(np.asarray(solar_elevation_sine)[0,0])
@@ -339,6 +530,19 @@ class CalmetListingWriter:
         self.stream.flush()
 
     def _convective_velocity(self,hour):
+        """Compute the listing's land/water convective velocity field.
+
+        Args:
+            hour: Solver fields for one timestamp.
+
+        Returns:
+            Float32 ``(ny, nx)`` convective velocity scale in metres per second.
+            Retained water values replace the land formula on water categories.
+
+        Raises:
+            ValueError: If input fields cannot be broadcast to the land-use
+                grid.
+        """
         surface=hour.surface
         value=convective_velocity_scale(surface.convective_mixing_height,
             surface.sensible_heat_flux,hour.temperature[0],surface.density,
@@ -350,12 +554,27 @@ class CalmetListingWriter:
         return np.asarray(value,dtype=np.float32)
 
     def close(self):
+        """Flush and close the listing stream; repeated calls are harmless."""
         if self.stream is not None:
             self.stream.close()
             self.stream=None
 
     def __enter__(self):
+        """Return this open writer for context-manager use.
+
+        Returns:
+            The :class:`CalmetListingWriter` instance.
+        """
         return self
 
     def __exit__(self,*exc):
+        """Close the listing on context-manager exit.
+
+        Args:
+            *exc: Exception type, value, and traceback supplied by the context
+                manager protocol.
+
+        Returns:
+            ``None``; exceptions are not suppressed.
+        """
         self.close()

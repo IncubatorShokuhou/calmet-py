@@ -8,6 +8,7 @@ import importlib
 import importlib.machinery
 import inspect
 import sys
+import textwrap
 import types
 from dataclasses import MISSING, fields
 from pathlib import Path
@@ -42,7 +43,7 @@ def _omitted_parameters(config_type: type, grid_type: type) -> tuple[str, ...]:
     return tuple(sorted(omitted))
 
 
-def _source_modules() -> tuple[types.ModuleType, types.ModuleType]:
+def _source_modules() -> tuple[types.ModuleType, types.ModuleType, types.ModuleType]:
     """Load API metadata without executing ``pycalmet.__init__``.
 
     The real package imports the generated module through ``pipeline``.  A
@@ -66,11 +67,35 @@ def _source_modules() -> tuple[types.ModuleType, types.ModuleType]:
 
     api = importlib.import_module(f"{_SOURCE_PACKAGE}.api")
     config = importlib.import_module(f"{_SOURCE_PACKAGE}.config")
-    return api, config
+    parameter_docs = importlib.import_module(
+        f"{_SOURCE_PACKAGE}._parameter_docs"
+    )
+    return api, config, parameter_docs
+
+
+def _doc_entry(name: str, description: str) -> list[str]:
+    """Render one indented Google ``Args`` entry for generated source.
+
+    Args:
+        name: Parameter name shown in the generated docstring.
+        description: Complete human-readable parameter description.
+
+    Returns:
+        Source lines wrapped to the project's normal line width.
+    """
+    prefix = f"        {name}: "
+    return textwrap.wrap(
+        description,
+        width=88,
+        initial_indent=prefix,
+        subsequent_indent=" " * len(prefix),
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
 
 
 def render() -> str:
-    api, config = _source_modules()
+    api, config, parameter_docs = _source_modules()
     CalmetConfig = config.CalmetConfig
     CalwrfConfig = config.CalwrfConfig
     CtgprocConfig = config.CtgprocConfig
@@ -156,10 +181,52 @@ def render() -> str:
             )
     lines.extend([
         ") -> Path:",
-        '    """Run all five stages from controls or fully typed parameters.',
+        '    """Run all five CALMET workflow stages without persistent intermediates.',
         "",
-        "    Every stage parameter uses its stage name as a prefix.  ``output``",
-        "    overrides ``calmet_output`` as the final product path.",
+        "    Args:",
+    ])
+    pipeline_arguments = {
+        "inp": (
+            "Pipeline configuration input. Pass a PipelineConfig or complete five-stage "
+            "mapping by itself, a directory containing calwrf.inp, terrel.inp, "
+            "ctgproc.inp, makegeo.inp, and calmet.inp with optional prefixed overrides, "
+            "or None to use explicit stage specifications or prefixed typed parameters."
+        ),
+        "calwrf": (
+            "CALWRF configuration object, mapping, or control-file path. Supply this "
+            "together with terrel, ctgproc, makegeo, and calmet when inp is None, or "
+            "omit all five stage specifications to use prefixed parameters."
+        ),
+        "terrel": "TERREL configuration object, mapping, or control-file path.",
+        "ctgproc": "CTGPROC configuration object, mapping, or control-file path.",
+        "makegeo": "MAKEGEO configuration object, mapping, or control-file path.",
+        "calmet": "CALMET configuration object, mapping, or control-file path.",
+        "output": (
+            "Final CALMET product path; when supplied, this overrides calmet_output."
+        ),
+    }
+    for name, description in pipeline_arguments.items():
+        lines.extend(_doc_entry(name, description))
+    for stage in STAGES:
+        for parameter in parameters[stage]:
+            description = parameter_docs.parameter_meaning(
+                stage, parameter.name, "en"
+            )
+            lines.extend(_doc_entry(
+                f"{stage}_{parameter.name}",
+                f"{stage.upper()} stage. {description}",
+            ))
+    lines.extend([
+        "",
+        "    Returns:",
+        "        Path to the final CALMET meteorological output.",
+        "",
+        "    Raises:",
+        "        TypeError: If pipeline input modes are combined, a stage specification",
+        "            is missing, or a parameter is unknown, duplicated, or invalid.",
+        "        ValueError: If a stage configuration fails validation.",
+        "        OSError: If a required input cannot be read or the final output cannot",
+        "            be written.",
         '    """',
         "    values = locals()",
         "    supplied = _EXPLICIT_ARGUMENTS.get() or frozenset()",

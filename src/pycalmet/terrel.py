@@ -15,15 +15,24 @@ from .config import TerrelConfig
 def run(config: TerrelConfig) -> Path:
     """Generate a gridded terrain product.
 
-    Parameters
-    ----------
-    config
-        Terrain sources, target grid, processing options, and output path.
+    Args:
+        config: TERREL configuration containing terrain sources, target grid,
+            averaging or peak processing, optional coastline/receptor/QA
+            products, and the primary output path.
 
-    Returns
-    -------
-    pathlib.Path
-        Path to the generated terrain product.
+    Returns:
+        Path to the generated NetCDF or legacy terrain product.
+
+    Raises:
+        FileNotFoundError: If a configured terrain source does not exist.
+        ValueError: If a source, grid, sampling mode, or processing option is
+            invalid.
+        NotImplementedError: If an explicit terrain source type is unsupported.
+        OSError: If an input cannot be read or an output cannot be written.
+
+    Notes:
+        The primary product is published atomically. The run can also write
+        configured save, coastline, receptor, plot, and raw-echo files.
     """
     from ._terrel import run as _run
 

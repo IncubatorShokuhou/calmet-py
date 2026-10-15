@@ -13,13 +13,48 @@ from .datetime_utils import format_ordinal_code,parse_ordinal_code
 
 
 def _datetime(code: int, seconds: int) -> datetime:
+    """Decode a CLOUD.DAT ordinal timestamp.
+
+    Args:
+        code: Integer ``YYYYJJJHH`` ordinal-date code.
+        seconds: Seconds after the encoded hour.
+
+    Returns:
+        Decoded naive :class:`datetime` in the file's declared time basis.
+
+    Raises:
+        ValueError: If the code or seconds do not form a valid timestamp.
+    """
     try: return parse_ordinal_code(code,seconds)
     except ValueError as error: raise ValueError(f'invalid CLOUD.DAT timestamp {code}/{seconds}') from error
 
 
 class CloudData:
-    """In-memory indexed CLOUD.DAT records, keyed by interval ending time."""
+    """In-memory indexed CLOUD.DAT records, keyed by interval ending time.
+
+    Attributes:
+        path: Path to the CLOUD.DAT input file.
+        nx: Number of grid columns.
+        ny: Number of grid rows.
+        records: Mapping from interval-ending datetimes to float32 cloud
+            fractions of shape ``(ny, nx)`` and range 0--1.
+    """
+
     def __init__(self,path,nx,ny,format=2):
+        """Read and validate every cloud-fraction record.
+
+        Args:
+            path: Path to CLOUD.DAT.
+            nx: Number of grid columns expected in every field.
+            ny: Number of grid rows expected in every field.
+            format: CALMET ``IFORMC`` value: ``1`` for sequential-unformatted
+                binary or ``2`` for formatted text.
+
+        Raises:
+            FileNotFoundError: If ``path`` does not exist.
+            ValueError: If the format selector, timestamps, record lengths,
+                labels, duplicate ending times, or cloud fractions are invalid.
+        """
         self.path=Path(path); self.nx=int(nx); self.ny=int(ny)
         if not self.path.is_file(): raise FileNotFoundError(self.path)
         if format==2: records=self._formatted()
@@ -35,6 +70,17 @@ class CloudData:
         if not self.records: raise ValueError('CLOUD.DAT contains no records')
 
     def _formatted(self):
+        """Iterate over records decoded from formatted CLOUD.DAT text.
+
+        Yields:
+            Tuples ``(begin, end, values)``. ``values`` is a float32 array of
+            shape ``(ny, nx)`` containing cloud fraction from 0 to 1.
+
+        Raises:
+            UnicodeDecodeError: If the file is not ASCII.
+            ValueError: If a record is incomplete or contains an invalid label,
+                timestamp, or numeric field.
+        """
         tokens=shlex.split(self.path.read_text(encoding='ascii',errors='strict'),comments=False)
         width=5+self.nx*self.ny
         if len(tokens)%width: raise ValueError('formatted CLOUD.DAT has an incomplete record')
@@ -48,6 +94,16 @@ class CloudData:
             yield begin,end,values
 
     def _unformatted(self):
+        """Iterate over sequential-unformatted CLOUD.DAT records.
+
+        Yields:
+            Tuples ``(begin, end, values)``. ``values`` is a float32 array of
+            shape ``(ny, nx)`` containing cloud fraction from 0 to 1.
+
+        Raises:
+            ValueError: If a record has the wrong byte length, label, or
+                timestamp encoding.
+        """
         expected=24+4*self.nx*self.ny
         with FortranSequentialReader(self.path) as reader:
             while (payload:=reader.read_record()) is not None:
@@ -60,13 +116,47 @@ class CloudData:
                 yield _datetime(begin_code,begin_sec),_datetime(end_code,end_sec),values
 
     def at_end(self,when):
+        """Return the cloud field for an exact interval-ending time.
+
+        Args:
+            when: Interval-ending datetime to retrieve.
+
+        Returns:
+            Float32 cloud-fraction array of shape ``(ny, nx)``.
+
+        Raises:
+            ValueError: If no record ends at ``when``.
+        """
         try: return self.records[when]
         except KeyError as error: raise ValueError(f'CLOUD.DAT has no record ending at {when}') from error
 
 
 class CloudDataWriter:
-    """Write OUTCLD's formatted or sequential-unformatted records."""
+    """Write OUTCLD formatted or sequential-unformatted records.
+
+    Attributes:
+        path: Destination CLOUD.DAT path.
+        nx: Number of grid columns required by :meth:`append`.
+        ny: Number of grid rows required by :meth:`append`.
+        format: CALMET ``IFORMC`` value, either ``1`` or ``2``.
+        stream: Open formatted or Fortran sequential output stream, or
+            ``None`` after :meth:`close`.
+    """
+
     def __init__(self,path,nx,ny,format=2):
+        """Open a CLOUD.DAT destination.
+
+        Args:
+            path: Output path; missing parent directories are created.
+            nx: Number of grid columns.
+            ny: Number of grid rows.
+            format: ``1`` for sequential-unformatted binary or ``2`` for
+                formatted ASCII text.
+
+        Raises:
+            OSError: If the destination cannot be created.
+            ValueError: If ``format`` is not 1 or 2.
+        """
         self.path=Path(path); self.nx=int(nx); self.ny=int(ny); self.format=int(format)
         self.path.parent.mkdir(parents=True,exist_ok=True)
         if self.format==1: self.stream=FortranSequentialWriter(self.path)
@@ -75,9 +165,35 @@ class CloudDataWriter:
 
     @staticmethod
     def _code(value):
+        """Encode a datetime for a CLOUD.DAT interval header.
+
+        Args:
+            value: Datetime to encode.
+
+        Returns:
+            Tuple ``(ordinal_code, seconds)`` where ``seconds`` is the offset
+            after the encoded hour.
+
+        Raises:
+            ValueError: If ``value`` cannot be represented as a CALMET ordinal
+                code.
+        """
         return format_ordinal_code(value),value.minute*60+value.second
 
     def append(self,begin,end,field):
+        """Append one cloud-fraction grid and flush formatted output.
+
+        Args:
+            begin: Beginning datetime of the output interval.
+            end: Ending datetime of the output interval.
+            field: Array-like cloud fraction with shape ``(ny, nx)`` and
+                finite values in the closed interval 0--1.
+
+        Raises:
+            ValueError: If ``field`` has the wrong shape, contains invalid
+                values, or either timestamp cannot be encoded.
+            OSError: If writing to the destination fails.
+        """
         values=np.asarray(field,dtype='<f4')
         if values.shape!=(self.ny,self.nx):
             raise ValueError('CLOUD.DAT field does not match configured grid')
@@ -95,6 +211,25 @@ class CloudDataWriter:
             self.stream.flush()
 
     def close(self):
+        """Close the output stream; repeated calls are harmless."""
         if self.stream is not None: self.stream.close(); self.stream=None
-    def __enter__(self): return self
-    def __exit__(self,*exc): self.close()
+
+    def __enter__(self):
+        """Return this writer for use as a context manager.
+
+        Returns:
+            The open :class:`CloudDataWriter` instance.
+        """
+        return self
+
+    def __exit__(self,*exc):
+        """Close the writer when leaving a context-manager block.
+
+        Args:
+            *exc: Exception type, value, and traceback supplied by the context
+                manager protocol.
+
+        Returns:
+            ``None``; exceptions are not suppressed.
+        """
+        self.close()

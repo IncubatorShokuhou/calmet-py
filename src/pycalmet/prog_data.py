@@ -17,7 +17,19 @@ _NOON=timedelta(hours=12)
 
 
 def _parse_hour(value):
-    """Parse a PROG.DAT decimal ``HH.MM`` value at the file boundary."""
+    """Parse a PROG.DAT decimal ``HH.MM`` value at the file boundary.
+
+    Args:
+        value: Numeric time-of-day label encoded as decimal ``HH.MM``.
+
+    Returns:
+        Tuple containing the time since midnight and whether the special
+        ``24.00`` end-of-day label was used.
+
+    Raises:
+        ValueError: If the value is non-finite, has non-minute precision, or
+            is not a valid 24-hour clock label.
+    """
     hour=float(value)
     if not np.isfinite(hour):
         raise ValueError('PROG.DAT hour must be finite')
@@ -37,11 +49,35 @@ def _parse_hour(value):
 
 
 def _hour_label(value):
-    """Return the normalized time-of-day for a decimal ``HH.MM`` value."""
+    """Return normalized time-of-day for a decimal ``HH.MM`` label.
+
+    Args:
+        value: Numeric PROG.DAT hour label.
+
+    Returns:
+        Time elapsed since midnight; ``24.00`` normalizes to zero.
+
+    Raises:
+        ValueError: If ``value`` is not a valid PROG.DAT hour.
+    """
     return _parse_hour(value)[0]
 
 
 def _array(payload, dtype, count, label):
+    """Decode one fixed-size binary PROG.DAT record.
+
+    Args:
+        payload: Raw Fortran sequential-record payload.
+        dtype: NumPy dtype used to interpret the payload.
+        count: Required number of scalar values.
+        label: Record name included in validation errors.
+
+    Returns:
+        Writable one-dimensional NumPy array copied from ``payload``.
+
+    Raises:
+        ValueError: If the decoded record length differs from ``count``.
+    """
     values=np.frombuffer(payload,dtype=dtype)
     if values.size!=count:
         raise ValueError(f'PROG.DAT {label} record contains {values.size} values; expected {count}')
@@ -50,7 +86,19 @@ def _array(payload, dtype, count, label):
 
 @dataclass(frozen=True, slots=True)
 class ProgRecord:
-    """One hour-ending CSUMM prognostic wind field."""
+    """One hour-ending CSUMM prognostic wind field.
+
+    Attributes:
+        hour: Decimal ``HH.MM`` ending-time label.
+        x_origin_km: Source-grid west origin in kilometres.
+        y_origin_km: Source-grid south origin in kilometres.
+        spacing_km: Common horizontal grid spacing in kilometres.
+        height_m: One-dimensional source-level heights in metres.
+        u_cm_s: Eastward wind with shape ``(level, y, x)`` in centimetres per
+            second.
+        v_cm_s: Northward wind with shape ``(level, y, x)`` in centimetres per
+            second.
+    """
 
     hour: float
     x_origin_km: float
@@ -62,9 +110,24 @@ class ProgRecord:
 
 
 class ProgData:
-    """Legacy sequential-unformatted PROG.DAT used by ``IPROG=1/2``."""
+    """Legacy sequential-unformatted PROG.DAT used by ``IPROG=1/2``.
+
+    Attributes:
+        path: Path to the decoded file.
+        records: Ordered prognostic wind records from the file.
+    """
 
     def __init__(self,path):
+        """Read and validate all wind fields in a PROG.DAT file.
+
+        Args:
+            path: Little-endian Fortran sequential-unformatted file path.
+
+        Raises:
+            OSError: If the file cannot be opened or read.
+            ValueError: If a record is truncated, has invalid dimensions or
+                heights, or the file contains no usable field.
+        """
         self.path=Path(path)
         records=[]
         with FortranSequentialReader(self.path) as reader:
@@ -90,6 +153,18 @@ class ProgData:
 
     @staticmethod
     def _required(reader,label):
+        """Read a required sequential record.
+
+        Args:
+            reader: Open :class:`FortranSequentialReader`.
+            label: Record name included in a truncation error.
+
+        Returns:
+            Raw bytes from the next sequential record.
+
+        Raises:
+            ValueError: If the file ends before the record is available.
+        """
         payload=reader.read_record()
         if payload is None:
             raise ValueError(f'truncated PROG.DAT before {label} record')
@@ -97,6 +172,22 @@ class ProgData:
 
     @classmethod
     def _read_component(cls,reader,nx,ny,nz,label):
+        """Read one row-recorded three-dimensional wind component.
+
+        Args:
+            reader: Open sequential-record reader.
+            nx: Number of values per row.
+            ny: Number of rows per level.
+            nz: Number of vertical levels.
+            label: Component label, normally ``"U"`` or ``"V"``.
+
+        Returns:
+            ``float32`` array with shape ``(nz, ny, nx)`` in centimetres per
+            second.
+
+        Raises:
+            ValueError: If any component row is missing or has the wrong size.
+        """
         result=np.empty((nz,ny,nx),dtype=MODEL_DTYPE)
         for level in range(nz):
             for row in range(ny):
@@ -106,7 +197,18 @@ class ProgData:
         return result
 
     def at_hour(self,hour):
-        """Return the first record matching a normalized ending-hour label."""
+        """Return the first record matching a normalized ending-hour label.
+
+        Args:
+            hour: Decimal ``HH.MM`` ending-time label.
+
+        Returns:
+            First record with the requested clock time.
+
+        Raises:
+            ValueError: If the label is invalid, record order is invalid, or
+                no record matches.
+        """
         wanted=_hour_label(hour)
         self._record_offsets()
         for record in self.records:
@@ -115,12 +217,40 @@ class ProgData:
         raise ValueError(f'PROG.DAT has no record for ending hour {float(hour):g}')
 
     def interpolate(self,hour,grid: GridConfig,target_height_m):
-        """Apply vertical and four-corner inverse-distance interpolation."""
+        """Interpolate a selected ending-hour wind field to a CALMET grid.
+
+        Args:
+            hour: Decimal ``HH.MM`` ending-time label.
+            grid: Target CALMET horizontal grid.
+            target_height_m: One-dimensional target-level heights in metres.
+
+        Returns:
+            Tuple of eastward and northward ``float32`` winds in metres per
+            second, each with shape ``(level, ny, nx)``.
+
+        Raises:
+            ValueError: If the hour is unavailable or interpolation cannot
+                cover every target point.
+        """
         return self.interpolate_record(self.at_hour(hour),grid,target_height_m)
 
     @staticmethod
     def interpolate_record(record,grid: GridConfig,target_height_m):
-        """Interpolate one explicitly selected record without hour ambiguity."""
+        """Interpolate an explicitly selected record without hour ambiguity.
+
+        Args:
+            record: Source prognostic field.
+            grid: Target CALMET horizontal grid.
+            target_height_m: Non-empty vector of target heights in metres.
+
+        Returns:
+            Tuple of eastward and northward ``float32`` winds in metres per
+            second, each with shape ``(level, ny, nx)``.
+
+        Raises:
+            ValueError: If target heights are invalid or a target horizontal
+                point has no source-grid neighbours.
+        """
         target_height=np.asarray(target_height_m,dtype=MODEL_DTYPE)
         source_height=np.asarray(record.height_m,dtype=MODEL_DTYPE)
         if target_height.ndim!=1 or target_height.size<1:
@@ -177,7 +307,16 @@ class ProgData:
                 np.asarray(output_v,dtype=MODEL_DTYPE))
 
     def _record_offsets(self):
-        """Unwrap record clocks into an ordered, date-independent timeline."""
+        """Unwrap record clocks into an ordered, date-independent timeline.
+
+        Returns:
+            Tuple of monotonically increasing offsets from an arbitrary day
+            zero, including inferred midnight rollovers.
+
+        Raises:
+            ValueError: If a clock label is invalid or records move backwards
+                without a plausible midnight rollover.
+        """
         offsets=[]
         day=timedelta(0)
         previous_offset=None
@@ -215,6 +354,18 @@ class ProgData:
         Dates are supplied by the caller because ``PROG.DAT`` stores only a
         decimal clock.  Record order supplies day rollovers; leading and
         intervening records earlier than a requested time are skipped.
+
+        Args:
+            times: Strictly increasing ending datetimes at whole-minute
+                precision and with compatible timezone awareness.
+
+        Returns:
+            Tuple containing exactly one PROG.DAT record per requested time.
+
+        Raises:
+            TypeError: If any requested value is not a datetime.
+            ValueError: If times are not whole-minute and strictly ordered, if
+                timezones are incompatible, or if no record sequence matches.
         """
         targets=tuple(times)
         if not targets:

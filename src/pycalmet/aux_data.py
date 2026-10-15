@@ -14,6 +14,36 @@ from .datetime_utils import parse_calendar,parse_ordinal_code
 
 @dataclass(frozen=True,slots=True)
 class AuxiliaryHeader:
+    """Static metadata decoded from the CALMET.AUX header.
+
+    Attributes:
+        comments: Producer comments stored in the file header.
+        start: Declared beginning of the model run.
+        end: Declared end of the model run.
+        wire_start: Original ``(year, month, day, hour, seconds)`` start fields.
+        wire_end: Original ``(year, month, day, hour, seconds)`` end fields.
+        timezone: CALMET time-zone label.
+        run_hours: Declared run duration in hours.
+        nx: Number of grid columns.
+        ny: Number of grid rows.
+        nz: Number of vertical layers.
+        spacing_m: Horizontal grid spacing in metres.
+        x_origin_m: Grid x origin in metres.
+        y_origin_m: Grid y origin in metres.
+        projection: CALPUFF projection identifier.
+        datum: CALPUFF horizontal datum identifier.
+        datum_date: Datum database date written by the producer.
+        false_easting_km: Projection false easting in kilometres.
+        false_northing_km: Projection false northing in kilometres.
+        hemisphere: UTM hemisphere code.
+        utm_zone: UTM zone number.
+        latitude_origin: Projection latitude of origin in degrees north.
+        longitude_origin: Projection longitude of origin in degrees east.
+        standard_parallel_1: First standard parallel in degrees north.
+        standard_parallel_2: Second standard parallel in degrees north.
+        z_faces_m: Float32 array of shape ``(nz + 1,)`` containing layer-face
+            heights in metres above ground level.
+    """
     comments: tuple[str,...]
     start: datetime
     end: datetime
@@ -43,6 +73,22 @@ class AuxiliaryHeader:
 
 @dataclass(frozen=True,slots=True)
 class AuxiliaryCloudHour:
+    """Cloud-water fields for one CALMET.AUX output interval.
+
+    Attributes:
+        begin: Inclusive interval beginning.
+        end: Interval ending.
+        wire_time_bounds: Original ordinal-date codes and seconds as
+            ``(begin_code, begin_seconds, end_code, end_seconds)``.
+        cloud_water_above_g_kg: Float32 ``(ny, nx)`` cloud-water mixing ratio
+            above the model top, in grams per kilogram.
+        cloud_bottom_above_m: Float32 ``(ny, nx)`` cloud-bottom height above
+            the model top, in metres.
+        cloud_top_above_m: Float32 ``(ny, nx)`` cloud-top height above the
+            model top, in metres.
+        cloud_water_3d_g_kg: Float32 ``(nz, ny, nx)`` in-model cloud-water
+            mixing ratio, in grams per kilogram.
+    """
     begin: datetime
     end: datetime
     wire_time_bounds: tuple[int,int,int,int]
@@ -53,23 +99,72 @@ class AuxiliaryCloudHour:
 
 
 class AuxiliaryData:
-    """Stream and validate a GNU sequential-unformatted CALMET.AUX file."""
+    """Stream and validate a GNU sequential-unformatted CALMET.AUX file.
+
+    Attributes:
+        path: Path to the input file.
+        reader: Sequential-unformatted record reader positioned after the
+            most recently consumed record.
+        header: Validated static file metadata.
+    """
     _fields_2d=('CLDMRUP','ZCLDBOT','ZCLDTOP')
 
     def __init__(self,path: str | Path):
+        """Open a CALMET.AUX file and read its static header.
+
+        Args:
+            path: Path to the sequential-unformatted CALMET.AUX file.
+
+        Raises:
+            OSError: If the file cannot be opened.
+            ValueError: If the declaration, grid metadata, variable table, or
+                vertical coordinates are invalid or unsupported.
+        """
         self.path=Path(path)
         self.reader=FortranSequentialReader(self.path)
         self.header=self._read_header()
 
     @staticmethod
-    def _text(value): return value.decode('ascii').rstrip()
+    def _text(value):
+        """Decode one fixed-width ASCII field and remove trailing spaces.
+
+        Args:
+            value: Bytes containing an ASCII field.
+
+        Returns:
+            Decoded text with trailing whitespace removed.
+
+        Raises:
+            UnicodeDecodeError: If ``value`` is not valid ASCII.
+        """
+        return value.decode('ascii').rstrip()
 
     def _record(self,description):
+        """Read one required Fortran record.
+
+        Args:
+            description: Human-readable record name used in error messages.
+
+        Returns:
+            Raw record payload as bytes.
+
+        Raises:
+            ValueError: If the file ends before the record is available.
+        """
         record=self.reader.read_record()
         if record is None: raise ValueError(f'truncated CALMET.AUX {description}')
         return record
 
     def _read_header(self):
+        """Decode and validate the declaration and static metadata records.
+
+        Returns:
+            An :class:`AuxiliaryHeader` describing the grid and run period.
+
+        Raises:
+            ValueError: If a required record is missing, malformed, or uses
+                unsupported CALMET.AUX dimensions or variables.
+        """
         declaration=self._record('declaration')
         if (len(declaration)!=96 or self._text(declaration[:16])!='CALMET.AUX' or
                 self._text(declaration[16:32])!='1.1'):
@@ -119,6 +214,21 @@ class AuxiliaryData:
 
     @staticmethod
     def _decode_timestamp(record):
+        """Decode one CALMET.AUX interval timestamp record.
+
+        Args:
+            record: Sixteen-byte record containing four little-endian int32
+                values: begin code, begin seconds, end code, and end seconds.
+
+        Returns:
+            Tuple ``(begin, end, wire_bounds)`` where the first two elements
+            are datetimes and ``wire_bounds`` preserves the four encoded
+            integer values.
+
+        Raises:
+            ValueError: If the record size, encoded dates, or interval order
+                is invalid.
+        """
         if len(record)!=16: raise ValueError('invalid CALMET.AUX timestamp record')
         begin_code,begin_seconds,end_code,end_seconds=struct.unpack('<4i',record)
         try:
@@ -131,9 +241,30 @@ class AuxiliaryData:
         return begin,end,(begin_code,begin_seconds,end_code,end_seconds)
 
     def _timestamp(self):
+        """Read the next timestamp record.
+
+        Returns:
+            Tuple ``(begin, end)`` of decoded datetimes.
+
+        Raises:
+            ValueError: If the timestamp record is missing or invalid.
+        """
         return self._decode_timestamp(self._record('timestamp'))[:2]
 
     def _compressed(self,label):
+        """Decode one CALMET zero-run-compressed two-dimensional field.
+
+        Args:
+            label: Expected twelve-character field label.
+
+        Returns:
+            Float32 array of shape ``(ny, nx)``. Negative encoded values
+            expand to zero runs; nonnegative values are retained.
+
+        Raises:
+            ValueError: If record lengths, labels, or the expanded grid size
+                do not match the header.
+        """
         count_record=self._record(f'{label} compressed count')
         if len(count_record)!=4: raise ValueError('invalid CALMET.AUX compressed count')
         count=struct.unpack('<i',count_record)[0]
@@ -152,6 +283,17 @@ class AuxiliaryData:
         return values.reshape(self.header.ny,self.header.nx)
 
     def read_hour(self):
+        """Read the next complete cloud-water interval.
+
+        Returns:
+            An :class:`AuxiliaryCloudHour` containing three float32
+            ``(ny, nx)`` fields and one float32 ``(nz, ny, nx)`` field, or
+            ``None`` at end of file.
+
+        Raises:
+            ValueError: If a field is malformed or its timestamp differs from
+                the other fields in the interval.
+        """
         first=self.reader.read_record()
         if first is None: return None
         begin,end,wire_time_bounds=self._decode_timestamp(first)
@@ -167,6 +309,26 @@ class AuxiliaryData:
                          for level in range(1,self.header.nz+1)])
         return AuxiliaryCloudHour(begin,end,wire_time_bounds,*fields,layers)
 
-    def close(self): self.reader.close()
-    def __enter__(self): return self
-    def __exit__(self,*exc): self.close()
+    def close(self):
+        """Close the underlying sequential-record stream."""
+        self.reader.close()
+
+    def __enter__(self):
+        """Return this reader for use as a context manager.
+
+        Returns:
+            The open :class:`AuxiliaryData` instance.
+        """
+        return self
+
+    def __exit__(self,*exc):
+        """Close the reader when leaving a context-manager block.
+
+        Args:
+            *exc: Exception type, value, and traceback supplied by the context
+                manager protocol.
+
+        Returns:
+            ``None``; exceptions are not suppressed.
+        """
+        self.close()

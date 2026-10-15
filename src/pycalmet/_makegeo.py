@@ -29,7 +29,18 @@ STANDARD_PROPERTIES={int(category):(float(Z0[i]),float(ALBEDO[i]),float(BOWEN[i]
 
 
 def _category_sum(values, mask=None):
-    """Sum category fractions with extra precision for the reduction."""
+    """Sum category fractions with extra reduction precision.
+
+    Args:
+        values: Array shaped ``(category, ...)``; values are read as ``float32``.
+        mask: Optional Boolean selector for the category axis.
+
+    Returns:
+        ``float64`` array over the remaining axes.
+
+    Raises:
+        ValueError: If ``mask`` cannot select the category axis.
+    """
     data=np.asarray(values,dtype=MODEL_DTYPE)
     selected=(np.ones(data.shape[0],dtype=bool) if mask is None else
               np.asarray(mask,dtype=bool))
@@ -37,7 +48,16 @@ def _category_sum(values, mask=None):
 
 
 def _water_sum(fractions, categories, water_categories):
-    """Sum fractions assigned to configured water categories."""
+    """Sum land-use fractions assigned to configured water categories.
+
+    Args:
+        fractions: ``float32``-compatible array shaped ``(category, ...)``.
+        categories: Category identifier for each first-axis row.
+        water_categories: Category identifiers treated as water.
+
+    Returns:
+        ``float64`` water-fraction array over the spatial axes.
+    """
     data=np.asarray(fractions,dtype=MODEL_DTYPE)
     categories=np.asarray(categories)
     return np.sum(data[np.isin(categories,water_categories)],axis=0,
@@ -45,7 +65,18 @@ def _water_sum(fractions, categories, water_categories):
 
 
 def _snow_albedo_values(normal, snowy, reduction, maximum_age, age):
-    """Evaluate WTSWALB's snow-age branch at floating-point boundaries."""
+    """Evaluate WTSWALB's category-specific snow-age albedo decay.
+
+    Args:
+        normal: Snow-free albedo values as fractions.
+        snowy: Fresh-snow albedo values as fractions.
+        reduction: Category snow-albedo reduction coefficients.
+        maximum_age: Positive category decay time scales in days.
+        age: Snow ages in days.
+
+    Returns:
+        ``float32`` albedo array with the broadcast input shape.
+    """
     normal=np.asarray(normal,dtype=MODEL_DTYPE)
     snowy=np.asarray(snowy,dtype=MODEL_DTYPE)
     reduction=np.asarray(reduction,dtype=MODEL_DTYPE)
@@ -58,6 +89,18 @@ def _snow_albedo_values(normal, snowy, reduction, maximum_age, age):
 
 @dataclass(frozen=True,slots=True)
 class GeophysicalResult:
+    """Summarize one completed MAKEGEO operation.
+
+    Attributes:
+        output: Primary generated geophysical product path.
+        populated_cells: Number of grid cells with land-use coverage.
+        terrain_minimum_m: Minimum output terrain height in metres.
+        terrain_maximum_m: Maximum output terrain height in metres.
+        outputs: All generated paths; snow runs contain one path per day.
+        qa_cell: Validated one-based QA cell, when configured.
+        qa_values: Surface-property values reported for ``qa_cell``.
+    """
+
     output: Path
     populated_cells: int
     terrain_minimum_m: float
@@ -68,7 +111,17 @@ class GeophysicalResult:
 
 
 def _qa_cell_values(terrain, fields, config):
-    """Return MAKEGEO's list-file QA fields using one-based IXQA/IYQA."""
+    """Extract MAKEGEO list-file values at a configured QA cell.
+
+    Args:
+        terrain: Terrain-height array shaped ``(y, x)`` in metres.
+        fields: Seven output surface fields, each shaped ``(y, x)``.
+        config: Target grid and optional one-based ``qa_cell``.
+
+    Returns:
+        Tuple of Python floats ordered as dominant land use, terrain, and the
+        remaining six surface properties; ``None`` if no valid cell is set.
+    """
     if config.qa_cell is None:
         return None
     ix,iy=config.qa_cell
@@ -79,7 +132,14 @@ def _qa_cell_values(terrain, fields, config):
 
 @dataclass(frozen=True,slots=True)
 class SnowReference:
-    """Sparse CTGPROC-to-SNODAS cross-reference used by MAKEGEO."""
+    """Store the sparse CTGPROC-to-SNODAS cross-reference.
+
+    Attributes:
+        cell_index: Zero-based flattened MAKEGEO target-cell indices.
+        category_index: Zero-based input-category indices.
+        snow_grid_index: One-based flattened global SNODAS cell indices.
+        fraction: ``float32`` sample weights for each reference fragment.
+    """
 
     cell_index: np.ndarray
     category_index: np.ndarray
@@ -89,6 +149,37 @@ class SnowReference:
 
 @dataclass(frozen=True,slots=True)
 class SnowDataHeader:
+    """Describe the formatted ``SNOW.DAT`` grid and source window.
+
+    Attributes:
+        dataset: Dataset declaration string.
+        version: File-format version string.
+        modification: Producer or modification description.
+        projection: Processed-grid projection identifier.
+        datum: Processed-grid datum identifier.
+        date_system: Datum-table date or date-system label.
+        units: Processed-grid coordinate units.
+        longitude_origin: Processed-grid longitude origin in degrees east.
+        latitude_origin: Processed-grid latitude origin in degrees north.
+        nx: Processed-window column count.
+        ny: Processed-window row count.
+        dx: Processed-grid longitudinal spacing in degrees.
+        dy: Processed-grid latitudinal spacing in degrees.
+        timezone: Timestamp time-zone label.
+        datetime_type: Timestamp representation label.
+        raw_longitude_origin: Global SNODAS longitude origin in degrees east.
+        raw_latitude_origin: Global SNODAS latitude origin in degrees north.
+        raw_nx: Global raw-grid column count.
+        raw_ny: Global raw-grid row count.
+        raw_dx: Global raw-grid longitudinal spacing in degrees.
+        raw_dy: Global raw-grid latitudinal spacing in degrees.
+        i_begin: One-based first raw-grid column in the processed window.
+        i_end: One-based last raw-grid column in the processed window.
+        j_begin: One-based first raw-grid row in the processed window.
+        j_end: One-based last raw-grid row in the processed window.
+        variables_per_day: Number of packed fields in each daily group.
+    """
+
     dataset: str
     version: str
     modification: str
@@ -119,13 +210,38 @@ class SnowDataHeader:
 
 @dataclass(frozen=True,slots=True)
 class SnowVariable:
+    """Store one decoded daily ``SNOW.DAT`` variable.
+
+    Attributes:
+        timestamp: Time-zone-naive valid time.
+        name: Fixed-width variable identifier, such as ``SNOWDEP``.
+        values: Two-dimensional ``float32`` field in the variable's physical
+            units, with missing packed values represented by NaN.
+    """
+
     timestamp: datetime
     name: str
     values: np.ndarray
 
 
 def _expand_packed_snow(packed,minimum,missing,scale,size):
-    """Expand RDSN's signed-int16 run stream and restore physical values."""
+    """Expand RDSN's signed-integer runs and restore physical values.
+
+    Args:
+        packed: Encoded value/run-length integer stream.
+        minimum: Additive packed-data offset.
+        missing: Packed integer used for missing values.
+        scale: Nonzero divisor converting packed integers to physical units.
+        size: Required number of expanded grid values.
+
+    Returns:
+        One-dimensional ``float32`` array of length ``size``; missing values
+        are NaN.
+
+    Raises:
+        ValueError: If scale is zero or the run stream is truncated, overflows,
+            or does not exactly fill the output grid.
+    """
     packed=np.asarray(packed,dtype=np.int64).ravel()
     if scale==0.:
         raise ValueError('packed snow scale must be non-zero')
@@ -154,6 +270,18 @@ def _expand_packed_snow(packed,minimum,missing,scale,size):
 
 
 def _read_formatted_snow_header(stream):
+    """Parse and validate the header of a formatted ``SNOW.DAT`` stream.
+
+    Args:
+        stream: Open text stream positioned at the declaration record.
+
+    Returns:
+        Parsed processed-grid, raw-grid, time, and variable-count metadata.
+
+    Raises:
+        ValueError: If declaration, comments, geometry, window, or dimensions
+            are truncated or invalid.
+    """
     first=stream.readline()
     if len(first)<32:
         raise ValueError('SNOW.DAT header record 1 is truncated')
@@ -190,7 +318,20 @@ def _read_formatted_snow_header(stream):
 
 
 def _formatted_snow_timestamp(line,offset,label):
-    """Parse one fixed-width ``YYYY MM DD HH SSSS`` timestamp."""
+    """Parse one fixed-width ``YYYY MM DD HH SSSS`` timestamp.
+
+    Args:
+        line: Fixed-width variable-header record.
+        offset: Zero-based character offset of the timestamp.
+        label: Timestamp label used in error messages.
+
+    Returns:
+        Pair of a time-zone-naive :class:`datetime` and its five parsed integer
+        fields ``(year, month, day, hour, seconds)``.
+
+    Raises:
+        ValueError: If fields or their calendar/time ranges are invalid.
+    """
     try:
         fields=(int(line[offset:offset+4]),int(line[offset+4:offset+7]),
                 int(line[offset+7:offset+10]),int(line[offset+10:offset+13]),
@@ -208,6 +349,20 @@ def _formatted_snow_timestamp(line,offset,label):
 
 
 def _read_formatted_snow_variable(stream,header):
+    """Read and expand one packed variable from a formatted snow stream.
+
+    Args:
+        stream: Open text stream positioned at a variable header or EOF.
+        header: Parsed snow grid dimensions.
+
+    Returns:
+        Decoded :class:`SnowVariable` with a ``float32`` ``(ny, nx)`` field,
+        or ``None`` at clean end of file.
+
+    Raises:
+        ValueError: If timestamps, packed metadata, record counts, or run data
+            are inconsistent or truncated.
+    """
     line=stream.readline()
     if not line:
         return None
@@ -243,7 +398,20 @@ def _read_formatted_snow_variable(stream,header):
 
 
 def _fill_snow_spatial(values,radius=2):
-    """Vectorized FILLS square-window search using the original snapshot."""
+    """Fill missing snow cells from expanding square spatial windows.
+
+    Args:
+        values: Two-dimensional snow field; NaN marks missing values.
+        radius: Maximum non-negative search radius in grid cells.
+
+    Returns:
+        ``float32`` array with the input shape. Each missing cell receives the
+        first available square-window mean; unresolved cells remain NaN.
+
+    Raises:
+        ValueError: If ``values`` is not two-dimensional or ``radius`` is
+            negative.
+    """
     source=np.asarray(values,dtype=MODEL_DTYPE)
     if source.ndim!=2 or radius<0:
         raise ValueError('spatial snow fill requires a 2-D field and non-negative radius')
@@ -273,7 +441,20 @@ def _fill_snow_spatial(values,radius=2):
 
 
 def _fill_snow_temporal(values,current=1):
-    """Vectorized FILLT: use current day, else mean all available window days."""
+    """Fill missing current-day snow values from a multi-day window.
+
+    Args:
+        values: ``(day, y, x)`` snow array; NaN marks missing values.
+        current: Zero-based day index retained where it is finite.
+
+    Returns:
+        ``float32`` ``(y, x)`` field using the current day where available and
+        the mean of all finite window days elsewhere.
+
+    Raises:
+        ValueError: If ``values`` is not three-dimensional or ``current`` is
+            outside its day axis.
+    """
     window=np.asarray(values,dtype=MODEL_DTYPE)
     if window.ndim!=3 or not 0<=current<window.shape[0]:
         raise ValueError('temporal snow fill requires (day,y,x) and a valid current index')
@@ -292,12 +473,42 @@ def _fill_snow_temporal(values,current=1):
 
 
 def _snow_control_date(value):
+    """Normalize a MAKEGEO snow-control value to naive midnight.
+
+    Args:
+        value: Supported date, datetime, integer, or string date value.
+
+    Returns:
+        Time-zone-naive :class:`datetime` at midnight on the parsed date.
+
+    Raises:
+        TypeError: If the value has an unsupported type.
+        ValueError: If the value is not a valid calendar date.
+    """
     day=parse_date(value,'MAKEGEO snow date')
     return datetime.combine(day,datetime.min.time())
 
 
 def _iter_formatted_snow_days(path,start_date,end_date):
-    """Stream RDSN's rolling three-day window as daily depth/age fields."""
+    """Stream RDSN's rolling three-day window as daily depth and age fields.
+
+    Args:
+        path: Formatted ``SNOW.DAT`` input path.
+        start_date: First requested calendar day, inclusive.
+        end_date: Last requested calendar day, inclusive.
+
+    Yields:
+        Tuples ``(date, depth, age, header)``. ``date`` is naive midnight;
+        depth is a temporally/spatially filled ``float32`` ``(ny, nx)`` field
+        in the file's physical units; age is ``int32`` days since qualifying
+        precipitation; header describes the processed SNODAS window.
+
+    Raises:
+        ValueError: If the date interval, SNODAS geometry, daily groups,
+            timestamps, variables, continuity, or requested-day coverage is
+            invalid.
+        OSError: If the snow file cannot be read.
+    """
     start=_snow_control_date(start_date); end=_snow_control_date(end_date)
     if start>end:
         raise ValueError('snow_start_date/IDATEBEG must not follow snow_end_date/IDATEEND')
@@ -363,7 +574,22 @@ def _iter_formatted_snow_days(path,start_date,end_date):
 
 
 def _read_snow_reference(path,g,categories):
-    """Read CTGPROC's SNOWREF arrays without materialising legacy 4-D arrays."""
+    """Read CTGPROC's sparse SNOWREF cross-reference.
+
+    Args:
+        path: NetCDF or legacy ASCII land-use product containing snow metadata.
+        g: MAKEGEO target grid.
+        categories: Ordered input land-use category identifiers.
+
+    Returns:
+        Validated sparse reference with zero-based target/category indices,
+        one-based global SNODAS indices, and ``float32`` fractions.
+
+    Raises:
+        ValueError: If snow metadata is absent, incomplete, out of bounds,
+            duplicated, incorrectly ordered, or contains invalid fractions.
+        OSError: If the land-use file cannot be read.
+    """
     source=Path(path)
     if source.suffix.lower() in {'.nc','.nc4','.cdf'}:
         with Dataset(source) as dataset:
@@ -431,6 +657,19 @@ def _read_snow_reference(path,g,categories):
     return SnowReference(cell,land,snow,fraction)
 
 def _validate_netcdf_grid(dataset,g,label):
+    """Validate optional NetCDF grid metadata against a target grid.
+
+    Args:
+        dataset: Open netCDF4 dataset.
+        g: Expected grid dimensions, geometry, projection, and datum.
+        label: Human-readable input label used in errors.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If any present grid attribute differs from ``g``.
+    """
     expected={'grid_nx':g.nx,'grid_ny':g.ny,'grid_dx_km':g.dx_km,
               'grid_dy_km':g.dy_km,'x_origin_km':g.x_origin_km,
               'y_origin_km':g.y_origin_km}
@@ -452,6 +691,18 @@ def _validate_netcdf_grid(dataset,g,label):
 
 
 def _legacy_angle(value):
+    """Parse a legacy directional angle with an optional compass suffix.
+
+    Args:
+        value: Numeric text optionally suffixed with N, S, E, or W.
+
+    Returns:
+        Signed angle as a float in degrees; longitudes are normalized to the
+        ``[-180, 180]`` branch when needed.
+
+    Raises:
+        ValueError: If the text is empty, nonnumeric, or has multiple suffixes.
+    """
     token=re.sub(r'\s+','',str(value))
     if not token:
         raise ValueError('empty directional angle')
@@ -475,6 +726,21 @@ def _legacy_grid_header(lines,index,g,label,*,landuse=False):
     The legacy reader checks the full projection, datum, and grid geometry for
     each terrain and land-use input.  Return the first line following the grid
     record together with that record's fields.
+
+    Args:
+        lines: Complete legacy input file as text records.
+        index: Zero-based index of the projection record.
+        g: Expected MAKEGEO target grid.
+        label: Human-readable input label used in errors.
+        landuse: Require the additional land-use category-count field.
+
+    Returns:
+        Pair ``(next_index, grid_fields)`` where ``next_index`` points to the
+        line after the grid record and ``grid_fields`` contains its tokens.
+
+    Raises:
+        ValueError: If projection parameters, datum, dimensions, geometry,
+            false offsets, UTM settings, or header structure do not match.
     """
     try:
         projection=lines[index][:8].strip().upper(); index+=1
@@ -538,6 +804,22 @@ def _legacy_grid_header(lines,index,g,label,*,landuse=False):
 
 
 def _read_terrain(path,g):
+    """Read terrain heights from a NetCDF or legacy TERREL product.
+
+    Args:
+        path: Terrain product path.
+        g: Expected MAKEGEO target grid.
+
+    Returns:
+        ``float32`` terrain-height array shaped ``(g.ny, g.nx)`` in metres,
+        ordered south to north along the first axis.
+
+    Raises:
+        KeyError: If a NetCDF product lacks ``terrain_height``.
+        ValueError: If grid metadata, shape, legacy header, units, ordering, or
+            sample count is invalid.
+        OSError: If the product cannot be read.
+    """
     p=Path(path)
     if p.suffix.lower() in {'.nc','.nc4','.cdf'}:
         with Dataset(p) as ds:
@@ -570,6 +852,24 @@ def _read_terrain(path,g):
     return terrain[::-1] if order[1].upper()=='N_S' else terrain
 
 def _read_landuse(path,g,expected_categories=None):
+    """Read category fractions from a NetCDF or legacy CTGPROC product.
+
+    Args:
+        path: FRACTION land-use product path.
+        g: Expected MAKEGEO target grid.
+        expected_categories: Optional required category identifiers and order.
+
+    Returns:
+        Pair ``(categories, fractions)``. Categories are ``int64`` and
+        fractions are ``float32`` with shape
+        ``(category, g.ny, g.nx)``.
+
+    Raises:
+        KeyError: If required NetCDF category or fraction variables are absent.
+        ValueError: If file type, version, grid metadata, categories, shape,
+            cell ordering, units, or trailing records are invalid.
+        OSError: If the product cannot be read.
+    """
     p=Path(path)
     expected=(None if expected_categories is None else
               np.asarray(tuple(expected_categories),dtype=np.int64))
@@ -629,6 +929,20 @@ def _read_landuse(path,g,expected_categories=None):
     return categories,result
 
 def _split_categories(categories,frac,splits):
+    """Transfer configured percentages between existing category fractions.
+
+    Args:
+        categories: One-dimensional category identifier array.
+        frac: ``float32``-compatible fractions shaped ``(category, y, x)``.
+        splits: Sequence of ``(source, target, percent)`` transfers.
+
+    Returns:
+        Pair of ``int64`` categories and a ``float32`` fraction copy. With no
+        splits, the original objects are returned unchanged.
+
+    Raises:
+        ValueError: If a source or target category is absent.
+    """
     if not splits: return categories,frac
     categories=np.asarray(categories,dtype=np.int64)
     result=np.array(frac,dtype=MODEL_DTYPE,copy=True)
@@ -650,6 +964,24 @@ def _split_categories(categories,frac,splits):
     return categories,result
 
 def _fields(frac,config,categories=USGS38):
+    """Derive the seven static MAKEGEO surface fields.
+
+    Args:
+        frac: Land-use fractions shaped ``(category, y, x)``.
+        config: Category properties, mapping, coverage, and water controls.
+        categories: Category identifier corresponding to each fraction layer.
+
+    Returns:
+        Tuple ``(dominant, roughness, albedo, Bowen ratio, soil heat-flux
+        parameter, anthropogenic heat flux, leaf-area index)``. ``dominant``
+        is an integer category array; physical fields are ``float32`` and all
+        arrays have shape ``(grid.ny, grid.nx)``. Roughness is in metres.
+
+    Raises:
+        ValueError: If category properties or output mappings are incomplete,
+            coverage is below the configured threshold, a replacement category
+            is absent, or weighted values are physically invalid.
+    """
     categories,frac=_split_categories(categories,frac,config.category_splits)
     frac=np.asarray(frac,dtype=MODEL_DTYPE)
     properties=config.input_properties or STANDARD_PROPERTIES
@@ -677,6 +1009,15 @@ def _fields(frac,config,categories=USGS38):
     selected=np.argmax(np.where(eligible,frac,-np.inf),axis=0)
     dominant=mapped[selected]
     def weighted(values,*,logarithmic=False):
+        """Calculate a category-fraction weighted target-grid field.
+
+        Args:
+            values: One property value for each input category.
+            logarithmic: Use a geometric rather than arithmetic mean.
+
+        Returns:
+            ``float32`` array shaped ``(grid.ny, grid.nx)``.
+        """
         weights=np.asarray(frac,dtype=ACCUM_DTYPE)
         reference=np.asarray(values,dtype=ACCUM_DTYPE)
         if logarithmic:
@@ -695,7 +1036,29 @@ def _fields(frac,config,categories=USGS38):
 
 def _snow_weighted_fields(frac,categories,reference,snow_depth,snow_age,config,
                           *,snow_i_offset=0,snow_j_offset=0,snow_full_nx=6935):
-    """Vectorized WTSWZ0/WTSW/WTSWALB daily surface-property kernel."""
+    """Derive daily snow-adjusted MAKEGEO surface fields.
+
+    Args:
+        frac: Static land-use fractions shaped ``(category, y, x)``.
+        categories: Category identifier corresponding to each fraction layer.
+        reference: Sparse target-cell/category-to-SNODAS sample mapping.
+        snow_depth: Two-dimensional snow depth field in metres.
+        snow_age: Matching integer snow-age field in days.
+        config: Normal/snow property tables and snow algorithm controls.
+        snow_i_offset: Zero-based global column of the snow-data window.
+        snow_j_offset: Zero-based global row of the snow-data window.
+        snow_full_nx: Column count of the flattened global SNODAS grid.
+
+    Returns:
+        Tuple ``(dominant, roughness, albedo, Bowen ratio, soil heat-flux
+        parameter, anthropogenic heat flux, leaf-area index)`` on the target
+        grid. Physical arrays are ``float32``; roughness and snow depth use
+        metres.
+
+    Raises:
+        ValueError: If property tables, output maps, snow arrays, reference
+            indices/weights, roughness controls, or albedo controls are invalid.
+    """
     categories,frac=_split_categories(categories,frac,config.category_splits)
     normal=config.input_properties or STANDARD_PROPERTIES
     snowy=config.snow_properties
@@ -738,6 +1101,15 @@ def _snow_weighted_fields(frac,categories,reference,snow_depth,snow_age,config,
         raise ValueError('snow-grid reference has no weight for one or more target cells')
 
     def aggregate(values,*,logarithmic=False):
+        """Aggregate SNODAS-fragment values to MAKEGEO target cells.
+
+        Args:
+            values: One value per sparse reference fragment.
+            logarithmic: Use a geometric rather than arithmetic weighted mean.
+
+        Returns:
+            ``float32`` array shaped ``(config.grid.ny, config.grid.nx)``.
+        """
         values=np.asarray(values,dtype=ACCUM_DTYPE)
         if logarithmic:
             values=np.log(values)
@@ -795,7 +1167,19 @@ def _snow_weighted_fields(frac,categories,reference,snow_depth,snow_age,config,
     return (dominant,roughness,*fields)
 
 def _merge_landuse(primary,secondary):
-    """LLU2 replacement: supplement only cells missing from the primary."""
+    """Supplement only cells missing from a primary land-use grid.
+
+    Args:
+        primary: Primary ``float32`` fractions shaped ``(category, y, x)``.
+        secondary: Secondary fractions with the same category order and shape.
+
+    Returns:
+        Array selecting all secondary category layers where the primary total
+        is at most ``0.001``; other cells retain the primary values.
+
+    Raises:
+        ValueError: If the two arrays have different shapes.
+    """
     primary=np.asarray(primary,dtype=MODEL_DTYPE)
     secondary=np.asarray(secondary,dtype=MODEL_DTYPE)
     if primary.shape!=secondary.shape: raise ValueError('primary and secondary land-use grids do not match')
@@ -803,6 +1187,23 @@ def _merge_landuse(primary,secondary):
     return np.where(missing[None,:,:],secondary,primary)
 
 def _write_netcdf(path,terrain,fields,g,config):
+    """Write a modern NetCDF MAKEGEO geophysical product.
+
+    Args:
+        path: Destination path.
+        terrain: ``(y, x)`` terrain height in metres.
+        fields: Seven MAKEGEO output fields shaped ``(y, x)``.
+        g: Output grid geometry, projection, and datum.
+        config: Output category and water-category metadata.
+
+    Returns:
+        None. Continuous variables are stored as ``float32`` and dominant land
+        use as ``int16``.
+
+    Raises:
+        ValueError: If an input field cannot conform to the grid dimensions.
+        OSError: If the NetCDF file cannot be created or written.
+    """
     names=('dominant_landuse','roughness_length','albedo','bowen_ratio','soil_heat_flux_parameter','anthropogenic_heat_flux','leaf_area_index')
     terrain=np.asarray(terrain,dtype=MODEL_DTYPE)
     fields=(fields[0],*(np.asarray(value,dtype=MODEL_DTYPE) for value in fields[1:]))
@@ -820,7 +1221,21 @@ def _write_netcdf(path,terrain,fields,g,config):
         for name,data in zip(names,fields): ds.createVariable(name,'i2' if name=='dominant_landuse' else 'f4',('y','x'),zlib=True)[:]=data
 
 def _comma_rows(stream,data,*,width,decimals,values_per_record):
-    """Write Fortran repeated ``F/I,a1`` records with format reversion."""
+    """Write Fortran-style comma-delimited rows with format reversion.
+
+    Args:
+        stream: Open text output stream.
+        data: Two-dimensional array written from its last row to first.
+        width: Fixed field width in characters.
+        decimals: Decimal places for floats; ``None`` writes integers.
+        values_per_record: Maximum number of values on one text record.
+
+    Returns:
+        None.
+
+    Raises:
+        OSError: If the stream cannot be written.
+    """
     for row in np.asarray(data)[::-1]:
         fields=[(f'{int(value):{width}d}' if decimals is None else
                  f'{float(value):{width}.{decimals}f}')
@@ -833,10 +1248,36 @@ def _comma_rows(stream,data,*,width,decimals,values_per_record):
 
 
 def _rows(stream,data,fmt):
+    """Write one legacy MAKEGEO floating grid using its named format.
+
+    Args:
+        stream: Open text output stream.
+        data: Two-dimensional numeric grid.
+        fmt: ``".4f"`` for four decimal places; other supported fields use
+            two decimal places.
+
+    Returns:
+        None.
+    """
     decimals=4 if fmt=='.4f' else 2
     _comma_rows(stream,data,width=7,decimals=decimals,values_per_record=100)
 
 def _write_legacy(path,terrain,fields,g,config):
+    """Write a legacy ASCII ``GEO.DAT`` MAKEGEO product.
+
+    Args:
+        path: Destination :class:`Path`.
+        terrain: ``(y, x)`` terrain height in metres.
+        fields: Dominant category and six physical fields shaped ``(y, x)``.
+        g: Output grid geometry, projection, and datum.
+        config: Title, output categories, and water-category bounds.
+
+    Returns:
+        None.
+
+    Raises:
+        OSError: If the output file cannot be written.
+    """
     dominant,z0,alb,bow,soil,qf,lai=fields
     with path.open('w',encoding='ascii') as s:
         s.write(f"{'GEO.DAT':<16}{'2.1':<16}"
@@ -866,6 +1307,22 @@ def _write_legacy(path,terrain,fields,g,config):
 
 
 def _write_qa_grids(terrain,dominant,g,config):
+    """Write optional Surfer QA grids and the MAKEGEO color map.
+
+    Args:
+        terrain: ``(y, x)`` terrain-height field in metres.
+        dominant: ``(y, x)`` dominant output land-use categories.
+        g: Grid dimensions, origin, and spacing in kilometres.
+        config: QA output paths and IMAGE coordinate-mode setting.
+
+    Returns:
+        None. A constant terrain field removes an existing terrain plot rather
+        than writing a degenerate Surfer grid.
+
+    Raises:
+        ValueError: If ``image_mode`` is not 0 or 1.
+        OSError: If a configured QA product cannot be written.
+    """
     if config.image_mode not in {0,1}:
         raise ValueError('MAKEGEO IMAGE must be zero or one')
     if config.landuse_plot_output is not None:
@@ -925,6 +1382,23 @@ def _write_qa_grids(terrain,dominant,g,config):
         path.write_text(colors,encoding='ascii')
 
 def run(config: MakegeoConfig) -> GeophysicalResult:
+    """Build static or daily snow-adjusted CALMET geophysical fields.
+
+    Args:
+        config: Terrain and land-use inputs, target grid, category properties,
+            optional snow data, QA controls, and output settings.
+
+    Returns:
+        Summary containing the primary output path, all dated snow outputs,
+        coverage count, terrain range in metres, and optional QA-cell values.
+
+    Raises:
+        FileNotFoundError: If a configured input file does not exist.
+        KeyError: If a required NetCDF variable is absent.
+        ValueError: If input grids, categories, properties, coverage, snow
+            metadata, dates, or output controls are invalid.
+        OSError: If an input cannot be read or an output cannot be written.
+    """
     terrain=(_read_terrain(config.terrain,config.grid) if config.use_terrain else
              np.zeros((config.grid.ny,config.grid.nx),dtype=MODEL_DTYPE))
     expected_categories=tuple((config.input_properties or STANDARD_PROPERTIES).keys())

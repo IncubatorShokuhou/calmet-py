@@ -15,18 +15,56 @@ from .datums import (datum_definition,datum_proj4_parameters,datum_shift,
 
 
 def _earth(datum: str) -> str:
+    """Return the PROJ earth-model parameters for a CALPUFF datum.
+
+    Args:
+        datum: CALPUFF datum or spherical-earth identifier.
+
+    Returns:
+        PROJ ellipsoid, sphere, and datum-shift parameter fragment.
+
+    Raises:
+        ValueError: If ``datum`` is unknown.
+    """
     normalized=normalize_datum(datum)
     # ESR-R is the historical CALPUFF spelling for the ESR-S sphere.
     return datum_proj4_parameters('ESR-S' if normalized=='ESR-R' else normalized)
 
 
 def geographic_crs(datum: str) -> CRS:
-    """Geographic CRS for a CALPUFF datum/region identifier."""
+    """Construct the longitude/latitude CRS for a CALPUFF datum.
+
+    Args:
+        datum: CALPUFF datum or spherical-earth identifier.
+
+    Returns:
+        Longitude-first pyproj geographic CRS with angular coordinates in
+        degrees.
+
+    Raises:
+        ValueError: If ``datum`` is unknown.
+    """
     return CRS.from_proj4(f'+proj=longlat {_earth(datum)} +no_defs')
 
 
 def grid_crs(grid: GridConfig, datum: str | None=None, *, units: str='m') -> CRS:
-    """Construct the CRS represented by CALPUFF grid-control parameters."""
+    """Construct a projected CRS from CALPUFF grid controls.
+
+    Args:
+        grid: Grid geometry and projection parameters. Supported projections
+            are LCC, TTM, UTM, PS, EM, LAZA, and ACEA.
+        datum: Optional datum override. ``None`` uses ``grid.datum``.
+        units: Linear output units, either ``"m"`` or ``"km"``.
+
+    Returns:
+        pyproj CRS matching CALPUFF's projection origin, false offsets,
+        ellipsoid, datum, and requested linear units.
+
+    Raises:
+        ValueError: If ``datum`` is unknown or ``units`` is not ``"m"`` or
+            ``"km"``.
+        NotImplementedError: If ``grid.projection`` is unsupported.
+    """
     datum_name=grid.datum if datum is None else datum
     projection=grid.projection.upper(); earth=_earth(datum_name)
     offsets=f'+x_0={grid.false_easting_km*1000:g} +y_0={grid.false_northing_km*1000:g}'
@@ -80,7 +118,27 @@ def grid_crs(grid: GridConfig, datum: str | None=None, *, units: str='m') -> CRS
 
 def project_geographic(longitude,latitude,grid: GridConfig,source_datum: str,
                        *,units: str='m'):
-    """Project geographic points with pyproj."""
+    """Project geographic coordinates onto a CALPUFF grid.
+
+    Args:
+        longitude: Scalar or array-like longitude in degrees east.
+        latitude: Scalar or array-like latitude in degrees north.
+        grid: Target CALPUFF grid and datum definition.
+        source_datum: Datum of ``longitude`` and ``latitude``.
+        units: Linear units of the returned coordinates, ``"m"`` or
+            ``"km"``.
+
+    Returns:
+        Pair ``(x, y)`` in the requested units. Scalar inputs return Python
+        floats; broadcast array inputs return ``float64`` arrays with their
+        broadcast shape, in the target grid CRS.
+
+    Raises:
+        ValueError: If the inputs cannot be broadcast, a datum is unknown, or
+            ``units`` is invalid.
+        NotImplementedError: If the target projection is unsupported.
+        pyproj.exceptions.ProjError: If PROJ cannot transform a coordinate.
+    """
     target_datum=grid.datum
     lon,lat,_=datum_shift(longitude,latitude,source=source_datum,target=target_datum)
     transformer=Transformer.from_crs(geographic_crs(target_datum),
@@ -92,7 +150,26 @@ def project_geographic(longitude,latitude,grid: GridConfig,source_datum: str,
 
 
 def unproject_geographic(x,y,grid: GridConfig,target_datum: str,*,units: str='m'):
-    """Unproject grid points with pyproj and apply the requested datum shift."""
+    """Convert CALPUFF grid coordinates to geographic coordinates.
+
+    Args:
+        x: Scalar or array-like projected easting in ``units``.
+        y: Scalar or array-like projected northing in ``units``.
+        grid: Source CALPUFF grid and datum definition.
+        target_datum: Datum requested for the geographic result.
+        units: Linear units of ``x`` and ``y``, ``"m"`` or ``"km"``.
+
+    Returns:
+        Pair ``(longitude, latitude)`` in angular degrees on
+        ``target_datum``. Scalar inputs return Python floats; broadcast array
+        inputs return ``float64`` arrays with their broadcast shape.
+
+    Raises:
+        ValueError: If inputs cannot be broadcast, a datum is unknown, or
+            ``units`` is invalid.
+        NotImplementedError: If the source projection is unsupported.
+        pyproj.exceptions.ProjError: If PROJ cannot transform a coordinate.
+    """
     source_datum=grid.datum
     x_array,y_array=np.broadcast_arrays(np.asarray(x,dtype=float),np.asarray(y,dtype=float))
     shape=x_array.shape
@@ -108,14 +185,53 @@ def unproject_geographic(x,y,grid: GridConfig,target_datum: str,*,units: str='m'
 
 def transform_grid(x,y,source_grid: GridConfig,target_grid: GridConfig,
                    *,units: str='m'):
-    """Transform projected points between grids."""
+    """Transform projected coordinates between two CALPUFF grids.
+
+    Args:
+        x: Scalar or array-like source-grid easting in ``units``.
+        y: Scalar or array-like source-grid northing in ``units``.
+        source_grid: Projection and datum of the input coordinates.
+        target_grid: Projection and datum of the returned coordinates.
+        units: Shared linear units for input and output, ``"m"`` or ``"km"``.
+
+    Returns:
+        Pair ``(x, y)`` in the target grid CRS and requested units. Scalar
+        inputs return floats; broadcast array inputs return ``float64``
+        arrays with their broadcast shape.
+
+    Raises:
+        ValueError: If inputs, units, or datum identifiers are invalid.
+        NotImplementedError: If either projection is unsupported.
+        pyproj.exceptions.ProjError: If PROJ cannot transform a coordinate.
+    """
     lon,lat=unproject_geographic(x,y,source_grid,source_grid.datum,units=units)
     return project_geographic(lon,lat,target_grid,source_grid.datum,units=units)
 
 
 def project_from_crs(x,y,source_crs: CRS,source_datum: str,target_grid: GridConfig,
                      *,units: str='m'):
-    """Transform an externally defined projection with COORDLIB datum rules."""
+    """Project coordinates from an external CRS to a CALPUFF grid.
+
+    Args:
+        x: Scalar or array-like coordinate on ``source_crs``'s x axis.
+        y: Scalar or array-like coordinate on ``source_crs``'s y axis.
+        source_crs: pyproj CRS describing the input coordinate axes and units.
+        source_datum: CALPUFF datum represented by ``source_crs``.
+        target_grid: Target CALPUFF grid and datum definition.
+        units: Linear units for the returned grid coordinates, ``"m"`` or
+            ``"km"``.
+
+    Returns:
+        Pair of target-grid coordinates. Scalar inputs return floats;
+        broadcast array inputs return ``float64`` arrays with their broadcast
+        shape and the requested linear units.
+
+    Raises:
+        ValueError: If inputs cannot be broadcast, a datum is unknown, or
+            ``units`` is invalid.
+        NotImplementedError: If the target projection is unsupported.
+        pyproj.exceptions.ProjError: If PROJ cannot transform a coordinate.
+    """
     transformer=Transformer.from_crs(source_crs,geographic_crs(source_datum),always_xy=True)
     x_array,y_array=np.broadcast_arrays(np.asarray(x,dtype=float),np.asarray(y,dtype=float))
     shape=x_array.shape
@@ -126,13 +242,51 @@ def project_from_crs(x,y,source_crs: CRS,source_datum: str,target_grid: GridConf
 
 def project_glaz_to_lcc(x, y, source_grid: GridConfig, target_grid: GridConfig,
                         *, units: str = 'km'):
-    """Transform GLAZ coordinates to the target LCC grid with pyproj."""
+    """Transform legacy GLAZ coordinates to a target LCC grid.
+
+    Args:
+        x: Scalar or array-like GLAZ-grid easting in ``units``.
+        y: Scalar or array-like GLAZ-grid northing in ``units``.
+        source_grid: GLAZ source-grid projection and datum.
+        target_grid: Target Lambert conformal conic grid definition.
+        units: Shared linear units for input and output, ``"m"`` or ``"km"``.
+
+    Returns:
+        Pair of target-LCC coordinates. Scalar inputs return floats;
+        broadcast array inputs return ``float64`` arrays with their broadcast
+        shape and the requested units.
+
+    Raises:
+        ValueError: If inputs, units, or datum identifiers are invalid.
+        NotImplementedError: If a grid projection is unsupported.
+        pyproj.exceptions.ProjError: If PROJ cannot transform a coordinate.
+    """
     return transform_grid(x, y, source_grid, target_grid, units=units)
 
 
 def unproject_to_crs(x,y,source_grid: GridConfig,target_crs: CRS,target_datum: str,
                      *,units: str='m'):
-    """Transform a CALPUFF grid to an external projection via COORDLIB."""
+    """Transform CALPUFF grid coordinates to an external projected CRS.
+
+    Args:
+        x: Scalar or array-like source-grid easting in ``units``.
+        y: Scalar or array-like source-grid northing in ``units``.
+        source_grid: Source CALPUFF grid and datum definition.
+        target_crs: pyproj CRS defining the result axes and their units.
+        target_datum: CALPUFF datum represented by ``target_crs``.
+        units: Linear units of source ``x`` and ``y``, ``"m"`` or ``"km"``.
+
+    Returns:
+        Pair of coordinates in ``target_crs`` units. Scalar inputs return
+        floats; broadcast array inputs return ``float64`` arrays with their
+        broadcast shape.
+
+    Raises:
+        ValueError: If inputs cannot be broadcast, a datum is unknown, or
+            ``units`` is invalid.
+        NotImplementedError: If the source projection is unsupported.
+        pyproj.exceptions.ProjError: If PROJ cannot transform a coordinate.
+    """
     lon,lat=unproject_geographic(x,y,source_grid,target_datum,units=units)
     transformer=Transformer.from_crs(geographic_crs(target_datum),target_crs,always_xy=True)
     lon_array,lat_array=np.broadcast_arrays(np.asarray(lon,dtype=float),np.asarray(lat,dtype=float))
@@ -144,6 +298,25 @@ def unproject_to_crs(x,y,source_grid: GridConfig,target_crs: CRS,target_datum: s
 
 
 def grid_convergence(grid: GridConfig, longitude, latitude):
-    """Meridian convergence in degrees, positive east of the central line."""
+    """Calculate meridian convergence for a CALPUFF grid.
+
+    Args:
+        grid: Grid projection and datum definition.
+        longitude: Scalar or array-like longitude in degrees east on the grid
+            datum.
+        latitude: Scalar or array-like latitude in degrees north on the grid
+            datum.
+
+    Returns:
+        ``float64`` NumPy array of meridian-convergence angles in degrees,
+        positive east of the projection's central line, with the broadcast
+        coordinate shape.
+
+    Raises:
+        ValueError: If coordinate shapes are incompatible or the grid datum
+            is invalid.
+        NotImplementedError: If the grid projection is unsupported.
+        pyproj.exceptions.ProjError: If PROJ cannot evaluate the factors.
+    """
     lon=np.asarray(longitude,dtype=float); lat=np.asarray(latitude,dtype=float)
     return np.asarray(Proj(grid_crs(grid)).get_factors(lon,lat).meridian_convergence)

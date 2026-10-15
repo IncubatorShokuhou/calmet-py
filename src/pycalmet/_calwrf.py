@@ -33,7 +33,22 @@ _LIMITS_2D = {
 
 
 def _horizontal_range_check(values, low, high, ys, xs):
-    """Apply CALWRF INTERPH to a selected horizontal domain."""
+    """Replace out-of-range values from valid horizontal neighbours.
+
+    Args:
+        values: Array whose last two axes are the full WRF ``(y, x)`` grid.
+            Leading axes, such as the vertical level, are preserved.
+        low: Inclusive lower validity limit in the units of ``values``.
+        high: Inclusive upper validity limit in the units of ``values``.
+        ys: Zero-based slice selecting rows from the full source grid.
+        xs: Zero-based slice selecting columns from the full source grid.
+
+    Returns:
+        A float32 array over the selected horizontal domain. Its shape is
+        ``values.shape[:-2] + (len(ys), len(xs))``. Invalid cells are replaced
+        by the mean of valid north, south, east, and west neighbours, or by
+        the nearest range bound when no valid neighbour exists.
+    """
     original = np.asarray(values, dtype="f4")
     result = original[..., ys, xs].copy()
     ny, nx = original.shape[-2:]
@@ -60,7 +75,21 @@ def _horizontal_range_check(values, low, high, ys, xs):
 
 
 def _vertical_range_check(values, low, high, zs, ys, xs):
-    """Apply CALWRF's two-level INTERPH rule to hydrometeors."""
+    """Replace invalid hydrometeors from adjacent vertical mass levels.
+
+    Args:
+        values: Three-dimensional WRF field ordered as ``(level, y, x)``.
+        low: Inclusive lower validity limit in the units of ``values``.
+        high: Inclusive upper validity limit in the units of ``values``.
+        zs: Zero-based slice selecting mass levels.
+        ys: Zero-based slice selecting source-grid rows.
+        xs: Zero-based slice selecting source-grid columns.
+
+    Returns:
+        A float32 ``(level, y, x)`` array over the requested subdomain.
+        Invalid values are replaced by the mean of valid levels immediately
+        above and below, or by the nearest bound when neither is valid.
+    """
     original = np.asarray(values, dtype="f4")
     result = original[zs, ys, xs].copy()
     kk = np.arange(zs.start, zs.stop)
@@ -77,28 +106,93 @@ def _vertical_range_check(values, low, high, zs, ys, xs):
 
 
 def _times(ds: nc.Dataset) -> list[str]:
+    """Decode all WRF ``Times`` records.
+
+    Args:
+        ds: Open WRF NetCDF dataset containing the character variable
+            ``Times(time, DateStrLen)``.
+
+    Returns:
+        Timestamp strings in source-record order, normally formatted as
+        ``YYYY-MM-DD_HH:MM:SS``.
+
+    Raises:
+        KeyError: If the dataset has no ``Times`` variable.
+    """
     values = nc.chartostring(ds.variables["Times"][:])
     return [str(x) for x in np.asarray(values).tolist()]
 
 
 def _wrf_timestamp(value: str) -> datetime:
+    """Parse one WRF timestamp into a naive calendar datetime.
+
+    Args:
+        value: WRF timestamp text accepted by
+            :func:`pycalmet.datetime_utils.parse_timestamp`.
+
+    Returns:
+        A naive :class:`datetime.datetime` containing the calendar fields in
+        ``value``.
+
+    Raises:
+        ValueError: If ``value`` is not a supported timestamp.
+    """
     try: return parse_timestamp(value)
     except ValueError as error: raise ValueError(f"invalid CALWRF timestamp: {value!r}") from error
 
 
 def _write_time_text(variable,index,text):
-    """Write one WRF-style timestamp without netCDF4 scalar-string coercion."""
+    """Write one WRF-style timestamp without scalar-string coercion.
+
+    Args:
+        variable: NetCDF character variable with dimensions
+            ``(time, date_strlen)`` and a date length of 19 bytes.
+        index: Zero-based time-record index to update.
+        text: Timestamp convertible to exactly 19 ASCII bytes, normally
+            ``YYYY-MM-DD_HH:MM:SS``.
+
+    Returns:
+        None.
+
+    Raises:
+        UnicodeEncodeError: If ``text`` contains non-ASCII characters.
+        ValueError: If the encoded timestamp is not exactly 19 bytes.
+        IndexError: If ``index`` lies outside ``variable``.
+    """
     encoded=str(text).encode('ascii')
     if len(encoded)!=19:
         raise ValueError('CALWRF time_text values must contain 19 ASCII bytes')
     variable[index]=np.frombuffer(encoded,dtype='S1')
 
 def _selection(value,size,label):
-    """Convert CALWRF's inclusive one-based subset to a Python slice."""
+    """Convert an inclusive one-based CALWRF range to a Python slice.
+
+    Args:
+        value: Inclusive ``(start, end)`` indices, or ``None`` to select the
+            complete axis.
+        size: Number of elements available on the source axis.
+        label: Axis label included in validation errors, such as ``I``.
+
+    Returns:
+        A zero-based, stop-exclusive :class:`slice` bounded by ``size``.
+
+    Raises:
+        ValueError: If the requested indices are invalid or outside the axis.
+    """
     return fortran_inclusive_slice(value,size,label=f'CALWRF {label}')
 
 
 def destagger_x(a: np.ndarray) -> np.ndarray:
+    """Average adjacent points along the WRF west-east staggered axis.
+
+    Args:
+        a: Numeric array whose last axis has length ``nx + 1``. Other axes are
+            preserved.
+
+    Returns:
+        A float32 array with the same leading dimensions and last-axis length
+        ``nx``. Values are arithmetic means of adjacent staggered points.
+    """
     values = np.asarray(a, dtype=np.float32)
     return (np.float32(0.5) * (values[..., :-1] + values[..., 1:])).astype(
         np.float32, copy=False,
@@ -106,6 +200,16 @@ def destagger_x(a: np.ndarray) -> np.ndarray:
 
 
 def destagger_y(a: np.ndarray) -> np.ndarray:
+    """Average adjacent points along the WRF south-north staggered axis.
+
+    Args:
+        a: Numeric array whose penultimate axis has length ``ny + 1``. Other
+            axes are preserved.
+
+    Returns:
+        A float32 array with penultimate-axis length ``ny`` and all other
+        dimensions unchanged.
+    """
     values = np.asarray(a, dtype=np.float32)
     return (np.float32(0.5) * (values[..., :-1, :] + values[..., 1:, :])).astype(
         np.float32, copy=False,
@@ -113,6 +217,16 @@ def destagger_y(a: np.ndarray) -> np.ndarray:
 
 
 def destagger_z(a: np.ndarray) -> np.ndarray:
+    """Average adjacent points along the leading WRF vertical-stagger axis.
+
+    Args:
+        a: Numeric array ordered with a leading staggered vertical axis of
+            length ``nz + 1``.
+
+    Returns:
+        A float32 mass-level array with leading-axis length ``nz`` and all
+        remaining dimensions unchanged.
+    """
     values = np.asarray(a, dtype=np.float32)
     return (np.float32(0.5) * (values[:-1, ...] + values[1:, ...])).astype(
         np.float32, copy=False,
@@ -120,7 +234,17 @@ def destagger_z(a: np.ndarray) -> np.ndarray:
 
 
 def _geopotential_height(ph: np.ndarray, phb: np.ndarray) -> np.ndarray:
-    """Convert staggered geopotential to mass-level height."""
+    """Convert WRF staggered geopotential to mass-level geometric height.
+
+    Args:
+        ph: Perturbation geopotential in m2 s-2, ordered as
+            ``(staggered_level, y, x)``.
+        phb: Base-state geopotential in m2 s-2 with the same shape as ``ph``.
+
+    Returns:
+        Float32 geometric height in metres on mass levels, with one fewer
+        element along the leading vertical axis.
+    """
     geopotential = np.asarray(ph, dtype=np.float32) + np.asarray(
         phb, dtype=np.float32,
     )
@@ -128,7 +252,16 @@ def _geopotential_height(ph: np.ndarray, phb: np.ndarray) -> np.ndarray:
 
 
 def _cone(truelat1: float, truelat2: float) -> float:
-    """Return the Lambert conformal cone parameter."""
+    """Calculate the Lambert conformal cone parameter used by WRF.
+
+    Args:
+        truelat1: First true latitude in decimal degrees.
+        truelat2: Second true latitude in decimal degrees.
+
+    Returns:
+        Dimensionless Lambert cone parameter. Nearly equal standard
+        parallels use the tangent-cone limit ``sin(abs(truelat1))``.
+    """
     first=float(truelat1); second=float(truelat2)
     if abs(first-second)<=0.1:
         return float(np.sin(np.deg2rad(abs(first))))
@@ -140,7 +273,24 @@ def _cone(truelat1: float, truelat2: float) -> float:
 
 
 def rotation_angle(ds: nc.Dataset, lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
-    """CALWRF map-to-earth rotation angle in radians."""
+    """Calculate the CALWRF grid-to-earth wind rotation angle.
+
+    Args:
+        ds: Open WRF NetCDF dataset supplying ``MAP_PROJ``, ``STAND_LON``,
+            and, for Lambert grids, ``TRUELAT1`` and ``TRUELAT2`` attributes.
+        lat: Mass-point latitude in decimal degrees.
+        lon: Mass-point longitude in decimal degrees, broadcast-compatible
+            with ``lat``.
+
+    Returns:
+        A float32 array in radians with the broadcast shape of ``lat`` and
+        ``lon``. WRF projection identifiers greater than or equal to three
+        follow CALWRF and return zero rotation.
+
+    Raises:
+        ValueError: If ``MAP_PROJ`` is neither 1, 2, nor a value at least 3.
+        AttributeError: If an attribute required by the projection is absent.
+    """
     map_projection=int(getattr(ds,"MAP_PROJ",0))
     # CALWRF sets OP_ROT=.FALSE. for every WRF projection code >= 3, not
     # only Mercator (3).  This also covers global/rotated lat-lon products
@@ -165,7 +315,18 @@ def rotation_angle(ds: nc.Dataset, lat: np.ndarray, lon: np.ndarray) -> np.ndarr
 
 
 def earth_wind(u: np.ndarray, v: np.ndarray, alpha: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Rotate WRF grid-relative U/V to eastward/northward components."""
+    """Rotate WRF grid-relative wind to earth-relative components.
+
+    Args:
+        u: Grid-x wind component in m s-1.
+        v: Grid-y wind component in m s-1, broadcast-compatible with ``u``.
+        alpha: Grid-to-earth rotation angle in radians, broadcast-compatible
+            with the wind arrays.
+
+    Returns:
+        A pair ``(eastward, northward)`` of float32 arrays in m s-1 with the
+        broadcast input shape.
+    """
     u=np.asarray(u,dtype=np.float32)
     v=np.asarray(v,dtype=np.float32)
     angle=np.asarray(alpha,dtype=np.float32)
@@ -178,6 +339,18 @@ def earth_wind(u: np.ndarray, v: np.ndarray, alpha: np.ndarray) -> tuple[np.ndar
 
 
 def speed_direction(u: np.ndarray, v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Convert earth-relative vector wind to meteorological polar form.
+
+    Args:
+        u: Eastward wind component in m s-1.
+        v: Northward wind component in m s-1, broadcast-compatible with ``u``.
+
+    Returns:
+        A pair ``(speed, direction)`` of float32 arrays. Speed is in m s-1;
+        direction is the clockwise direction from which the wind blows in
+        degrees in ``(0, 360]``. The historical CALWRF wrapping rule reports
+        calm cells as 360 degrees.
+    """
     u=np.asarray(u,dtype=np.float32)
     v=np.asarray(v,dtype=np.float32)
     speed=np.hypot(u,v).astype(np.float32,copy=False)
@@ -193,6 +366,24 @@ def _var(
     dst: nc.Dataset, name: str, dims: tuple[str, ...], units: str,
     compression=1, dtype="f4",
 ) -> nc.Variable:
+    """Create a compressed NetCDF variable and assign its physical units.
+
+    Args:
+        dst: Open writable NetCDF dataset.
+        name: Variable name to create.
+        dims: Ordered dimension names already defined in ``dst``.
+        units: CF-style unit text stored on the variable.
+        compression: NetCDF4 deflate level from 0 through 9. Zero disables
+            deflation and shuffling.
+        dtype: NetCDF4 or NumPy data-type specification.
+
+    Returns:
+        The newly created writable :class:`netCDF4.Variable`.
+
+    Raises:
+        RuntimeError: If the variable cannot be created, for example because
+            its name already exists or a dimension is missing.
+    """
     var=dst.createVariable(name,dtype,dims,
                            zlib=compression>0,complevel=compression,
                            shuffle=compression>0)
@@ -201,7 +392,22 @@ def _var(
 
 
 def _mass_coordinate(source: nc.Dataset,name: str,time_index=0) -> np.ndarray:
-    """Read WRF mass-point coordinates using CALWRF's alias fallback."""
+    """Read a WRF mass-point coordinate using CALWRF's alias fallback.
+
+    Args:
+        source: Open WRF NetCDF dataset.
+        name: Primary coordinate variable name, normally ``XLAT`` or
+            ``XLONG``. The ``_M`` suffix is tried second.
+        time_index: Zero-based source time index.
+
+    Returns:
+        A float64 ``(y, x)`` coordinate array in the units declared by WRF,
+        normally decimal degrees.
+
+    Raises:
+        ValueError: If neither ``name`` nor ``name + '_M'`` is present.
+        IndexError: If ``time_index`` is outside the coordinate variable.
+    """
     for candidate in (name,f'{name}_M'):
         if candidate in source.variables:
             return np.asarray(source[candidate][time_index],dtype='f8')
@@ -209,7 +415,18 @@ def _mass_coordinate(source: nc.Dataset,name: str,time_index=0) -> np.ndarray:
 
 
 def _rain_increment(current,previous):
-    """Return an accumulation increment, detecting a counter reset."""
+    """Calculate a precipitation accumulation increment across one record.
+
+    Args:
+        current: Current cumulative precipitation in millimetres.
+        previous: Previous cumulative field in millimetres, or ``None`` for
+            the first available record.
+
+    Returns:
+        A float32 array in millimetres with the shape of ``current``. Negative
+        differences are treated as accumulation-counter resets, in which case
+        the current cumulative value is returned.
+    """
     values=np.asarray(current,dtype='f4')
     if previous is None:
         return values.copy()
@@ -218,7 +435,18 @@ def _rain_increment(current,previous):
 
 
 def _rain_increments(rainnc,rainc,previous):
-    """Return reset-aware total, grid, and convective rain increments."""
+    """Calculate reset-aware total and component precipitation increments.
+
+    Args:
+        rainnc: Current WRF ``RAINNC`` grid-scale accumulation in millimetres.
+        rainc: Current WRF ``RAINC`` convective accumulation in millimetres.
+        previous: Pair ``(previous_rainnc, previous_rainc)`` in millimetres,
+            or ``None`` when no earlier record is available.
+
+    Returns:
+        A tuple ``(total, grid, convective)`` of float32 arrays in millimetres
+        with the broadcast input shape.
+    """
     nonconvective=np.asarray(rainnc,dtype='f4')
     convective=np.asarray(rainc,dtype='f4')
     previous_nonconvective=None if previous is None else previous[0]
@@ -229,7 +457,23 @@ def _rain_increments(rainnc,rainc,previous):
 
 
 def _surface_variable(source,index,name,shape,*,required=False):
-    """Read one CALWRF 2-D field, retaining its missing-field policy."""
+    """Read one WRF surface field using CALWRF's missing-field policy.
+
+    Args:
+        source: Open WRF NetCDF dataset.
+        index: Zero-based source time index.
+        name: WRF variable name.
+        shape: Expected ``(y, x)`` shape used for an absent optional field.
+        required: Whether absence of ``name`` is an error.
+
+    Returns:
+        A float32 ``(y, x)`` array in the source variable's physical units.
+        An absent optional field is represented by zeros.
+
+    Raises:
+        ValueError: If a required variable is absent.
+        IndexError: If ``index`` is outside the variable's time dimension.
+    """
     if name in source.variables:
         return np.asarray(source[name][index],dtype='f4')
     if required:
@@ -240,7 +484,23 @@ def _surface_variable(source,index,name,shape,*,required=False):
 
 
 def _volume_variable(source,index,name,shape,*,required=False):
-    """Read one CALWRF 3-D field with its required/optional policy."""
+    """Read one WRF volume field using CALWRF's missing-field policy.
+
+    Args:
+        source: Open WRF NetCDF dataset.
+        index: Zero-based source time index.
+        name: WRF variable name.
+        shape: Expected ``(level, y, x)`` shape for an absent optional field.
+        required: Whether absence of ``name`` is an error.
+
+    Returns:
+        A float32 ``(level, y, x)`` array in the source variable's physical
+        units. An absent optional field is represented by zeros.
+
+    Raises:
+        ValueError: If a required variable is absent.
+        IndexError: If ``index`` is outside the variable's time dimension.
+    """
     if name in source.variables:
         return np.asarray(source[name][index],dtype='f4')
     if required:
@@ -249,7 +509,19 @@ def _volume_variable(source,index,name,shape,*,required=False):
 
 
 def _surface_wind(source,index,shape,alpha):
-    """Return CALWRF WD10/WS10, including its missing-U10 shortcut."""
+    """Read and rotate WRF 10-m wind into CALWRF speed and direction.
+
+    Args:
+        source: Open WRF NetCDF dataset.
+        index: Zero-based source time index.
+        shape: Expected horizontal ``(y, x)`` shape.
+        alpha: Grid-to-earth rotation angles in radians with ``shape``.
+
+    Returns:
+        A pair ``(speed, direction)`` of float32 ``(y, x)`` arrays. Speed is
+        in m s-1 and meteorological direction is in degrees. If ``U10`` is
+        absent, both arrays are zero without requiring ``V10``.
+    """
     if 'U10' not in source.variables:
         zeros=np.zeros(shape,dtype='f4')
         return zeros.copy(),zeros
@@ -261,7 +533,18 @@ def _surface_wind(source,index,shape,alpha):
 
 
 def _pressure_temperature(perturbation_pressure,base_pressure,perturbation_theta):
-    """CALWRF pressure (hPa) and potential-temperature conversion."""
+    """Convert WRF pressure and potential temperature to CALWRF fields.
+
+    Args:
+        perturbation_pressure: WRF ``P`` perturbation pressure in pascals.
+        base_pressure: WRF ``PB`` base-state pressure in pascals.
+        perturbation_theta: WRF ``T`` perturbation potential temperature in
+            kelvins relative to 300 K.
+
+    Returns:
+        A pair ``(pressure, temperature)`` of float32 arrays with the broadcast
+        input shape. Pressure is in hectopascals and temperature is in kelvins.
+    """
     pressure=(np.asarray(perturbation_pressure,dtype=np.float32)+
               np.asarray(base_pressure,dtype=np.float32))*np.float32(0.01)
     theta=np.asarray(perturbation_theta,dtype=np.float32)+np.float32(300.0)
@@ -272,7 +555,24 @@ def _pressure_temperature(perturbation_pressure,base_pressure,perturbation_theta
 
 
 def _select_wrf_times(paths,begin,end):
-    """Select output records and CALWRF's optional preceding rain record."""
+    """Select unique hourly WRF records in an inclusive time interval.
+
+    Args:
+        paths: WRF NetCDF paths searched in order.
+        begin: Inclusive naive start datetime.
+        end: Inclusive naive end datetime.
+
+    Returns:
+        A pair ``(selected, baseline)``. ``selected`` is chronologically
+        ordered and contains ``(path, record_index, timestamp_text)`` tuples,
+        keeping the first file for duplicate times. ``baseline`` has the same
+        structure for ``begin - 1 hour`` or is ``None``.
+
+    Raises:
+        OSError: If a WRF file cannot be opened.
+        KeyError: If a file has no ``Times`` variable.
+        ValueError: If a source timestamp cannot be parsed.
+    """
     selected_by_time={}
     baseline=None
     baseline_time=begin-timedelta(hours=1)
@@ -290,6 +590,25 @@ def _select_wrf_times(paths,begin,end):
 
 
 def _copy_static(src: nc.Dataset,dst: nc.Dataset,ys,xs,zs,compression=1) -> None:
+    """Copy time-invariant WRF grid fields into a CALWRF NetCDF dataset.
+
+    Args:
+        src: Open source WRF NetCDF dataset.
+        dst: Open writable CALWRF NetCDF dataset with ``level``, ``y``, and
+            ``x`` dimensions already defined.
+        ys: Zero-based slice selecting source rows.
+        xs: Zero-based slice selecting source columns.
+        zs: Zero-based slice selecting source mass levels.
+        compression: NetCDF4 deflate level used for created variables.
+
+    Returns:
+        None. ``dst`` is modified in place with latitude and longitude in
+        degrees, terrain in metres, land-use category, and dimensionless sigma.
+
+    Raises:
+        KeyError: If a required WRF grid variable is absent.
+        RuntimeError: If an output variable cannot be created or written.
+    """
     for name, units in (("terrain", "m"),):
         _var(dst,name,("y","x"),units,compression)
     for name,units in (("latitude","degrees_north"),("longitude","degrees_east")):
@@ -303,6 +622,31 @@ def _copy_static(src: nc.Dataset,dst: nc.Dataset,ys,xs,zs,compression=1) -> None
 
 
 def _create_output(path: Path,src: nc.Dataset,nt: int,ny: int,nx: int,nz: int,ys,xs,zs,*,compression=1) -> nc.Dataset:
+    """Create and initialize the canonical CALWRF NetCDF product.
+
+    Args:
+        path: Destination NetCDF path. Missing parent directories are created.
+        src: Open WRF dataset supplying static grid data and metadata.
+        nt: Number of hourly output records.
+        ny: Number of selected south-north cells.
+        nx: Number of selected west-east cells.
+        nz: Number of selected mass levels.
+        ys: Zero-based slice selecting source rows.
+        xs: Zero-based slice selecting source columns.
+        zs: Zero-based slice selecting source mass levels.
+        compression: NetCDF4 deflate level from 0 through 9.
+
+    Returns:
+        An open writable :class:`netCDF4.Dataset`. The caller owns it and must
+        close it. Variables use float32 model fields except float64 geographic
+        coordinates and int16 land-use categories.
+
+    Raises:
+        OSError: If ``path`` cannot be created.
+        KeyError: If required WRF dimensions or variables are absent.
+        AttributeError: If required WRF grid-spacing metadata is absent.
+        RuntimeError: If NetCDF dimensions or variables cannot be created.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     dst = nc.Dataset(path, "w", format="NETCDF4")
     dst.createDimension("time", nt)
@@ -363,6 +707,28 @@ def _create_output(path: Path,src: nc.Dataset,nt: int,ny: int,nx: int,nz: int,ys
 
 
 def run(config: CalwrfConfig) -> Path:
+    """Extract an hourly WRF interval into CALWRF meteorological products.
+
+    Args:
+        config: Validated CALWRF configuration containing WRF input paths, an
+            inclusive hourly interval, optional one-based ``i``, ``j``, and
+            ``k`` subsets, compression, and output paths.
+
+    Returns:
+        Path to the canonical NetCDF output specified by ``config.output``.
+
+    Raises:
+        FileNotFoundError: If any configured WRF input does not exist.
+        ValueError: If paths overlap unsafely, the interval or compression is
+            invalid, no complete hourly coverage is available, a configured
+            subdomain is invalid, or required WRF content is missing.
+        OSError: If an input cannot be opened or an output cannot be written.
+
+    Notes:
+        The canonical NetCDF output is always written. Depending on ``config``,
+        this function also writes legacy M3D/M2D files and a text listing.
+        Existing destination files may be replaced.
+    """
     active_surface_output=(config.surface_output
                            if config.create_surface and config.legacy_output is not None
                            else None)

@@ -19,10 +19,35 @@ SPATIAL_DTYPE=np.float64
 
 
 def _julian(year,day,hour):
+    """Convert SEA.DAT ordinal time fields to a timestamp.
+
+    Args:
+        year: Four-digit calendar year.
+        day: One-based day of year.
+        hour: Hour value accepted by :func:`parse_ordinal`.
+
+    Returns:
+        Naive Gregorian timestamp represented by the three fields.
+
+    Raises:
+        ValueError: If the ordinal fields do not form a valid timestamp.
+    """
     return parse_ordinal(year,day,hour)
 
 
 def _angle(text):
+    """Parse a signed projection angle with an optional compass suffix.
+
+    Args:
+        text: Numeric angle optionally followed by ``N``, ``S``, ``E``, or
+            ``W``.
+
+    Returns:
+        Angle in signed decimal degrees; south and west are negative.
+
+    Raises:
+        ValueError: If no numeric angle can be parsed.
+    """
     match=re.search(r'([-+]?\d+(?:\.\d*)?)\s*([NSEW]?)',text.strip(),re.I)
     if not match: raise ValueError(f'invalid SEA.DAT projection angle: {text!r}')
     value=float(match.group(1))
@@ -31,6 +56,29 @@ def _angle(text):
 
 @dataclass(frozen=True,slots=True)
 class SeaRecord:
+    """One time-bounded overwater observation from SEA.DAT.
+
+    Attributes:
+        begin: Inclusive start of the observation interval.
+        end: Exclusive end of the observation interval.
+        x_km: Station easting in source-projection kilometres.
+        y_km: Station northing in source-projection kilometres.
+        anemometer_height_m: Wind sensor height in metres.
+        air_sensor_height_m: Air temperature/humidity sensor height in metres.
+        water_sensor_depth_m: Water temperature sensor depth in metres.
+        air_water_delta_k: Air minus water temperature in kelvin.
+        air_temperature_k: Air temperature in kelvin.
+        relative_humidity: Relative humidity in percent.
+        mixing_height_m: Observed overwater mixing height in metres.
+        gradient_below_k_m: Temperature gradient below the mixing height in
+            kelvin per metre.
+        gradient_above_k_m: Temperature gradient above the mixing height in
+            kelvin per metre.
+        wind_speed_m_s: Wind speed in metres per second.
+        wind_direction_deg: Meteorological wind direction in degrees.
+        wave_period_s: Wave period in seconds, or a negative missing sentinel.
+        wave_height_m: Wave height in metres, or a negative missing sentinel.
+    """
     begin: datetime
     end: datetime
     x_km: float
@@ -52,7 +100,24 @@ class SeaRecord:
 
 @dataclass(frozen=True,slots=True)
 class GriddedSeaData:
-    """Nearest valid SEA.DAT record fields on the CALMET grid."""
+    """Nearest valid SEA.DAT record fields on the CALMET grid.
+
+    Attributes:
+        air_temperature_k: Air temperature in kelvin.
+        sea_temperature_k: Derived sea temperature in kelvin.
+        relative_humidity: Relative humidity in percent.
+        anemometer_height_m: Wind sensor height in metres.
+        air_sensor_height_m: Temperature sensor height in metres.
+        water_sensor_depth_m: Water sensor depth in metres.
+        wave_period_s: Wave period in seconds.
+        wave_height_m: Wave height in metres.
+        station_longitude: Longitude of the station selected for each cell in
+            degrees east.
+
+    Notes:
+        All fields have shape ``(ny, nx)``; numeric meteorological arrays use
+        ``float32`` and station longitude uses spatial ``float64`` precision.
+    """
     air_temperature_k: np.ndarray
     sea_temperature_k: np.ndarray
     relative_humidity: np.ndarray
@@ -65,8 +130,34 @@ class GriddedSeaData:
 
 
 class SeaData:
-    """Read one station per modern formatted SEA.DAT, as RDHDOW/RDOW do."""
+    """Read one station per formatted SEA.DAT, as RDHDOW/RDOW do.
+
+    Attributes:
+        path: Path to the parsed SEA.DAT file.
+        version: Dataset version text from the file header.
+        projection: CALMET source projection code.
+        datum: Source horizontal datum name.
+        datum_date: Datum metadata date copied from the header.
+        timezone: Version 2.11 timezone label, otherwise ``None``.
+        start: Beginning of the declared or inferred record period.
+        end: End of the declared or inferred record period.
+        identifier: Integer station identifier.
+        name: Station name.
+        source_grid: One-cell grid carrying the station projection metadata.
+        records: Chronologically contiguous :class:`SeaRecord` values.
+    """
     def __init__(self,path):
+        """Parse and validate a formatted SEA.DAT file.
+
+        Args:
+            path: ASCII SEA.DAT path using a supported pre-2.2 layout.
+
+        Raises:
+            OSError: If the file cannot be read.
+            UnicodeError: If the file is not strict ASCII.
+            ValueError: If the header, projection, time span, record width, or
+                record chronology is invalid.
+        """
         self.path=Path(path)
         lines=self.path.read_text(encoding='ascii',errors='strict').splitlines()
         if not lines: raise ValueError('empty SEA.DAT')
@@ -155,26 +246,63 @@ class SeaData:
         self.records=tuple(records)
 
     def at_begin(self,timestamp):
+        """Select the record whose half-open interval contains a timestamp.
+
+        Args:
+            timestamp: Naive timestamp in the SEA.DAT time basis.
+
+        Returns:
+            The covering station record.
+
+        Raises:
+            ValueError: If no record covers ``timestamp``.
+        """
         record=next((item for item in self.records if item.begin<=timestamp<item.end),None)
         if record is None: raise ValueError(f'SEA.DAT has no record covering {timestamp}')
         return record
 
     def point(self,target_grid):
-        """Transform the current record-independent station coordinate to target km."""
+        """Transform the station coordinate to a target grid.
+
+        Args:
+            target_grid: Grid whose projection and datum define the result.
+
+        Returns:
+            Two-element ``float64`` array ``(x_km, y_km)``.
+        """
         record=self.records[0]
         return np.asarray(transform_grid(record.x_km,record.y_km,
                                          self.source_grid,target_grid,units='km'),
                           dtype=SPATIAL_DTYPE)
 
     def longitude_latitude(self):
-        """Return station longitude/latitude derived from its projected coordinate."""
+        """Derive the station's WGS-84 longitude and latitude.
+
+        Returns:
+            Tuple ``(longitude_deg_east, latitude_deg_north)``.
+        """
         record=self.records[0]
         return unproject_geographic(record.x_km,record.y_km,self.source_grid,
                                     'WGS-84',units='km')
 
 
 def grid_sea_mixing_height(values,station_xy,grid,block_size=65536):
-    """Interpolate observed overwater mixing height with all valid stations."""
+    """Interpolate observed overwater mixing height from valid stations.
+
+    Args:
+        values: One mixing-height value per station in metres; values at or
+            above 9998 are missing.
+        station_xy: ``(station, 2)`` source coordinates in grid kilometres.
+        grid: Target CALMET grid.
+        block_size: Number of target cells processed per distance block.
+
+    Returns:
+        ``float32`` mixing-height array in metres with shape ``(ny, nx)``.
+        The array is all NaN when no station is valid.
+
+    Raises:
+        ValueError: If station coordinates do not match ``values``.
+    """
     data=np.asarray(values,dtype=COMPUTE_DTYPE)
     points=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
     valid=data<COMPUTE_DTYPE(9998.)
@@ -207,7 +335,23 @@ def grid_sea_mixing_height(values,station_xy,grid,block_size=65536):
 
 
 def grid_water_mixing_gradient(values,station_xy,grid,default,block_size=65536):
-    """Interpolate the above-mixing-height lapse rate from SEA stations."""
+    """Interpolate the above-mixing-height gradient from SEA stations.
+
+    Args:
+        values: One temperature gradient per station in kelvin per metre;
+            values at or above 9998 are missing.
+        station_xy: ``(station, 2)`` coordinates in grid kilometres.
+        grid: Target CALMET grid.
+        default: Gradient used where no valid observation is available, in
+            kelvin per metre.
+        block_size: Number of target cells processed per distance block.
+
+    Returns:
+        ``float32`` gradient array with shape ``(ny, nx)``.
+
+    Raises:
+        ValueError: If station coordinates do not match ``values``.
+    """
     data=np.asarray(values,dtype=COMPUTE_DTYPE)
     points=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
     if points.shape!=(data.size,2):
@@ -239,7 +383,20 @@ def grid_water_mixing_gradient(values,station_xy,grid,default,block_size=65536):
 
 
 def _nearest_sea_indices(points,valid,grid):
-    """Return nearest SEA-station indices into a valid subset."""
+    """Select the nearest valid SEA station for every target cell.
+
+    Args:
+        points: ``(station, 2)`` coordinates in grid kilometres.
+        valid: Boolean station-validity mask.
+        grid: Target CALMET grid.
+
+    Returns:
+        Flat integer array of original station indices with ``nx * ny``
+        elements in row-major grid order.
+
+    Raises:
+        ValueError: If shapes are inconsistent or no candidate is valid.
+    """
     points=np.asarray(points,dtype=SPATIAL_DTYPE)
     valid=np.asarray(valid,dtype=bool)
     if points.ndim!=2 or points.shape[1]!=2 or valid.shape!=(points.shape[0],):
@@ -255,20 +412,53 @@ def _nearest_sea_indices(points,valid,grid):
 
 
 def nearest_sea_waves(records,station_xy,grid):
-    """Grid WATERP's independently selected valid SEA wave observations."""
+    """Grid WATERP's independently selected valid wave observations.
+
+    Args:
+        records: Station records for the current timestep.
+        station_xy: ``(station, 2)`` coordinates in grid kilometres.
+        grid: Target CALMET grid.
+
+    Returns:
+        Tuple of ``float32`` wave-period and wave-height arrays, each with
+        shape ``(ny, nx)`` and units of seconds and metres respectively.
+    """
     records=tuple(records); points=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
     valid=np.array([(item.wave_period_s>=0.) and (item.wave_height_m>=0.)
                     for item in records])
     chosen=(_nearest_sea_indices(points,valid,grid) if valid.any() else
             np.zeros(grid.nx*grid.ny,dtype=np.intp))
     def field(name):
+        """Gather one wave attribute at the selected station indices.
+
+        Args:
+            name: :class:`SeaRecord` wave-field name.
+
+        Returns:
+            ``float32`` field with shape ``(ny, nx)``.
+        """
         return np.asarray([getattr(records[index],name) for index in chosen],
                           dtype=COMPUTE_DTYPE).reshape(grid.ny,grid.nx)
     return field('wave_period_s'),field('wave_height_m')
 
 
 def nearest_sea_data(records,station_xy,longitudes,grid):
-    """Reproduce WATER's nearest station having a valid air-water delta."""
+    """Select WATER fields from the nearest station with a valid delta.
+
+    Args:
+        records: Station records for the current timestep.
+        station_xy: ``(station, 2)`` coordinates in grid kilometres.
+        longitudes: WGS-84 station longitudes in degrees east.
+        grid: Target CALMET grid.
+
+    Returns:
+        Gridded overwater fields, or ``None`` when every station lacks a valid
+        air-water temperature difference.
+
+    Raises:
+        ValueError: If station coordinates or longitudes do not match the
+            record count.
+    """
     records=tuple(records); points=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
     longitude=np.asarray(longitudes,dtype=SPATIAL_DTYPE)
     if points.shape!=(len(records),2) or longitude.shape!=(len(records),):
@@ -277,6 +467,14 @@ def nearest_sea_data(records,station_xy,longitudes,grid):
     if not valid.any(): return None
     chosen=_nearest_sea_indices(points,valid,grid)
     def field(name):
+        """Gather one scalar observation at the primary selected stations.
+
+        Args:
+            name: :class:`SeaRecord` attribute name.
+
+        Returns:
+            ``float32`` field with shape ``(ny, nx)``.
+        """
         return np.asarray([getattr(records[index],name) for index in chosen],
                           dtype=COMPUTE_DTYPE).reshape(grid.ny,grid.nx)
     air=field('air_temperature_k'); delta=field('air_water_delta_k')
@@ -298,6 +496,14 @@ def nearest_sea_data(records,station_xy,longitudes,grid):
         # WATER leaves NOW=1 when every station has missing wave data.
         wave_chosen=np.zeros(chosen.size,dtype=np.intp)
     def wave_field(name):
+        """Gather one wave observation at independently selected stations.
+
+        Args:
+            name: :class:`SeaRecord` wave-field name.
+
+        Returns:
+            ``float32`` field with shape ``(ny, nx)``.
+        """
         return np.asarray([getattr(records[index],name) for index in wave_chosen],
                           dtype=COMPUTE_DTYPE).reshape(grid.ny,grid.nx)
     return GriddedSeaData(

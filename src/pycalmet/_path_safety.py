@@ -8,7 +8,16 @@ from typing import Sequence
 
 
 def _same_path(first: str | Path, second: str | Path) -> bool:
-    """Return whether two path spellings identify the same filesystem entry."""
+    """Return whether two path spellings identify the same filesystem entry.
+
+    Args:
+        first: First existing or prospective filesystem path.
+        second: Second existing or prospective filesystem path.
+
+    Returns:
+        ``True`` when both paths identify the same entry after resolving
+        symlinks and non-existent path components.
+    """
     left = Path(first)
     right = Path(second)
     try:
@@ -26,7 +35,19 @@ def validate_calwrf_paths(
     surface_output: str | Path | None,
     listing_output: str | Path | None,
 ) -> None:
-    """Reject CALWRF paths that could overwrite an input or another output."""
+    """Reject CALWRF paths that could overwrite an input or another output.
+
+    Args:
+        wrf_files: Source WRF NetCDF paths that must remain unchanged.
+        output: Primary CALWRF NetCDF output path.
+        legacy_output: Optional traditional M3D output path.
+        surface_output: Optional traditional M2D output path.
+        listing_output: Optional human-readable listing path.
+
+    Raises:
+        ValueError: If two outputs alias one another or an output aliases a
+            WRF input, including through a symlink or normalized path.
+    """
     outputs = tuple(
         (name, path)
         for name, path in (

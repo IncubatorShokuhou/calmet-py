@@ -16,14 +16,51 @@ ACCUM_DTYPE=np.float64
 
 @dataclass(frozen=True,slots=True)
 class PrecipitationRecord:
+    """Station precipitation rates for one observation interval.
+
+    Attributes:
+        begin: Inclusive interval beginning.
+        end: Exclusive interval ending.
+        rate_mm_h: Float32 array of shape ``(station,)`` containing
+            precipitation rates in millimetres per hour. Values near 9999
+            represent missing observations.
+    """
     begin: datetime
     end: datetime
     rate_mm_h: np.ndarray
 
 
 class PrecipitationData:
-    """Read formatted, unpacked PRECIP.DAT 2.1 records."""
+    """Read formatted, unpacked PRECIP.DAT records.
+
+    Attributes:
+        path: Source PRECIP.DAT path.
+        version: File-format version string.
+        datum: Datum identifier for station coordinates.
+        timezone: Time-zone field from the file header.
+        start: Declared beginning of the observation period.
+        end: Declared end of the observation period.
+        stations: Tuple of :class:`~pycalmet.surface_data.SurfaceStation`
+            metadata in record order.
+        records: Chronological tuple of :class:`PrecipitationRecord` objects.
+    """
+
     def __init__(self,path,*,station_metadata=None,datum=None):
+        """Parse formatted PRECIP.DAT text and validate its timeline.
+
+        Args:
+            path: Path to formatted PRECIP.DAT.
+            station_metadata: Station metadata supplied by the control file
+                when the file declares projection ``NONE``. Must be ``None``
+                when station coordinates are embedded in the file.
+            datum: Control-file datum used with projection ``NONE``.
+
+        Raises:
+            FileNotFoundError: If ``path`` does not exist.
+            UnicodeDecodeError: If the file is not ASCII.
+            ValueError: If header metadata, station definitions, timestamps,
+                record widths, or interval continuity are invalid.
+        """
         self.path=Path(path)
         if not self.path.is_file(): raise FileNotFoundError(self.path)
         lines=self.path.read_text(encoding='ascii',errors='strict').splitlines()
@@ -95,13 +132,39 @@ class PrecipitationData:
         self.records=tuple(records)
 
     def at_begin(self,timestamp):
+        """Return the record whose half-open interval contains a timestamp.
+
+        Args:
+            timestamp: Datetime satisfying ``record.begin <= timestamp <
+                record.end``.
+
+        Returns:
+            The covering :class:`PrecipitationRecord`.
+
+        Raises:
+            ValueError: If no record covers ``timestamp``.
+        """
         for record in self.records:
             if record.begin<=timestamp<record.end: return record
         raise ValueError(f'PRECIP.DAT has no record covering {timestamp!s}')
 
 
 def unpack_precipitation(words,count):
-    """Expand CALMET PACK zero runs (negative word means that many zeros)."""
+    """Expand CALMET PACK zero runs.
+
+    Args:
+        words: One-dimensional encoded values. A nonnegative word is a data
+            value; a negative word encodes that many consecutive zeros.
+        count: Required number of decoded station values.
+
+    Returns:
+        Float32 array of shape ``(count,)`` containing precipitation rates in
+        millimetres per hour.
+
+    Raises:
+        ValueError: If the encoded sequence does not expand to ``count``
+            values.
+    """
     output=[]
     for word in np.asarray(words,dtype=MODEL_DTYPE):
         if word>=0.: output.append(float(word))
@@ -111,10 +174,40 @@ def unpack_precipitation(words,count):
 
 
 def read_unformatted_precipitation(path,*,station_metadata=None,datum=None):
-    """Read GNU-Fortran sequential-unformatted PRECIP.DAT 2.1."""
+    """Read a GNU-Fortran sequential-unformatted PRECIP.DAT file.
+
+    Args:
+        path: Path to a legacy or version 2.1 binary file.
+        station_metadata: Control-file station metadata required when the file
+            declares projection ``NONE``.
+        datum: Control-file datum required with projection ``NONE``.
+
+    Returns:
+        A fully populated :class:`PrecipitationData` instance. Each record's
+        ``rate_mm_h`` is a float32 ``(station,)`` array.
+
+    Raises:
+        OSError: If the input file cannot be opened.
+        ValueError: If record framing, metadata, packing, timestamps, station
+            identifiers, or interval continuity are invalid.
+    """
     source=Path(path); result=object.__new__(PrecipitationData); result.path=source
     with FortranSequentialReader(source) as reader:
         def record(size=None,label='record'):
+            """Read and optionally size-check one required binary record.
+
+            Args:
+                size: Expected payload length in bytes, or ``None`` to accept
+                    any length.
+                label: Record description used in validation errors.
+
+            Returns:
+                Raw record payload as bytes.
+
+            Raises:
+                ValueError: If the file ends early or the payload length is
+                    not ``size``.
+            """
             payload=reader.read_record()
             if payload is None: raise ValueError(f'truncated unformatted PRECIP.DAT {label}')
             if size is not None and len(payload)!=size: raise ValueError(f'unformatted PRECIP.DAT {label} has wrong size')
@@ -199,13 +292,55 @@ def read_unformatted_precipitation(path,*,station_metadata=None,datum=None):
 
 
 def load_precipitation(path,format=2,*,station_metadata=None,datum=None):
+    """Load PRECIP.DAT using the CALMET ``IFORMP`` selector.
+
+    Args:
+        path: Path to PRECIP.DAT.
+        format: ``1`` for sequential-unformatted binary or ``2`` for formatted
+            text.
+        station_metadata: Control-file station metadata for projection
+            ``NONE``.
+        datum: Control-file datum for projection ``NONE``.
+
+    Returns:
+        Parsed :class:`PrecipitationData`.
+
+    Raises:
+        ValueError: If ``format`` is not 1 or 2, or the selected reader rejects
+            the file.
+    """
     if format==1: return read_unformatted_precipitation(path,station_metadata=station_metadata,datum=datum)
     if format==2: return PrecipitationData(path,station_metadata=station_metadata,datum=datum)
     raise ValueError('PRECIP.DAT format/IFORMP must be 1 or 2')
 
 
 def grid_precipitation(values,station_xy,grid,method=2,radius_km=50.,cutoff=.01):
-    """Vectorized/blockwise CALMET GRIDE methods 1, 2 and 3."""
+    """Interpolate station precipitation with CALMET GRIDE methods 1--3.
+
+    Args:
+        values: Station precipitation rates in millimetres per hour. Values
+            greater than or equal to 9998 are treated as missing.
+        station_xy: Float-like array of shape ``(station, 2)`` containing
+            station x/y coordinates in kilometres relative to the CALMET grid
+            origin.
+        grid: Grid configuration providing ``nx``, ``ny``, ``dx_km``, and
+            ``dy_km``.
+        method: GRIDE method: ``1`` for inverse distance, ``2`` for inverse
+            squared distance, or ``3`` for exponentially damped inverse
+            squared distance.
+        radius_km: Search radius for methods 1 and 2. For method 3, zero asks
+            the routine to infer a wet/dry decorrelation scale.
+        cutoff: Interpolated rates below this value, in millimetres per hour,
+            are set to zero.
+
+    Returns:
+        Float32 precipitation-rate array of shape ``(grid.ny, grid.nx)`` in
+        millimetres per hour. An all-missing station vector produces zeros.
+
+    Raises:
+        ValueError: If station coordinates have the wrong shape or ``method``
+            is not 1, 2, or 3.
+    """
     f32=MODEL_DTYPE
     rates=np.asarray(values,dtype=f32)
     # Spatial distances and weighted station accumulations are the deliberate

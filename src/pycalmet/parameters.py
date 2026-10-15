@@ -18,12 +18,33 @@ from .datetime_utils import exact_integer,parse_calendar,parse_timezone_label
 
 @dataclass(frozen=True, slots=True)
 class NormalizedParameters:
+    """Canonical parameters separated by their configuration destination.
+
+    Attributes:
+        values: Top-level configuration fields keyed by their Python names.
+            Required.
+        grid: Flattened :class:`GridConfig` fields, without the ``grid.``
+            prefix used internally by the alias table. Required.
+        special: Intermediate values needed to assemble structured fields or
+            implement legacy control-file switches. Keys omit the internal
+            ``$`` prefix. Required.
+    """
+
     values: dict[str, Any]
     grid: dict[str, Any]
     special: dict[str, Any]
 
 
 def _single(value: Any) -> Any:
+    """Unwrap a non-text sequence that contains exactly one item.
+
+    Args:
+        value: Scalar or sequence supplied through the public or legacy API.
+
+    Returns:
+        The sequence's only item when ``value`` is a one-item, non-text
+        sequence; otherwise ``value`` unchanged.
+    """
     if (isinstance(value, Sequence)
             and not isinstance(value, (str, bytes, bytearray, Path))
             and len(value) == 1):
@@ -32,10 +53,33 @@ def _single(value: Any) -> Any:
 
 
 def _identity(value: Any) -> Any:
+    """Apply only the common one-item sequence normalization.
+
+    Args:
+        value: Parameter value to normalize.
+
+    Returns:
+        ``value`` after unwrapping a one-item non-text sequence.
+    """
     return _single(value)
 
 
 def _number(value: Any) -> int | float:
+    """Parse a Python or Fortran numeric scalar without losing integers.
+
+    Fortran double-precision exponent markers (``D`` or ``d``) are accepted.
+
+    Args:
+        value: Numeric value or text, optionally wrapped in a one-item
+            sequence.
+
+    Returns:
+        An ``int`` for integral text and a ``float`` for decimal or
+        exponential text.
+
+    Raises:
+        ValueError: If the normalized text is not a valid number.
+    """
     value = _single(value)
     if isinstance(value, bool):
         return int(value)
@@ -46,18 +90,64 @@ def _number(value: Any) -> int | float:
 
 
 def _integer(value: Any) -> int:
+    """Convert a scalar to an exact integer.
+
+    Args:
+        value: Integral number or numeric text, optionally in a one-item
+            sequence.
+
+    Returns:
+        The exactly represented integer.
+
+    Raises:
+        ValueError: If ``value`` is nonnumeric, non-finite, or not integral.
+    """
     return exact_integer(_single(value))
 
 
 def _named_integer(label: str) -> Callable[[Any], int]:
+    """Build an exact-integer converter that names its control variable.
+
+    Args:
+        label: Legacy control-variable name used in conversion errors.
+
+    Returns:
+        A converter accepting one parameter value and returning an integer.
+    """
     return lambda value: exact_integer(_single(value),label)
 
 
 def _real(value: Any) -> float:
+    """Convert a scalar, including Fortran numeric text, to ``float``.
+
+    Args:
+        value: Numeric value or text, optionally in a one-item sequence.
+
+    Returns:
+        The floating-point value.
+
+    Raises:
+        ValueError: If ``value`` cannot be parsed as a number.
+    """
     return float(_number(value))
 
 
 def _logical(value: Any) -> bool:
+    """Parse a Python or Fortran logical scalar.
+
+    Accepted true tokens are ``T``, ``.TRUE.``, ``TRUE``, and ``1``;
+    accepted false tokens are ``F``, ``.FALSE.``, ``FALSE``, and ``0``.
+
+    Args:
+        value: Boolean, zero/one number, or logical text, optionally wrapped
+            in a one-item sequence.
+
+    Returns:
+        The parsed Boolean value.
+
+    Raises:
+        ValueError: If ``value`` is not a recognized logical representation.
+    """
     value = _single(value)
     if isinstance(value, bool):
         return value
@@ -72,14 +162,46 @@ def _logical(value: Any) -> bool:
 
 
 def _upper(value: Any) -> str:
+    """Normalize a scalar as stripped uppercase text.
+
+    Args:
+        value: Value to normalize, optionally in a one-item sequence.
+
+    Returns:
+        The stripped, uppercase string representation.
+    """
     return str(_single(value)).strip().upper()
 
 
 def _text(value: Any) -> str:
+    """Normalize a scalar as text without changing whitespace or case.
+
+    Args:
+        value: Value to normalize, optionally in a one-item sequence.
+
+    Returns:
+        The string representation of the normalized value.
+    """
     return str(_single(value))
 
 
 def _angle(value: Any) -> float:
+    """Parse a signed latitude or longitude with an optional compass suffix.
+
+    ``S`` and ``W`` force a negative sign, while ``N`` and ``E`` force a
+    positive sign. East/west values outside [-180, 180] are wrapped once to
+    match the traditional control-file convention.
+
+    Args:
+        value: Numeric angle or text containing at most one of ``NSEW``.
+
+    Returns:
+        The signed angle in decimal degrees.
+
+    Raises:
+        ValueError: If the value is not numeric or contains multiple compass
+            directions.
+    """
     token = re.sub(r"\s+", "", str(_single(value)))
     directions = re.findall(r"[NSEW]", token, re.I)
     if len(directions) > 1:
@@ -104,6 +226,15 @@ def _angle(value: Any) -> float:
 
 
 def _tokens(value: Any) -> list[Any]:
+    """Split a scalar or sequence into whitespace/comma-delimited tokens.
+
+    Args:
+        value: Text, a sequence of values, or a scalar. String elements of a
+            sequence are split further when they contain delimiters.
+
+    Returns:
+        Tokens in their original order. Non-string tokens retain their types.
+    """
     if isinstance(value, str):
         return [item for item in re.split(r"[\s,]+", value.strip()) if item]
     if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, Path)):
@@ -118,29 +249,90 @@ def _tokens(value: Any) -> list[Any]:
 
 
 def _integers(value: Any) -> tuple[int, ...]:
+    """Parse every token in a value as an exact integer.
+
+    Args:
+        value: Scalar, delimited text, or sequence of integer values.
+
+    Returns:
+        Parsed integers in input order.
+
+    Raises:
+        ValueError: If a token is nonnumeric, non-finite, or not integral.
+    """
     return tuple(_integer(item) for item in _tokens(value))
 
 
 def _nonzero_integers(value: Any) -> tuple[int, ...]:
+    """Parse integer tokens and discard zero padding values.
+
+    Args:
+        value: Scalar, delimited text, or sequence of integer values.
+
+    Returns:
+        Parsed nonzero integers in input order.
+
+    Raises:
+        ValueError: If a token is nonnumeric, non-finite, or not integral.
+    """
     return tuple(item for item in _integers(value) if item != 0)
 
 
 def _reals(value: Any) -> tuple[float, ...]:
+    """Parse every token in a value as a floating-point number.
+
+    Args:
+        value: Scalar, delimited text, or sequence of numeric values.
+
+    Returns:
+        Parsed floating-point values in input order.
+
+    Raises:
+        ValueError: If a token is not numeric.
+    """
     return tuple(_real(item) for item in _tokens(value))
 
 
 def _files(value: Any) -> tuple[str | Path, ...]:
+    """Normalize one path or a path sequence to a tuple.
+
+    Args:
+        value: A string/path scalar or iterable of strings and paths.
+
+    Returns:
+        A tuple containing the supplied path values.
+    """
     if isinstance(value, (str, Path)):
         return (value,)
     return tuple(value)
 
 
 def _file_or_files(value: Any) -> str | Path | tuple[str | Path, ...]:
+    """Normalize path input while preserving a scalar for one file.
+
+    Args:
+        value: A string/path scalar or iterable of strings and paths.
+
+    Returns:
+        The sole path when one was supplied, otherwise a tuple of paths.
+    """
     result = _files(value)
     return result[0] if len(result) == 1 else result
 
 
 def _sampling(value: Any) -> str:
+    """Translate TERREL's ``MSHEET`` switch to a sampling method name.
+
+    Args:
+        value: ``0`` for legacy sheet-corner interpolation or ``1`` for
+            direct transformation of every terrain sample.
+
+    Returns:
+        ``"legacy"`` for zero or ``"direct"`` for one.
+
+    Raises:
+        ValueError: If the value is not exactly 0 or 1.
+    """
     method = _integer(value)
     if method not in {0, 1}:
         raise ValueError("MSHEET must be 0 or 1")
@@ -151,10 +343,26 @@ Alias = tuple[tuple[str, ...], Callable[[Any], Any]]
 
 
 def _alias(target: str | tuple[str, ...], converter: Callable[[Any], Any] = _identity) -> Alias:
+    """Create an alias-table entry for one or more canonical destinations.
+
+    Args:
+        target: Canonical field name or names populated by the alias.
+        converter: Function converting the supplied legacy value.
+
+    Returns:
+        The normalized target tuple paired with ``converter``.
+    """
     return ((target,) if isinstance(target, str) else target, converter)
 
 
 def _add(mapping: dict[str, Alias], converter: Callable[[Any], Any], **items: str) -> None:
+    """Add multiple legacy-to-canonical aliases using one converter.
+
+    Args:
+        mapping: Alias table modified in place.
+        converter: Value converter shared by all new entries.
+        **items: Mapping from legacy control names to canonical field names.
+    """
     for legacy, target in items.items():
         mapping[legacy] = _alias(target, converter)
 
@@ -245,6 +453,22 @@ for kind in CTG_KINDS:
 
 
 def _records(value: Any, count: int) -> list[list[Any]]:
+    """Normalize legacy fixed-width records to lists of fields.
+
+    Mapping input is converted from ``key -> remaining fields`` to records
+    beginning with the key. Text records are split on whitespace and commas.
+
+    Args:
+        value: One record, a sequence of records, or a mapping of record keys
+            to their remaining fields.
+        count: Required number of fields in every normalized record.
+
+    Returns:
+        A list of mutable field lists, one for each record.
+
+    Raises:
+        ValueError: If any record does not contain exactly ``count`` fields.
+    """
     if isinstance(value, Mapping):
         value = [[key, *record] for key, record in value.items()]
     elif isinstance(value, (str, Path)) or not isinstance(value, Sequence):
@@ -260,15 +484,52 @@ def _records(value: Any, count: int) -> list[list[Any]]:
 
 
 def _properties(value: Any) -> dict[int, tuple[float, float, float, float, float, float, int]]:
+    """Parse MAKEGEO surface-property records keyed by input category.
+
+    Args:
+        value: Eight-field records containing an input category, six real
+            properties, and the mapped output category.
+
+    Returns:
+        Input categories mapped to six floating-point properties followed by
+        the integer output category.
+
+    Raises:
+        ValueError: If a record has the wrong width or a field is not numeric.
+    """
     return {_integer(row[0]): (*(_real(item) for item in row[1:7]), _integer(row[7]))
             for row in _records(value, 8)}
 
 
 def _snow_age(value: Any) -> dict[int, tuple[int, float]]:
+    """Parse MAKEGEO snow-age parameter records.
+
+    Args:
+        value: Three-field records containing category, integer age time
+            scale in days, and albedo-reduction factor.
+
+    Returns:
+        Categories mapped to ``(age_time_scale_days, reduction_factor)``.
+
+    Raises:
+        ValueError: If a record has the wrong width or a field is not numeric.
+    """
     return {_integer(row[0]): (_integer(row[1]), _real(row[2])) for row in _records(value, 3)}
 
 
 def _splits(value: Any) -> tuple[tuple[int, int, float], ...]:
+    """Parse MAKEGEO land-use category split records.
+
+    Args:
+        value: Three-field records containing source category, target
+            category, and percentage.
+
+    Returns:
+        Parsed ``(source_category, target_category, percent)`` records.
+
+    Raises:
+        ValueError: If a record has the wrong width or a field is not numeric.
+    """
     return tuple((_integer(row[0]), _integer(row[1]), _real(row[2]))
                  for row in _records(value, 3))
 
@@ -394,11 +655,34 @@ ALIASES: dict[type[Any], dict[str, Alias]] = {
 
 
 def _duplicate(cls: type[Any], target: str, old: str, new: str) -> TypeError:
+    """Create the error used when two spellings claim one parameter.
+
+    Args:
+        cls: Configuration class whose parameter is duplicated.
+        target: Canonical field name, possibly with ``grid.`` or ``$``.
+        old: First spelling that supplied the field.
+        new: Later spelling that supplied the same field.
+
+    Returns:
+        A descriptive ``TypeError`` ready to be raised by the caller.
+    """
     label = target.removeprefix("grid.").removeprefix("$")
     return TypeError(f"duplicate {cls.__name__} parameter {label!r}: {old!r} and {new!r}")
 
 
 def _timezone(value: str) -> tuple[int, str]:
+    """Parse a CALMET ``ABTZ`` timezone label for a whole-hour offset.
+
+    Args:
+        value: CALMET timezone label, with insignificant whitespace and case.
+
+    Returns:
+        A pair containing the UTC offset in hours and canonical label.
+
+    Raises:
+        ValueError: If the label is unsupported or encodes a fractional-hour
+            offset that CALMET cannot represent.
+    """
     try:
         return parse_timezone_label("".join(str(value).split()).upper())
     except (TypeError,ValueError) as error:
@@ -409,6 +693,23 @@ def _timezone(value: str) -> tuple[int, str]:
 
 
 def _date(parts: Mapping[str, Any], prefix: str) -> datetime:
+    """Assemble a CALMET begin or end timestamp from legacy date fields.
+
+    CALMET accepts hour 24 and second 3600 boundary notation; the shared
+    calendar parser normalizes those values into the following day or hour.
+
+    Args:
+        parts: Date components keyed by names such as ``IBYR`` and ``IESEC``.
+        prefix: ``"IB"`` for the begin time or ``"IE"`` for the end time.
+
+    Returns:
+        A naive, second-precision ``datetime``.
+
+    Raises:
+        TypeError: If any required year, month, day, or hour field is absent.
+        ValueError: If a component is invalid or outside CALMET's accepted
+            hour and second boundary ranges.
+    """
     required = [prefix + suffix for suffix in ("YR", "MO", "DY", "HR")]
     missing = [name for name in required if name not in parts]
     if missing:
@@ -428,6 +729,19 @@ def _date(parts: Mapping[str, Any], prefix: str) -> datetime:
 
 
 def _station(value: Any, count: int) -> tuple[Any, ...]:
+    """Parse one legacy CALMET station-control row.
+
+    Args:
+        value: Shell-like text or an iterable containing station fields.
+        count: Required row width for the selected station type.
+
+    Returns:
+        A tuple containing the station name, integer identifier, and remaining
+        coordinates or metadata converted to floats.
+
+    Raises:
+        ValueError: If the row width is wrong or a numeric field is invalid.
+    """
     if isinstance(value, str):
         parts = shlex.split(value)
     else:
@@ -438,6 +752,17 @@ def _station(value: Any, count: int) -> tuple[Any, ...]:
 
 
 def _ctg_datum(kind: str, special: Mapping[str, Any]) -> str:
+    """Select the source datum for one CTGPROC land-use input type.
+
+    Args:
+        kind: Uppercase CTGPROC input type, such as ``CTG`` or ``NLCD01``.
+        special: Parsed legacy values containing optional ``source_datum.*``
+            overrides.
+
+    Returns:
+        The explicit datum override or the format-specific traditional
+        default.
+    """
     if kind == "CTG": return str(special.get("source_datum.CTG", "NAS-C"))
     if kind == "NZGEN": return str(special.get("source_datum.NZGEN", "WGS-84"))
     if kind.startswith("NLCD"): return str(special.get("source_datum.NLCD", "NAR-C"))
@@ -448,7 +773,28 @@ def _ctg_datum(kind: str, special: Mapping[str, Any]) -> str:
 
 
 def normalize_public_parameters(cls: type[Any], parameters: Mapping[str, Any]) -> NormalizedParameters:
-    """Return case-insensitive Python fields for descriptive or legacy names."""
+    """Normalize descriptive and legacy keywords for a configuration class.
+
+    Names are matched case-insensitively. Descriptive Python fields are kept
+    as top-level values, flattened grid fields are separated into ``grid``,
+    and legacy switches are resolved into structured sources, station rows,
+    time ranges, barriers, and lake-breeze regions where applicable.
+
+    Args:
+        cls: One of the supported stage configuration dataclasses.
+        parameters: User-supplied keyword names and values. Names may be
+            descriptive Python fields, flattened grid fields, or traditional
+            control-file variables.
+
+    Returns:
+        Canonical top-level, grid, and intermediate special parameters.
+
+    Raises:
+        TypeError: If a name is unknown, two spellings set the same field, or
+            a required group of companion fields is incomplete.
+        ValueError: If a value, declared count, date, source selection, or
+            structured legacy record is invalid or inconsistent.
+    """
     aliases = ALIASES.get(cls, {})
     canonical = {field.name.casefold(): field.name for field in fields(cls)}
     grid_canonical = {field.name.casefold(): field.name for field in fields(GridConfig)}
@@ -461,6 +807,16 @@ def normalize_public_parameters(cls: type[Any], parameters: Mapping[str, Any]) -
                         for name in parameters)
 
     def assign(target: str, value: Any, spelling: str) -> None:
+        """Store one canonical field and reject duplicate spellings.
+
+        Args:
+            target: Canonical top-level, ``grid.*``, or ``$`` special key.
+            value: Converted value to store.
+            spelling: User-facing name that supplied the value.
+
+        Raises:
+            TypeError: If another spelling already claimed ``target``.
+        """
         if target in claimed:
             raise _duplicate(cls, target, claimed[target], spelling)
         claimed[target] = spelling

@@ -7,6 +7,23 @@ import numpy as np
 
 
 def _fortran_exponential(value,digits,width):
+    """Format a scalar like a fixed-width Fortran ``E`` field.
+
+    Args:
+        value: Numeric scalar to format.
+        digits: Number of digits after the mantissa decimal point.
+        width: Minimum output field width.
+
+    Returns:
+        Right-justified exponential string with a two-digit signed exponent.
+
+    Raises:
+        TypeError: If ``value`` is not convertible to ``float``.
+        ValueError: If formatting controls or a NaN value cannot be converted
+            by the exponent calculation.
+        OverflowError: If an infinite value cannot be converted to an integer
+            exponent.
+    """
     value=float(value)
     if value==0.:
         exponent=0; mantissa=0.
@@ -19,9 +36,36 @@ def _fortran_exponential(value,digits,width):
 
 
 class FinalWindDebugWriter:
-    """Reproduce ``OUTFIL`` records written to ``TEST.OUT`` for ``IPR8``."""
+    """Reproduce ``OUTFIL`` records written to ``TEST.OUT`` for ``IPR8``.
+
+    Attributes:
+        stream: Open ASCII output stream, or ``None`` after closing.
+        nx: Number of horizontal columns.
+        ny: Number of horizontal rows.
+        nz: Number of wind layers.
+        dx_km: Grid-cell width in kilometres.
+        dy_km: Grid-cell height in kilometres.
+        first_hour: First whole-hour timestamp seen, or ``None`` before output.
+    """
 
     def __init__(self,path,nx,ny,nz,dx_km,dy_km):
+        """Open TEST.OUT and store its fixed grid metadata.
+
+        Args:
+            path: Destination ASCII path; missing parent directories are
+                created.
+            nx: Number of grid columns.
+            ny: Number of grid rows.
+            nz: Number of horizontal-wind layers.
+            dx_km: Grid-cell width in kilometres.
+            dy_km: Grid-cell height in kilometres.
+
+        Raises:
+            OSError: If the destination directory or file cannot be created.
+
+        Notes:
+            Construction truncates an existing destination file.
+        """
         target=Path(path); target.parent.mkdir(parents=True,exist_ok=True)
         self.stream=target.open('w',encoding='ascii')
         self.nx=int(nx); self.ny=int(ny); self.nz=int(nz)
@@ -30,15 +74,61 @@ class FinalWindDebugWriter:
 
     @staticmethod
     def _rows(values,format_spec,width):
+        """Yield fixed-size chunks from each row of an array.
+
+        Args:
+            values: Array-like object whose first axis is iterated as rows.
+            format_spec: Python scalar format specification for each value.
+            width: Maximum number of values emitted per text line.
+
+        Yields:
+            Concatenated formatted strings without newline terminators.
+
+        Raises:
+            ValueError: If ``width`` is zero or a value cannot be formatted
+                with ``format_spec``.
+        """
         array=np.asarray(values)
         for row in array:
             for first in range(0,row.size,width):
                 yield ''.join(format(value,format_spec) for value in row[first:first+width])
 
     def append(self,hour):
+        """Append final U/V/W fields from one solver hour.
+
+        Args:
+            hour: Solver output providing ``timestamp`` and wind arrays.
+
+        Raises:
+            ValueError: If wind arrays do not match the configured grid.
+            OSError: If writing or flushing TEST.OUT fails.
+
+        Notes:
+            This delegates to :meth:`append_fields` and writes no other solver
+            fields.
+        """
         self.append_fields(hour.timestamp,hour.wind.u,hour.wind.v,hour.wind.w)
 
     def append_fields(self,timestamp,u,v,w):
+        """Append one timestamp and its final wind arrays to TEST.OUT.
+
+        Args:
+            timestamp: Model timestamp used to derive one-based simulation hour.
+            u: Horizontal U wind with shape ``(nz, ny, nx)`` in metres per
+                second.
+            v: Horizontal V wind with shape ``(nz, ny, nx)`` in metres per
+                second.
+            w: Face vertical velocity with shape ``(nz + 1, ny, nx)`` in metres
+                per second.
+
+        Raises:
+            ValueError: If U, V, or W has the wrong shape.
+            OSError: If writing or flushing the output stream fails.
+
+        Notes:
+            U/V use fixed-point fields and W uses exponential fields. Data are
+            flattened level-major, row-major without numerical conversion.
+        """
         current=timestamp.replace(minute=0,second=0,microsecond=0)
         if self.first_hour is None: self.first_hour=current
         nh=int((current-self.first_hour).total_seconds()//3600)+1
@@ -57,15 +147,46 @@ class FinalWindDebugWriter:
         stream.flush()
 
     def close(self):
+        """Flush and close TEST.OUT; repeated calls are harmless."""
         if self.stream is not None:
             self.stream.close(); self.stream=None
 
-    def __enter__(self): return self
-    def __exit__(self,*exc): self.close()
+    def __enter__(self):
+        """Return this open writer for context-manager use.
+
+        Returns:
+            The :class:`FinalWindDebugWriter` instance.
+        """
+        return self
+
+    def __exit__(self,*exc):
+        """Close TEST.OUT on context-manager exit.
+
+        Args:
+            *exc: Exception type, value, and traceback supplied by the context
+                manager protocol.
+
+        Returns:
+            ``None``; exceptions are not suppressed.
+        """
+        self.close()
 
 
 def format_wind_number_map(values):
-    """Reproduce the legacy ``WNDLPT`` two-digit scaled number map."""
+    """Reproduce the legacy ``WNDLPT`` two-digit scaled number map.
+
+    Args:
+        values: Nonempty two-dimensional numeric field. Only the first 36 rows
+            and 72 columns are printed.
+
+    Returns:
+        Newline-terminated number-map text. Nonzero fields are float32-scaled
+        so rounded integers normally occupy two digits; all-zero fields return
+        the legacy suppression message.
+
+    Raises:
+        ValueError: If ``values`` is not two-dimensional or is empty.
+    """
     data=np.asarray(values,dtype=np.float32)
     if data.ndim!=2: raise ValueError('WNDLPT fields must be two-dimensional')
     maximum=float(np.max(np.abs(data)))
@@ -97,14 +218,56 @@ def format_wind_number_map(values):
 
 
 class WindPrintWriter:
-    """Write the requested wind-module diagnostic maps to ``TEST.PRT``."""
+    """Write requested wind-module diagnostic maps to ``TEST.PRT``.
+
+    Attributes:
+        stream: Open ASCII output stream, or ``None`` after closing.
+        fields: Tuple of wind-module print switches.
+        levels: Optional maximum number of levels for selected products.
+        first_hour: First whole-hour timestamp seen, or ``None`` before output.
+    """
 
     def __init__(self,path,fields,levels=None):
+        """Open TEST.PRT and retain its field switches.
+
+        Args:
+            path: Destination ASCII path; missing parent directories are
+                created.
+            fields: Sequence of at least nine truth-like print switches using
+                CALMET's wind-debug switch order.
+            levels: Optional maximum number of levels printed for speed,
+                direction, and divergence products.
+
+        Raises:
+            OSError: If the destination directory or file cannot be created.
+
+        Notes:
+            Construction truncates an existing destination file. Switch count
+            and level validity are consumed when :meth:`append` is called.
+        """
         target=Path(path); target.parent.mkdir(parents=True,exist_ok=True)
         self.stream=target.open('w',encoding='ascii')
         self.fields=tuple(fields); self.levels=levels; self.first_hour=None
 
     def _windpr(self,u,v,w,include_w):
+        """Write component number maps for every horizontal wind level.
+
+        Args:
+            u: Array-like U wind with shape ``(level, ny, nx)`` in metres per
+                second.
+            v: Array-like V wind with the same shape and units as ``u``.
+            w: Face W velocity with shape ``(level + 1, ny, nx)`` when
+                ``include_w`` is true; ignored otherwise.
+            include_w: Whether to print interior W faces before U/V maps.
+
+        Raises:
+            IndexError: If requested component levels are missing.
+            ValueError: If a selected map is not a nonempty 2-D field.
+            OSError: If writing TEST.PRT fails.
+
+        Notes:
+            Each component is passed through :func:`format_wind_number_map`.
+        """
         for level in range(u.shape[0]):
             if include_w and level:
                 self.stream.write(
@@ -121,7 +284,22 @@ class WindPrintWriter:
             self.stream.write(format_wind_number_map(v[level]))
 
     def _speed_direction(self,u,v):
-        """Print final horizontal-wind speed and meteorological direction."""
+        """Print final horizontal-wind speed and meteorological direction.
+
+        Args:
+            u: Array-like U wind with shape ``(level, ny, nx)`` in metres per
+                second.
+            v: Array-like V wind with the same shape and units as ``u``.
+
+        Raises:
+            IndexError: If V has fewer requested levels than U.
+            ValueError: If a selected level is not a nonempty 2-D field.
+            OSError: If writing TEST.PRT fails.
+
+        Notes:
+            Calm directions are printed as zero; non-calm northerly flow is
+            printed as 360 degrees.
+        """
         u=np.asarray(u); v=np.asarray(v)
         levels=u.shape[0] if self.levels is None else min(int(self.levels),u.shape[0])
         for level in range(levels):
@@ -140,6 +318,26 @@ class WindPrintWriter:
             self.stream.write(format_wind_number_map(direction))
 
     def append(self,hour):
+        """Append all enabled wind-stage diagnostics for one solver hour.
+
+        Args:
+            hour: Solver output containing final winds, divergence, timestamp,
+                and any retained intermediate wind stages requested by
+                ``fields``.
+
+        Raises:
+            IndexError: If ``fields`` has fewer than nine switches or selected
+                arrays lack required levels.
+            RuntimeError: If an enabled intermediate stage was not retained.
+            TypeError: If a selected product requires ``levels`` but it is
+                ``None`` or not integer-compatible.
+            ValueError: If a selected map is not a nonempty 2-D field.
+            OSError: If writing or flushing TEST.PRT fails.
+
+        Notes:
+            Enabled sections are written in legacy TEST.PRT order: intermediate
+            stages, final wind, final divergence, then speed and direction.
+        """
         current=hour.timestamp.replace(minute=0,second=0,microsecond=0)
         if self.first_hour is None: self.first_hour=current
         nh=int((current-self.first_hour).total_seconds()//3600)+1
@@ -201,7 +399,25 @@ class WindPrintWriter:
         self.stream.flush()
 
     def close(self):
+        """Flush and close TEST.PRT; repeated calls are harmless."""
         if self.stream is not None: self.stream.close(); self.stream=None
 
-    def __enter__(self): return self
-    def __exit__(self,*exc): self.close()
+    def __enter__(self):
+        """Return this open writer for context-manager use.
+
+        Returns:
+            The :class:`WindPrintWriter` instance.
+        """
+        return self
+
+    def __exit__(self,*exc):
+        """Close TEST.PRT on context-manager exit.
+
+        Args:
+            *exc: Exception type, value, and traceback supplied by the context
+                manager protocol.
+
+        Returns:
+            ``None``; exceptions are not suppressed.
+        """
+        self.close()

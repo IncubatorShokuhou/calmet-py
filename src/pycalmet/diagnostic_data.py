@@ -10,6 +10,28 @@ import numpy as np
 
 @dataclass(frozen=True, slots=True)
 class DiagnosticRecord:
+    """One optional set of PREPDI diagnostic overrides.
+
+    Attributes:
+        surface_temperature_k: Domain diagnostic surface temperature in
+            kelvin, or ``None`` when that record type was not requested.
+        lapse_rate_k_m: Domain temperature lapse rate in kelvin per metre, or
+            ``None``. DIAG.DAT stores this value in kelvin per kilometre.
+        initial_u_m_s: Initial grid-wide U wind component in metres per second,
+            or ``None``.
+        initial_v_m_s: Initial grid-wide V wind component in metres per second,
+            or ``None``.
+        surface_u_m_s: Float64 array of shape ``(surface_station,)`` containing
+            surface-station U components in metres per second. Missing values
+            are encoded as 9999; ``None`` means surface winds were not read.
+        surface_v_m_s: Surface-station V components with the same representation
+            as ``surface_u_m_s``.
+        upper_u_m_s: Float64 array of shape ``(level, upper_station)`` containing
+            upper-air U components in metres per second. Missing values are
+            encoded as 9999; ``None`` means upper winds were not read.
+        upper_v_m_s: Upper-air V components with the same representation as
+            ``upper_u_m_s``.
+    """
     surface_temperature_k: float | None = None
     lapse_rate_k_m: float | None = None
     initial_u_m_s: float | None = None
@@ -21,7 +43,19 @@ class DiagnosticRecord:
 
 
 def _fixed_value(line: str, label: str, width: int) -> float:
-    """Read the value following the ten columns skipped by formats 1010/1030."""
+    """Read the value following the ten columns skipped by formats 1010/1030.
+
+    Args:
+        line: Fixed-column DIAG.DAT record text.
+        label: Record description used in validation errors.
+        width: Number of characters occupied by the numeric field.
+
+    Returns:
+        Parsed floating-point value from columns 11 through ``10 + width``.
+
+    Raises:
+        ValueError: If the record is too short or the field is not numeric.
+    """
     if len(line) < 10+width:
         raise ValueError(f'DIAG.DAT {label} record is shorter than ten columns')
     try:
@@ -31,26 +65,97 @@ def _fixed_value(line: str, label: str, width: int) -> float:
 
 
 class DiagnosticData:
-    """Index supported PREPDI DIAG.DAT records by CALMET interval start."""
+    """Index supported PREPDI DIAG.DAT records by CALMET interval start.
+
+    Attributes:
+        path: Path to the formatted DIAG.DAT file.
+        records: Mapping from interval-start datetimes to
+            :class:`DiagnosticRecord` objects.
+    """
 
     def __init__(self, path, start: datetime, count: int, timestep_seconds: int,
                  *, surface_temperature=False, lapse_rate=False, initial_wind=False,
                  surface_wind=False,upper_wind=False,surface_wind_names=(),
                  upper_wind_names=(),levels=0,iextrp=-1):
+        """Read the requested sequence of diagnostic records.
+
+        Args:
+            path: Path to formatted DIAG.DAT text.
+            start: Beginning datetime assigned to the first record group.
+            count: Number of timestep record groups to read.
+            timestep_seconds: Seconds between consecutive record keys.
+            surface_temperature: Whether each group contains a domain surface
+                temperature scalar.
+            lapse_rate: Whether each group contains a lapse-rate scalar.
+            initial_wind: Whether each group contains initial U and V scalars.
+            surface_wind: Whether surface-wind blocks should be consumed even
+                when ``surface_wind_names`` is empty.
+            upper_wind: Whether upper-air wind blocks should be consumed even
+                when ``upper_wind_names`` is empty.
+            surface_wind_names: Expected surface-station names. Names are
+                normalized to uppercase four-character identifiers.
+            upper_wind_names: Expected upper-air station names, normalized in
+                the same way.
+            levels: Number of CALMET layers in each upper-air block.
+            iextrp: Surface-wind extrapolation option. A positive value permits
+                the first upper-air level unless the station is also a surface
+                station.
+
+        Raises:
+            OSError: If the input file cannot be read.
+            UnicodeDecodeError: If the input is not ASCII.
+            ValueError: If a requested record is missing or malformed, station
+                identifiers are ambiguous, or ``levels`` is negative.
+        """
         self.path=Path(path)
         lines=iter(self.path.read_text(encoding='ascii',errors='strict').splitlines())
 
         def take(label,width):
+            """Read one fixed-width scalar from the next input line.
+
+            Args:
+                label: Record description used in error messages.
+                width: Width of the numeric field after the ten-column prefix.
+
+            Returns:
+                Parsed scalar value.
+
+            Raises:
+                ValueError: If the file ends early or the field is invalid.
+            """
             try: return _fixed_value(next(lines),label,width)
             except StopIteration as error:
                 raise ValueError(f'DIAG.DAT ends before {label} record') from error
 
         def line(label):
+            """Return the next raw line from DIAG.DAT.
+
+            Args:
+                label: Record description used when reporting early EOF.
+
+            Returns:
+                The next line without its newline terminator.
+
+            Raises:
+                ValueError: If the file ends before the requested line.
+            """
             try: return next(lines)
             except StopIteration as error:
                 raise ValueError(f'DIAG.DAT ends before {label} record') from error
 
         def names(values,label):
+            """Normalize and validate a station-name sequence.
+
+            Args:
+                values: Station identifiers accepted by ``str``.
+                label: Station group name used in validation errors.
+
+            Returns:
+                Tuple of unique uppercase names truncated to four characters.
+
+            Raises:
+                ValueError: If two inputs collapse to the same A4 identifier.
+            """
             normalized=tuple(str(item).strip().upper()[:4] for item in values)
             if len(set(normalized))!=len(normalized):
                 raise ValueError(f'DIAG.DAT {label} station names are not unique in A4 format')
@@ -64,12 +169,38 @@ class DiagnosticData:
         if nz<0: raise ValueError('DIAG.DAT level count must be non-negative')
 
         def fields(text,start,number,label):
+            """Decode consecutive five-character numeric fields.
+
+            Args:
+                text: Fixed-column record text.
+                start: Zero-based character offset of the first field.
+                number: Number of fields to decode.
+                label: Record description used in validation errors.
+
+            Returns:
+                List of ``number`` floating-point values.
+
+            Raises:
+                ValueError: If the record is too short or a field is not
+                    numeric.
+            """
             if len(text)<start+5*number:
                 raise ValueError(f'DIAG.DAT {label} record is too short')
             try: return [float(text[start+5*i:start+5*(i+1)]) for i in range(number)]
             except ValueError as error: raise ValueError(f'invalid DIAG.DAT {label} record') from error
 
         def surface_block():
+            """Read one LAST-terminated surface-wind station block.
+
+            Returns:
+                Tuple ``(u, v)`` of float64 arrays with shape
+                ``(surface_station,)`` and units of metres per second. Missing
+                component values are encoded as 9999.
+
+            Raises:
+                ValueError: If a row is truncated, malformed, or names an
+                    unconfigured station.
+            """
             u=np.full(len(surface_names),9999.); v=np.full(len(surface_names),9999.)
             lookup={name:index for index,name in enumerate(surface_names)}
             while True:
@@ -86,6 +217,17 @@ class DiagnosticData:
             return u,v
 
         def upper_block():
+            """Read one LAST-terminated upper-air wind station block.
+
+            Returns:
+                Tuple ``(u, v)`` of float64 arrays with shape
+                ``(level, upper_station)`` and units of metres per second.
+                Missing components are encoded as 9999.
+
+            Raises:
+                ValueError: If a primary or continuation row is truncated,
+                    malformed, or names an unconfigured station.
+            """
             u=np.full((nz,len(upper_names)),9999.); v=np.full_like(u,9999.)
             lookup={name:index for index,name in enumerate(upper_names)}
             total=2*nz+1; first=min(total,11)
@@ -122,6 +264,17 @@ class DiagnosticData:
         self.records=records
 
     def at_begin(self, when: datetime) -> DiagnosticRecord:
+        """Return the diagnostic record at an exact interval beginning.
+
+        Args:
+            when: Interval-start datetime used while indexing the file.
+
+        Returns:
+            The corresponding :class:`DiagnosticRecord`.
+
+        Raises:
+            ValueError: If no diagnostic record begins at ``when``.
+        """
         try: return self.records[when]
         except KeyError as error:
             raise ValueError(f'DIAG.DAT has no record for {when}') from error

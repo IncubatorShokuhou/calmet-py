@@ -21,6 +21,15 @@ SPATIAL_DTYPE=np.float64
 
 @dataclass(frozen=True,slots=True)
 class SurfaceStation:
+    """Surface observation-station metadata.
+
+    Attributes:
+        identifier: Integer station identifier used by SURF.DAT.
+        name: Station name, commonly limited to four characters by CALMET.
+        latitude: Geographic latitude in decimal degrees north.
+        longitude: Geographic longitude in decimal degrees east.
+        anemometer_height_m: Wind-sensor height in metres above local ground.
+    """
     identifier: int
     name: str
     latitude: float
@@ -30,6 +39,25 @@ class SurfaceStation:
 
 @dataclass(frozen=True,slots=True)
 class SurfaceRecord:
+    """Meteorological observations for one SURF.DAT interval.
+
+    Attributes:
+        begin: Inclusive interval beginning.
+        end: Exclusive interval ending.
+        wind_speed: Float32 ``(station,)`` wind speed in metres per second.
+        wind_direction: Float32 ``(station,)`` meteorological direction in
+            degrees from north.
+        ceiling_hundreds_ft: Int32 ``(station,)`` ceiling height in hundreds
+            of feet.
+        cloud_tenths: Int32 ``(station,)`` total cloud cover in tenths.
+        temperature_k: Float32 ``(station,)`` air temperature in kelvin.
+        relative_humidity: Int32 ``(station,)`` relative humidity in percent.
+        pressure_mb: Float32 ``(station,)`` station pressure in millibars.
+        precipitation_code: Int32 ``(station,)`` CALMET precipitation code.
+
+    Notes:
+        Individual missing observations use the SURF.DAT sentinel 9999.
+    """
     begin: datetime
     end: datetime
     wind_speed: np.ndarray
@@ -43,7 +71,20 @@ class SurfaceRecord:
 
 
 def unpack_surface(words):
-    """Vectorized CALMET UNPCKS decimal-field decoding (3 words/station)."""
+    """Decode CALMET UNPCKS decimal fields for multiple stations.
+
+    Args:
+        words: Nonnegative integer-like array of shape ``(station, 3)``.
+
+    Returns:
+        Dictionary of eight arrays accepted by :class:`SurfaceRecord`.
+        Continuous fields are float32 and coded fields are int32, each with
+        shape ``(station,)`` and the units documented by ``SurfaceRecord``.
+        Encoded missing values are normalized to 9999.
+
+    Raises:
+        ValueError: If ``words`` is not a nonnegative ``(station, 3)`` array.
+    """
     packed=np.asarray(words,dtype=np.int64)
     if packed.ndim!=2 or packed.shape[1]!=3 or np.any(packed<0):
         raise ValueError('packed surface data must have shape (station,3) and be non-negative')
@@ -73,16 +114,56 @@ def unpack_surface(words):
 
 
 def _instant(year,day,hour,seconds):
+    """Build a SURF.DAT datetime from ordinal-date components.
+
+    Args:
+        year: Four- or two-digit year accepted by the CALMET parser.
+        day: One-based day of year.
+        hour: Hour of day.
+        seconds: Seconds after the hour.
+
+    Returns:
+        Decoded naive :class:`datetime`.
+
+    Raises:
+        ValueError: If the ordinal timestamp is invalid.
+    """
     try: return parse_ordinal(year,day,hour,seconds)
     except ValueError as error: raise ValueError('invalid SURF.DAT timestamp') from error
 
 
 def _coded_instant(code,seconds=0):
+    """Decode a compact SURF.DAT ordinal timestamp.
+
+    Args:
+        code: Integer ``YYYYJJJHH`` ordinal-date code.
+        seconds: Seconds after the encoded hour.
+
+    Returns:
+        Decoded naive :class:`datetime`.
+
+    Raises:
+        ValueError: If the encoded timestamp is invalid.
+    """
     try: return parse_ordinal_code(code,seconds)
     except ValueError as error: raise ValueError(f'invalid SURF.DAT coded time {code!r}') from error
 
 
 def _coordinate(text,latitude):
+    """Parse a signed or hemisphere-qualified geographic coordinate.
+
+    Args:
+        text: Coordinate such as ``30.5``, ``30.5N``, or ``W120``.
+        latitude: ``True`` to enforce the latitude range; ``False`` for
+            longitude.
+
+    Returns:
+        Coordinate in signed decimal degrees, positive north or east.
+
+    Raises:
+        ValueError: If the syntax, hemisphere combination, or numeric range is
+            invalid.
+    """
     value=re.sub(r'\s+','',text.upper())
     match=re.fullmatch(r'([NSEW]?)([+-]?\d+(?:\.\d*)?)([NSEW]?)',value)
     if not match: raise ValueError(f'unsupported SURF.DAT coordinate {text!r}')
@@ -96,8 +177,37 @@ def _coordinate(text,latitude):
 
 
 class SurfaceData:
-    """Read a formatted, unpacked SURF.DAT dataset."""
+    """Read a formatted, unpacked SURF.DAT dataset.
+
+    Attributes:
+        path: Source SURF.DAT path.
+        version: File-format version string.
+        datum: Datum identifier for station coordinates.
+        datum_date: Datum database date, or an empty string for projection
+            ``NONE``.
+        timezone: File time-zone label or legacy numeric field.
+        start: Declared beginning of the observation period.
+        end: Declared end of the observation period.
+        stations: Tuple of :class:`SurfaceStation` metadata in record order.
+        records: Chronological list of :class:`SurfaceRecord` objects.
+    """
+
     def __init__(self,path,*,station_metadata=None,datum=None):
+        """Parse formatted SURF.DAT text and validate its timeline.
+
+        Args:
+            path: Path to formatted SURF.DAT.
+            station_metadata: Control-file stations required when the file
+                declares projection ``NONE``. Must be ``None`` when station
+                coordinates are embedded in the file.
+            datum: Control-file datum required with projection ``NONE``.
+
+        Raises:
+            FileNotFoundError: If ``path`` does not exist.
+            UnicodeDecodeError: If the file is not ASCII.
+            ValueError: If header metadata, station definitions, timestamps,
+                meteorological fields, or interval continuity are invalid.
+        """
         self.path=Path(path)
         if not self.path.is_file(): raise FileNotFoundError(self.path)
         lines=self.path.read_text(encoding='ascii',errors='strict').splitlines()
@@ -179,16 +289,57 @@ class SurfaceData:
             raise ValueError('SURF.DAT records fall outside the declared header period')
 
     def at_begin(self,when):
+        """Return the record whose half-open interval contains a timestamp.
+
+        Args:
+            when: Datetime satisfying ``record.begin <= when < record.end``.
+
+        Returns:
+            Covering :class:`SurfaceRecord`.
+
+        Raises:
+            ValueError: If no record covers ``when``.
+        """
         for record in self.records:
             if record.begin<=when<record.end: return record
         raise ValueError(f'SURF.DAT has no record covering {when}')
 
 
 def read_unformatted_surface(path,*,station_metadata=None,datum=None):
-    """Read legacy or 2.1 GNU-Fortran sequential-unformatted SURF.DAT."""
+    """Read legacy or 2.1 GNU-Fortran sequential-unformatted SURF.DAT.
+
+    Args:
+        path: Path to the binary SURF.DAT file.
+        station_metadata: Control-file stations required for projection
+            ``NONE``.
+        datum: Control-file datum required for projection ``NONE``.
+
+    Returns:
+        A populated :class:`SurfaceData` instance whose observation fields are
+        float32 or int32 arrays of shape ``(station,)``.
+
+    Raises:
+        OSError: If the input file cannot be opened.
+        ValueError: If record framing, metadata, packing, timestamps, station
+            identifiers, field sizes, or interval continuity are invalid.
+    """
     source=Path(path); result=object.__new__(SurfaceData); result.path=source
     with FortranSequentialReader(source) as reader:
         def record(size=None,label='record'):
+            """Read and optionally size-check one required binary record.
+
+            Args:
+                size: Expected payload length in bytes, or ``None`` to accept
+                    any length.
+                label: Record description used in validation errors.
+
+            Returns:
+                Raw record payload as bytes.
+
+            Raises:
+                ValueError: If the file ends early or the payload length is
+                    not ``size``.
+            """
             payload=reader.read_record()
             if payload is None: raise ValueError(f'truncated unformatted SURF.DAT {label}')
             if size is not None and len(payload)!=size: raise ValueError(f'unformatted SURF.DAT {label} has wrong size')
@@ -259,6 +410,16 @@ def read_unformatted_surface(path,*,station_metadata=None,datum=None):
             else:
                 offset=prefix_size
                 def take(dtype):
+                    """Consume one station-vector field from a record payload.
+
+                    Args:
+                        dtype: NumPy dtype describing the little-endian int32
+                            or float32 field.
+
+                    Returns:
+                        Independent array of shape ``(station,)`` with the
+                        requested dtype.
+                    """
                     nonlocal offset
                     values=np.frombuffer(payload,dtype=dtype,count=count,offset=offset).copy(); offset+=4*count
                     return values
@@ -275,14 +436,45 @@ def read_unformatted_surface(path,*,station_metadata=None,datum=None):
 
 
 def load_surface(path,format=2,*,station_metadata=None,datum=None):
-    """Load SURF.DAT according to CALMET IFORMS (1=binary, 2=text)."""
+    """Load SURF.DAT according to CALMET ``IFORMS``.
+
+    Args:
+        path: Path to SURF.DAT.
+        format: ``1`` for sequential-unformatted binary or ``2`` for formatted
+            text.
+        station_metadata: Control-file stations for projection ``NONE``.
+        datum: Control-file datum for projection ``NONE``.
+
+    Returns:
+        Parsed :class:`SurfaceData` instance.
+
+    Raises:
+        ValueError: If ``format`` is not 1 or 2, or the selected reader rejects
+            the file.
+    """
     if format==1: return read_unformatted_surface(path,station_metadata=station_metadata,datum=datum)
     if format==2: return SurfaceData(path,station_metadata=station_metadata,datum=datum)
     raise ValueError('SURF.DAT format/IFORMS must be 1 or 2')
 
 
 def station_grid_mapping(stations,grid,datum):
-    """Return station map coordinates and CALMET's nearest-station grid."""
+    """Project stations and build CALMET's nearest-station grid.
+
+    Args:
+        stations: Sequence of :class:`SurfaceStation` objects.
+        grid: Target CALMET grid configuration.
+        datum: Datum identifier of the station longitude/latitude coordinates.
+
+    Returns:
+        Tuple ``(points, nearest)``. ``points`` is a float64 array of shape
+        ``(station, 2)`` containing projected x/y coordinates in kilometres;
+        ``nearest`` is an int32 array of shape ``(grid.ny, grid.nx)`` holding
+        zero-based station indices.
+
+    Raises:
+        ValueError: If projection metadata or the station coordinate array is
+            invalid.
+    """
     sx,sy=project_geographic([item.longitude for item in stations],
                              [item.latitude for item in stations],grid,datum,units='km')
     points=np.asarray(np.column_stack((sx,sy)),dtype=SPATIAL_DTYPE)
@@ -290,7 +482,22 @@ def station_grid_mapping(stations,grid,datum):
 
 
 def _nearest_indices(points,targets,block_size=65536):
-    """Query the nearest source point for each target."""
+    """Query the nearest source point for each target.
+
+    Args:
+        points: Float-like source coordinates of shape ``(source, 2)``.
+        targets: Float-like query coordinates of shape ``(target, 2)`` in the
+            same units and coordinate system.
+        block_size: Maximum targets passed to the k-d tree per query block.
+
+    Returns:
+        Platform-integer array of shape ``(target,)`` containing zero-based
+        source indices.
+
+    Raises:
+        ValueError: If coordinate shapes are invalid, no source exists, or
+            ``block_size`` is not positive.
+    """
     source=np.asarray(points,dtype=SPATIAL_DTYPE)
     query=np.asarray(targets,dtype=SPATIAL_DTYPE)
     if source.ndim!=2 or source.shape[1]!=2 or source.shape[0]<1:
@@ -308,7 +515,24 @@ def _nearest_indices(points,targets,block_size=65536):
 
 
 def _nearest_neighbors(points,targets,count,block_size=65536):
-    """Return the closest source points and their distances."""
+    """Return the closest source points and their distances.
+
+    Args:
+        points: Float-like source coordinates of shape ``(source, 2)``.
+        targets: Float-like query coordinates of shape ``(target, 2)`` in the
+            same units.
+        count: Requested neighbor count, capped at the number of sources.
+        block_size: Maximum targets queried in one k-d tree call.
+
+    Returns:
+        Tuple ``(distances, indices)`` with shape ``(target, neighbor)``.
+        Distances are float64 in the coordinate units and indices use the
+        platform integer dtype.
+
+    Raises:
+        ValueError: If coordinate shapes, ``count``, or ``block_size`` are
+            invalid.
+    """
     source=np.asarray(points,dtype=SPATIAL_DTYPE)
     query=np.asarray(targets,dtype=SPATIAL_DTYPE)
     if source.ndim!=2 or source.shape[1]!=2 or source.shape[0]<1:
@@ -333,7 +557,22 @@ def _nearest_neighbors(points,targets,count,block_size=65536):
 
 
 def _nearest_station_grid(points,grid,block_size=65536):
-    """Return zero-based nearest-station IDs for every grid cell."""
+    """Return zero-based nearest-station IDs for every grid cell.
+
+    Args:
+        points: Float-like ``(station, 2)`` projected coordinates in kilometres.
+        grid: Target grid configuration; station coordinates may include the
+            grid origin while cell targets are evaluated relative to it.
+        block_size: Maximum grid-cell targets queried per block.
+
+    Returns:
+        Int32 array of shape ``(grid.ny, grid.nx)`` containing zero-based
+        nearest-station indices.
+
+    Raises:
+        ValueError: If station coordinates are invalid or ``block_size`` is not
+            positive.
+    """
     points=np.asarray(points,dtype=SPATIAL_DTYPE)
     if points.ndim!=2 or points.shape[1]!=2 or points.shape[0]<1:
         raise ValueError('nearest-station coordinates must have shape (station, 2)')
@@ -347,12 +586,49 @@ def _nearest_station_grid(points,grid,block_size=65536):
 
 
 def fill_missing_surface(record,station_xy,*,cloud_method=1,itprog=0):
-    """Fill missing values from each variable's nearest valid station."""
+    """Fill required missing observations from each variable's nearest station.
+
+    Args:
+        record: :class:`SurfaceRecord` whose station vectors use 9999 as the
+            missing sentinel.
+        station_xy: Float-like array of shape ``(station, 2)`` containing
+            projected station coordinates in a common distance unit.
+        cloud_method: CALMET cloud method. Ceiling and cloud cover are filled
+            only for methods below 3.
+        itprog: Temperature-processing mode. Temperature is not filled when
+            ``itprog == 2``.
+
+    Returns:
+        A new :class:`SurfaceRecord`. Required temperature, humidity, pressure,
+        cloud, and ceiling fields have nearest valid values substituted while
+        winds and precipitation codes are copied unchanged. Float arrays are
+        float32 and coded arrays are int32.
+
+    Raises:
+        ValueError: If station coordinates do not match the record or a
+            required variable is missing at every station.
+    """
     coordinates=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
     count=record.wind_speed.size
     if coordinates.shape!=(count,2): raise ValueError('surface station coordinates have wrong shape')
 
     def filled(values,required,integer=False):
+        """Fill one station vector from its nearest valid observations.
+
+        Args:
+            values: One-dimensional station field.
+            required: Whether missing values must be filled.
+            integer: Whether to return int32 and apply the integer missing
+                sentinel; otherwise return float32.
+
+        Returns:
+            Independent array with the same shape as ``values``. Required
+            missing elements contain the nearest valid station value.
+
+        Raises:
+            ValueError: If filling is required and no station has a valid
+                value.
+        """
         source=np.asarray(values,dtype=np.int32 if integer else COMPUTE_DTYPE)
         missing=(source>=9998.99
                  if not integer else source>=9999)
@@ -377,7 +653,25 @@ def fill_missing_surface(record,station_xy,*,cloud_method=1,itprog=0):
 
 
 def surface_cloud_fields(record,nearest_station,external_cloud=None):
-    """Vectorized OUTCLD/PGTSTB nearest-station cloud and ceiling fields."""
+    """Map OUTCLD/PGTSTB cloud cover and ceiling to the model grid.
+
+    Args:
+        record: :class:`SurfaceRecord` containing station cloud and ceiling
+            observations.
+        nearest_station: Integer array of shape ``(ny, nx)`` with zero-based
+            station indices.
+        external_cloud: Optional cloud-fraction array of shape ``(ny, nx)``.
+            When omitted, station cloud tenths are converted to fractions.
+
+    Returns:
+        Tuple ``(cloud, ceiling)``. ``cloud`` is float32 with shape ``(ny, nx)``
+        and unitless fraction; ``ceiling`` is int32 with the same shape and
+        units of hundreds of feet.
+
+    Raises:
+        ValueError: If station indices are invalid or ``external_cloud`` does
+            not match the target grid.
+    """
     nearest=np.asarray(nearest_station)
     if nearest.ndim!=2 or np.any((nearest<0)|(nearest>=record.cloud_tenths.size)):
         raise ValueError('nearest surface-station index is invalid')
@@ -392,7 +686,32 @@ def surface_cloud_fields(record,nearest_station,external_cloud=None):
 
 def interpolate_surface_scalar(values,station_xy,grid,*,radius_km=500.,maximum_stations=5,
                                power=1,target_water=None,station_water=None,empty_fallback=None):
-    """Interpolate T or RH with physical-distance IDW and land/water grouping."""
+    """Interpolate a surface scalar with IDW and land/water separation.
+
+    Args:
+        values: Float-like ``(station,)`` values, such as temperature in kelvin
+            or relative humidity in percent. Values at least 9998.99 are
+            missing.
+        station_xy: Float-like ``(station, 2)`` projected coordinates in
+            kilometres.
+        grid: Target grid configuration.
+        radius_km: Maximum distance for weighted neighbors. If every selected
+            neighbor is farther away, the nearest valid station is used.
+        maximum_stations: Maximum nearest stations included for each cell.
+        power: Inverse-distance exponent, either 1 or 2.
+        target_water: Optional boolean ``(grid.ny, grid.nx)`` water mask.
+        station_water: Optional boolean ``(station,)`` water-station mask.
+        empty_fallback: Optional two-value ``(land, water)`` fallback used when
+            a target category has no valid station.
+
+    Returns:
+        Float32 array of shape ``(grid.ny, grid.nx)`` in the same units as
+        ``values``.
+
+    Raises:
+        ValueError: If shapes or interpolation controls are invalid, or a land
+            or water target has no usable station and no fallback.
+    """
     values=np.asarray(values,dtype=COMPUTE_DTYPE)
     points=np.asarray(station_xy,dtype=SPATIAL_DTYPE)
     if points.shape!=(values.size,2): raise ValueError('surface scalar station coordinates have wrong shape')
@@ -448,7 +767,29 @@ def interpolate_surface_scalar(values,station_xy,grid,*,radius_km=500.,maximum_s
 
 def _near_upper_air(station_count,station_xy,upper_xy,upper_valid,
                     separation_cells,dx_km,dy_km):
-    """Return stations within RMIN2 of a valid upper-air station."""
+    """Identify surface stations within RMIN2 of valid upper-air data.
+
+    Args:
+        station_count: Number of surface stations.
+        station_xy: Float-like ``(station_count, 2)`` surface coordinates in
+            kilometres.
+        upper_xy: Float-like ``(upper_station, 2)`` upper-air coordinates in
+            kilometres, or ``None`` to disable filtering.
+        upper_valid: Boolean ``(upper_station,)`` mask of usable upper-air
+            observations.
+        separation_cells: RMIN2 distance in grid-cell units. A negative value
+            disables filtering.
+        dx_km: Grid-cell width in kilometres.
+        dy_km: Grid-cell height in kilometres.
+
+    Returns:
+        Boolean array of shape ``(station_count,)``; ``True`` marks surface
+        stations whose extrapolated profiles should be skipped.
+
+    Raises:
+        ValueError: If enabled coordinates or masks have inconsistent shapes,
+            or grid spacing is not positive.
+    """
     skip=np.zeros(station_count,dtype=bool)
     if separation_cells<0. or upper_xy is None:
         return skip
@@ -470,7 +811,23 @@ def _near_upper_air(station_count,station_xy,upper_xy,upper_valid,
 
 
 def _wind_components(wind_speed,wind_direction,grid_convergence_degrees=None):
-    """Convert meteorological wind observations to grid-oriented U/V."""
+    """Convert meteorological wind observations to grid-oriented components.
+
+    Args:
+        wind_speed: Station wind speeds in metres per second.
+        wind_direction: Meteorological directions in degrees from north, with
+            the same shape as ``wind_speed``.
+        grid_convergence_degrees: Optional map-meridian convergence in degrees
+            for every observation.
+
+    Returns:
+        Tuple ``(u, v, valid, direction)``. Components and adjusted directions
+        are float32 arrays with the input shape; ``u`` and ``v`` are metres per
+        second and use 9999 for missing values. ``valid`` is boolean.
+
+    Raises:
+        ValueError: If speed, direction, and convergence shapes differ.
+    """
     speed=np.asarray(wind_speed,dtype=COMPUTE_DTYPE)
     direction=np.asarray(wind_direction,dtype=COMPUTE_DTYPE)
     if speed.shape!=direction.shape:
@@ -492,7 +849,37 @@ def _apply_wind_extrapolation(u,v,valid,calm_speed,anem,levels,roughness,*,
                               iextrp,factors,station_latitude,station_xy,
                               upper_xy,upper_valid,upper_air_separation_cells,
                               dx_km,dy_km,power_exponent):
-    """Apply one vertical profile directly from each surface observation."""
+    """Apply one IEXTRP vertical profile to each surface observation.
+
+    Args:
+        u: Float-like ``(station,)`` grid-oriented U wind in metres per second.
+        v: Float-like ``(station,)`` grid-oriented V wind in metres per second.
+        valid: Boolean ``(station,)`` observation-validity mask.
+        calm_speed: Float-like ``(station,)`` speed used to identify calms.
+        anem: Float-like ``(station,)`` anemometer heights in metres.
+        levels: Float-like ``(level,)`` target heights in metres above ground.
+        roughness: Float-like ``(station,)`` roughness lengths in metres.
+        iextrp: Signed PREPDI option; its absolute value selects method 1--4.
+        factors: Per-level FEXTR2 factors required by method 3.
+        station_latitude: Station latitudes in degrees, required by method 4.
+        station_xy: ``(station, 2)`` projected coordinates in kilometres.
+        upper_xy: ``(upper_station, 2)`` upper-air coordinates, or ``None``.
+        upper_valid: Boolean validity mask for ``upper_xy``.
+        upper_air_separation_cells: RMIN2 exclusion distance in grid cells.
+        dx_km: Grid-cell width in kilometres.
+        dy_km: Grid-cell height in kilometres.
+        power_exponent: Scalar or ``(station,)`` exponent for method 2.
+
+    Returns:
+        Tuple ``(u_profile, v_profile)`` of float32 arrays with shape
+        ``(level, station)`` and units of metres per second. Missing values are
+        9999.
+
+    Raises:
+        ValueError: If RMIN2 inputs are inconsistent, the option is unsupported,
+            method-specific inputs have wrong shapes, or method 4 encounters
+            an anemometer height equal to roughness length.
+    """
     output_u=np.full((levels.size,u.size),9999.,dtype=COMPUTE_DTYPE)
     output_v=np.full_like(output_u,9999.)
     skip=_near_upper_air(u.size,station_xy,upper_xy,upper_valid,
@@ -556,7 +943,37 @@ def wind_profiles(wind_speed,wind_direction,anemometer_height_m,z_centers_m,roug
                   grid_convergence_degrees=None,station_xy=None,upper_xy=None,
                   upper_valid=None,upper_air_separation_cells=-1.,dx_km=1.,dy_km=1.,
                   power_exponent=.143):
-    """Convert land/overwater wind observations and apply IEXTRP 1--4."""
+    """Convert observed winds and apply PREPDI IEXTRP methods 1--4.
+
+    Args:
+        wind_speed: ``(station,)`` wind speed in metres per second.
+        wind_direction: ``(station,)`` meteorological direction in degrees.
+        anemometer_height_m: ``(station,)`` sensor heights in metres.
+        z_centers_m: ``(level,)`` target layer-center heights in metres.
+        roughness_m: ``(station,)`` roughness lengths in metres.
+        iextrp: Signed extrapolation option; absolute values 1--4 are supported.
+        factors: ``(level,)`` FEXTR2 factors used by method 3.
+        station_latitude: ``(station,)`` latitude in degrees for method 4.
+        grid_convergence_degrees: Optional ``(station,)`` map convergence in
+            degrees.
+        station_xy: Optional ``(station, 2)`` projected coordinates in
+            kilometres for RMIN2 filtering.
+        upper_xy: Optional ``(upper_station, 2)`` upper-air coordinates.
+        upper_valid: Optional boolean ``(upper_station,)`` availability mask.
+        upper_air_separation_cells: RMIN2 exclusion distance in grid cells; a
+            negative value disables it.
+        dx_km: Grid-cell width in kilometres.
+        dy_km: Grid-cell height in kilometres.
+        power_exponent: Scalar or ``(station,)`` exponent for method 2.
+
+    Returns:
+        Tuple of float32 U and V arrays, each shaped ``(level, station)`` in
+        metres per second and using 9999 for missing values.
+
+    Raises:
+        ValueError: If input shapes, heights, roughness, RMIN2 controls, or the
+            selected IEXTRP method are invalid.
+    """
     speed=np.asarray(wind_speed,dtype=COMPUTE_DTYPE)
     anem=np.asarray(anemometer_height_m,dtype=COMPUTE_DTYPE)
     roughness=np.asarray(roughness_m,dtype=COMPUTE_DTYPE)
@@ -579,7 +996,33 @@ def surface_wind_profiles(record,anemometer_height_m,z_centers_m,roughness_m,iex
                           station_xy=None,upper_xy=None,upper_valid=None,
                           upper_air_separation_cells=-1.,dx_km=1.,dy_km=1.,
                           power_exponent=.143):
-    """Convert a SURF.DAT record and apply PREPDI IEXTRP 1--4."""
+    """Apply PREPDI wind extrapolation to one SURF.DAT record.
+
+    Args:
+        record: :class:`SurfaceRecord` supplying wind speed and direction.
+        anemometer_height_m: ``(station,)`` sensor heights in metres.
+        z_centers_m: ``(level,)`` target layer-center heights in metres.
+        roughness_m: ``(station,)`` roughness lengths in metres.
+        iextrp: Signed extrapolation option; absolute values 1--4 are supported.
+        factors: ``(level,)`` factors required by method 3.
+        station_latitude: ``(station,)`` latitude in degrees for method 4.
+        grid_convergence_degrees: Optional ``(station,)`` map convergence in
+            degrees.
+        station_xy: Optional ``(station, 2)`` coordinates in kilometres.
+        upper_xy: Optional ``(upper_station, 2)`` upper-air coordinates.
+        upper_valid: Optional boolean ``(upper_station,)`` validity mask.
+        upper_air_separation_cells: RMIN2 exclusion distance in grid cells.
+        dx_km: Grid-cell width in kilometres.
+        dy_km: Grid-cell height in kilometres.
+        power_exponent: Scalar or ``(station,)`` exponent for method 2.
+
+    Returns:
+        Tuple of float32 U and V arrays with shape ``(level, station)`` and
+        units of metres per second.
+
+    Raises:
+        ValueError: If profile inputs or the selected method are invalid.
+    """
     return wind_profiles(record.wind_speed,record.wind_direction,anemometer_height_m,
         z_centers_m,roughness_m,iextrp,factors,station_latitude,
         grid_convergence_degrees,station_xy,upper_xy,upper_valid,
@@ -591,7 +1034,34 @@ def component_wind_profiles(u_component,v_component,anemometer_height_m,z_center
                             station_xy=None,upper_xy=None,upper_valid=None,
                             upper_air_separation_cells=-1.,dx_km=1.,dy_km=1.,
                             power_exponent=.143):
-    """Profile grid-oriented DIAG.DAT U/V surface observations."""
+    """Profile grid-oriented DIAG.DAT U/V surface observations.
+
+    Args:
+        u_component: ``(station,)`` U wind in metres per second.
+        v_component: ``(station,)`` V wind in metres per second.
+        anemometer_height_m: ``(station,)`` sensor heights in metres.
+        z_centers_m: ``(level,)`` target layer-center heights in metres.
+        roughness_m: ``(station,)`` roughness lengths in metres.
+        iextrp: Signed extrapolation option; absolute values 1--4 are supported.
+        factors: ``(level,)`` factors required by method 3.
+        station_latitude: ``(station,)`` latitude in degrees for method 4.
+        station_xy: Optional ``(station, 2)`` coordinates in kilometres.
+        upper_xy: Optional ``(upper_station, 2)`` upper-air coordinates.
+        upper_valid: Optional boolean ``(upper_station,)`` validity mask.
+        upper_air_separation_cells: RMIN2 exclusion distance in grid cells.
+        dx_km: Grid-cell width in kilometres.
+        dy_km: Grid-cell height in kilometres.
+        power_exponent: Scalar or ``(station,)`` exponent for method 2.
+
+    Returns:
+        Tuple of float32 U and V arrays with shape ``(level, station)`` and
+        units of metres per second. Components above 900 are treated as
+        missing.
+
+    Raises:
+        ValueError: If component shapes, profile inputs, RMIN2 controls, or the
+            selected extrapolation method are invalid.
+    """
     u=np.asarray(u_component,dtype=COMPUTE_DTYPE)
     v=np.asarray(v_component,dtype=COMPUTE_DTYPE)
     if u.shape!=v.shape: raise ValueError('surface U/V components have different shapes')

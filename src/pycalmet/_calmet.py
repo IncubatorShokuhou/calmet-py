@@ -46,7 +46,28 @@ from .wind_debug import FinalWindDebugWriter,WindPrintWriter
 
 @contextmanager
 def _single_meteorology_dataset(path,temporary_directory):
-    """Open one canonical NetCDF or transparently stage one formatted M3D."""
+    """Open one canonical NetCDF or transparently stage one formatted M3D.
+
+    Args:
+        path: Canonical CALWRF NetCDF or traditional formatted ``3D.DAT``
+            input path.
+        temporary_directory: Directory in which to create a temporary NetCDF
+            conversion when ``path`` is a formatted M3D file.
+
+    Yields:
+        Open read-only :class:`netCDF4.Dataset`. Variables retain their stored
+        dimensions and dtypes; meteorological model fields are normally
+        indexed as ``(time, level, y, x)`` or ``(time, y, x)``.
+
+    Raises:
+        OSError: If the source cannot be read or the staged NetCDF cannot be
+            created.
+        ValueError: If a traditional M3D source is malformed.
+
+    Notes:
+        A staged NetCDF file is deleted when the context exits, including
+        exceptional exits.
+    """
     with Path(path).open('rb') as stream: signature=stream.read(16)
     if signature.startswith(b'3D.DAT'):
         from .legacy_m3d import M3DReader
@@ -62,7 +83,17 @@ def _single_meteorology_dataset(path,temporary_directory):
 
 
 def _validate_mm4_static_headers(sources):
-    """Require every native MM4 file to describe the same source grid."""
+    """Require every native MM4 file to describe the same source grid.
+
+    Args:
+        sources: Nonempty sequence of native ``MM4Data`` readers. Their grid
+            dimensions, sigma levels, coordinates, terrain, land use, and top
+            pressure are compared with the first source.
+
+    Raises:
+        ValueError: If any later source has incompatible scalar metadata or
+            an array with different shape or values.
+    """
     reference=sources[0]
     expected=reference.header
     scalar_fields={
@@ -105,7 +136,16 @@ def _validate_mm4_static_headers(sources):
 
 
 def _same_mm4_record(left,right):
-    """Return whether overlapping native MM4 records contain identical data."""
+    """Return whether overlapping native MM4 records contain identical data.
+
+    Args:
+        left: First native MM4 hourly record.
+        right: Second native MM4 hourly record for the same timestamp.
+
+    Returns:
+        ``True`` when all surface and three-dimensional meteorological arrays
+        have identical shapes and values, treating collocated NaNs as equal.
+    """
     fields=('sea_level_pressure_mb','precipitation_mm_h','snow_code','pressure_mb',
             'height_agl_m','temperature_k','relative_humidity','wind_direction_deg',
             'wind_speed_m_s')
@@ -115,7 +155,31 @@ def _same_mm4_record(left,right):
 
 @contextmanager
 def _meteorology_input(config,paths,temporary_directory,start,end):
-    """Open canonical meteorology or adapt native MM4/PROG records."""
+    """Open canonical meteorology or adapt native MM4/PROG records.
+
+    Args:
+        config: Validated CALMET configuration controlling the prognostic
+            format, model grid, time steps, and interpolation options.
+        paths: Ordered meteorological input paths.
+        temporary_directory: Directory used for temporary M3D-to-NetCDF
+            conversions.
+        start: Inclusive local beginning of the CALMET integration.
+        end: Inclusive meteorological boundary at the end of the integration.
+
+    Yields:
+        Pair ``(dataset, provider)``. ``dataset`` is a NetCDF-like object with
+        a ``time_text`` variable. ``provider`` is ``None`` for canonical
+        CALWRF input, or a callable returning a ``Step1Fields`` object for an
+        interval-ending datetime when native MM4 or PROG input is adapted.
+        Step fields use ``float32`` and horizontal ``(y, x)`` or vertical
+        ``(level, y, x)`` layouts.
+
+    Raises:
+        ValueError: If native records are inconsistent, have unsupported time
+            spacing, conflict at an overlap, or do not cover the requested
+            interval.
+        OSError: If an input cannot be opened or a temporary conversion fails.
+    """
     if config.iprog in {3,4,5}:
         with Path(paths[0]).open('rb') as stream: sample=stream.read(256)
         native_mm4=(not sample.startswith((b'CDF',b'\x89HDF',b'3D.DAT')) and
@@ -176,6 +240,27 @@ def _meteorology_input(config,paths,temporary_directory,start,end):
                            for value in all_times],dtype='S1')
             state=None; cache={}; built=-1
             def provider(ending):
+                """Materialize the native MM4 step ending at ``ending``.
+
+                Args:
+                    ending: Naive local interval-ending datetime on the
+                        CALMET computational timeline.
+
+                Returns:
+                    ``Step1Fields`` whose two-dimensional fields have shape
+                    ``(y, x)`` and three-dimensional fields have shape
+                    ``(level, y, x)``. Physical arrays use ``float32`` and SI
+                    units except explicitly named pressure and precipitation
+                    fields.
+
+                Raises:
+                    ValueError: If no indexed MM4 record covers the requested
+                        ending time.
+
+                Notes:
+                    Earlier hourly records are built first so the mutable
+                    thermal state and cache evolve deterministically.
+                """
                 nonlocal state,built
                 target=(ending if ending.minute==0 and ending.second==0 else
                         ending.replace(minute=0,second=0,microsecond=0)+timedelta(hours=1))
@@ -233,6 +318,21 @@ def _meteorology_input(config,paths,temporary_directory,start,end):
     text=np.array([list(value.strftime('%Y-%m-%d_%H:%M:%S')) for value in all_times],dtype='S1')
     dataset={'time_text':text}
     def provider(ending):
+        """Build a target-grid step from the selected PROG record.
+
+        Args:
+            ending: Naive local interval-ending datetime on the CALMET
+                computational timeline.
+
+        Returns:
+            ``Step1Fields`` mapped to the CALMET grid, with horizontal fields
+            shaped ``(y, x)``, vertical fields shaped ``(level, y, x)``, and
+            physical arrays represented in ``float32``.
+
+        Raises:
+            ValueError: If the requested ending time has no selected PROG
+                record.
+        """
         try: record=selected[ending]
         except KeyError as error: raise ValueError(f'PROG.DAT has no record for {ending}') from error
         return build_prog_step_fields(prog,record.hour,config.grid,config.z_faces_m,record=record)
@@ -240,7 +340,25 @@ def _meteorology_input(config,paths,temporary_directory,start,end):
 
 
 class _ConcatenatedVariable:
+    """Read-only time-axis view over equivalent variables from several files.
+
+    Attributes:
+        _variables: Source variable objects in meteorology-file order.
+        _records: ``(source_index, local_time_index)`` pairs defining the
+            deduplicated global time axis.
+        shape: Concatenated shape ``(time, *source_shape[1:])``.
+        dimensions: NetCDF dimension names copied from the first source.
+        dtype: NumPy dtype reported by the first source variable.
+    """
+
     def __init__(self,variables,records):
+        """Create a concatenated variable view.
+
+        Args:
+            variables: Equivalent NetCDF-like variables, one per source file.
+            records: Ordered ``(source_index, local_time_index)`` pairs to
+                expose along the concatenated time axis.
+        """
         self._variables=tuple(variables)
         self._records=tuple(records)
         self.shape=(len(self._records),*variables[0].shape[1:])
@@ -248,6 +366,23 @@ class _ConcatenatedVariable:
         self.dtype=variables[0].dtype
 
     def __getitem__(self,key):
+        """Read one time record or a slice of concatenated records.
+
+        Args:
+            key: Integer time index, time slice, or tuple whose first element
+                is a time integer/slice and remaining elements index the
+                source variable's trailing axes.
+
+        Returns:
+            Source scalar or NumPy array for an integer index; a stacked array
+            with time as axis 0 for a slice. Shape, dtype, and physical units
+            otherwise follow the source variable.
+
+        Raises:
+            IndexError: If an integer time index lies outside the concatenated
+                time axis.
+            TypeError: If the time selector is neither an integer nor a slice.
+        """
         first=key[0] if isinstance(key,tuple) else key
         rest=key[1:] if isinstance(key,tuple) else ()
         if isinstance(first,(int,np.integer)):
@@ -265,8 +400,26 @@ class _ConcatenatedVariable:
 
 
 class _ConcatenatedMeteorology:
-    """Minimal read-only netCDF-like view over sequential CALWRF datasets."""
+    """Minimal read-only NetCDF-like view over sequential CALWRF datasets.
+
+    Attributes:
+        _datasets: Source datasets in chronological file order.
+        variables: Mapping of common variable names to concatenated time
+            variables or the first dataset's static variable.
+    """
+
     def __init__(self,datasets):
+        """Validate and concatenate several canonical meteorology datasets.
+
+        Args:
+            datasets: Sequence of at least two open NetCDF-like CALWRF
+                datasets in chronological order.
+
+        Raises:
+            ValueError: If required variables are missing, static fields or
+                variable layouts differ, timestamps are unordered, a file is
+                empty, or duplicate timestamps contain different data.
+        """
         self._datasets=tuple(datasets)
         if len(self._datasets)<2: raise ValueError('concatenated meteorology needs multiple files')
         required=('time_text','latitude','longitude','terrain','landuse')
@@ -317,12 +470,40 @@ class _ConcatenatedMeteorology:
                 self.variables[name]=_ConcatenatedVariable(variables,records)
             else: self.variables[name]=variables[0]
 
-    def __getitem__(self,name): return self.variables[name]
+    def __getitem__(self,name):
+        """Return a common static or concatenated variable by name.
+
+        Args:
+            name: NetCDF variable name.
+
+        Returns:
+            The stored source variable or ``_ConcatenatedVariable`` view.
+
+        Raises:
+            KeyError: If the variable is not common to all input datasets.
+        """
+        return self.variables[name]
 
 
 @contextmanager
 def _meteorology_dataset(paths,temporary_directory):
-    """Open and concatenate canonical NetCDF and/or formatted M3D files."""
+    """Open and concatenate canonical NetCDF and/or formatted M3D files.
+
+    Args:
+        paths: One path or an ordered iterable of meteorology paths.
+        temporary_directory: Directory used for temporary formatted-M3D
+            conversions.
+
+    Yields:
+        One open NetCDF dataset for a single source, or a read-only
+        ``_ConcatenatedMeteorology`` view for multiple sources. Time-dependent
+        variables use time as axis 0 and retain their source dtype and units.
+
+    Raises:
+        ValueError: If no paths are supplied or multiple datasets cannot be
+            concatenated consistently.
+        OSError: If an input or temporary staged file cannot be opened.
+    """
     if isinstance(paths,(str,Path)): paths=(Path(paths),)
     else: paths=tuple(Path(path) for path in paths)
     if not paths: raise ValueError('meteorology file list is empty')
@@ -334,7 +515,26 @@ def _meteorology_dataset(paths,temporary_directory):
 
 @contextmanager
 def _geophysical_dataset(path,temporary_directory):
-    """Open canonical NetCDF or transparently stage a formatted GEO.DAT."""
+    """Open canonical NetCDF or transparently stage a formatted GEO.DAT.
+
+    Args:
+        path: Canonical geophysical NetCDF or traditional formatted
+            ``GEO.DAT`` path.
+        temporary_directory: Directory in which to stage a temporary NetCDF
+            conversion.
+
+    Yields:
+        Open read-only :class:`netCDF4.Dataset` containing geophysical
+        ``(y, x)`` grids such as terrain in metres and surface properties.
+
+    Raises:
+        OSError: If the source cannot be read or the staged NetCDF cannot be
+            created.
+        ValueError: If a traditional GEO source is malformed.
+
+    Notes:
+        Any staged NetCDF file is removed when the context exits.
+    """
     with Path(path).open('rb') as stream: signature=stream.read(16)
     if signature.strip().upper().startswith(b'GEO.DAT'):
         from .legacy_geo import GeoReader
@@ -349,7 +549,20 @@ def _geophysical_dataset(path,temporary_directory):
         with Dataset(path) as dataset: yield dataset
 
 def _timezone_offset(label: str) -> int:
-    """Convert UTC label using CALMET's positive-west integer convention."""
+    """Convert a UTC label to CALMET's positive-west integer convention.
+
+    Args:
+        label: Timezone label accepted by ``parse_timezone_label``, such as
+            ``UTC+0800`` or ``UTC-0500``.
+
+    Returns:
+        Whole-hour offset using CALMET's convention: positive values are west
+        of UTC and negative values are east of UTC.
+
+    Raises:
+        ValueError: If the label is malformed or contains a nonintegral-hour
+            offset.
+    """
     try:
         return parse_timezone_label(label)[0]
     except (TypeError,ValueError) as error:
@@ -357,7 +570,17 @@ def _timezone_offset(label: str) -> int:
 
 
 def _validate_input_timezone(value,base_timezone: int,dataset: str):
-    """Compare legacy integer or modern UTC data timezone with CALMET IBTZ."""
+    """Compare an input timezone with the configured CALMET base timezone.
+
+    Args:
+        value: Legacy numeric positive-west offset or modern UTC label.
+        base_timezone: CALMET positive-west base offset in whole hours.
+        dataset: Input name used in validation errors.
+
+    Raises:
+        ValueError: If the input timezone is malformed, nonintegral, or does
+            not equal ``base_timezone``.
+    """
     try:
         offset=(_timezone_offset(value) if isinstance(value,str) else
                 exact_integer(value,f'{dataset} timezone'))
@@ -370,7 +593,18 @@ def _validate_input_timezone(value,base_timezone: int,dataset: str):
 
 
 def _validate_input_span(data,start: datetime,end: datetime,dataset: str):
-    """Reproduce READHD's declared begin/end coverage checks."""
+    """Reproduce READHD's declared begin/end coverage checks.
+
+    Args:
+        data: Input reader exposing declared ``start`` and ``end`` datetimes.
+        start: Required CALMET interval beginning in local model time.
+        end: Required CALMET interval ending in local model time.
+        dataset: Input name used in validation errors.
+
+    Raises:
+        ValueError: If the declared input period does not contain the complete
+            requested CALMET interval.
+    """
     if data.start>start or data.end<end:
         raise ValueError(
             f'{dataset} declared period {data.start}..{data.end} does not cover '
@@ -378,7 +612,18 @@ def _validate_input_span(data,start: datetime,end: datetime,dataset: str):
 
 
 def _validate_upper_span(data,start: datetime,end: datetime,base_timezone: int):
-    """Validate that one UTC UP.DAT station covers the requested run."""
+    """Validate that one UTC UP.DAT station covers the requested run.
+
+    Args:
+        data: Upper-air reader exposing UTC ``start`` and ``end`` datetimes.
+        start: CALMET run beginning in naive local model time.
+        end: CALMET run ending in naive local model time.
+        base_timezone: CALMET positive-west offset used to convert the run to
+            UTC.
+
+    Raises:
+        ValueError: If the sounding file begins too late or ends too early.
+    """
     run_start=start+timedelta(hours=base_timezone)
     run_end=end+timedelta(hours=base_timezone)
     if data.start>run_start:
@@ -388,7 +633,18 @@ def _validate_upper_span(data,start: datetime,end: datetime,base_timezone: int):
 
 
 def _validate_sea_metadata(config, stations):
-    """Apply RDHDOW checks that depend on CALMET run controls."""
+    """Apply RDHDOW checks that depend on CALMET run controls.
+
+    Args:
+        config: CALMET configuration supplying timezone, COARE method, and
+            grid controls.
+        stations: Iterable of loaded ``SeaData`` station readers.
+
+    Raises:
+        ValueError: If a SEA file version cannot support the requested COARE
+            mode, its timezone differs from CALMET, or station files disagree
+            on projection or datum metadata.
+    """
     reference=None
     for data in stations:
         if config.overwater_flux_method<0 and float(data.version[:4])<2.1:
@@ -423,7 +679,20 @@ def _validate_sea_metadata(config, stations):
 
 
 def _surface_control_metadata(config):
-    """Convert Group-7 projected station rows to the LL representation."""
+    """Convert Group-7 projected surface-station rows to geographic metadata.
+
+    Args:
+        config: CALMET configuration containing projected surface control
+            rows and the target grid definition.
+
+    Returns:
+        Tuple of ``SurfaceStation`` objects with latitude/longitude in degrees
+        and anemometer height in metres, or ``None`` when no rows are supplied.
+
+    Raises:
+        ValueError: If a station timezone differs from the CALMET base
+            timezone or coordinates cannot be transformed.
+    """
     rows=tuple(config.surface_control_stations)
     if not rows: return None
     zones=np.asarray([item[4] for item in rows],dtype=np.float64)
@@ -436,6 +705,19 @@ def _surface_control_metadata(config):
 
 
 def _precipitation_control_metadata(config):
+    """Convert projected precipitation-control rows to station metadata.
+
+    Args:
+        config: CALMET configuration containing projected precipitation rows
+            and the target grid definition.
+
+    Returns:
+        Tuple of ``SurfaceStation`` objects with latitude/longitude in degrees
+        and zero anemometer height, or ``None`` when no rows are supplied.
+
+    Raises:
+        ValueError: If the configured coordinates cannot be transformed.
+    """
     rows=tuple(config.precipitation_control_stations)
     if not rows: return None
     longitude,latitude=unproject_geographic([item[2] for item in rows],
@@ -445,6 +727,20 @@ def _precipitation_control_metadata(config):
 
 
 def _upper_control_metadata(config):
+    """Convert projected upper-air control rows to station metadata.
+
+    Args:
+        config: CALMET configuration containing projected upper-air rows and
+            the target grid definition.
+
+    Returns:
+        Tuple of ``UpperAirStation`` objects with latitude/longitude in degrees
+        and zero elevation, or ``None`` when no rows are supplied.
+
+    Raises:
+        ValueError: If a station timezone differs from the CALMET base
+            timezone or coordinates cannot be transformed.
+    """
     rows=tuple(config.upper_control_stations)
     if not rows: return None
     zones=np.asarray([item[4] for item in rows],dtype=np.float64)
@@ -456,12 +752,35 @@ def _upper_control_metadata(config):
                  for item,lat,lon in zip(rows,latitude,longitude))
 
 def _legacy_close(first,second,tolerance=1.e-4):
+    """Compare scalars with the relative tolerance used by legacy headers.
+
+    Args:
+        first: First numeric scalar.
+        second: Second numeric scalar.
+        tolerance: Maximum difference divided by the absolute pair mean.
+
+    Returns:
+        ``True`` for exact equality or a relative difference no greater than
+        ``tolerance``. Values whose difference is not below their absolute
+        mean are rejected before division.
+    """
     if first==second: return True
     difference=abs(first-second); average=.5*abs(first+second)
     return difference<average and difference/average<=tolerance
 
 def _validate_geophysical_grid(dataset,grid):
-    """READGE grid/header compatibility checks for canonical NetCDF GEO."""
+    """Apply READGE grid/header compatibility checks to canonical NetCDF GEO.
+
+    Args:
+        dataset: Open geophysical NetCDF dataset whose optional global
+            attributes describe the grid and datum.
+        grid: Expected CALMET grid configuration; distances are in kilometres
+            and angular projection parameters in degrees.
+
+    Raises:
+        ValueError: If a present numeric or text attribute differs from the
+            configured grid beyond the legacy relative tolerance.
+    """
     expected={
         'grid_nx':grid.nx,'grid_ny':grid.ny,'grid_dx_km':grid.dx_km,'grid_dy_km':grid.dy_km,
         'x_origin_km':grid.x_origin_km,'y_origin_km':grid.y_origin_km,
@@ -503,6 +822,23 @@ def _prognostic_precipitation_radius(mapper,requested_km,station_count):
     The longer median cardinal spacing is the smallest useful radius.  The
     corresponding cell diagonal, enlarged by five percent, is the automatic
     radius used when the request falls outside the useful interval.
+
+    Args:
+        mapper: ``PrognosticMapper`` whose source coordinates are flattened
+            ``(point, 2)`` x/y positions in kilometres, or ``None``.
+        requested_km: User-requested precipitation interpolation radius in
+            kilometres.
+        station_count: Precipitation source selector; ``-1`` enables the
+            prognostic automatic-radius rule.
+
+    Returns:
+        Requested radius unchanged when the automatic rule is inactive or the
+        grid spacing cannot be derived; otherwise the requested radius when it
+        lies in the useful interval, or 105 percent of the source-cell
+        diagonal in kilometres.
+
+    Raises:
+        ValueError: If mapper coordinates do not match ``source_shape``.
     """
     if station_count!=-1 or mapper is None: return requested_km
     ny,nx=mapper.source_shape
@@ -527,7 +863,16 @@ def _prognostic_precipitation_radius(mapper,requested_km,station_count):
     return maximum if requested<minimum or requested>maximum else requested
 
 def _output_path(config: CalmetConfig) -> Path:
-    """Select OPENOT's METDAT/PACDAT target for the requested format."""
+    """Select OPENOT's METDAT/PACDAT target for the requested format.
+
+    Args:
+        config: CALMET configuration containing primary and optional MESOPAC
+            output paths.
+
+    Returns:
+        ``mesopac_output`` as a :class:`Path` for output format 2 when it is
+        provided; otherwise the primary ``output`` path.
+    """
     if config.legacy_output_format==2 and config.mesopac_output is not None:
         return Path(config.mesopac_output)
     return Path(config.output)
@@ -535,7 +880,25 @@ def _output_path(config: CalmetConfig) -> Path:
 def _write_distance_to_coast_grid(
         path: str | Path,landuse,grid: GridConfig,
         water_range: tuple[int,int]) -> np.ndarray:
-    """Write SETCOAST's optional Surfer ASCII distance grid."""
+    """Write SETCOAST's optional Surfer ASCII distance grid.
+
+    Args:
+        path: Destination Surfer ASCII grid path; missing parents are created.
+        landuse: Integer dominant-land-use grid with shape ``(ny, nx)``.
+        grid: CALMET grid geometry and spacings in kilometres.
+        water_range: Inclusive pair of land-use categories treated as water.
+
+    Returns:
+        ``float`` array with shape ``(ny, nx)`` containing distance to the
+        nearest coast in kilometres.
+
+    Raises:
+        OSError: If the destination directory or ASCII file cannot be written.
+
+    Notes:
+        The file is replaced with a DSAA Surfer grid using CALMET cell-centre
+        coordinates in kilometres.
+    """
     distance=distance_to_coast(landuse,water_range,grid.dx_km,grid.dy_km)
     xb=grid.x_origin_km+grid.dx_km
     yb=grid.y_origin_km+grid.dy_km
@@ -552,7 +915,17 @@ def _write_distance_to_coast_grid(
 
 
 def _diagnostic_input_options(config: CalmetConfig) -> dict[str,bool]:
-    """Return only DIAG.DAT fields that the selected modern path consumes."""
+    """Return only DIAG.DAT fields that the selected modern path consumes.
+
+    Args:
+        config: CALMET configuration containing NOOBS, diagnostic switches,
+            and temperature controls.
+
+    Returns:
+        Boolean mapping for ``surface_temperature``, ``lapse_rate``,
+        ``initial_wind``, ``surface_wind``, and ``upper_wind``. A value is
+        true only when the active observation mode consumes that field.
+    """
     has_surface_observations=config.noobs in {0,1}
     has_upper_observations=config.noobs==0
     return {
@@ -567,6 +940,27 @@ def _diagnostic_input_options(config: CalmetConfig) -> dict[str,bool]:
 
 
 def _validate(config: CalmetConfig):
+    """Validate coupled CALMET controls and derive the vertical faces array.
+
+    Args:
+        config: Fully normalized CALMET configuration. Its grid, observation,
+            prognostic, output, cloud, precipitation, temperature, wind, and
+            mixing-height controls are checked together.
+
+    Returns:
+        One-dimensional ``float32`` array of vertical cell-face heights in
+        metres with shape ``(nz + 1,)``.
+
+    Raises:
+        ValueError: If any control is outside its supported domain, required
+            inputs or per-level values are absent, coupled options conflict,
+            timestamps do not align with the computational step, or the run
+            violates vertical-grid and initialization constraints.
+
+    Notes:
+        When ``config.barrier_top_level`` is ``None``, validation sets it to
+        the number of CALMET layers. No other model fields are created.
+    """
     projection=config.grid.projection.upper()
     if projection not in {'UTM','LCC','TTM','PS','EM','LAZA'}:
         raise ValueError('CALMET PMAP must be UTM, LCC, TTM, PS, EM, or LAZA')
@@ -816,6 +1210,25 @@ def _validate(config: CalmetConfig):
 
 
 def _initial_guess_at(config,initial_guess,timestamp,centers):
+    """Interpolate coarse CALMET initial-guess winds at one target time.
+
+    Args:
+        config: CALMET configuration supplying timestep, base timezone, and
+            target grid.
+        initial_guess: ``InitialGuessCalmetSeries`` containing coarse fields
+            and its source timezone.
+        timestamp: Naive local beginning of the target CALMET interval.
+        centers: One-dimensional target layer-centre heights in metres with
+            shape ``(nz,)``.
+
+    Returns:
+        Pair ``(u, v)`` of ``float32`` wind-component arrays in metres per
+        second, each shaped ``(nz, ny, nx)`` on the target CALMET grid.
+
+    Raises:
+        ValueError: If the initial-guess timezone is unsupported or its
+            records cannot cover/interpolate the requested interval ending.
+    """
     try: igf_timezone=_timezone_offset(initial_guess.timezone)
     except ValueError as error:
         raise ValueError(f'unsupported IGFDAT timezone: {initial_guess.timezone!r}') from error
@@ -826,6 +1239,27 @@ def _initial_guess_at(config,initial_guess,timestamp,centers):
 
 def _noobs_step_transform(config,initial_guess,diagnostic,precipitation=None,
                           precipitation_points=None,sea=()):
+    """Build a prognostic-only step transformer for optional auxiliary data.
+
+    Args:
+        config: CALMET configuration controlling time, temperature, sea, and
+            precipitation handling.
+        initial_guess: Optional coarse ``InitialGuessCalmetSeries``.
+        diagnostic: Optional ``DiagnosticData`` supplying surface temperature.
+        precipitation: Optional station precipitation reader.
+        precipitation_points: ``(station, 2)`` station x/y coordinates in
+            kilometres relative to the CALMET origin.
+        sea: Iterable of ``SeaData`` station readers.
+
+    Returns:
+        Callable ``transform(step, timestamp)`` that returns a replaced
+        ``Step1Fields`` object. Updated physical grids retain ``float32`` and
+        horizontal ``(ny, nx)`` or vertical ``(nz, ny, nx)`` layouts.
+
+    Raises:
+        ValueError: During transformation, if prognostic offshore data needed
+            by water-temperature mode 2 is unavailable.
+    """
     faces=np.asarray(config.z_faces_m,dtype=np.float32)
     centers=.5*(faces[:-1]+faces[1:])
     sea=tuple(sea)
@@ -833,6 +1267,22 @@ def _noobs_step_transform(config,initial_guess,diagnostic,precipitation=None,
                 if sea else np.empty((0,2)))
     sea_longitudes=[data.longitude_latitude()[0] for data in sea]
     def transform(step,timestamp):
+        """Merge optional prognostic-only inputs into one Step-1 state.
+
+        Args:
+            step: Source ``Step1Fields`` for the current interval.
+            timestamp: Naive local beginning of the CALMET interval.
+
+        Returns:
+            New ``Step1Fields`` with selected initial winds, diagnostic
+            temperature, precipitation, SEA fields, and water gradients.
+            Horizontal fields have shape ``(ny, nx)`` and model arrays use
+            ``float32`` except integer precipitation codes.
+
+        Raises:
+            ValueError: If water-temperature mode 2 requires missing
+                prognostic offshore fields.
+        """
         changes={}
         if initial_guess is not None:
             changes['u'],changes['v']=_initial_guess_at(
@@ -885,7 +1335,37 @@ def _noobs_step_transform(config,initial_guess,diagnostic,precipitation=None,
 def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,sea=(),weights=None,
                             diagnostic=None,initial_guess=None,surface_stations=None,
                             upper_stations=None):
-    """Compose PREPDI observations with WIND1/INTER2 for supported modes."""
+    """Compose PREPDI observations with WIND1/INTER2 for supported modes.
+
+    Args:
+        config: CALMET configuration controlling observations, interpolation,
+            wind analysis, temperature, precipitation, and overwater physics.
+        surface: Loaded ``SurfaceData`` or ``None`` when DIAG.DAT supplies the
+            permitted wind-only surface observations.
+        geo: Open geophysical dataset containing ``(ny, nx)`` terrain and
+            surface-property grids.
+        upper_air: Iterable of loaded ``UpperAirData`` station readers.
+        precipitation: Optional loaded station precipitation data.
+        sea: Iterable of loaded ``SeaData`` overwater stations.
+        weights: Optional observation-weight array shaped ``(nz, ny, nx)``.
+        diagnostic: Optional ``DiagnosticData`` reader.
+        initial_guess: Optional coarse ``InitialGuessCalmetSeries``.
+        surface_stations: Optional explicit surface metadata used when no
+            surface file is opened.
+        upper_stations: Optional explicit upper-air metadata used when no
+            sounding files are opened.
+
+    Returns:
+        Pair ``(transform, nearest_surface)``. ``transform`` replaces a
+        ``Step1Fields`` object for one interval; ``nearest_surface`` is an
+        integer ``(ny, nx)`` array of zero-based nearest surface-station
+        indices.
+
+    Raises:
+        ValueError: If required station metadata is absent, station/data counts
+            differ, or configured coordinates and observation inputs cannot be
+            prepared.
+    """
     surface_stations=tuple(surface.stations if surface is not None else
                            (() if surface_stations is None else surface_stations))
     if not surface_stations:
@@ -961,6 +1441,33 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
             rmax_water_km=config.maximum_surface_radius_km,observation_weight=weights,
             background_weight=(1.-weights)/config.prognostic_radius_km**2)
     def transform(step,timestamp,physical_context=None):
+        """Analyze observations and replace fields for one model interval.
+
+        Args:
+            step: Prognostic ``Step1Fields`` background. Horizontal fields use
+                ``(ny, nx)`` and vertical fields ``(nz, ny, nx)``.
+            timestamp: Naive local beginning of the CALMET interval.
+            physical_context: Optional mutable ``StepTransformContext`` with
+                preceding mixing heights, thermal jumps, Coriolis values,
+                solar forcing, GMT hour, and COARE warm-layer state.
+
+        Returns:
+            New ``Step1Fields`` containing objective-analysis winds in metres
+            per second and any selected observed temperature, humidity,
+            precipitation, cloud, and overwater fields. Model floating arrays
+            are ``float32``; precipitation and cloud codes remain integral.
+
+        Raises:
+            ValueError: If a required observation, offshore field, diagnostic
+                wind, station selection, or prognostic strength is missing.
+            RuntimeError: If similarity-theory extrapolation lacks its physical
+                context or warm-layer grid indices.
+
+        Notes:
+            Similarity-theory paths may initialize or sample warm-layer state
+            on ``physical_context``. Debug fields are copied into the returned
+            step when requested.
+        """
         diagnostic_record=None if diagnostic is None else diagnostic.at_begin(timestamp)
         if surface is None:
             # OPENOT/READHD deliberately omit SURF.DAT for IDIOPT4.  PREPDI
@@ -1159,6 +1666,31 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
             if abs(config.imixh)==1: mixing_options['conste']=config.conste
             ipsifcn=1 if config.overwater_flux_method==0 else 0
             def ordered_water_profiles(function,arguments,keywords,grid_iy=None,grid_ix=None):
+                """Evaluate water-station profiles with isolated warm-layer state.
+
+                Args:
+                    function: Water-profile solver, either the delta-temperature
+                        implementation or the COARE implementation.
+                    arguments: Positional arguments forwarded to ``function``.
+                    keywords: Keyword arguments forwarded to ``function``.
+                    grid_iy: Optional integer y indices of the water stations.
+                    grid_ix: Optional integer x indices of the water stations.
+
+                Returns:
+                    Pair ``(u, v)`` taken from the solver result. Each is a
+                    ``float32`` wind-component array in metres per second with
+                    shape ``(nz, station)``.
+
+                Raises:
+                    RuntimeError: If COARE warm-layer processing is enabled
+                        without station grid indices.
+
+                Notes:
+                    The routine may initialize the grid warm-layer state on
+                    ``physical_context``. Station solvers receive copies of
+                    the selected state so they cannot advance the grid state
+                    before the later full-grid surface solve.
+                """
                 warm=(config.warm_layer and function is coare_water_station_profiles)
                 station_keywords=dict(keywords)
                 if warm:
@@ -1679,7 +2211,33 @@ def _surface_step_transform(config,surface,geo,upper_air=(),precipitation=None,s
     return transform,nearest
 
 def run(config: CalmetConfig) -> Path:
-    """Run a supported CALMET diagnostic/objective-analysis path."""
+    """Run the configured CALMET diagnostic and objective-analysis workflow.
+
+    Args:
+        config: Fully normalized ``CalmetConfig`` containing input paths,
+            target grid, inclusive/exclusive run interval, physics controls,
+            observation choices, and output selections.
+
+    Returns:
+        Primary output :class:`Path`. This is the configured NetCDF,
+        traditional CALMET, or MESOPAC path; with ``save_output=False`` it is
+        still returned after the model and requested diagnostics complete.
+
+    Raises:
+        FileNotFoundError: If a required meteorology or geophysical input path
+            does not exist.
+        ValueError: If controls or input metadata are inconsistent, records do
+            not bracket every requested boundary, required observations are
+            missing, or a selected model path cannot be constructed.
+        OSError: If an input cannot be read or an output, diagnostic, listing,
+            auxiliary, or temporary file cannot be created.
+
+    Notes:
+        The routine opens all readers and writers, advances stateful hourly or
+        subhourly fields, and closes every optional output on normal and
+        exceptional exits. Model arrays are normally ``float32`` with
+        horizontal ``(ny, nx)`` and vertical ``(nz, ny, nx)`` layouts.
+    """
     faces=_validate(config)
     meteorology=((Path(config.meteorology),) if isinstance(config.meteorology,(str,Path)) else
                  tuple(Path(path) for path in config.meteorology))
@@ -1917,11 +2475,34 @@ def run(config: CalmetConfig) -> Path:
                                       config.cloud_data_format)
                       if config.cloud_output else None)
         def append_cloud(hour):
+            """Append one interval cloud field when cloud output is enabled.
+
+            Args:
+                hour: ``HourFields`` whose ``step1.cloud_fraction`` is a
+                    dimensionless ``float32`` ``(ny, nx)`` grid.
+
+            Notes:
+                Writes the interval ``[timestamp, timestamp + timestep)`` to
+                the already-open ``CloudDataWriter``; otherwise has no effect.
+            """
             if cloud_writer is not None:
                 cloud_writer.append(hour.timestamp,
                     hour.timestamp+timedelta(seconds=config.timestep_seconds),
                     hour.step1.cloud_fraction)
         def open_listing():
+            """Open the optional CALMET text listing.
+
+            Returns:
+                ``CalmetListingWriter`` for the configured or derived listing
+                path, or ``None`` when neither field printing nor
+                micrometeorology debugging is enabled.
+
+            Raises:
+                OSError: If the listing destination cannot be opened.
+
+            Notes:
+                Opening the writer creates or replaces the listing file.
+            """
             if not config.print_fields and not config.micrometeorology_debug:
                 return None
             target=(Path(config.listing_output) if config.listing_output is not None
@@ -1929,6 +2510,19 @@ def run(config: CalmetConfig) -> Path:
             return CalmetListingWriter(target,config,
                 geo_fields['dominant_landuse'],water_range)
         def open_wind_debug():
+            """Open requested stage-specific binary wind-debug writers.
+
+            Returns:
+                List of ``(stage_attribute, FinalWindDebugWriter)`` pairs.
+                ``stage_attribute`` is ``None`` for final winds; the list is
+                empty when master wind-debug output is disabled.
+
+            Raises:
+                OSError: If a selected debug destination cannot be opened.
+
+            Notes:
+                Each enabled writer creates or replaces its destination file.
+            """
             if not config.wind_debug_output:
                 return []
             specifications=(
@@ -1946,6 +2540,22 @@ def run(config: CalmetConfig) -> Path:
                     writers.append((stage,writer))
             return writers
         def append_wind_debug(writers,hour):
+            """Append one hour to every selected wind-debug output.
+
+            Args:
+                writers: Iterable of ``(stage_attribute, writer)`` pairs from
+                    ``open_wind_debug``.
+                hour: ``HourFields`` containing final and optionally retained
+                    stage winds, each in metres per second with shape
+                    ``(nz, ny, nx)``.
+
+            Raises:
+                RuntimeError: If a requested intermediate wind stage was not
+                    retained by the solver.
+
+            Notes:
+                Writes records to each supplied ``FinalWindDebugWriter``.
+            """
             for stage,writer in writers:
                 if stage is None:
                     writer.append(hour)
@@ -1955,6 +2565,18 @@ def run(config: CalmetConfig) -> Path:
                         raise RuntimeError(f'missing retained wind debug stage {stage}')
                     writer.append_fields(hour.timestamp,*fields)
         def open_wind_print():
+            """Open the optional formatted wind diagnostic writer.
+
+            Returns:
+                ``WindPrintWriter`` for the configured or derived path, or
+                ``None`` when no wind-debug fields are selected.
+
+            Raises:
+                OSError: If the diagnostic destination cannot be opened.
+
+            Notes:
+                Opening the writer creates or replaces the output file.
+            """
             if not any(config.wind_debug_fields):
                 return None
             target=(Path(config.wind_print_output) if config.wind_print_output is not None

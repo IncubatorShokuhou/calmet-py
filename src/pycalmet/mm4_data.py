@@ -14,6 +14,20 @@ MODEL_DTYPE=np.float32
 
 
 def _fields(line: str, widths, converters, label: str):
+    """Decode adjacent fixed-width fields from one MM4.DAT line.
+
+    Args:
+        line: Raw text record without interpretation.
+        widths: Field widths in characters.
+        converters: One conversion callable per width.
+        label: Record name included in parse errors.
+
+    Returns:
+        Converted field values in source order.
+
+    Raises:
+        ValueError: If any field cannot be converted.
+    """
     values=[]; begin=0
     try:
         for width,convert in zip(widths,converters):
@@ -26,6 +40,23 @@ def _fields(line: str, widths, converters, label: str):
 
 @dataclass(frozen=True,slots=True)
 class MM4Header:
+    """Static model and subdomain metadata from MM4.DAT.
+
+    Attributes:
+        label: File creation label.
+        start: First modeled timestamp.
+        hours: Declared duration in hours.
+        model_nx: Full-model east-west dimension.
+        model_ny: Full-model north-south dimension.
+        sigma_levels: Native sigma-coordinate levels.
+        top_pressure_mb: Model-top pressure in millibars.
+        i_start: One-based source subdomain start index in X.
+        j_start: One-based source subdomain start index in Y.
+        latitude: Subdomain latitudes in degrees north, shape ``(y, x)``.
+        longitude: Subdomain longitudes in degrees east, shape ``(y, x)``.
+        terrain_height_m: Terrain elevation in metres, shape ``(y, x)``.
+        landuse: Integer land-use categories, shape ``(y, x)``.
+    """
     label: str
     start: datetime
     hours: int
@@ -43,6 +74,20 @@ class MM4Header:
 
 @dataclass(frozen=True,slots=True)
 class MM4Record:
+    """One hourly MM4 meteorological record.
+
+    Attributes:
+        timestamp: Beginning or label time carried by the source record.
+        sea_level_pressure_mb: Sea-level pressure on ``(y, x)`` in millibars.
+        precipitation_mm_h: Hourly precipitation rate on ``(y, x)``.
+        snow_code: Integer surface snow code on ``(y, x)``.
+        pressure_mb: Pressure on ``(level, y, x)`` in millibars.
+        height_agl_m: Height above local terrain on ``(level, y, x)`` in metres.
+        temperature_k: Temperature on ``(level, y, x)`` in kelvin.
+        relative_humidity: Relative humidity on ``(level, y, x)`` in percent.
+        wind_direction_deg: Meteorological direction in degrees.
+        wind_speed_m_s: Wind speed in metres per second.
+    """
     timestamp: datetime
     sea_level_pressure_mb: np.ndarray
     precipitation_mm_h: np.ndarray
@@ -57,6 +102,34 @@ class MM4Record:
 
 @dataclass(frozen=True,slots=True)
 class MM4Interpolated:
+    """MM4 fields interpolated onto the CALMET grid and vertical levels.
+
+    Attributes:
+        u: Eastward wind in metres per second, shape ``(level, ny, nx)``.
+        v: Northward wind in metres per second, shape ``(level, ny, nx)``.
+        temperature_k: Layer temperature in kelvin.
+        relative_humidity: Layer relative humidity in percent.
+        pressure_mb: Layer pressure in millibars.
+        profile_height_m: Native profile heights including the surface.
+        profile_temperature_k: Native profile temperatures including surface.
+        surface_density: Air density at the surface in kilograms per cubic
+            metre.
+        precipitation_mm_h: Surface precipitation rate.
+        surface_pressure_mb: Surface pressure in millibars.
+        surface_relative_humidity: Surface relative humidity in percent.
+        cloud_fraction: Cloud fraction from zero to one.
+        ceiling_height_m: Cloud-ceiling height in metres.
+        precipitation_code: Integer CALMET precipitation type code.
+        surface_temperature_k: Diagnosed surface temperature in kelvin.
+        thermal_state: Source-grid thermal memory for the next timestep.
+        prognostic_observation_u: Optional observation-form eastward wind.
+        prognostic_observation_v: Optional observation-form northward wind.
+        prognostic_observation_strength: Optional interpolation weight sum.
+
+    Notes:
+        Unless stated otherwise, gridded numeric fields use ``float32`` and
+        horizontal shape ``(ny, nx)``.
+    """
     u: np.ndarray
     v: np.ndarray
     temperature_k: np.ndarray
@@ -79,9 +152,25 @@ class MM4Interpolated:
 
 
 class MM4Data:
-    """Load native formatted MM4 data as vectorized hourly arrays."""
+    """Load native formatted MM4 data as vectorized hourly arrays.
+
+    Attributes:
+        path: Path to the decoded MM4.DAT file.
+        header: Static grid and model metadata.
+        records: Ordered hourly meteorological records.
+    """
 
     def __init__(self,path):
+        """Read and validate a fixed-column MM4.DAT file.
+
+        Args:
+            path: ASCII MM4.DAT file path.
+
+        Raises:
+            OSError: If the file cannot be opened or read.
+            UnicodeError: If the source is not ASCII.
+            ValueError: If the header or a meteorological record is malformed.
+        """
         self.path=Path(path)
         with self.path.open(encoding='ascii') as stream:
             self.header=self._read_header(stream)
@@ -90,12 +179,36 @@ class MM4Data:
 
     @staticmethod
     def _line(stream,label):
+        """Read one required text line without its newline.
+
+        Args:
+            stream: Open MM4.DAT text stream.
+            label: Expected record name included in truncation errors.
+
+        Returns:
+            Source line with trailing CR/LF removed.
+
+        Raises:
+            ValueError: If the file ends before the line is available.
+        """
         line=stream.readline()
         if not line: raise ValueError(f'truncated MM4.DAT before {label}')
         return line.rstrip('\r\n')
 
     @classmethod
     def _read_header(cls,stream):
+        """Decode the MM4 model header and static subdomain grid.
+
+        Args:
+            stream: Open stream positioned at the first header record.
+
+        Returns:
+            Validated static MM4 header.
+
+        Raises:
+            ValueError: If dimensions, dates, fields, or grid indices are
+                invalid.
+        """
         label=cls._line(stream,'creation label')[:36]
         values=_fields(cls._line(stream,'grid header'),(2,2,2,2,4,4,4,4,6),
                        (int,int,int,int,int,int,int,int,float),'grid header')
@@ -123,6 +236,18 @@ class MM4Data:
                          terrain,landuse)
 
     def _read_records(self,stream):
+        """Decode all remaining hourly surface and vertical records.
+
+        Args:
+            stream: Open stream positioned after the static header.
+
+        Returns:
+            Tuple of vectorized hourly records.
+
+        Raises:
+            ValueError: If a record is truncated, inconsistent, or has an
+                unexpected grid index.
+        """
         header=self.header; ny,nx=header.latitude.shape; levels=8+header.sigma_levels.size
         records=[]
         while True:
@@ -175,13 +300,37 @@ class MM4Data:
         return tuple(records)
 
     def at_time(self,timestamp):
+        """Select the record with an exact timestamp.
+
+        Args:
+            timestamp: Naive hourly model timestamp.
+
+        Returns:
+            Matching MM4 record.
+
+        Raises:
+            ValueError: If the file has no record at ``timestamp``.
+        """
         for record in self.records:
             if record.timestamp==timestamp: return record
         raise ValueError(f'MM4.DAT has no record for {timestamp}')
 
     @staticmethod
     def _sorted_above_ground_profiles(**fields):
-        """Sort profiles, discard underground levels, and remove duplicates."""
+        """Sort profiles, discard underground levels, and remove duplicates.
+
+        Args:
+            **fields: Named three-dimensional arrays with common shape
+                ``(level, y, x)``; a ``height`` field in metres is required.
+
+        Returns:
+            Dictionary of packed arrays in ascending height order. Repeated
+            tail values pad columns containing fewer unique valid levels.
+
+        Raises:
+            ValueError: If field shapes differ or a column has no above-ground
+                level.
+        """
         height=np.asarray(fields['height'])
         if any(np.asarray(values).shape!=height.shape for values in fields.values()):
             raise ValueError('MM4.DAT profile fields must have identical shapes')
@@ -205,7 +354,20 @@ class MM4Data:
 
     @staticmethod
     def _interpolate_pressure_level(values,pressure_mb,target_pressure_mb):
-        """Interpolate columns on pressure, using the nearest endpoint outside range."""
+        """Interpolate columns to pressure using nearest endpoint extrapolation.
+
+        Args:
+            values: Source values with shape ``(level, y, x)``.
+            pressure_mb: Matching source pressures in millibars.
+            target_pressure_mb: Scalar target pressure in millibars.
+
+        Returns:
+            ``float32`` field with shape ``(y, x)``.
+
+        Raises:
+            ValueError: If shapes differ, inputs are not three-dimensional, or
+                a column has no finite positive pressure level.
+        """
         values=np.asarray(values)
         pressure=np.asarray(pressure_mb)
         if values.shape!=pressure.shape or values.ndim!=3:
@@ -239,7 +401,40 @@ class MM4Data:
                            prognostic_observation_barriers=(),
                            prognostic_observation_barrier_top_level=0,
                            prognostic_ocean_category=16):
-        """Apply RDHD4/RDMM4 vertical and four-neighbour interpolation."""
+        """Apply RDHD4/RDMM4 vertical and four-neighbour interpolation.
+
+        Args:
+            record: Hourly source field to interpolate.
+            grid: Target CALMET grid.
+            target_height_m: Non-empty vector of CALMET layer-centre heights
+                above ground in metres.
+            cloud_method: CALMET ``MCLOUD`` option: 3 uses 850-mb humidity and
+                4 uses the MM5 column method.
+            precipitation_method: Radius-interpolation method for precipitation.
+            precipitation_radius_km: Precipitation influence radius or method-3
+                scale in kilometres.
+            precipitation_cutoff: Rates below this value become zero, in
+                millimetres per hour.
+            base_timezone: CALMET base timezone offset used for solar time.
+            thermal_state: Optional source-grid nocturnal thermal state from
+                the preceding timestep.
+            prognostic_observation_rmin_km: Optional radius that enables a
+                second interpolation treating model cells as observations.
+            prognostic_observation_barriers: Barrier line segments in grid
+                kilometres for observation-form interpolation.
+            prognostic_observation_barrier_top_level: Highest zero-based level
+                at which barriers apply.
+            prognostic_ocean_category: MM4 land-use code treated as ocean.
+
+        Returns:
+            Interpolated winds, thermodynamic fields, precipitation, clouds,
+            and next-step thermal state on the target grid.
+
+        Raises:
+            ValueError: If the target grid lies outside the source domain,
+                target heights or thermal state are invalid, or
+                ``cloud_method`` is outside the supported values 3 and 4.
+        """
         from .calmet_solver import (PrognosticMapper,SourceThermalState,
                                     _prognostic_wind_components,_stull_temperature,_vertical_centers,
                                     solar_at_step_midpoint)
@@ -264,6 +459,14 @@ class MM4Data:
         if centers.ndim!=1 or centers.size<1:
             raise ValueError('target MM4 heights must be a non-empty vector')
         def wind_centers(field):
+            """Interpolate a wind component vertically with surface log law.
+
+            Args:
+                field: Source component on ``(level, y, x)``.
+
+            Returns:
+                Component at target centres on ``(target_level, y, x)``.
+            """
             base=_vertical_centers(field,height,centers)
             flat=np.asarray(field).reshape(field.shape[0],-1)
             zflat=height.reshape(height.shape[0],-1)
@@ -301,7 +504,17 @@ class MM4Data:
         for level in range(2,height.shape[0]):
             duplicate=zflat[following,columns]==zflat[anchor,columns]
             following=np.where(duplicate,np.minimum(following+1,height.shape[0]-1),following)
-        def gather(values,index): return np.asarray(values).reshape(values.shape[0],-1)[index,columns].reshape(flat_shape)
+        def gather(values,index):
+            """Gather a different vertical index in every source column.
+
+            Args:
+                values: Source array with shape ``(level, y, x)``.
+                index: Flat integer level index for every horizontal column.
+
+            Returns:
+                Gathered two-dimensional source-grid field.
+            """
+            return np.asarray(values).reshape(values.shape[0],-1)[index,columns].reshape(flat_shape)
         anchor_z=gather(height,anchor); following_z=gather(height,following)
         anchor_temperature=gather(temperature,anchor); following_temperature=gather(temperature,following)
         temperature=np.asarray(temperature,dtype=MODEL_DTYPE)
@@ -397,6 +610,14 @@ class MM4Data:
         precipitation_code=np.where(precipitation>0.,
             np.where(mapped_temperature[0]<273.15,20,10),0).astype(np.int32)
         def as_model(value):
+            """Cast a result field to the model's ``float32`` dtype.
+
+            Args:
+                value: Array-like result field.
+
+            Returns:
+                NumPy ``float32`` view or copy.
+            """
             return np.asarray(value,dtype=MODEL_DTYPE)
         profile_height=np.concatenate((
             np.zeros((1,grid.ny,grid.nx),dtype=MODEL_DTYPE),

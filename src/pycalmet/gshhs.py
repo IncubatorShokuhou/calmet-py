@@ -18,7 +18,25 @@ from .projections import project_geographic,unproject_geographic
 
 @dataclass(frozen=True,slots=True)
 class GshhsHeader:
-    """Normalized BREADH fields for one GSHHS polygon."""
+    """Normalized BREADH fields for one GSHHS polygon.
+
+    Attributes:
+        identifier: Source polygon identifier.
+        point_count: Number of encoded longitude/latitude vertices.
+        level: GSHHS nesting level (land, lake, island, or pond).
+        west_microdegrees: Western bound in integer microdegrees east.
+        east_microdegrees: Eastern bound in integer microdegrees east.
+        south_microdegrees: Southern bound in integer microdegrees north.
+        north_microdegrees: Northern bound in integer microdegrees north.
+        area_tenth_km2: Polygon area in tenths of a square kilometre.
+        version: Detected GSHHS on-disk format version.
+        crosses_greenwich: Whether longitudes cross the Greenwich branch.
+        source: GSHHS source code, where zero denotes WDBII.
+        river_lake: Whether a level-2 polygon represents a river-lake feature.
+        full_area_tenth_km2: Full-resolution area when provided by the format.
+        container: Identifier of the containing polygon, or ``-1``.
+        ancestor: Identifier of the ancestor polygon, or ``-1``.
+    """
 
     identifier: int
     point_count: int
@@ -39,46 +57,17 @@ class GshhsHeader:
 
 @dataclass(frozen=True,slots=True)
 class GshhsPolygon:
-    """One decoded polygon with east longitude and north latitude degrees."""
+    """One decoded polygon in geographic degrees.
+
+    Attributes:
+        header: Normalized source header.
+        longitude: ``float64`` longitude vector in degrees east.
+        latitude: ``float64`` latitude vector in degrees north.
+    """
 
     header: GshhsHeader
     longitude: np.ndarray
     latitude: np.ndarray
-
-
-def boundary_side(x,y,xmax,xmin,ymax,ymin):
-    """Vectorized transcription of COASTEXT ISIDE (west/north/east/south)."""
-    x_array,y_array=np.broadcast_arrays(np.asarray(x,dtype=float),np.asarray(y,dtype=float))
-    west=np.abs(x_array-xmin); east=np.abs(x_array-xmax)
-    south=np.abs(y_array-ymin); north=np.abs(y_array-ymax)
-    side=np.empty(x_array.shape,dtype=np.int8)
-    vertical=(x_array>xmin)&(x_array<xmax)&((y_array<=ymin)|(y_array>=ymax))
-    side[vertical]=np.where(south[vertical]<north[vertical],4,2)
-    horizontal=(~vertical)&(y_array>ymin)&(y_array<ymax)&((x_array<=xmin)|(x_array>=xmax))
-    side[horizontal]=np.where(east[horizontal]<west[horizontal],3,1)
-    remaining=~(vertical|horizontal)
-    inside=((x_array>=xmin)&(x_array<=xmax)&(y_array>=ymin)&(y_array<=ymax))
-    choose_horizontal=np.where(inside,np.minimum(south,north)>np.minimum(east,west),
-                               np.minimum(south,north)<np.minimum(east,west))
-    use_horizontal=remaining&choose_horizontal
-    side[use_horizontal]=np.where(east[use_horizontal]<west[use_horizontal],3,1)
-    use_vertical=remaining&~choose_horizontal
-    side[use_vertical]=np.where(south[use_vertical]<north[use_vertical],4,2)
-    return int(side) if not side.shape else side
-
-
-def _append_corner(points,side1,side2,bounds):
-    """PCORNER, including its consecutive duplicate cancellation."""
-    xmin,xmax,ymin,ymax=bounds
-    product=side1*side2
-    corners={2:(xmin,ymax),6:(xmax,ymax),12:(xmax,ymin),4:(xmin,ymin)}
-    if side1==side2 or product not in corners:
-        raise ValueError(f'invalid coastline side transition {side1}->{side2}')
-    corner=corners[product]
-    if points and points[-1]==corner:
-        points.pop()
-    else:
-        points.append(corner)
 
 
 def clip_coast_polygon(longitude,latitude,x,y,kind,geographic_bounds,
@@ -90,6 +79,26 @@ def clip_coast_polygon(longitude,latitude,x,y,kind,geographic_bounds,
     clipped and written to BLN.  Odd GSHHS levels are counter-clockwise and
     even levels are clockwise, preserving the nesting convention consumed by
     CTGPROC.
+
+    Args:
+        longitude: One-dimensional vertex longitudes in degrees east.
+        latitude: Matching vertex latitudes in degrees north.
+        x: Matching projected eastings in the units of ``projected_bounds``.
+        y: Matching projected northings in the units of ``projected_bounds``.
+        kind: GSHHS nesting level; odd rings are oriented counter-clockwise and
+            even rings clockwise.
+        geographic_bounds: Geographic ``(xmin, xmax, ymin, ymax)`` extraction
+            bounds in degrees.
+        projected_bounds: Target ``(xmin, xmax, ymin, ymax)`` clipping bounds.
+        polygon_bounds: Optional precomputed geographic bounds for the ring.
+
+    Returns:
+        Tuple of ``float64`` closed-ring arrays, each shaped ``(vertex, 2)``.
+        The tuple is empty when there is no positive-area intersection.
+
+    Raises:
+        ValueError: If coordinates are not a one-dimensional ring with at
+            least three vertices.
     """
     lon,lat,px,py=np.broadcast_arrays(*(np.asarray(value,dtype=float)
                                         for value in (longitude,latitude,x,y)))
@@ -111,6 +120,14 @@ def clip_coast_polygon(longitude,latitude,x,y,kind,geographic_bounds,
         return ()
 
     def polygon_parts(geometry):
+        """Yield positive-area Polygon parts from a Shapely geometry.
+
+        Args:
+            geometry: Polygon or multipart result from clipping.
+
+        Yields:
+            Non-empty positive-area Shapely polygons, recursively flattened.
+        """
         if geometry.geom_type=='Polygon':
             if not geometry.is_empty and geometry.area>0.:
                 yield geometry
@@ -132,6 +149,15 @@ def clip_coast_polygon(longitude,latitude,x,y,kind,geographic_bounds,
 
 
 def _packed_header(values: tuple[int,...],version: int) -> GshhsHeader:
+    """Decode a packed v1.4/v2 flag word into normalized header fields.
+
+    Args:
+        values: Big-endian integer header values in source order.
+        version: Detected file-format version.
+
+    Returns:
+        Normalized polygon header.
+    """
     identifier,count,flag,west,east,south,north,area,*extra=values
     return GshhsHeader(
         identifier,count,flag&255,west,east,south,north,area,version,
@@ -141,7 +167,20 @@ def _packed_header(values: tuple[int,...],version: int) -> GshhsHeader:
 
 
 def _read_header(stream: BinaryIO,version: int | None) -> tuple[GshhsHeader,int]:
-    """Read one header, detecting the historical layout on the first call."""
+    """Read one header and detect the historical layout on the first call.
+
+    Args:
+        stream: Seekable binary GSHHS input stream.
+        version: Previously detected layout, or ``None`` for the first polygon.
+
+    Returns:
+        Tuple containing the normalized header and persistent layout code.
+
+    Raises:
+        EOFError: If the stream is cleanly positioned at end of file.
+        ValueError: If a header is truncated, has a negative point count, or
+            contains an inconsistent version marker.
+    """
     start=stream.tell(); prefix=stream.read(12)
     if not prefix:
         raise EOFError
@@ -194,7 +233,18 @@ def _read_header(stream: BinaryIO,version: int | None) -> tuple[GshhsHeader,int]
 
 
 def iter_gshhs(path: str | Path) -> Iterator[GshhsPolygon]:
-    """Yield all polygons while enforcing one consistent file version."""
+    """Yield all polygons while enforcing one consistent file version.
+
+    Args:
+        path: Big-endian GSHHS binary database path.
+
+    Yields:
+        Decoded polygons in file order.
+
+    Raises:
+        OSError: If the file cannot be opened or read.
+        ValueError: If a polygon header or point payload is malformed.
+    """
     version=None
     with Path(path).open('rb') as stream:
         while True:
@@ -214,13 +264,39 @@ def iter_gshhs(path: str | Path) -> Iterator[GshhsPolygon]:
 
 
 def _longitude_branch(longitude,center):
+    """Wrap longitude values onto the branch centred on a region.
+
+    Args:
+        longitude: Scalar or array longitude in degrees east.
+        center: Desired centre of the 360-degree branch.
+
+    Returns:
+        NumPy array of wrapped longitudes in ``[center-180, center+180)``.
+    """
     values=np.asarray(longitude,dtype=float)
     return (values-center+180.)%360.-180.+center
 
 
 def extract_gshhs(source: str | Path,output: str | Path,grid: GridConfig,
                   *,source_datum='WGS-84',wdbii_datum='WGS-72') -> int:
-    """Extract COASTEXT-compatible projected polygons and write a BLN file."""
+    """Extract projected polygons and write a COASTEXT-compatible BLN file.
+
+    Args:
+        source: Raw GSHHS binary database path.
+        output: Destination ASCII BLN path; parent directories are created.
+        grid: Target projection, datum, extent, and spacing.
+        source_datum: Datum assigned to retained GSHHS-source coordinates.
+        wdbii_datum: Parsed legacy WDBII datum control. Modern extraction skips
+            source-zero WDBII polygons, matching the released COASTEXT switch,
+            so this value is retained for control-file compatibility.
+
+    Returns:
+        Number of polygon records written to ``output``.
+
+    Raises:
+        OSError: If the source cannot be read or output cannot be written.
+        ValueError: If GSHHS data, datum, or projection parameters are invalid.
+    """
     x0,y0=grid.x_origin_km,grid.y_origin_km
     x1=x0+grid.nx*grid.dx_km; y1=y0+grid.ny*grid.dy_km
     width=(x1-x0)*.01; height=(y1-y0)*.01

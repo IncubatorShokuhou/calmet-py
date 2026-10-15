@@ -17,25 +17,57 @@ from pyproj import CRS,Transformer
 
 
 def _nint(values):
+    """Round values with the CALWRF default-REAL ``NINT`` convention.
+
+    Args:
+        values: Scalar or array-like numeric values. Inputs are rounded to
+            single precision before applying half-away-from-zero rounding.
+
+    Returns:
+        A NumPy ``int64`` array with the same shape as ``values``.
+    """
     return fortran_nint(values)
 
 
 def _r4_scale(value,scale):
-    """Apply a CALWRF default-REAL unit conversion without scalar promotion."""
+    """Apply a CALWRF default-REAL multiplication without promotion.
+
+    Args:
+        value: Scalar or array-like values to scale.
+        scale: Scalar conversion factor.
+
+    Returns:
+        A NumPy ``float32`` scalar or array, matching the shape of ``value``.
+    """
     return np.float32(np.float32(value)*np.float32(scale))
 
 
 def _r4_divide(value,divisor):
-    """Apply a CALWRF default-REAL division without scalar promotion."""
+    """Apply a CALWRF default-REAL division without promotion.
+
+    Args:
+        value: Scalar or array-like dividend.
+        divisor: Scalar divisor.
+
+    Returns:
+        A NumPy ``float32`` scalar or array, matching the shape of ``value``.
+    """
     return np.float32(np.float32(value)/np.float32(divisor))
 
 
-def _legacy_vertical_velocity(value):
-    value=np.float32(value)
-    return np.float32(0.) if abs(value)<np.float32(.00499) else value
-
-
 def _relative_humidity(qvapor,pressure_hpa,temperature_k):
+    """Reproduce CALWRF's single-precision relative-humidity diagnostic.
+
+    Args:
+        qvapor: Water-vapour mixing ratio in kg/kg. The input may be any shape
+            broadcastable with ``pressure_hpa`` and ``temperature_k``.
+        pressure_hpa: Atmospheric pressure in hPa.
+        temperature_k: Air temperature in K.
+
+    Returns:
+        A ``float32`` array of relative humidity in percent, clipped to the
+        inclusive range 0--100 and broadcast to the common input shape.
+    """
     f32=np.float32
     temperature=np.asarray(temperature_k,dtype=f32)
     pressure=np.asarray(pressure_hpa,dtype=f32)
@@ -56,6 +88,19 @@ def _relative_humidity(qvapor,pressure_hpa,temperature_k):
 
 
 def _date_number(text):
+    """Encode a canonical whole-hour timestamp as ``YYYYMMDDHH``.
+
+    Args:
+        text: Timestamp string accepted by
+            :func:`pycalmet.datetime_utils.parse_timestamp`.
+
+    Returns:
+        The ten-digit CALWRF timestamp as an integer.
+
+    Raises:
+        ValueError: If ``text`` is invalid or contains nonzero minutes,
+            seconds, or microseconds that the legacy format cannot represent.
+    """
     timestamp=parse_timestamp(text)
     if timestamp.minute or timestamp.second or timestamp.microsecond:
         raise ValueError(
@@ -65,6 +110,16 @@ def _date_number(text):
 
 
 def _compressed_water(values):
+    """Format one M3D row of cloud and precipitation mixing ratios.
+
+    Args:
+        values: One-dimensional cloud-water component values in g/kg. Negative
+            values are written as zero.
+
+    Returns:
+        Concatenated six-column ``F6.3`` fields. If more than one component is
+        below 0.00049 g/kg, a single negative run-count field is returned.
+    """
     values=np.maximum(np.asarray(values,dtype=np.float32),np.float32(0.))
     if values.size>1 and np.all(values<np.float32(.00049)):
         return f'{-float(values.size):6.3f}'
@@ -72,6 +127,24 @@ def _compressed_water(values):
 
 
 def _header(stream,dataset,name,variables_2d=()):
+    """Write the common CALWRF file identifier and comment records.
+
+    Args:
+        stream: Open text stream positioned at the beginning of an output
+            file.
+        dataset: Canonical CALWRF NetCDF dataset. It is accepted alongside the
+            other header writers for a consistent internal interface.
+        name: Legacy dataset identifier, normally ``"3D.DAT"`` or
+            ``"2D.DAT"``.
+        variables_2d: Sequence of ``(name, units, description)`` metadata
+            triples included in an M2D header.
+
+    Returns:
+        None. Header records are appended to ``stream``.
+
+    Raises:
+        OSError: If the output stream cannot be written.
+    """
     version='2.1'; modification='WRF_ARW         Python          Created by PyCALMET'
     stream.write(f'{name:<16}{version:<16}{modification:<64}\n')
     # RDHD53 does not merely display this comment: when it sees ``CALWRF`` it
@@ -89,6 +162,28 @@ def _header(stream,dataset,name,variables_2d=()):
 
 
 def _common_header(stream,dataset,times,iout):
+    """Write the projection, period, vertical, and static-grid records.
+
+    Args:
+        stream: Open legacy-format text stream positioned after its comments.
+        dataset: Canonical CALWRF NetCDF dataset containing ``latitude``,
+            ``longitude``, ``sigma``, ``terrain``, and ``landuse`` variables,
+            together with ``time``, ``level``, ``y``, and ``x`` dimensions.
+        times: Ordered canonical timestamp strings; the first timestamp and
+            sequence length define the legacy output period.
+        iout: Six integer output switches written as three-column fields.
+
+    Returns:
+        None. Grid metadata and ``(y, x)`` static-cell records are appended to
+        ``stream``. Coordinates are degrees, origins and spacing are km, and
+        terrain is rounded to integer metres.
+
+    Raises:
+        KeyError: If a required NetCDF dimension or variable is missing.
+        ValueError: If the map projection is unsupported, source-grid bounds
+            are inconsistent, or the first timestamp is invalid.
+        OSError: If records cannot be written to ``stream``.
+    """
     map_projection=int(getattr(dataset,'map_proj',1))
     try:
         projection={1:'LCC',2:'PS',3:'EM'}[map_projection]
@@ -164,7 +259,27 @@ def _common_header(stream,dataset,times,iout):
 
 
 def write_m3d(canonical_path,m3d_path,m2d_path=None):
-    """Stream canonical CALWRF NetCDF into legacy formatted files."""
+    """Convert canonical CALWRF NetCDF to formatted M3D and optional M2D.
+
+    Args:
+        canonical_path: Path to the canonical CALWRF NetCDF input.
+        m3d_path: Destination for formatted ``3D.DAT`` records. Parent
+            directories are created when needed.
+        m2d_path: Optional destination for formatted ``2D.DAT`` records.
+            Parent directories are created when needed.
+
+    Returns:
+        None. The function writes ``m3d_path`` and, when requested,
+        ``m2d_path``. Existing files at those paths are replaced.
+
+    Raises:
+        KeyError: If a required canonical dimension or variable is absent.
+        ValueError: If a timestamp is not an exact hour, projection metadata
+            is unsupported, or source-grid bounds are inconsistent.
+        OSError: If an input cannot be opened or an output cannot be created
+            or written. A failure after output creation can leave a partial
+            legacy file.
+    """
     m3d_path=Path(m3d_path); m3d_path.parent.mkdir(parents=True,exist_ok=True)
     with nc.Dataset(canonical_path) as dataset:
         times=[str(value) for value in nc.chartostring(dataset['time_text'][:]).tolist()]
@@ -236,6 +351,27 @@ def write_m3d(canonical_path,m3d_path,m2d_path=None):
 
 
 def _write_m2d(dataset,times,path,iout):
+    """Write canonical surface variables as a formatted CALWRF M2D file.
+
+    Args:
+        dataset: Open canonical CALWRF NetCDF dataset containing all seventeen
+            surface variables emitted by CALWRF.
+        times: Ordered canonical timestamp strings, one per ``time`` record.
+        path: Destination ``2D.DAT`` path.
+        iout: Six integer output switches shared with the companion M3D file.
+
+    Returns:
+        None. The destination parent is created and ``path`` is replaced with
+        fixed-width rows ordered by time, variable, and north-to-south grid
+        row.
+
+    Raises:
+        KeyError: If a required surface variable is missing.
+        ValueError: If a timestamp is invalid or cannot be represented at
+            whole-hour precision.
+        OSError: If the destination directory or file cannot be created or
+            written. A write failure can leave a partial file.
+    """
     variables=(('PSFC','hPa','SURFACE PRESSURE','surface_pressure',.01),
         ('RAIN','cm','TOTAL PRECIPITATION','precipitation',.1),
         ('SNOWC','none','FRACTIONAL SNOW COVER','snow_cover',1.),

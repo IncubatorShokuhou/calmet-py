@@ -7,11 +7,38 @@ import numpy as np
 
 
 def _numbers(line):
+    """Extract decimal and scientific-notation tokens from one text line.
+
+    Args:
+        line: WT.DAT text, potentially including nonnumeric labels.
+
+    Returns:
+        List of matched numeric strings. Exponents may use ``E`` or ``D``.
+    """
     return re.findall(r'[-+]?\d+(?:\.\d*)?(?:[EeDd][-+]?\d+)?',line)
 
 
 def read_weight_data(path,nx,ny,z_centers_m):
-    """Read RDWT's formatted fine-grid weights, returned as ``(z,y,x)``."""
+    """Read RDWT formatted fine-grid station/prognostic weights.
+
+    Args:
+        path: Path to formatted WT.DAT text.
+        nx: Expected number of fine-grid columns.
+        ny: Expected number of fine-grid rows.
+        z_centers_m: One-dimensional CALMET layer-center heights in metres, in
+            the order expected in the file.
+
+    Returns:
+        Float32 array of shape ``(len(z_centers_m), ny, nx)`` containing
+        dimensionless weights from 0 to 1. File rows are reversed so the
+        returned y axis follows CALMET array order.
+
+    Raises:
+        OSError: If the input file cannot be read.
+        UnicodeDecodeError: If the file is not ASCII.
+        ValueError: If headers, grid dimensions, level heights, row widths, or
+            weight ranges are invalid.
+    """
     lines=Path(path).read_text(encoding='ascii',errors='strict').splitlines()
     if len(lines)<6: raise ValueError('WT.DAT is truncated')
     index=3

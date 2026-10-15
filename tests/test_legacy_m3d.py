@@ -6,9 +6,8 @@ import numpy as np
 import pytest
 
 from pycalmet.legacy_m3d import _level, _surface, _water
-from pycalmet.legacy_calwrf import (_legacy_vertical_velocity,_nint,_r4_divide,
-                                    _r4_scale,_relative_humidity,_compressed_water,
-                                    write_m3d)
+from pycalmet.legacy_calwrf import (_nint,_r4_divide,_r4_scale,
+                                    _relative_humidity,_compressed_water,write_m3d)
 from pycalmet.legacy_m2d import M2DReader
 from pycalmet.legacy_m3d import M3DReader
 from pycalmet._calmet import _meteorology_dataset
@@ -60,12 +59,6 @@ def test_legacy_unit_scaling_retains_default_real_rounding():
 def test_nint_rounds_half_away_from_zero_like_fortran():
     values=np.array([-2.5,-2.49,-.5,-.49,0.,.49,.5,2.49,2.5],dtype=np.float32)
     np.testing.assert_array_equal(_nint(values),[-3,-2,-1,0,0,0,1,2,3])
-
-
-def test_legacy_vertical_velocity_uses_calwrf_threshold():
-    assert _legacy_vertical_velocity(np.float32(-.00498)).view(np.uint32)==0
-    retained=_legacy_vertical_velocity(np.float32(-.004994))
-    assert retained.view(np.uint32)==np.float32(-.004994).view(np.uint32)
 
 
 def test_fixed_width_surface_parser():

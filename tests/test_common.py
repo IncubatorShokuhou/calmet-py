@@ -2,16 +2,10 @@
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
 
 from pycalmet._common import (
-    as_real4,
     fortran_inclusive_slice,
-    fortran_nint,
-    km_to_m,
-    m_to_km,
-    missing_mask,
 )
 
 

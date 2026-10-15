@@ -76,6 +76,19 @@ COORD_DTYPE=np.float64
 
 @dataclass(frozen=True,slots=True)
 class GlazSpec:
+    """Describe one raw global GLAZ equal-area raster.
+
+    Attributes:
+        nx: Number of raster columns.
+        ny: Number of raster rows.
+        x_origin_km: X coordinate of the first pixel centre, in kilometres.
+        y_origin_km: Y coordinate of the first pixel centre, in kilometres.
+        latitude_origin: Lambert azimuthal equal-area latitude of origin, in
+            degrees north.
+        longitude_origin: Lambert azimuthal equal-area central longitude, in
+            degrees east.
+    """
+
     nx: int
     ny: int
     x_origin_km: float
@@ -94,6 +107,19 @@ GLAZ_SPECS={
 
 @dataclass(frozen=True, slots=True)
 class LanduseResult:
+    """Summarize a completed CTGPROC land-use aggregation.
+
+    Attributes:
+        output: Generated land-use product path.
+        source_cells_read: Number of source raster cells or point records read.
+        samples_inside_grid: Number of mesh samples accepted by the target grid.
+        populated_cells: Number of target cells with at least one sample.
+        average_hits: Integer mean source-sample count per target cell.
+        low_hit_threshold: QA hit-count threshold derived from the configured
+            percentage of ``average_hits``.
+        low_hit_cells: Number of target cells below the QA threshold.
+    """
+
     output: Path
     source_cells_read: int
     samples_inside_grid: int
@@ -105,13 +131,31 @@ class LanduseResult:
 
 @dataclass(frozen=True,slots=True)
 class CoastPolygon:
+    """Store one projected COASTRD polygon.
+
+    Attributes:
+        kind: Nested coastline polygon type, from 1 through 4.
+        x: One-dimensional ``float64`` x coordinates in target-grid kilometres.
+        y: One-dimensional ``float64`` y coordinates in target-grid kilometres.
+    """
+
     kind: int
     x: np.ndarray
     y: np.ndarray
 
 
 def _grid_indices(x, y, grid):
-    """Return zero-based grid indices for projected coordinates."""
+    """Convert projected coordinates to zero-based target-cell indices.
+
+    Args:
+        x: Scalar or array-like x coordinate in grid kilometres.
+        y: Scalar or array-like y coordinate in grid kilometres.
+        grid: Target grid origin and cell spacing.
+
+    Returns:
+        Pair of ``int64`` arrays ``(ix, iy)`` with the respective input shapes.
+        Index values are not clipped to the grid extent.
+    """
     x=np.asarray(x,dtype=COORD_DTYPE); y=np.asarray(y,dtype=COORD_DTYPE)
     delx=x-float(grid.x_origin_km); dely=y-float(grid.y_origin_km)
     qx=delx/float(grid.dx_km); qy=dely/float(grid.dy_km)
@@ -121,18 +165,46 @@ def _grid_indices(x, y, grid):
 
 
 def _inside_grid(x, y, grid):
+    """Locate projected samples and flag those inside the target grid.
+
+    Args:
+        x: Scalar or array-like x coordinate in grid kilometres.
+        y: Scalar or array-like y coordinate in grid kilometres.
+        grid: Target grid origin, dimensions, and spacing.
+
+    Returns:
+        Tuple ``(ix, iy, inside)`` of ``int64`` cell-index arrays and a Boolean
+        mask. Arrays have the corresponding input shape.
+    """
     ix,iy=_grid_indices(x,y,grid)
     return ix,iy,(ix>=0)&(ix<grid.nx)&(iy>=0)&(iy<grid.ny)
 
 
 def _grid_centers_1d(origin, spacing, count):
-    """Construct grid-cell centre coordinates."""
+    """Construct regularly spaced one-dimensional cell-centre coordinates.
+
+    Args:
+        origin: Coordinate of the outer grid edge, in caller-defined units.
+        spacing: Signed cell spacing in the same units.
+        count: Number of cells.
+
+    Returns:
+        One-dimensional ``float64`` array of length ``count``.
+    """
     index=np.arange(int(count),dtype=COORD_DTYPE)+.5
     return float(origin)+float(spacing)*index
 
 
 def _snow_grid_indices(longitude, latitude):
-    """Map geographic coordinates to CTGPROC's fixed SNODAS grid."""
+    """Map geographic coordinates to CTGPROC's fixed SNODAS grid.
+
+    Args:
+        longitude: Scalar or array-like longitude in degrees east on WGS 84.
+        latitude: Scalar or array-like latitude in degrees north on WGS 84.
+
+    Returns:
+        Pair of one-based ``int64`` SNODAS column and row arrays.
+    """
     longitude=np.asarray(longitude,dtype=COORD_DTYPE)
     latitude=np.asarray(latitude,dtype=COORD_DTYPE)
     lon_ratio=(longitude+124.729584)/8.33333377e-3
@@ -144,7 +216,13 @@ def _snow_grid_indices(longitude, latitude):
 
 @dataclass(slots=True)
 class SnowGridInfo:
-    """Sparse equivalent of CTGPROC's NGSNOW/IPSNOW/RSNOW arrays."""
+    """Store the sparse CTGPROC-to-SNODAS sample mapping.
+
+    Attributes:
+        grid: Target CTGPROC grid used to flatten cell indices.
+        hits: Hit counts keyed by ``(cell, land-use category, SNODAS cell)``.
+        order: First-seen SNODAS cell order for each target-cell/category pair.
+    """
 
     grid: GridConfig
     hits: dict[tuple[int, int, int], int]
@@ -152,10 +230,28 @@ class SnowGridInfo:
 
     @classmethod
     def create(cls, grid):
+        """Create an empty sparse snow mapping.
+
+        Args:
+            grid: Target CTGPROC grid.
+
+        Returns:
+            Empty mapping associated with ``grid``.
+        """
         return cls(grid, {}, {})
 
     def add_hits(self, cell, category, snow_grid, count=1):
-        """Accumulate one sparse snow-grid record without fixed array limits."""
+        """Accumulate one sparse snow-grid record without fixed array limits.
+
+        Args:
+            cell: Zero-based flattened target-grid cell index.
+            category: Land-use category identifier.
+            snow_grid: One-based flattened SNODAS grid index.
+            count: Number of samples to add.
+
+        Returns:
+            None.
+        """
         group=(int(cell),int(category)); snow_grid=int(snow_grid)
         grids=self.order.setdefault(group,[])
         if snow_grid not in grids:
@@ -164,14 +260,28 @@ class SnowGridInfo:
         self.hits[key]=self.hits.get(key,0)+int(count)
 
     def merge(self, other):
-        """Merge sparse records from a previous modern continuation file."""
+        """Merge sparse records from a continuation dataset.
+
+        Args:
+            other: Sparse mapping on the same target grid.
+
+        Returns:
+            None. This mapping is updated in place.
+        """
         for (cell,category),grids in other.order.items():
             for snow_grid in grids:
                 self.add_hits(cell,category,snow_grid,
                               other.hits[cell,category,snow_grid])
 
     def remap(self, mapping):
-        """Return snow records with land-use categories mapped like the grid."""
+        """Remap snow-record land-use categories like the main grid.
+
+        Args:
+            mapping: Source-to-output integer category mapping.
+
+        Returns:
+            New sparse mapping with hit counts merged under remapped categories.
+        """
         remapped=type(self).create(self.grid)
         for (cell,category),grids in self.order.items():
             target=mapping.get(category,category)
@@ -181,6 +291,17 @@ class SnowGridInfo:
         return remapped
 
     def add(self, x, y, categories, good):
+        """Add accepted projected samples to the sparse SNODAS mapping.
+
+        Args:
+            x: One-dimensional projected sample x coordinates in kilometres.
+            y: One-dimensional projected sample y coordinates in kilometres.
+            categories: Land-use category for each sample.
+            good: Boolean mask selecting samples accepted by CTGPROC.
+
+        Returns:
+            None. Records are accumulated in place.
+        """
         selected=np.flatnonzero(good)
         if selected.size==0:
             return
@@ -196,6 +317,20 @@ class SnowGridInfo:
             self.add_hits(raw_cell,raw_category,raw_snow)
 
     def records(self, categories):
+        """Encode sparse snow hits using the output category ordering.
+
+        Args:
+            categories: Ordered output land-use category identifiers.
+
+        Returns:
+            Pair ``(grouped, totals)``. ``grouped`` maps zero-based
+            ``(target cell, one-based category position)`` keys to ordered
+            ``(SNODAS cell, hit count)`` records. ``totals`` is an ``int64``
+            vector with one total per flattened target cell.
+
+        Raises:
+            ValueError: If a recorded category is absent from ``categories``.
+        """
         lookup={int(value):index+1 for index,value in enumerate(categories)}
         grouped={}
         totals=np.zeros(self.grid.nx*self.grid.ny,dtype=np.int64)
@@ -215,7 +350,21 @@ class SnowGridInfo:
 
 
 def _bin_samples(counts,columns,x,y,categories,good,config,snow=None):
-    """Vectorized LUGRID count update plus optional sample-level snow QA."""
+    """Accumulate accepted source samples into target land-use counts.
+
+    Args:
+        counts: Mutable ``(category, flattened cell)`` integer count array.
+        columns: Mapping from category identifiers to rows in ``counts``.
+        x: Projected sample x coordinates in target-grid kilometres.
+        y: Projected sample y coordinates in target-grid kilometres.
+        categories: Category identifier for each sample.
+        good: Boolean mask selecting samples to accumulate.
+        config: Active CTGPROC configuration and target grid.
+        snow: Optional sparse SNODAS mapping updated for accepted samples.
+
+    Returns:
+        None. ``counts`` and, when supplied, ``snow`` are updated in place.
+    """
     if snow is not None:
         snow.add(x,y,categories,good)
     ix,iy=_grid_indices(np.asarray(x)[good],np.asarray(y)[good],config.grid)
@@ -228,18 +377,50 @@ def _bin_samples(counts,columns,x,y,categories,good,config,snow=None):
 
 
 def _read_with_optional_snow(function,*args,snow=None,**kwargs):
-    """Keep the established reader call contract when snow QA is disabled."""
+    """Call a source reader with snow bookkeeping only when enabled.
+
+    Args:
+        function: Reader callable accepting ``*args`` and, optionally, ``snow``.
+        *args: Positional arguments forwarded to ``function``.
+        snow: Optional sparse snow mapping.
+        **kwargs: Keyword arguments forwarded to ``function``.
+
+    Returns:
+        Unmodified return value from ``function``.
+    """
     if snow is None:
         return function(*args,**kwargs)
     return function(*args,snow=snow,**kwargs)
 
 
 def _qa_directory(config):
+    """Resolve the directory for CTGPROC sample-coordinate QA files.
+
+    Args:
+        config: CTGPROC output and QA-directory settings.
+
+    Returns:
+        Explicit QA directory, or the main output file's parent directory.
+    """
     return (Path(config.qa_output_directory) if config.qa_output_directory is not None
             else Path(config.output).parent)
 
 
 def _qa_write(config,name,*columns):
+    """Append projected sample columns to one optional QA text file.
+
+    Args:
+        config: CTGPROC QA enable flag and destination settings.
+        name: QA filename relative to the resolved QA directory.
+        *columns: Array-like equally sized columns written as rows.
+
+    Returns:
+        None. Disabled or empty QA output performs no I/O.
+
+    Raises:
+        ValueError: If the columns cannot be combined into equal-length rows.
+        OSError: If the QA file cannot be opened or written.
+    """
     if not config.qa_cell_output:
         return
     values=np.column_stack(tuple(np.asarray(column).ravel() for column in columns))
@@ -250,7 +431,22 @@ def _qa_write(config,name,*columns):
 
 
 def _read_coastline_bln(path,grid,*,allow_empty=False):
-    """Read COASTRD's pre-extracted BLN polygon representation."""
+    """Read COASTRD's pre-extracted target-grid BLN polygons.
+
+    Args:
+        path: ASCII BLN coastline file.
+        grid: Target grid used to validate polygon coverage; coordinates are
+            interpreted in this grid's kilometres.
+        allow_empty: Return an empty tuple instead of rejecting an empty file.
+
+    Returns:
+        Tuple of validated :class:`CoastPolygon` objects in file order.
+
+    Raises:
+        ValueError: If headers, points, polygon types, lengths, or grid bounds
+            are invalid.
+        OSError: If the file cannot be read.
+    """
     source=Path(path)
     lines=source.read_text(encoding='ascii',errors='strict').splitlines()
     polygons=[]; index=0
@@ -292,7 +488,17 @@ def _read_coastline_bln(path,grid,*,allow_empty=False):
 
 
 def _polygon_membership(px,py,polygon):
-    """Return Shapely's standard outside, boundary, and inside states."""
+    """Classify points relative to one coastline polygon.
+
+    Args:
+        px: Array-like point x coordinates in target-grid kilometres.
+        py: Array-like point y coordinates in target-grid kilometres.
+        polygon: Coastline polygon in the same target-grid CRS.
+
+    Returns:
+        ``int8`` array with ``-1`` outside, ``0`` on the boundary, and ``1``
+        inside, with the broadcast point shape.
+    """
     px=np.asarray(px,dtype=COORD_DTYPE); py=np.asarray(py,dtype=COORD_DTYPE)
     coordinates=np.column_stack((np.asarray(polygon.x,dtype=COORD_DTYPE),
                                  np.asarray(polygon.y,dtype=COORD_DTYPE)))
@@ -305,7 +511,17 @@ def _polygon_membership(px,py,polygon):
 
 
 def _coastline_types(x,y,polygons):
-    """Return IPTYPE's highest nested polygon type for each point."""
+    """Apply IPTYPE's nested coastline classification to projected points.
+
+    Args:
+        x: Array-like point x coordinates in target-grid kilometres.
+        y: Array-like point y coordinates in target-grid kilometres.
+        polygons: Ordered coastline polygons with nesting types 1 through 4.
+
+    Returns:
+        ``int8`` array matching ``x`` with the highest containing polygon
+        type; zero denotes marine or otherwise unclassified points.
+    """
     result=np.zeros(np.asarray(x).shape,dtype=np.int8)
     flat=result.ravel(); px=np.asarray(x).ravel(); py=np.asarray(y).ravel()
     for polygon in polygons:
@@ -322,6 +538,20 @@ def _coastline_types(x,y,polygons):
 
 
 def _fill_empty_ocean(counts,categories,config):
+    """Seed unsampled marine target cells with one ocean-category hit.
+
+    Args:
+        counts: Mutable ``(category, y, x)`` integer hit array.
+        categories: Category identifier corresponding to each first-axis row.
+        config: CTGPROC coastline, ocean-category, and target-grid settings.
+
+    Returns:
+        Number of previously empty cells classified and filled as ocean.
+
+    Raises:
+        ValueError: If no coastline file is configured, the ocean category is
+            missing or duplicated, or coastline geometry is invalid.
+    """
     if config.coastline_file is None:
         raise ValueError('fill_empty_ocean requires coastline_file/COASTBLN')
     matches=np.flatnonzero(np.asarray(categories)==config.ocean_category)
@@ -338,6 +568,18 @@ def _fill_empty_ocean(counts,categories,config):
 
 
 def _coastline_polygons(config):
+    """Load coastline polygons when land/marine category swapping is enabled.
+
+    Args:
+        config: CTGPROC coastline-swap and target-grid settings.
+
+    Returns:
+        Tuple of coastline polygons, or an empty tuple when swapping is off.
+
+    Raises:
+        ValueError: If swapping is enabled without a coastline file or the
+            coastline file is invalid.
+    """
     if not config.coastline_swap:
         return ()
     if config.coastline_file is None:
@@ -347,7 +589,20 @@ def _coastline_polygons(config):
 
 
 def _swap_coastline_categories(categories,x,y,config,polygons):
-    """Apply LUGRID's LMARSWAP rule to projected source samples."""
+    """Apply LUGRID's LMARSWAP rule to projected source samples.
+
+    Args:
+        categories: Source land-use categories.
+        x: Sample x coordinates in target-grid kilometres.
+        y: Sample y coordinates in target-grid kilometres.
+        config: Coastline-swap and ocean-category settings.
+        polygons: Preloaded coastline polygons in the target-grid CRS.
+
+    Returns:
+        Pair ``(categories, keep)`` containing an ``int16`` category array and
+        a Boolean inclusion mask. Marine samples are assigned the configured
+        ocean category where required.
+    """
     values=np.asarray(categories,dtype=np.int16)
     if not polygons and config.coastline_file is None:
         return values,np.ones(values.shape,dtype=bool)
@@ -359,7 +614,21 @@ def _swap_coastline_categories(categories,x,y,config,polygons):
     return swapped,keep
 
 def _remap_categories(categories,counts,mapping):
-    """Apply a source-to-output class map and merge repeated targets."""
+    """Apply a category map and merge source classes sharing one target.
+
+    Args:
+        categories: One-dimensional source category identifiers.
+        counts: Integer counts whose first axis corresponds to ``categories``.
+        mapping: Source-to-output positive integer category mapping.
+
+    Returns:
+        Pair of unique ``int16`` output categories and merged count array with
+        the same spatial shape and dtype as ``counts``.
+
+    Raises:
+        ValueError: If a mapping key is absent from ``categories`` or a target
+            category is not positive.
+    """
     source=np.asarray(categories,dtype=np.int16)
     unknown=sorted(set(mapping)-set(int(value) for value in source))
     if unknown: raise ValueError(f'category_map contains absent source categories: {unknown}')
@@ -373,7 +642,20 @@ def _remap_categories(categories,counts,mapping):
 
 
 def _merge_global_counts(accumulated,current,categories,excluded_water=52):
-    """Vectorized GMERGE handling for continent-exclusion water cells."""
+    """Merge one global-region count grid with GMERGE water precedence.
+
+    Args:
+        accumulated: Mutable accumulated ``(category, y, x)`` count array.
+        current: Count array for the next global region.
+        categories: Category identifiers for the first axis of both arrays.
+        excluded_water: Category marking water outside the source continent.
+
+    Returns:
+        None. ``accumulated`` is updated in place.
+
+    Raises:
+        ValueError: If ``excluded_water`` is absent or duplicated.
+    """
     matches=np.flatnonzero(np.asarray(categories)==excluded_water)
     if matches.size!=1: raise ValueError('GMERGE excluded-water category is absent')
     water=int(matches[0])
@@ -389,7 +671,20 @@ def _merge_global_counts(accumulated,current,categories,excluded_water=52):
 
 def _select_glaz_markers(center_lon,center_lat,left_lon,right_lon,
                          lower_lat,upper_lat):
-    """GSELECT overlap tests after its longitude-branch normalization."""
+    """Select global GLAZ regions using legacy GSELECT overlap tests.
+
+    Args:
+        center_lon: Target-grid centre longitude in degrees east.
+        center_lat: Target-grid centre latitude in degrees north.
+        left_lon: Western corner bound on the normalized longitude branch.
+        right_lon: Eastern corner bound on the normalized longitude branch.
+        lower_lat: Southern corner bound in degrees north.
+        upper_lat: Northern corner bound in degrees north.
+
+    Returns:
+        Set of GLAZ input-type identifiers whose regional extents overlap the
+        target markers.
+    """
     center_lon=float(center_lon); center_lat=float(center_lat)
     left_lon=float(left_lon); right_lon=float(right_lon)
     lower_lat=float(lower_lat); upper_lat=float(upper_lat)
@@ -411,7 +706,18 @@ def _select_glaz_markers(center_lon,center_lat,left_lon,right_lon,
 
 
 def _select_glaz_regions(grid):
-    """Transform target markers and reproduce GSELECT's regional screen."""
+    """Transform a target grid and select overlapping GLAZ source regions.
+
+    Args:
+        grid: Target grid, interpreted in its configured projection and datum.
+
+    Returns:
+        Set of overlapping GLAZ input-type identifiers.
+
+    Raises:
+        ValueError: If the grid datum is invalid.
+        NotImplementedError: If the grid projection is unsupported.
+    """
     x0=float(grid.x_origin_km); y0=float(grid.y_origin_km)
     x1=x0+grid.nx*float(grid.dx_km)
     y1=y0+grid.ny*float(grid.dy_km)
@@ -438,12 +744,42 @@ def _select_glaz_regions(grid):
     return _select_glaz_markers(center,latitude[0],left,right,lower,upper)
 
 def _lcc(g: GridConfig) -> CRS:
+    """Construct the kilometre-based target CRS used by raster readers.
+
+    Args:
+        g: CTGPROC target grid.
+
+    Returns:
+        pyproj CRS with coordinates expressed in kilometres.
+
+    Raises:
+        ValueError: If the grid datum is invalid.
+        NotImplementedError: If the grid projection is unsupported.
+    """
     return grid_crs(g,units='km')
 
 def _glaz_crs(spec: GlazSpec) -> CRS:
+    """Construct the spherical Lambert azimuthal CRS of a GLAZ raster.
+
+    Args:
+        spec: GLAZ regional raster geometry.
+
+    Returns:
+        Kilometre-based pyproj CRS using the GLAZ 6,370,997 m sphere.
+    """
     return CRS.from_proj4(f"+proj=laea +lat_0={spec.latitude_origin:g} +lon_0={spec.longitude_origin:g} +R=6370997 +units=km +no_defs")
 
 def _window(g, reverse, spec):
+    """Estimate a buffered GLAZ source window covering the target grid.
+
+    Args:
+        g: Target grid in kilometres.
+        reverse: Callable transforming target x/y arrays into GLAZ kilometres.
+        spec: GLAZ raster dimensions and pixel-centre origin.
+
+    Returns:
+        Pair of clipped Python ranges for source x and y pixel indices.
+    """
     x0=float(g.x_origin_km); y0=float(g.y_origin_km)
     x1=x0+g.nx*float(g.dx_km); y1=y0+g.ny*float(g.dy_km)
     x=np.array([x0,x1,x1,x0],dtype=COORD_DTYPE)
@@ -458,53 +794,69 @@ def _window(g, reverse, spec):
 
 
 def _mesh_offsets(mesh,cell_size=1.):
-    """Return evenly spaced subpixel offsets in source-coordinate units."""
+    """Construct evenly spaced subpixel offsets about a cell centre.
+
+    Args:
+        mesh: Positive number of samples along one cell axis.
+        cell_size: Signed source-cell size in caller-defined coordinate units.
+
+    Returns:
+        One-dimensional ``float64`` array of length ``mesh`` in source units.
+
+    Raises:
+        ZeroDivisionError: If ``mesh`` is zero.
+    """
     step=float(cell_size)/int(mesh)
     return (np.arange(int(mesh),dtype=COORD_DTYPE)+.5)*step-float(cell_size)/2.
 
 
 def _mesh_coordinates(centers,mesh,cell_size=1.):
-    """Return evenly spaced subpixel coordinates around each centre."""
+    """Expand source-cell centres into regularly spaced mesh coordinates.
+
+    Args:
+        centers: Scalar or array-like source-cell centre coordinates.
+        mesh: Number of samples along each cell axis.
+        cell_size: Signed source-cell size in the coordinate units.
+
+    Returns:
+        ``float64`` array with a trailing axis of length ``mesh``.
+    """
     center=np.asarray(centers,dtype=COORD_DTYPE)
     return center[...,None]+_mesh_offsets(mesh,cell_size)
 
 
 def _source_centers(origin,spacing,indices):
-    """Return source-pixel centre coordinates for zero-based indices."""
+    """Convert zero-based source indices to pixel-centre coordinates.
+
+    Args:
+        origin: Coordinate of source index zero in caller-defined units.
+        spacing: Signed source-pixel spacing in the same units.
+        indices: Scalar or array-like zero-based indices.
+
+    Returns:
+        ``float64`` array matching ``indices`` in source-coordinate units.
+    """
     return float(origin)+float(spacing)*np.asarray(indices,dtype=COORD_DTYPE)
 
 
-def _geotiff_geometry(scale,tie,raster_type,crs,*,orientation=1,
-                      extra_half_pixel=False):
-    """Decode legacy GeoTIFF tags for callers that supply raw metadata."""
-    source_crs=CRS.from_user_input(crs)
-    if source_crs.is_geographic:
-        unit_scale=1.
-        native_per_work=1.
-    else:
-        axes=source_crs.axis_info
-        metres_per_native=float(axes[0].unit_conversion_factor) if axes else 1.
-        unit_scale=metres_per_native/1000.
-        native_per_work=1000./metres_per_native
-    dx=float(scale[0])*unit_scale; dy=float(scale[1])*unit_scale
-    if dx<=0. or dy<=0.:
-        raise ValueError('GeoTIFF pixel scale must be positive')
-    if orientation not in {1,4}:
-        raise ValueError(f'unsupported GeoTIFF orientation {orientation}')
-    if orientation==1: dy=-dy
-    x0=float(tie[3])*unit_scale; y0=float(tie[4])*unit_scale
-    if int(raster_type)==1:
-        x0+=dx/2.; y0+=dy/2.
-    ix=int(float(tie[0])); iy=int(float(tie[1]))
-    if ix or iy:
-        x0-=dx*ix; y0-=dy*iy
-    if extra_half_pixel:
-        x0+=dx/2.; y0+=dy/2.
-    return x0,y0,dx,dy,native_per_work
-
-
 def _read_categorical_raster(path, *, fallback_crs=None):
-    """Read categorical pixels, validity, and centre coordinates with Rasterio."""
+    """Read categorical raster pixels and affine geometry with Rasterio.
+
+    Args:
+        path: GeoTIFF or other Rasterio-readable categorical raster.
+        fallback_crs: CRS used only when the raster carries no CRS metadata.
+
+    Returns:
+        Tuple ``(crs, x0, y0, dx, dy, data, photometric, valid)``. ``x0`` and
+        ``y0`` are first-pixel centres; ``dx`` and ``dy`` are signed pixel
+        spacings in CRS units; ``data`` retains the raster dtype and band
+        layout; ``valid`` is a two-dimensional Boolean mask. ``photometric``
+        is 1 for one-band values, 2 for RGB(A), and 3 for a palette band.
+
+    Raises:
+        ValueError: If the raster cannot be read, has no usable CRS, has a
+            rotated transform, or has invalid pixel spacing.
+    """
     path=Path(path)
     try:
         with rasterio.open(path) as source:
@@ -540,6 +892,21 @@ def _read_categorical_raster(path, *, fallback_crs=None):
 
 
 def _accumulate_glazas(path, config, snow=None):
+    """Window, mesh-sample, and accumulate one raw GLAZ regional raster.
+
+    Args:
+        path: Headerless one-byte GLAZ raster path.
+        config: Active source type, datum, mesh density, and target-grid settings.
+        snow: Optional sparse SNODAS mapping updated for accepted samples.
+
+    Returns:
+        Tuple ``(counts, cells_read, samples_inside)``. ``counts`` is an
+        ``int64`` array shaped ``(38, grid.ny, grid.nx)`` in USGS-38 order.
+
+    Raises:
+        ValueError: If the raster byte size or mesh density is invalid.
+        NotImplementedError: If the configured GLAZ region is unsupported.
+    """
     kind=config.input_type.upper(); spec=GLAZ_SPECS.get(kind)
     if spec is None: raise NotImplementedError(f"unsupported GLAZ input type: {kind}")
     if path.stat().st_size != spec.nx*spec.ny:
@@ -552,6 +919,15 @@ def _accumulate_glazas(path, config, snow=None):
                            lat0=spec.latitude_origin,lon0=spec.longitude_origin,
                            datum=config.input_datum)
     def reverse(x,y):
+        """Transform target-grid coordinates back to the GLAZ source CRS.
+
+        Args:
+            x: Array-like target-grid x coordinates in kilometres.
+            y: Array-like target-grid y coordinates in kilometres.
+
+        Returns:
+            Pair of ``float64`` GLAZ x/y arrays in kilometres.
+        """
         return unproject_to_crs(x,y,g,source_crs,config.input_datum,units='km')
     irange,jrange=_window(g,reverse,spec)
     counts=np.zeros((USGS38.size,g.ny*g.nx),dtype=np.int64)
@@ -586,6 +962,19 @@ def _accumulate_glazas(path, config, snow=None):
 
 
 def _ctg_record(line,path,number):
+    """Parse one free-form or fixed-column compressed CTG record.
+
+    Args:
+        line: ASCII source record.
+        path: Source path used in diagnostics.
+        number: One-based source line number used in diagnostics.
+
+    Returns:
+        Four integers ``(run_length, category, x_value, y_value)``.
+
+    Raises:
+        ValueError: If the record does not contain four valid integers.
+    """
     fields=line.split()
     try:
         if len(fields)==4: return tuple(int(value) for value in fields)
@@ -597,7 +986,21 @@ def _ctg_record(line,path,number):
 
 
 def _accumulate_ctg(path,config,snow=None):
-    """Expand USGS 200 m CTG run records and bin their mesh samples."""
+    """Expand USGS 200 m CTG run records and bin their mesh samples.
+
+    Args:
+        path: Compressed ASCII USGS CTG source path.
+        config: Active source datum, mesh density, coastline, and target grid.
+        snow: Optional sparse SNODAS mapping updated for accepted samples.
+
+    Returns:
+        Tuple ``(counts, cells_read, samples_inside)``. ``counts`` is an
+        ``int64`` array shaped ``(38, grid.ny, grid.nx)`` in USGS-38 order.
+
+    Raises:
+        ValueError: If the file header, UTM zone, run record, category,
+            coordinate anchors, or mesh density is invalid.
+    """
     lines=path.read_text(encoding='ascii',errors='strict').splitlines()
     if len(lines)<6: raise ValueError(f'compressed CTG file is truncated: {path}')
     try: zone=int(lines[0].ljust(55)[50:55])
@@ -650,7 +1053,22 @@ def _accumulate_ctg(path,config,snow=None):
     return counts.reshape(USGS38.size,config.grid.ny,config.grid.nx),read,inside
 
 def _read_generic(path,config,snow=None):
-    """Read CTGPROC ``GENERIC.LANDUSE`` point records and bin them by cell."""
+    """Read ``GENERIC.LANDUSE`` point records and bin them by target cell.
+
+    Args:
+        path: ASCII generic land-use dataset path.
+        config: Active target-grid, coastline, and QA settings.
+        snow: Optional sparse SNODAS mapping updated for accepted samples.
+
+    Returns:
+        Tuple ``(categories, counts, records_read, samples_inside)``.
+        ``categories`` is ``int16``; ``counts`` is ``int64`` with shape
+        ``(category, grid.ny, grid.nx)``.
+
+    Raises:
+        ValueError: If the header, category table, record, coordinate units,
+            latitude, coastline category, or datum is invalid.
+    """
     lines=path.read_text(encoding='ascii',errors='strict').splitlines()
     if not lines or lines[0][:16].strip().upper()!='GENERIC.LANDUSE':
         raise ValueError(f'generic land-use dataset header is invalid: {path}')
@@ -704,7 +1122,20 @@ def _read_generic(path,config,snow=None):
 
 
 def _read_nzgen(path,config,snow=None):
-    """Read New Zealand free-format points and apply the legacy NZCAT table."""
+    """Read New Zealand points and apply the legacy NZCAT translation.
+
+    Args:
+        path: Free-format ASCII NZGEN point dataset.
+        config: Active source datum, target-grid, coastline, and QA settings.
+        snow: Optional sparse SNODAS mapping updated for accepted samples.
+
+    Returns:
+        Tuple ``(counts, records_read, samples_inside)``. ``counts`` is an
+        ``int64`` array shaped ``(38, grid.ny, grid.nx)`` in USGS-38 order.
+
+    Raises:
+        ValueError: If a record, NZ category, latitude, or datum is invalid.
+    """
     records=[]
     for number,line in enumerate(path.read_text(encoding='ascii',errors='strict').splitlines(),start=1):
         if not line.strip(): continue
@@ -735,6 +1166,18 @@ def _read_nzgen(path,config,snow=None):
 
 
 def _nlcd92_state(path):
+    """Infer the legacy NLCD92 state-grid key from a source filename.
+
+    Args:
+        path: Source path whose filename precedes ``_nlcd`` or ``-nlcd`` with
+            a key in :data:`NLCD92_SPECS`.
+
+    Returns:
+        Lowercase state or regional lookup key.
+
+    Raises:
+        ValueError: If the filename does not identify a known NLCD92 grid.
+    """
     match=re.search(r'^(.+?)[_-]nlcd',path.name,re.IGNORECASE)
     if match is None or match.group(1).lower() not in NLCD92_SPECS:
         raise ValueError(f'NLCD92 filename does not identify a legacy state: {path.name}')
@@ -742,7 +1185,22 @@ def _nlcd92_state(path):
 
 
 def _accumulate_nlcd92(path,config,spec: Nlcd92Spec | None=None,snow=None):
-    """Read a headerless state NLCD92 byte grid using the legacy geometry table."""
+    """Read and accumulate a headerless state NLCD92 byte grid.
+
+    Args:
+        path: Headerless one-byte NLCD92 raster path.
+        config: Active source datum, target-grid, coastline, and QA settings.
+        spec: Optional geometry override; otherwise inferred from ``path``.
+        snow: Optional sparse SNODAS mapping updated for accepted samples.
+
+    Returns:
+        Tuple ``(counts, pixels_read, samples_inside)``. ``counts`` is an
+        ``int64`` array shaped ``(38, grid.ny, grid.nx)`` in USGS-38 order.
+
+    Raises:
+        ValueError: If the filename, raster size, source category, or datum is
+            invalid.
+    """
     spec=NLCD92_SPECS[_nlcd92_state(path)] if spec is None else spec
     if path.stat().st_size!=spec.nx*spec.ny:
         raise ValueError(f'NLCD92 raster must contain {spec.nx}x{spec.ny} bytes: {path}')
@@ -781,7 +1239,22 @@ def _accumulate_nlcd92(path,config,spec: Nlcd92Spec | None=None,snow=None):
 
 
 def _accumulate_nlcd_geotiff(path,config,translation,snow=None):
-    """Read an NLCD GeoTIFF using its standard CRS and affine tags."""
+    """Read and accumulate an NLCD GeoTIFF using its embedded geometry.
+
+    Args:
+        path: NLCD categorical GeoTIFF path.
+        config: Active target-grid, coastline, and QA settings.
+        translation: Integer lookup from source NLCD values to USGS classes.
+        snow: Optional sparse SNODAS mapping updated for accepted samples.
+
+    Returns:
+        Tuple ``(counts, pixels_read, samples_inside)``. ``counts`` is an
+        ``int64`` array shaped ``(38, grid.ny, grid.nx)`` in USGS-38 order.
+
+    Raises:
+        ValueError: If raster geometry, bands, dtype, source classes, mapped
+            classes, or target projection is invalid.
+    """
     source_crs,x0,y0,dx,dy,data,_,valid_data=_read_categorical_raster(path)
     if data.ndim!=2: raise ValueError('NLCD GeoTIFF must contain one two-dimensional band')
     if data.dtype.kind not in {'u','i'}: raise ValueError('NLCD GeoTIFF categories must be integers')
@@ -813,7 +1286,23 @@ def _accumulate_nlcd_geotiff(path,config,translation,snow=None):
 
 
 def _corine_indices(data,photometric,path,valid=None):
-    """Return one-based CORINE classes for index, class-code, or RGB TIFFs."""
+    """Decode index, class-code, or RGB CORINE pixels to class positions.
+
+    Args:
+        data: Raster data as one category band or RGB(A) bands.
+        photometric: Encoding flag: 2 for RGB, 3 for palette indices, or any
+            other value for three-digit CORINE class codes.
+        path: Source path used in validation messages.
+        valid: Optional Boolean raster validity mask.
+
+    Returns:
+        Two-dimensional ``int16`` array of one-based positions in the CORINE
+        translation table; invalid raster pixels are zero.
+
+    Raises:
+        ValueError: If shape, dtype, RGB range, validity-mask shape, or a
+            category value is invalid.
+    """
     raw=np.asarray(data)
     if photometric==2:
         if raw.ndim==3 and raw.shape[-1] in {3,4}: rgb=raw[...,:3]
@@ -855,7 +1344,21 @@ def _corine_indices(data,photometric,path,valid=None):
 
 
 def _accumulate_corine(path,config,snow=None):
-    """Mesh-sample all three CORINE GeoTIFF category encodings."""
+    """Mesh-sample and accumulate any supported CORINE GeoTIFF encoding.
+
+    Args:
+        path: CORINE categorical GeoTIFF path.
+        config: Active mesh, target-grid, coastline, and QA settings.
+        snow: Optional sparse SNODAS mapping updated for accepted samples.
+
+    Returns:
+        Tuple ``(counts, pixels_read, samples_inside)``. ``counts`` is an
+        ``int64`` array shaped ``(38, grid.ny, grid.nx)`` in USGS-38 order.
+
+    Raises:
+        ValueError: If raster geometry, encoding, categories, mesh density, or
+            projection metadata is invalid.
+    """
     source_crs,x0,y0,dx,dy,data,photometric,valid_data=_read_categorical_raster(path)
     indices=_corine_indices(data,photometric,path,valid_data)
     transformer=Transformer.from_crs(source_crs,_lcc(config.grid),always_xy=True)
@@ -890,7 +1393,25 @@ def _accumulate_corine(path,config,snow=None):
 
 def _accumulate_global_geotiff(path,config,translation,*,offset=0,missing=(),
                                fallback_epsg=None,snow=None):
-    """Mesh-sample a global categorical GeoTIFF as CTGPROC does."""
+    """Mesh-sample and accumulate a global categorical GeoTIFF.
+
+    Args:
+        path: Global categorical GeoTIFF path.
+        config: Active source type, mesh, target-grid, coastline, and QA settings.
+        translation: Integer lookup from adjusted source values to USGS classes.
+        offset: Integer added to each raw source value before lookup.
+        missing: Raw source values treated as absent.
+        fallback_epsg: EPSG code used only when the raster has no embedded CRS.
+        snow: Optional sparse SNODAS mapping updated for accepted samples.
+
+    Returns:
+        Tuple ``(counts, pixels_read, samples_inside)``. ``counts`` is an
+        ``int64`` array shaped ``(38, grid.ny, grid.nx)`` in USGS-38 order.
+
+    Raises:
+        ValueError: If raster geometry, dtype, categories, mesh density, or
+            projection metadata is invalid.
+    """
     source_crs,x0,y0,dx,dy,data,_,valid_data=_read_categorical_raster(
         path,fallback_crs=(None if fallback_epsg is None else CRS.from_epsg(fallback_epsg)))
     if data.ndim!=2 or data.dtype.kind not in {'u','i'}:
@@ -936,7 +1457,22 @@ def _accumulate_global_geotiff(path,config,translation,*,offset=0,missing=(),
 
 
 def _accumulate_modis(path,config,spec: ModisSpec | None=None,snow=None):
-    """Window and mesh-sample the raw BU MODIS global byte grid."""
+    """Window, mesh-sample, and accumulate a raw BU MODIS byte grid.
+
+    Args:
+        path: Headerless one-byte global MODIS land-cover raster.
+        config: Active source datum, mesh, target-grid, coastline, and QA settings.
+        spec: Optional raster geometry override; defaults to ``MODIS_SPEC``.
+        snow: Optional sparse SNODAS mapping updated for accepted samples.
+
+    Returns:
+        Tuple ``(counts, pixels_read, samples_inside)``. ``counts`` is an
+        ``int64`` array shaped ``(38, grid.ny, grid.nx)`` in USGS-38 order.
+
+    Raises:
+        ValueError: If raster size, mesh density, datum, or grid projection is
+            invalid.
+    """
     spec=MODIS_SPEC if spec is None else spec
     if path.stat().st_size!=spec.nx*spec.ny:
         raise ValueError(f'MODIS raster must contain {spec.nx}x{spec.ny} bytes: {path}')
@@ -986,7 +1522,23 @@ def _accumulate_modis(path,config,spec: ModisSpec | None=None,snow=None):
     return counts.reshape(USGS38.size,config.grid.ny,config.grid.nx),read,inside
 
 def _read_previous_landuse(path,grid):
-    """Read continuation counts and optional sparse snow records."""
+    """Read CTGPROC continuation hits and optional sparse snow records.
+
+    Args:
+        path: Modern NetCDF or legacy ASCII HITS land-use product.
+        grid: Target grid that the continuation product must match.
+
+    Returns:
+        Tuple ``(categories, counts, snow)``. Categories are ``int16``;
+        counts are non-negative ``int64`` with shape
+        ``(category, grid.ny, grid.nx)``; ``snow`` is an optional
+        :class:`SnowGridInfo`.
+
+    Raises:
+        ValueError: If file type, dimensions, geometry, projection, datum,
+            counts, or snow metadata does not match the target grid.
+        OSError: If the continuation file cannot be read.
+    """
     source=Path(path)
     if source.suffix.lower() in {'.nc','.nc4','.cdf'}:
         with Dataset(source) as dataset:
@@ -1119,6 +1671,22 @@ def _read_previous_landuse(path,grid):
 
 
 def _snow_rows(snow,categories):
+    """Flatten sparse snow hits into serializable fractional records.
+
+    Args:
+        snow: Optional sparse snow mapping.
+        categories: Ordered output land-use category identifiers.
+
+    Returns:
+        Pair ``(rows, totals)``. Each row contains zero-based target cell,
+        one-based category position, SNODAS cell, ``float32`` sample fraction,
+        and integer hit count. ``totals`` is an ``int64`` flattened-cell array;
+        it is empty when ``snow`` is ``None``.
+
+    Raises:
+        ValueError: If snow records contain a category absent from
+            ``categories``.
+    """
     if snow is None:
         return (),np.empty(0,dtype=np.int64)
     grouped,totals=snow.records(categories)
@@ -1132,6 +1700,26 @@ def _snow_rows(snow,categories):
 
 def _write_netcdf(path,fractions,counts,g,categories=USGS38,*,final_output=True,
                   snow=None,qa_statistics=None):
+    """Write a modern NetCDF CTGPROC land-use product.
+
+    Args:
+        path: Destination path.
+        fractions: Category fractions shaped ``(category, y, x)``.
+        counts: Category hit counts shaped ``(category, y, x)``.
+        g: Output grid geometry and datum.
+        categories: Ordered land-use category identifiers.
+        final_output: Mark the product as FRACTION; false marks continuation HITS.
+        snow: Optional sparse SNODAS mapping.
+        qa_statistics: Optional ``(average hits, threshold, low-cell count)``.
+
+    Returns:
+        None. Fractions are stored as ``float32`` and counts as ``int32``.
+
+    Raises:
+        ValueError: If array sizes are incompatible with ``g`` or snow
+            categories are inconsistent.
+        OSError: If the NetCDF file cannot be created or written.
+    """
     with Dataset(path,"w",format="NETCDF4") as ds:
         ds.createDimension("category",len(categories)); ds.createDimension("y",g.ny); ds.createDimension("x",g.nx)
         ds.Conventions="CF-1.8"; ds.source="PyCALMET CTGPROC NumPy port"; ds.projection=g.projection; ds.datum=g.datum
@@ -1163,6 +1751,24 @@ def _write_netcdf(path,fractions,counts,g,categories=USGS38,*,final_output=True,
 
 def _write_legacy(path,fractions,counts,g,categories=USGS38,*,final_output=True,
                   snow=None):
+    """Write a legacy ASCII ``LU.DAT`` CTGPROC product.
+
+    Args:
+        path: Destination :class:`Path`.
+        fractions: Category fractions shaped ``(category, y, x)``.
+        counts: Category hit counts shaped ``(category, y, x)``.
+        g: Output grid geometry, projection, and datum.
+        categories: Ordered land-use category identifiers.
+        final_output: Write FRACTION records when true, otherwise HITS records.
+        snow: Optional sparse SNODAS mapping appended to the file.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If snow categories are inconsistent with ``categories``.
+        OSError: If the output file cannot be written.
+    """
     with path.open("w",encoding="ascii") as s:
         file_type='FRACTION' if final_output else 'HITS'
         s.write(f"{'LU.DAT':<16}{'2.1':<16}"
@@ -1212,7 +1818,16 @@ def _write_legacy(path,fractions,counts,g,categories=USGS38,*,final_output=True,
 
 
 def _fractions_from_counts(counts):
-    """Convert integer category hits to the model's FP32 fractions."""
+    """Convert integer category hits to model-ready fractions.
+
+    Args:
+        counts: Integer hit array shaped ``(category, ...)``.
+
+    Returns:
+        Pair ``(totals, fractions)``. ``totals`` is an ``int64`` array over
+        the spatial axes; ``fractions`` is ``float32`` with the input shape.
+        Cells with no hits contain zero fractions.
+    """
     hits=np.asarray(counts,dtype=np.int64)
     totals=hits.sum(axis=0,dtype=np.int64)
     numerator=np.asarray(hits,dtype=np.float64)
@@ -1223,12 +1838,37 @@ def _fractions_from_counts(counts):
 
 
 def _low_hit_threshold(average_hits,threshold_percent):
-    """Return the integer hit-count threshold for QA reporting."""
+    """Calculate the integer low-hit threshold used for QA reporting.
+
+    Args:
+        average_hits: Integer mean number of source hits per target cell.
+        threshold_percent: Integer percentage of the mean used as the cutoff.
+
+    Returns:
+        Positive integer threshold, truncated like the legacy calculation.
+    """
     product=int(average_hits)*int(threshold_percent)
     return max(1,product//100)
 
 
 def run(config: CtgprocConfig) -> LanduseResult:
+    """Aggregate configured land-use sources onto a CTGPROC target grid.
+
+    Args:
+        config: Input datasets and source formats, target grid, category map,
+            coastline rules, QA controls, snow mapping, and output settings.
+
+    Returns:
+        Summary containing the output path and sampling/coverage statistics.
+
+    Raises:
+        FileNotFoundError: If a configured source dataset does not exist.
+        ValueError: If inputs, source metadata, target grid, mappings,
+            coastline controls, QA threshold, or output settings are invalid.
+        NotImplementedError: If a configured source type or projection is not
+            supported.
+        OSError: If a QA or output file cannot be written.
+    """
     if not 0<=config.qa_hit_threshold_percent<=100:
         raise ValueError('qa_hit_threshold_percent/ITHRESH must be between 0 and 100')
     output_format=config.output_format.lower()

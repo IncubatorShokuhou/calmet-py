@@ -6,6 +6,15 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True,slots=True)
 class Nlcd92Spec:
+    """Describe the fixed Albers grid of one raw NLCD 1992 state tile.
+
+    Attributes:
+        nx: Number of west-to-east raster columns.
+        ny: Number of north-to-south raster rows.
+        x_origin_km: Western source-grid origin in Albers kilometres.
+        y_origin_km: Southern source-grid origin in Albers kilometres.
+    """
+
     nx: int
     ny: int
     x_origin_km: float
@@ -14,6 +23,16 @@ class Nlcd92Spec:
 
 @dataclass(frozen=True,slots=True)
 class ModisSpec:
+    """Describe the global equal-angle MODIS land-cover grid.
+
+    Attributes:
+        nx: Number of longitude columns.
+        ny: Number of latitude rows.
+        x_origin: Longitude of the first cell centre, in degrees east.
+        y_origin: Latitude of the first cell centre, in degrees north.
+        spacing: Cell-centre spacing in angular degrees.
+    """
+
     nx: int=43200
     ny: int=21600
     x_origin: float=-180.+1./240.

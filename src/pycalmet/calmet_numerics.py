@@ -18,17 +18,49 @@ COORDINATE_DTYPE = np.float64
 
 
 def _model_array(value):
-    """Return a model-state array at the public numerical boundary."""
+    """Convert a numerical result to the model-state precision.
+
+    Args:
+        value: Scalar or array-like numerical values in any broadcast shape.
+
+    Returns:
+        A NumPy float32 array with the same shape as ``value``. Existing
+        float32 arrays may be returned without a copy.
+    """
     return np.asarray(value, dtype=MODEL_DTYPE)
 
 
 def _psiud(z_over_l,*,dtype=MODEL_DTYPE):
-    """CALMET's COARE/Dyer wind stability function."""
+    """Evaluate CALMET's COARE/Dyer momentum stability function.
+
+    Args:
+        z_over_l: Scalar or array-like dimensionless height-to-Monin-Obukhov-
+            length ratio.
+        dtype: NumPy floating dtype used for the calculation and result.
+
+    Returns:
+        Array with the shape of ``z_over_l`` and the requested floating dtype;
+        values are dimensionless momentum stability corrections.
+    """
     return psi_momentum_dyer(z_over_l,dtype=dtype)
 
 
 def _psiuc(height,monin_obukhov,fit=16,*,dtype=MODEL_DTYPE):
-    """PSIUC stability function used when ``IPSIFCN=1``."""
+    """Evaluate the PSIUC momentum correction used when ``IPSIFCN=1``.
+
+    Args:
+        height: Evaluation height in metres, scalar or array-like.
+        monin_obukhov: Monin-Obukhov length in metres, broadcast-compatible
+            with ``height``.
+        fit: Empirical unstable-fit coefficient; CALMET supports 15 or 16.
+        dtype: NumPy floating dtype used for calculation and output.
+
+    Returns:
+        Dimensionless array with the broadcast input shape and requested dtype.
+
+    Raises:
+        ValueError: If ``fit`` is neither 15 nor 16.
+    """
     if fit not in {15,16}: raise ValueError('PSIUC fit must be 15 or 16')
     work_dtype=np.dtype(dtype).type
     height,length=np.broadcast_arrays(np.asarray(height,dtype=work_dtype),
@@ -52,7 +84,33 @@ def _psiuc(height,monin_obukhov,fit=16,*,dtype=MODEL_DTYPE):
 def similarity_wind_profiles(u,v,anemometer_height_m,z_centers_m,z_faces_m,
         roughness_m,monin_obukhov_m,mixing_height_m,station_latitude,*,
         ipsifcn=0,minimum_mixing_height_m=50.):
-    """Vectorized SIMILT station profiles in the model's default precision."""
+    """Construct vectorized CALMET SIMILT station wind profiles.
+
+    Args:
+        u: One-dimensional station eastward winds in m s-1.
+        v: One-dimensional station northward winds in m s-1, matching ``u``.
+        anemometer_height_m: Wind measurement heights in metres by station.
+        z_centers_m: One-dimensional CALMET layer-centre heights in metres.
+        z_faces_m: One-dimensional layer-face heights in metres with one more
+            element than ``z_centers_m``.
+        roughness_m: Surface roughness length in metres by station.
+        monin_obukhov_m: Monin-Obukhov length in metres by station.
+        mixing_height_m: Mixing height in metres by station.
+        station_latitude: Station latitude in degrees north, used to select
+            the hemisphere-dependent wind turning direction.
+        ipsifcn: Momentum stability function selector: 0 for Dyer/COARE or 1
+            for PSIUC.
+        minimum_mixing_height_m: Minimum profile depth in metres.
+
+    Returns:
+        Pair ``(u_profile, v_profile)`` of float32 arrays with shape
+        ``(level, station)`` in m s-1. Layers whose upper face is above the
+        station mixing-height limit retain the missing value 9999.
+
+    Raises:
+        ValueError: If station arrays or vertical coordinates have
+            inconsistent shapes, or ``ipsifcn`` is unsupported.
+    """
     u=np.asarray(u,dtype=MODEL_DTYPE); v=np.asarray(v,dtype=MODEL_DTYPE)
     anem=np.asarray(anemometer_height_m,dtype=MODEL_DTYPE)
     roughness=np.asarray(roughness_m,dtype=MODEL_DTYPE)
@@ -117,7 +175,29 @@ def similarity_wind_profiles(u,v,anemometer_height_m,z_centers_m,z_faces_m,
 
 def cloud_liquid_water_profile(
         cloud_water_g_kg,height_agl_m,z_faces_m,threshold_g_kg=.005):
-    """Vectorized Z2FACE/PRFVAR mapping used by CALMET.AUX output."""
+    """Map source cloud liquid water to CALMET layers and above-model fields.
+
+    Args:
+        cloud_water_g_kg: Float-like array shaped ``(source_level, ...)`` with
+            cloud liquid water mixing ratio in g kg-1.
+        height_agl_m: Source mass-level heights above ground in metres with the
+            same shape as ``cloud_water_g_kg``.
+        z_faces_m: Strictly increasing one-dimensional CALMET layer faces in
+            metres above ground.
+        threshold_g_kg: Minimum source and reported above-model cloud water in
+            g kg-1.
+
+    Returns:
+        Tuple ``(mapped, above, bottom, top)`` of float32 arrays. ``mapped`` has
+        shape ``(target_level, ...)`` and units g kg-1; the remaining arrays
+        have the source profile's trailing shape, with ``above`` in g kg-1 and
+        cloud ``bottom`` and ``top`` in metres above ground. Absent cloud uses
+        zero. Inputs are not modified.
+
+    Raises:
+        ValueError: If cloud and height profiles differ, contain no source
+            level, or target faces are not a strictly increasing vector.
+    """
     cloud=np.asarray(cloud_water_g_kg,dtype=MODEL_DTYPE)
     height=np.asarray(height_agl_m,dtype=MODEL_DTYPE)
     target=np.asarray(z_faces_m,dtype=MODEL_DTYPE)
@@ -165,20 +245,33 @@ def cloud_liquid_water_profile(
         mapped,np.where(reported,average,0.),np.where(reported,bottom,0.),
         np.where(reported,top,0.)))
 
-def air_density(pressure_mb, temperature_k, nearest_station):
-    """AIRDen: ideal-gas density using the nearest surface station."""
-    pressure=np.asarray(pressure_mb,dtype=MODEL_DTYPE)
-    nearest=np.asarray(nearest_station,dtype=np.intp)
-    return density_from_pressure_temperature(pressure[nearest],temperature_k)
-
 def density_from_pressure_temperature(pressure_mb,temperature_k):
-    """AIRDEN ideal-gas density expression."""
+    """Calculate dry-air density with CALMET's AIRDEN ideal-gas expression.
+
+    Args:
+        pressure_mb: Atmospheric pressure in millibars, scalar or array-like.
+        temperature_k: Air temperature in kelvins, broadcast-compatible with
+            ``pressure_mb``.
+
+    Returns:
+        Float32 density in kg m-3 with the broadcast input shape.
+    """
     pressure=np.asarray(pressure_mb,dtype=MODEL_DTYPE)
     temperature=np.asarray(temperature_k,dtype=MODEL_DTYPE)
     return _model_array(.3484321*pressure/temperature)
 
 def coriolis_parameter(latitude_degrees, configured_value=999.):
-    """MICROI absolute Coriolis field, including its equatorial floor."""
+    """Calculate CALMET's absolute Coriolis field with an equatorial floor.
+
+    Args:
+        latitude_degrees: Latitude in decimal degrees, scalar or array-like.
+        configured_value: Scalar Coriolis parameter in s-1. Values above 998
+            request calculation from latitude.
+
+    Returns:
+        Float32 nonnegative Coriolis parameter in s-1 with the latitude shape;
+        all values are floored at ``2.5e-5`` s-1.
+    """
     latitude=np.asarray(latitude_degrees,dtype=np.float64)
     if configured_value>998.:
         omega=2.*np.pi/86400.
@@ -189,7 +282,21 @@ def coriolis_parameter(latitude_degrees, configured_value=999.):
     return _model_array(np.maximum(np.abs(value),np.float64(.25e-4)))
 
 def inverse_distance_squared(values, point_x, point_y, sample_x, sample_y, *, ignore_zero=False):
-    """R2INTERP/CINTERP, vectorised over any leading target dimensions."""
+    """Interpolate samples with CALMET R2INTERP inverse-square weighting.
+
+    Args:
+        values: Sample values whose final broadcast axis indexes samples.
+        point_x: Target x coordinates in the same units as ``sample_x``.
+        point_y: Target y coordinates, matching or broadcast-compatible with
+            ``point_x``.
+        sample_x: One-dimensional sample x coordinates.
+        sample_y: One-dimensional sample y coordinates matching ``sample_x``.
+        ignore_zero: If true, exclude sample values below ``1e-6``.
+
+    Returns:
+        Float32 interpolated values with the broadcast target shape. A target
+        with no retained weight receives zero. Inputs are not modified.
+    """
     values=np.asarray(values,dtype=MODEL_DTYPE)
     dx=np.asarray(sample_x,dtype=COORDINATE_DTYPE)-np.asarray(
         point_x,dtype=COORDINATE_DTYPE)[...,None]
@@ -207,10 +314,30 @@ def inverse_distance_squared(values, point_x, point_y, sample_x, sample_y, *, ig
 
 def lake_breeze_adjust(u, v, station_u, station_v, station_xy_m,
                        station_ids, regions, dx_m, dy_m):
-    """LLBREEZ/INTERB lowest-layer interpolation by coast distance.
+    """Apply LLBREEZ coast-distance interpolation to the lowest wind layer.
 
-    Region tuples contain ``XG1,XG2,YG1,YG2`` grid-line bounds, two
-    coastline endpoints in relative metres, and the ordered station IDs.
+    Args:
+        u: Wind eastward component shaped ``(level, y, x)`` in m s-1.
+        v: Wind northward component with the same shape and units as ``u``.
+        station_u: One-dimensional station eastward winds in m s-1.
+        station_v: One-dimensional station northward winds in m s-1.
+        station_xy_m: Float-like ``(station, 2)`` projected coordinates in m.
+        station_ids: One-dimensional integer identifiers corresponding to the
+            station arrays.
+        regions: Iterable of nine-item regions: grid-line bounds
+            ``XG1, XG2, YG1, YG2``, two coastline endpoints in relative metres,
+            and an ordered station-ID sequence.
+        dx_m: Target grid spacing along x in metres.
+        dy_m: Target grid spacing along y in metres.
+
+    Returns:
+        Pair of float32 ``(level, y, x)`` copies. Only lowest-layer cells inside
+        configured regions are replaced; other cells and higher layers remain
+        unchanged.
+
+    Raises:
+        ValueError: If wind or station shapes are inconsistent, a region has
+            the wrong layout or no stations, or a station ID is unavailable.
     """
     result_u=np.asarray(u,dtype=MODEL_DTYPE).copy()
     result_v=np.asarray(v,dtype=MODEL_DTYPE).copy()
@@ -280,6 +407,17 @@ def lake_breeze_adjust(u, v, station_u, station_v, station_xy_m,
         valid_u=values_u<990.; valid_v=values_v<990.
         if valid_u.any() and valid_v.any():
             def interpolate(values,valid):
+                """Interpolate one station component to active region cells.
+
+                Args:
+                    values: One-dimensional wind component for selected
+                        stations in m s-1.
+                    valid: Boolean mask selecting non-missing station values.
+
+                Returns:
+                    Float64 array of inverse-square coast-distance interpolated
+                    values, one per target cell in the current region.
+                """
                 top=np.zeros(target_x.size,dtype=np.float64)
                 bottom=np.zeros(target_x.size,dtype=np.float64)
                 for station in np.flatnonzero(valid):
@@ -293,7 +431,17 @@ def lake_breeze_adjust(u, v, station_u, station_v, station_xy_m,
     return result_u,result_v
 
 def wind_speed_direction(u,v):
-    """RTHETA meteorological speed and direction (calm direction is zero)."""
+    """Convert vector wind to CALMET RTHETA speed and direction.
+
+    Args:
+        u: Eastward wind component in m s-1, scalar or array-like.
+        v: Northward wind component in m s-1, broadcast-compatible with ``u``.
+
+    Returns:
+        Pair ``(speed, direction)`` of float32 arrays with the broadcast input
+        shape. Speed is in m s-1 and meteorological direction is degrees
+        clockwise from north; calm direction is zero.
+    """
     u=np.asarray(u,dtype=MODEL_DTYPE); v=np.asarray(v,dtype=MODEL_DTYPE)
     squared=u*u+v*v
     speed=np.sqrt(squared)
@@ -303,7 +451,16 @@ def wind_speed_direction(u,v):
     return _model_array(speed),_model_array(direction)
 
 def cloud_fraction(relative_humidity_percent):
-    """CLOUD3 Teixeira diagnostic cloud fraction."""
+    """Diagnose CLOUD3 cloud fraction with the Teixeira relation.
+
+    Args:
+        relative_humidity_percent: Relative humidity in percent, scalar or
+            array-like.
+
+    Returns:
+        Array with the input shape containing dimensionless cloud fraction.
+        Computation uses float32 and values at or above 99 percent map to one.
+    """
     rh=np.asarray(relative_humidity_percent,dtype=MODEL_DTYPE)
     rhd=rh/100.; gap=1.-rhd
     result=np.ones_like(rhd)
@@ -313,7 +470,20 @@ def cloud_fraction(relative_humidity_percent):
     return result
 
 def cloud_cover_teixeira_850(relative_humidity_percent,pressure_mb):
-    """CLOUD3 cover using the last prognostic level at or above 850 mb."""
+    """Diagnose CLOUD3 cover at the last level at or above 850 mb.
+
+    Args:
+        relative_humidity_percent: Float-like ``(level, y, x)`` relative
+            humidity in percent.
+        pressure_mb: Pressure in millibars with the same shape.
+
+    Returns:
+        Float32 dimensionless cloud fraction with shape ``(y, x)``. Columns
+        that never cross below 850 mb use zero relative humidity.
+
+    Raises:
+        ValueError: If inputs do not share a three-dimensional shape.
+    """
     rh=np.asarray(relative_humidity_percent,dtype=MODEL_DTYPE)
     pressure=np.asarray(pressure_mb,dtype=MODEL_DTYPE)
     if rh.shape!=pressure.shape or rh.ndim!=3:
@@ -324,10 +494,22 @@ def cloud_cover_teixeira_850(relative_humidity_percent,pressure_mb):
     return cloud_fraction(rh850)
 
 def cloud_cover_mm5(relative_humidity_percent, pressure_mb, height_m):
-    """CLOUD4 low/middle/high RH cloud cover and ceiling height.
+    """Diagnose CLOUD4 low, middle, and high cloud cover and ceiling.
 
-    Inputs use ``(z, y, x)`` axes.  The pressure thresholds and integer
-    midpoint choice intentionally match CALMET's original CLOUD4 routine.
+    Args:
+        relative_humidity_percent: Float-like ``(level, y, x)`` relative
+            humidity in percent.
+        pressure_mb: Pressure in millibars with the same shape.
+        height_m: Layer heights in metres above ground with the same shape.
+
+    Returns:
+        Pair ``(cover, ceiling)`` of float32 ``(y, x)`` arrays. ``cover`` is a
+        dimensionless fraction and ``ceiling`` is metres above ground, with
+        zero for clear columns. Pressure bands and integer midpoint selection
+        follow CALMET CLOUD4 exactly.
+
+    Raises:
+        ValueError: If inputs do not share a three-dimensional shape.
     """
     rh=np.asarray(relative_humidity_percent,dtype=MODEL_DTYPE)
     pressure=np.asarray(pressure_mb,dtype=MODEL_DTYPE)
@@ -335,10 +517,29 @@ def cloud_cover_mm5(relative_humidity_percent, pressure_mb, height_m):
     if rh.shape!=pressure.shape or rh.shape!=height.shape or rh.ndim!=3: raise ValueError('cloud profiles must share shape (z,y,x)')
     nz=rh.shape[0]; levels=np.arange(nz)[:,None,None]
     def first_below(threshold):
+        """Find the first level whose pressure is below a threshold.
+
+        Args:
+            threshold: Pressure threshold in millibars.
+
+        Returns:
+            Integer ``(y, x)`` level indices; columns with no crossing receive
+            ``nz``, one past the final valid level.
+        """
         mask=pressure<threshold
         return np.where(mask.any(axis=0),mask.argmax(axis=0),nz)
     klo,kmid,khi=first_below(970.),first_below(800.),first_below(450.)
     def band_max(start,stop=None):
+        """Find maximum relative humidity within column-specific level bands.
+
+        Args:
+            start: Integer ``(y, x)`` inclusive starting level.
+            stop: Optional integer ``(y, x)`` exclusive ending level.
+
+        Returns:
+            Float32 ``(y, x)`` maximum relative humidity in percent. An empty
+            band contributes zero.
+        """
         mask=levels>=start[None,:,:]
         if stop is not None: mask &= levels<stop[None,:,:]
         return np.max(np.where(mask,rh,0.),axis=0)
@@ -357,7 +558,26 @@ def cloud_cover_mm5(relative_humidity_percent, pressure_mb, height_m):
     return cover,ceiling
 
 def lapse_rate(temperature_k, previous_convective_height_m, z_centers_m, height_m=200., *, spatial=True):
-    """CGAMMA2 prognostic temperature lapse rate (K/m)."""
+    """Diagnose the CGAMMA2 near-surface potential-temperature lapse rate.
+
+    Args:
+        temperature_k: Float-like temperature shaped ``(level, y, x)`` in K.
+        previous_convective_height_m: Previous convective height shaped
+            ``(y, x)`` in metres.
+        z_centers_m: One-dimensional model layer centres in metres above ground.
+        height_m: Diagnostic interpolation height in metres above ground.
+        spatial: If true, retain cellwise lapse rates; otherwise replace them
+            with their domain mean.
+
+    Returns:
+        Float32 ``(y, x)`` lapse-rate field in K m-1. Cells with a previous
+        convective height at least ``height_m`` use the dry-adiabatic value
+        ``-0.0098`` K m-1.
+
+    Raises:
+        ValueError: If profile/grid shapes disagree or ``height_m`` is not
+            bracketed above the lowest model midpoint.
+    """
     temp=np.asarray(temperature_k,dtype=MODEL_DTYPE)
     zi=np.asarray(previous_convective_height_m,dtype=MODEL_DTYPE)
     centers=np.asarray(z_centers_m,dtype=MODEL_DTYPE)
@@ -378,7 +598,28 @@ def lapse_rate(temperature_k, previous_convective_height_m, z_centers_m, height_
 def froude_adjustment(u, v, terrain_m, maximum_terrain_m, gamma_k_per_m,
                       temperature_k, z_centers_m, critical_froude,
                       dx_m, dy_m):
-    """FRADJ terrain-blocking rotation with wind speed conserved."""
+    """Apply CALMET FRADJ terrain blocking while conserving wind speed.
+
+    Args:
+        u: Eastward wind shaped ``(level, y, x)`` in m s-1.
+        v: Northward wind with the same shape and units as ``u``.
+        terrain_m: Cell terrain shaped ``(y, x)`` in metres.
+        maximum_terrain_m: Local maximum terrain shaped ``(y, x)`` in metres.
+        gamma_k_per_m: Near-surface temperature lapse shaped ``(y, x)`` in
+            K m-1.
+        temperature_k: Surface temperature shaped ``(y, x)`` in kelvins.
+        z_centers_m: One-dimensional layer-centre heights above ground in m.
+        critical_froude: Scalar or broadcast-compatible critical Froude number.
+        dx_m: Grid spacing along x in metres.
+        dy_m: Grid spacing along y in metres.
+
+    Returns:
+        Pair of float32 ``(level, y, x)`` wind arrays in m s-1. Blocked
+        upslope flow is rotated tangentially; input arrays are not modified.
+
+    Raises:
+        ValueError: If wind, grid, or vertical-coordinate shapes disagree.
+    """
     u=np.array(u,dtype=MODEL_DTYPE,copy=True)
     v=np.array(v,dtype=MODEL_DTYPE,copy=True)
     terrain=np.asarray(terrain_m,dtype=MODEL_DTYPE)
@@ -417,11 +658,24 @@ def froude_adjustment(u, v, terrain_m, maximum_terrain_m, gamma_k_per_m,
     return _model_array(u),_model_array(v)
 
 def profile_temperature_layer(temperature_k, height_m, bottom_m, depth_m=200., *, minimum_lapse=.001):
-    """MIXDT2 temperatures and potential-temperature lapse above ``bottom``.
+    """Interpolate MIXDT2 layer temperatures and potential lapse.
 
-    Profiles use ``(z, y, x)`` axes and must bracket both requested heights.
-    Unlike a generic interpolator this reproduces MIXDT2's linear interpolation
-    and its dry-adiabatic conversion to potential-temperature lapse.
+    Args:
+        temperature_k: Temperature profiles shaped ``(level, y, x)`` in K.
+        height_m: Profile heights with the same shape in metres above ground.
+        bottom_m: Cellwise ``(y, x)`` bottom height in metres.
+        depth_m: Layer depth above ``bottom_m`` in metres.
+        minimum_lapse: Minimum potential-temperature lapse in K m-1.
+
+    Returns:
+        Tuple ``(lower, upper, lapse)`` of float32 ``(y, x)`` arrays. The first
+        two are temperatures in K at ``bottom_m`` and ``bottom_m + depth_m``;
+        ``lapse`` is potential-temperature lapse in K m-1 after the
+        dry-adiabatic conversion.
+
+    Raises:
+        ValueError: If profile shapes disagree, requested heights are not
+            bracketed, or profile heights do not increase strictly.
     """
     temperature=np.asarray(temperature_k,dtype=MODEL_DTYPE)
     height=np.asarray(height_m,dtype=MODEL_DTYPE)
@@ -429,6 +683,18 @@ def profile_temperature_layer(temperature_k, height_m, bottom_m, depth_m=200., *
     if temperature.shape!=height.shape or temperature.ndim!=3 or temperature.shape[1:]!=bottom.shape: raise ValueError('profiles must be (z,y,x) and bottom must match their grid')
     flat_t=temperature.reshape(temperature.shape[0],-1); flat_z=height.reshape(height.shape[0],-1); columns=np.arange(flat_t.shape[1])
     def interpolate(target):
+        """Interpolate all flattened temperature columns at target heights.
+
+        Args:
+            target: ``(y, x)`` heights in metres above ground.
+
+        Returns:
+            Float32 ``(y, x)`` temperatures in kelvins.
+
+        Raises:
+            ValueError: If a target is not bracketed or adjacent profile
+                heights fail to increase.
+        """
         target=np.asarray(target,dtype=MODEL_DTYPE).ravel()
         upper=np.sum(flat_z<=target[None,:],axis=0)
         if np.any(upper==0) or np.any(upper>=flat_z.shape[0]): raise ValueError('temperature profile does not bracket mixing-height layer')
@@ -448,10 +714,38 @@ def mixing_height_maul_carson(temperature_profile_k, profile_height_m, previous_
                                minimum_height_m=50., maximum_height_m=2500.,
                                threshold_flux_per_m=0., conste=.15, constn=2400.,
                                constb=1.41, relaxation=True, relaxation_time_s=800., land_mask=None):
-    """MIXHT2 + MIXHMC for CALMET's ``IMIXH=1`` land-cell path.
+    """Calculate MIXHT2/MIXHMC land mixing heights for ``IMIXH=1``.
 
-    Returns total height, convective height, and the updated temperature jump.
-    The implementation is array-vectorised across the horizontal grid.
+    Args:
+        temperature_profile_k: Temperature shaped ``(level, y, x)`` in K.
+        profile_height_m: Heights with the same shape in metres above ground.
+        previous_convective_height_m: Previous convective height in metres.
+        temperature_jump_k: Previous inversion temperature jump in K.
+        friction_velocity: Friction velocity in m s-1.
+        monin_obukhov_m: Monin-Obukhov length in metres.
+        sensible_heat_flux: Surface sensible heat flux in W m-2.
+        density: Air density in kg m-3.
+        coriolis: Absolute Coriolis parameter in s-1.
+        timestep_s: Integration time step in seconds.
+        depth_m: MIXDT2 layer depth in metres.
+        minimum_lapse: Minimum potential-temperature lapse in K m-1.
+        minimum_height_m: Lower mixing-height bound in metres.
+        maximum_height_m: Upper mixing-height bound in metres.
+        threshold_flux_per_m: Convective threshold coefficient in W m-3.
+        conste: Maul-Carson entrainment coefficient.
+        constn: Stable mechanical-height coefficient.
+        constb: Neutral/convective mechanical-height coefficient.
+        relaxation: Whether weak positive heating relaxes toward equilibrium.
+        relaxation_time_s: Relaxation time scale in seconds.
+        land_mask: Optional boolean ``(y, x)`` mask; false cells return NaN.
+
+    Returns:
+        Tuple ``(total, convective, temperature_jump)`` of float32 ``(y, x)``
+        arrays. Heights are metres and the updated jump is kelvins.
+
+    Raises:
+        ValueError: If the temperature profiles or requested MIXDT2 layer are
+            inconsistent.
     """
     old=np.asarray(previous_convective_height_m,dtype=MODEL_DTYPE)
     jump=np.asarray(temperature_jump_k,dtype=MODEL_DTYPE)
@@ -500,10 +794,24 @@ def convective_height_maul_carson(previous_convective_height_m,temperature_jump_
                                   timestep_s=3600.,threshold_flux_per_m=0.,
                                   maximum_height_m=2500.,minimum_lapse=.001,conste=.15,
                                   relaxation=True,relaxation_time_s=800.):
-    """CALMET MIXHMC from an already computed surface buoyancy flux.
+    """Calculate CALMET MIXHMC from a supplied surface buoyancy flux.
 
-    WATER supplies ``WT`` directly, unlike the land wrapper which derives it
-    from sensible heat flux and density.  Arrays are evaluated simultaneously.
+    Args:
+        previous_convective_height_m: Previous convective height in metres.
+        temperature_jump_k: Previous inversion temperature jump in kelvins.
+        buoyancy_flux_k_m_s: Surface kinematic buoyancy flux in K m s-1.
+        potential_lapse_k_m: Potential-temperature lapse in K m-1.
+        timestep_s: Integration time step in seconds.
+        threshold_flux_per_m: Convective threshold coefficient in W m-3.
+        maximum_height_m: Upper convective-height bound in metres.
+        minimum_lapse: Minimum lapse used in the integration in K m-1.
+        conste: Maul-Carson entrainment coefficient.
+        relaxation: Whether weak positive flux relaxes toward equilibrium.
+        relaxation_time_s: Relaxation time scale in seconds.
+
+    Returns:
+        Pair ``(convective_height, temperature_jump)`` of float32 arrays with
+        the broadcast input shape. Height is metres and jump is kelvins.
     """
     old=np.asarray(previous_convective_height_m,dtype=MODEL_DTYPE)
     jump=np.asarray(temperature_jump_k,dtype=MODEL_DTYPE)
@@ -535,7 +843,27 @@ def convective_height_batchvarova_gryning(
         timestep_s=3600.,minimum_height_m=50.,maximum_height_m=2500.,
         threshold_flux_per_m=0.,minimum_lapse=.001,relaxation=True,
         relaxation_time_s=800.):
-    """Vectorised CALMET ``MIXHBG`` driven by a surface buoyancy flux."""
+    """Solve vectorized CALMET MIXHBG convective heights.
+
+    Args:
+        previous_convective_height_m: Previous convective height in metres.
+        buoyancy_flux_k_m_s: Surface kinematic buoyancy flux in K m s-1.
+        potential_lapse_k_m: Potential-temperature lapse in K m-1.
+        friction_velocity: Friction velocity in m s-1.
+        monin_obukhov_m: Monin-Obukhov length in metres.
+        surface_temperature_k: Surface air temperature in kelvins.
+        timestep_s: Integration time step in seconds.
+        minimum_height_m: Lower convective-height bound in metres.
+        maximum_height_m: Upper convective-height bound in metres.
+        threshold_flux_per_m: Convective threshold coefficient in W m-3.
+        minimum_lapse: Minimum lapse in K m-1.
+        relaxation: Whether weak positive flux relaxes toward equilibrium.
+        relaxation_time_s: Relaxation time scale in seconds.
+
+    Returns:
+        Float32 convective height in metres with the broadcast input shape.
+        Nonlinear false-position iterations use float64 internally.
+    """
     old=np.asarray(previous_convective_height_m,dtype=np.float64)
     wt=np.asarray(buoyancy_flux_k_m_s,dtype=np.float64)
     gamma=np.maximum(np.asarray(potential_lapse_k_m,dtype=np.float64),
@@ -576,6 +904,16 @@ def convective_height_batchvarova_gryning(
     r5=np.asarray(e/d,dtype=np.float64)
 
     def fbg(zeta,zetap):
+        """Evaluate the Batchvarova-Gryning implicit height function.
+
+        Args:
+            zeta: Float64 transformed height array for the main logarithm.
+            zetap: Float64 transformed height array for the secondary logarithm.
+
+        Returns:
+            Float64 array with the broadcast input shape and the implicit
+            function value in the solver's transformed units.
+        """
         # Inactive vector lanes use benign placeholders because logarithms
         # require positive arguments even though those lanes are discarded.
         safe_zeta=np.where(zeta>0.,zeta,np.float64(1.)).astype(np.float64)
@@ -644,12 +982,42 @@ def mixing_height_batchvarova_gryning(temperature_profile_k, profile_height_m,
                                       threshold_flux_per_m=0., constn=2400.,
                                       constb=1.41, relaxation=True,
                                       relaxation_time_s=800., land_mask=None):
-    """Vectorised CALMET ``MIXHBG`` plus the common ``MIXHT2`` mechanics.
+    """Calculate MIXHBG plus common MIXHT2 mechanical mixing heights.
 
-    The nonlinear Batchvarova--Gryning equation uses a false-position secant
-    solver.  Its ten iterations operate on whole arrays; no horizontal
-    Python loop is used.  The temperature jump is unchanged because MIXHBG,
-    unlike MIXHMC, does not update CALMET's ``DPTT`` state.
+    Args:
+        temperature_profile_k: Temperature shaped ``(level, y, x)`` in K.
+        profile_height_m: Heights with the same shape in metres above ground.
+        previous_convective_height_m: Previous convective height in metres.
+        temperature_jump_k: Existing inversion temperature jump in kelvins.
+        friction_velocity: Friction velocity in m s-1.
+        monin_obukhov_m: Monin-Obukhov length in metres.
+        sensible_heat_flux: Surface sensible heat flux in W m-2.
+        density: Air density in kg m-3.
+        coriolis: Absolute Coriolis parameter in s-1.
+        surface_temperature_k: Surface air temperature in kelvins.
+        timestep_s: Integration time step in seconds.
+        depth_m: MIXDT2 layer depth in metres.
+        minimum_lapse: Minimum potential-temperature lapse in K m-1.
+        minimum_height_m: Lower mixing-height bound in metres.
+        maximum_height_m: Upper mixing-height bound in metres.
+        threshold_flux_per_m: Convective threshold coefficient in W m-3.
+        constn: Stable mechanical-height coefficient.
+        constb: Neutral/convective mechanical-height coefficient.
+        relaxation: Whether weak positive heating relaxes toward equilibrium.
+        relaxation_time_s: Relaxation time scale in seconds.
+        land_mask: Optional boolean ``(y, x)`` mask; false cells return NaN.
+
+    Returns:
+        Tuple ``(total, convective, temperature_jump)`` of float32 ``(y, x)``
+        arrays. Heights are metres. MIXHBG preserves the supplied jump in K.
+
+    Raises:
+        ValueError: If temperature profile shapes or the requested MIXDT2
+            layer are inconsistent.
+
+    Notes:
+        The nonlinear equation uses float64 vectorized false-position
+        iterations without a horizontal Python loop.
     """
     old=np.asarray(previous_convective_height_m,dtype=np.float64)
     jump=np.asarray(temperature_jump_k,dtype=np.float64)
@@ -691,19 +1059,39 @@ def mixing_height_batchvarova_gryning(temperature_profile_k, profile_height_m,
     return tuple(_model_array(value) for value in (total,convective,jump))
 
 def hosker_roughness(speed_m_s):
-    """Hosker wind-dependent water roughness with floating-point power semantics."""
+    """Calculate Hosker wind-dependent water roughness.
+
+    Args:
+        speed_m_s: Wind speed in m s-1, scalar or array-like.
+
+    Returns:
+        Float32 roughness length in metres with the input shape, floored at
+        ``2e-6`` m. Inputs are not modified.
+    """
     speed=np.asarray(speed_m_s,dtype=MODEL_DTYPE)
     return _model_array(np.maximum(2.e-6,2.e-6*np.power(speed,2.5)))
 
 
 def neutral_water_parameters(u10, v10, coriolis, *, constw=.16,
                              minimum_height_m=50., maximum_height_m=2500.):
-    """WATER's ``NOWSTA=0`` neutral overwater path used by NOOBS runs.
+    """Calculate WATER's neutral ``NOWSTA=0`` state for NOOBS runs.
 
-    It applies the Hosker wind-dependent roughness, neutral DeltaT friction
-    velocity, and the OCD mechanical mixing height.  With no SEA.DAT station
-    the legacy routine has zero buoyancy flux and therefore zero convective
-    mixing height even when ``IMIXH=1``.
+    Args:
+        u10: Ten-metre eastward wind in m s-1.
+        v10: Ten-metre northward wind in m s-1, broadcast-compatible with
+            ``u10``.
+        coriolis: Absolute Coriolis parameter in s-1, broadcast-compatible with
+            the wind.
+        constw: OCD overwater mechanical mixing-height coefficient.
+        minimum_height_m: Lower mixing-height bound in metres.
+        maximum_height_m: Upper mixing-height bound in metres.
+
+    Returns:
+        Six float32 arrays with the broadcast input shape:
+        ``(roughness_m, friction_velocity_m_s, monin_obukhov_m,
+        sensible_heat_flux_w_m2, mixing_height_m, convective_height_m)``.
+        The neutral path uses ``9.9e9`` m Monin-Obukhov length and zero heat
+        flux and convective height.
     """
     u=np.asarray(u10,dtype=MODEL_DTYPE); v=np.asarray(v10,dtype=MODEL_DTYPE)
     f=np.asarray(coriolis,dtype=MODEL_DTYPE)
@@ -719,7 +1107,34 @@ def neutral_water_parameters(u10, v10, coriolis, *, constw=.16,
 def neutral_water_station_profiles(u,v,anemometer_height_m,current_mixing_height_m,
         coriolis,z_centers_m,z_faces_m,station_latitude,*,constw=.16,
         minimum_height_m=50.,maximum_height_m=2500.,ipsifcn=0):
-    """WATER2 neutral/missing-sea-data station path followed by SIMILT."""
+    """Run WATER2's neutral station path followed by SIMILT profiles.
+
+    Args:
+        u: One-dimensional station eastward wind in m s-1.
+        v: One-dimensional station northward wind in m s-1.
+        anemometer_height_m: Wind measurement heights in metres by station.
+        current_mixing_height_m: Current grid mixing heights in metres sampled
+            at station locations.
+        coriolis: Absolute Coriolis parameter in s-1 by station.
+        z_centers_m: One-dimensional CALMET layer centres in metres.
+        z_faces_m: One-dimensional layer faces in metres.
+        station_latitude: Station latitude in degrees north.
+        constw: OCD overwater mechanical mixing-height coefficient.
+        minimum_height_m: Lower overwater mixing-height bound in metres.
+        maximum_height_m: Upper overwater mixing-height bound in metres.
+        ipsifcn: SIMILT stability function selector, 0 or 1.
+
+    Returns:
+        Six float32 arrays ``(u_profile, v_profile, roughness, friction,
+        monin_obukhov, mixing_height)``. Profiles have shape
+        ``(level, station)`` in m s-1; state arrays have shape ``(station,)``
+        and units m, m s-1, m, and m respectively. Missing/calm stations retain
+        the observed lowest layer, 9999 aloft, and NaN state.
+
+    Raises:
+        ValueError: If station/vertical shapes disagree or ``ipsifcn`` is
+            unsupported.
+    """
     u=np.asarray(u,dtype=MODEL_DTYPE); v=np.asarray(v,dtype=MODEL_DTYPE)
     values=tuple(np.asarray(value,dtype=MODEL_DTYPE) for value in (
         anemometer_height_m,current_mixing_height_m,coriolis,station_latitude))
@@ -758,7 +1173,19 @@ def neutral_water_station_profiles(u,v,anemometer_height_m,current_mixing_height
 
 def water_mechanical_height(friction_velocity,coriolis,*,constw=.16,
                             minimum_height_m=50.,maximum_height_m=2500.):
-    """WATER's floating-point ``ZIMECH=CONSTW*USTAR/FCORI`` calculation."""
+    """Calculate WATER mechanical mixing height ``CONSTW*USTAR/FCORI``.
+
+    Args:
+        friction_velocity: Friction velocity in m s-1.
+        coriolis: Absolute Coriolis parameter in s-1, broadcast-compatible with
+            ``friction_velocity``.
+        constw: Dimensionless overwater mechanical-height coefficient.
+        minimum_height_m: Lower returned height bound in metres.
+        maximum_height_m: Upper returned height bound in metres.
+
+    Returns:
+        Float32 mixing height in metres with the broadcast input shape.
+    """
     friction=np.asarray(friction_velocity,dtype=MODEL_DTYPE)
     coriolis=np.asarray(coriolis,dtype=MODEL_DTYPE)
     return _model_array(np.clip(constw*friction/coriolis,
@@ -766,7 +1193,15 @@ def water_mechanical_height(friction_velocity,coriolis,*,constw=.16,
 
 
 def saturation_vapor_pressure_lowe(temperature_c):
-    """CALMET ``ESAT`` Lowe polynomial in model precision."""
+    """Evaluate the CALMET ESAT Lowe saturation-vapour-pressure polynomial.
+
+    Args:
+        temperature_c: Air or water temperature in degrees Celsius, scalar or
+            array-like.
+
+    Returns:
+        Float32 saturation vapour pressure in millibars with the input shape.
+    """
     value=np.asarray(temperature_c,dtype=MODEL_DTYPE)
     coefficients=np.asarray(
         (6.107799961,.4436518521,.01428945805,.0002650648471,
@@ -781,10 +1216,20 @@ def saturation_vapor_pressure_lowe(temperature_c):
 def overwater_delta_temperature_state(air_temperature_k,sea_temperature_k,
                                       relative_humidity_percent,
                                       measurement_height_m):
-    """Prepare WATER's virtual-potential-temperature inputs to ``DELTAT``.
+    """Prepare WATER virtual-potential-temperature inputs for DELTAT.
 
-    The returned tuple is ``(theta, delta_theta_z, delta_theta_10m,
-    theta_10m)``.
+    Args:
+        air_temperature_k: Measured air temperature in kelvins.
+        sea_temperature_k: Sea-surface temperature in kelvins.
+        relative_humidity_percent: Measured relative humidity in percent.
+        measurement_height_m: Air measurement height above water in metres.
+
+    Returns:
+        Four broadcast float32 arrays in kelvins:
+        ``(theta, delta_theta_z, delta_theta_10m, theta_10m)``. ``theta`` is
+        measurement-height virtual potential temperature; the two deltas are
+        air-minus-saturated-surface differences at measurement height and
+        10 m; ``theta_10m`` is the corresponding 10-m value.
     """
     air,sea,rh,height=np.broadcast_arrays(
         np.asarray(air_temperature_k,dtype=MODEL_DTYPE),
@@ -815,7 +1260,26 @@ def delta_temperature_flux(wind_speed_10m,measurement_height_m,
                            virtual_potential_temperature_10m_k,
                            measurement_virtual_potential_temperature_k,
                            roughness_m):
-    """Vectorized CALMET ``DELTAT`` with double-precision nonlinear iteration."""
+    """Solve CALMET DELTAT surface-layer fluxes by nonlinear iteration.
+
+    Args:
+        wind_speed_10m: Ten-metre wind speed in m s-1.
+        measurement_height_m: Thermal measurement height in metres.
+        measurement_minus_surface_virtual_potential_k: Virtual potential
+            temperature difference at measurement height in kelvins.
+        ten_m_minus_surface_virtual_potential_k: Corresponding 10-m difference
+            in kelvins.
+        virtual_potential_temperature_10m_k: Ten-metre virtual potential
+            temperature in kelvins.
+        measurement_virtual_potential_temperature_k: Measurement-height
+            virtual potential temperature in kelvins.
+        roughness_m: Water roughness length in metres.
+
+    Returns:
+        Tuple ``(monin_obukhov, friction_velocity, buoyancy_heat_flux)`` of
+        float32 arrays with the broadcast input shape. Units are metres,
+        m s-1, and W m-2 respectively. Iteration uses float64 internally.
+    """
     wind,height,difference,difference_10m,theta_10m,theta,z0=np.broadcast_arrays(
         np.asarray(wind_speed_10m,dtype=np.float64),
         np.asarray(measurement_height_m,dtype=np.float64),
@@ -891,7 +1355,49 @@ def delta_temperature_water_station_profiles(u,v,anemometer_height_m,
         station_latitude,*,mixing_method=1,constw=.16,minimum_height_m=50.,
         maximum_height_m=2500.,threshold_flux_per_m=.05,ipsifcn=0,
         temperature_measurement_height_m=None,sea_temperature_k=None,**mixing_options):
-    """WATER2 station DeltaT branch, with neutral fallback, through SIMILT."""
+    """Run WATER2's DELTAT station branch through mixing and SIMILT.
+
+    Args:
+        u: One-dimensional station eastward wind in m s-1.
+        v: One-dimensional station northward wind in m s-1.
+        anemometer_height_m: Wind measurement heights in metres.
+        air_temperature_k: Station air temperatures in kelvins.
+        air_minus_sea_temperature_k: Air-minus-sea temperature in kelvins.
+        relative_humidity_percent: Station relative humidity in percent.
+        observed_mixing_height_m: Observed mixing heights in metres; values at
+            least 990 indicate missing observations.
+        current_mixing_height_m: Current grid mixing heights in metres.
+        coriolis: Absolute Coriolis parameter in s-1.
+        potential_lapse_k_m: Potential-temperature lapse in K m-1.
+        previous_temperature_jump_k: Previous inversion jump in kelvins.
+        z_centers_m: One-dimensional CALMET layer centres in metres.
+        z_faces_m: One-dimensional CALMET layer faces in metres.
+        station_latitude: Station latitude in degrees north.
+        mixing_method: Mixing-height selector ``-2``, ``-1``, 1, or 2.
+        constw: OCD overwater mechanical-height coefficient.
+        minimum_height_m: Lower overwater mixing-height bound in metres.
+        maximum_height_m: Upper overwater mixing-height bound in metres.
+        threshold_flux_per_m: Convective threshold coefficient in W m-3.
+        ipsifcn: SIMILT stability function selector, 0 or 1.
+        temperature_measurement_height_m: Optional thermal sensor heights in
+            metres; anemometer heights are used when omitted.
+        sea_temperature_k: Optional explicit sea temperature in kelvins;
+            otherwise it is derived from air temperature and delta.
+        **mixing_options: Additional keyword options passed to the selected
+            convective-height routine.
+
+    Returns:
+        Nine float32 arrays: ``(u_profile, v_profile, roughness, friction,
+        monin_obukhov, mixing_height, convective_height, temperature_jump,
+        buoyancy_heat_flux)``. Profiles are ``(level, station)`` in m s-1;
+        state arrays are ``(station,)`` with units m, m s-1, m, m, m, K, and
+        W m-2. Missing/calm winds use the neutral fallback state.
+
+    Raises:
+        ValueError: If station shapes disagree, ``mixing_method`` or
+            ``ipsifcn`` is unsupported, or downstream profile inputs are
+            invalid.
+    """
     base=neutral_water_station_profiles(u,v,anemometer_height_m,
         current_mixing_height_m,coriolis,z_centers_m,z_faces_m,station_latitude,
         constw=constw,minimum_height_m=minimum_height_m,
@@ -977,7 +1483,63 @@ def coare_water_station_profiles(u,v,anemometer_height_m,air_sensor_height_m,
         threshold_flux_per_m=.05,ipsifcn=0,sea_temperature_k=None,
         warm_layer_state=None,solar_time_s=None,water_sensor_depth_m=.6,
         **mixing_options):
-    """Stateless COARE branch of WATER2 followed by its mixing and SIMILT steps."""
+    """Run WATER2's COARE branch through mixing-height and SIMILT steps.
+
+    Args:
+        u: One-dimensional station eastward wind in m s-1.
+        v: One-dimensional station northward wind in m s-1.
+        anemometer_height_m: Wind measurement heights in metres.
+        air_sensor_height_m: Air temperature/humidity sensor heights in metres.
+        air_temperature_k: Station air temperatures in kelvins.
+        air_minus_sea_temperature_k: Air-minus-sea temperature in kelvins.
+        relative_humidity_percent: Station relative humidity in percent.
+        observed_mixing_height_m: Observed mixing heights in metres; at least
+            990 denotes missing.
+        current_mixing_height_m: Current grid mixing heights in metres.
+        coriolis: Absolute Coriolis parameter in s-1.
+        potential_lapse_k_m: Potential-temperature lapse in K m-1.
+        previous_temperature_jump_k: Previous inversion jump in kelvins.
+        z_centers_m: One-dimensional CALMET layer centres in metres.
+        z_faces_m: One-dimensional CALMET layer faces in metres.
+        station_latitude: Station latitude in degrees north.
+        shortwave_down_w_m2: Downward short-wave radiation in W m-2.
+        longwave_down_w_m2: Downward long-wave radiation in W m-2.
+        rainfall_mm_h: Rainfall rate in mm h-1.
+        mixing_method: Mixing-height selector ``-2``, ``-1``, 1, or 2.
+        coare_method: COARE selector ``+/-10``, ``+/-11``, or ``+/-12``.
+        wave_period_s: Wave period in seconds for negative method selectors.
+        wave_height_m: Significant wave height in metres for negative methods.
+        coastal_shelf_length_km: Shelf length supplied to COARE in kilometres.
+        distance_to_coast_km: Distance to coast in kilometres, scalar or by
+            station.
+        cool_skin: Whether to enable COARE cool-skin physics.
+        constw: OCD overwater mechanical-height coefficient.
+        minimum_height_m: Lower overwater mixing-height bound in metres.
+        maximum_height_m: Upper overwater mixing-height bound in metres.
+        threshold_flux_per_m: Convective threshold coefficient in W m-3.
+        ipsifcn: SIMILT stability function selector, 0 or 1.
+        sea_temperature_k: Optional explicit sea temperature in kelvins.
+        warm_layer_state: Optional COARE warm-layer state, either station-sized
+            or already selected.
+        solar_time_s: Local solar seconds required when warm-layer state is
+            supplied.
+        water_sensor_depth_m: Water temperature sensor depth in metres.
+        **mixing_options: Additional keyword options passed to the selected
+            convective-height routine.
+
+    Returns:
+        Ten items: nine arrays matching the DELTAT return layout
+        ``(u_profile, v_profile, roughness, friction, monin_obukhov,
+        mixing_height, convective_height, temperature_jump,
+        buoyancy_heat_flux)`` followed by updated warm-layer state or ``None``.
+        Arrays are float32; profiles are ``(level, station)`` and state fields
+        are ``(station,)`` in their documented physical units.
+
+    Raises:
+        ValueError: If ``coare_method`` or ``mixing_method`` is unsupported,
+            station shapes disagree, warm-layer time is missing, or downstream
+            COARE/SIMILT inputs are invalid.
+    """
     from .coare import (WarmLayerState,advance_warm_layer,surface_flux,
                         update_warm_layer_fluxes)
 
@@ -1098,14 +1660,36 @@ def upwind_mixing_average(u, v, mixing_height, convective_height, dx_m=None,
                           dy_m=None, *, grid_spacing_m=None,
                           minimum_radius_cells=10, half_angle_degrees=30.,
                           timestep_s=3600.):
-    """AVEMIX upwind-cone spatial averaging of ``ZI`` and ``ZICONV``.
+    """Apply AVEMIX upwind-cone averaging to mixing-height grids.
 
-    The target-cell loop is retained because every target has a differently
-    oriented and sized search window; all candidate-cell calculations inside
-    that window are NumPy-vectorised.  Trajectories, cone angles, and distance
-    weights are evaluated in physical metres, which supports rectangular grid
-    cells.  Omitting ``dy_m`` retains the former square-grid calling form;
-    ``grid_spacing_m`` remains an alias for its old keyword spelling.
+    Args:
+        u: Two-dimensional eastward transport wind in m s-1.
+        v: Two-dimensional northward transport wind in m s-1.
+        mixing_height: Two-dimensional total mixing height in metres.
+        convective_height: Two-dimensional convective mixing height in metres.
+        dx_m: Positive grid spacing along x in metres. When omitted,
+            ``grid_spacing_m`` supplies the legacy square-cell spacing.
+        dy_m: Positive grid spacing along y in metres. Defaults to ``dx_m``.
+        grid_spacing_m: Legacy alias for ``dx_m``; mutually exclusive with it.
+        minimum_radius_cells: Nonnegative square half-width always included
+            around each target, in grid cells.
+        half_angle_degrees: Upwind cone half-angle in ``[0, 90)`` degrees.
+        timestep_s: Positive trajectory duration in seconds.
+
+    Returns:
+        Pair of float32 ``(y, x)`` arrays containing averaged total and
+        convective mixing heights in metres. Inputs are not modified.
+
+    Raises:
+        TypeError: If both ``dx_m`` and ``grid_spacing_m`` are supplied.
+        ValueError: If field shapes disagree, spacings or time step are not
+            positive finite values, the cone/radius is invalid, or winds are
+            non-finite.
+
+    Notes:
+        Candidate geometry is evaluated in physical metres, supporting
+        rectangular cells. The target-cell loop is retained because each wind
+        vector defines a different search window.
     """
     u=np.asarray(u,dtype=np.float64); v=np.asarray(v,dtype=np.float64)
     zi=np.asarray(mixing_height,dtype=np.float64); zic=np.asarray(convective_height,dtype=np.float64)
@@ -1134,6 +1718,19 @@ def upwind_mixing_average(u, v, mixing_height, convective_height, dx_m=None,
     softening_m=np.sqrt(dx_m)*np.sqrt(dy_m)
     @lru_cache(maxsize=4096)
     def window_geometry(left,right,down,up):
+        """Build and cache relative coordinates for a clipped search window.
+
+        Args:
+            left: Number of candidate columns left of the target.
+            right: Number of candidate columns right of the target.
+            down: Number of candidate rows below the target.
+            up: Number of candidate rows above the target.
+
+        Returns:
+            Tuple ``(rx, ry, local, square)``. ``rx`` and ``ry`` are broadcast
+            float64 offsets in metres; ``local`` marks the target cell and
+            ``square`` marks the always-included minimum-radius window.
+        """
         rx_integer=np.arange(left,-right-1,-1,dtype=np.int64)[None,:]
         ry_integer=np.arange(down,-up-1,-1,dtype=np.int64)[:,None]
         rx=rx_integer.astype(COORDINATE_DTYPE)*dx_m
@@ -1205,6 +1802,26 @@ def mesopac_layer_average(u, v, mixing_height_m, z_faces_m, *,
     The lower layer extends from the ground to ``max(ZI, 10 m)``.  The
     upper layer extends from ZI to the greater of 3000 m or ZI + 300 m,
     matching the fixed arguments used by CALMET's OUTPC path.
+
+    Args:
+        u: Eastward wind with shape ``(level, y, x)`` in m s-1.
+        v: Northward wind with shape ``(level, y, x)`` in m s-1.
+        mixing_height_m: Mixing height with shape ``(y, x)`` in metres.
+        z_faces_m: Increasing layer-face heights with shape ``(level + 1,)``
+            in metres above ground level.
+        upper_top_m: Minimum top of the upper averaging layer in metres.
+        minimum_upper_depth_m: Minimum upper-layer depth above the local
+            mixing height in metres.
+
+    Returns:
+        Tuple of four float32 arrays ``(lower_u, lower_v, upper_u, upper_v)``.
+        Every array has shape ``(y, x)`` and units m s-1. Inputs are not
+        modified.
+
+    Raises:
+        ValueError: If wind, mixing-height, or face dimensions disagree, if
+            the faces are not strictly increasing, or if either averaging
+            interval extends above the highest face.
     """
     u=np.asarray(u,dtype=np.float64)
     v=np.asarray(v,dtype=np.float64)
@@ -1228,6 +1845,17 @@ def mesopac_layer_average(u, v, mixing_height_m, z_faces_m, *,
     upper_depth=np.maximum(np.minimum(ceiling,top)-np.maximum(bottom,zi),np.float64(0.))
 
     def average(values,depth):
+        """Average one wind component using per-layer overlap depths.
+
+        Args:
+            values: Wind values with shape ``(level, y, x)`` in m s-1.
+            depth: Included depth per layer with shape ``(level, y, x)`` in
+                metres.
+
+        Returns:
+            A float64 array with shape ``(y, x)`` containing the
+            depth-weighted mean wind in m s-1. Neither input is modified.
+        """
         numerator=np.cumsum(np.asarray(values*depth,dtype=np.float64),
                             axis=0,dtype=np.float64)[-1]
         denominator=np.cumsum(depth,axis=0,dtype=np.float64)[-1]
@@ -1256,6 +1884,25 @@ def prognostic_temperature_3d(prognostic_temperature_k, surface_temperature_k,
     layer wholly below the top is therefore fully mixed, a layer wholly above
     it retains its prognostic value, and a layer intersected by the top varies
     continuously as that top moves through the layer.
+
+    Args:
+        prognostic_temperature_k: Prognostic temperature with shape
+            ``(level, y, x)`` in kelvins.
+        surface_temperature_k: Final surface temperature with shape ``(y, x)``
+            in kelvins.
+        convective_height_m: Convective mixing height with shape ``(y, x)``
+            in metres above ground level.
+        z_faces_m: Increasing layer-face heights with shape ``(level + 1,)``
+            in metres above ground level.
+
+    Returns:
+        A new float32 array with shape ``(level, y, x)`` in kelvins. The
+        lowest layer equals ``surface_temperature_k`` and higher intersected
+        layers contain an overlap-weighted blend.
+
+    Raises:
+        ValueError: If the fields do not share CALMET grid dimensions or the
+            face vector is not finite and strictly increasing.
     """
     source=np.asarray(prognostic_temperature_k,dtype=MODEL_DTYPE)
     surface=np.asarray(surface_temperature_k,dtype=MODEL_DTYPE)
@@ -1284,7 +1931,27 @@ def prognostic_temperature_3d(prognostic_temperature_k, surface_temperature_k,
 
 def pgt_stability(u10, v10, solar_elevation_sine, cloud_fraction_field,
                   ceiling_height_m, landuse, monin_obukhov_m, water_range=(50,55)):
-    """PGTSTB Turner land classes plus WATER's Monin-Obukhov classes."""
+    """Diagnose Pasquill-Gifford-Turner stability over land and water.
+
+    Args:
+        u10: Eastward 10 m wind in m s-1, broadcastable to the surface grid.
+        v10: Northward 10 m wind in m s-1, broadcastable to the surface grid.
+        solar_elevation_sine: Sine of solar elevation, dimensionless and
+            broadcastable to the surface grid.
+        cloud_fraction_field: Cloud fraction from 0 to 1, broadcastable to
+            the surface grid.
+        ceiling_height_m: Cloud-ceiling height in metres, broadcastable to
+            the surface grid.
+        landuse: Integer land-use categories on the surface grid.
+        monin_obukhov_m: Monin-Obukhov length in metres, broadcastable to the
+            surface grid and used for water cells.
+        water_range: Inclusive pair of land-use category numbers treated as
+            water.
+
+    Returns:
+        An int8 array on the broadcast surface-grid shape. Values 1 through 6
+        represent stability classes A through F. Inputs are not modified.
+    """
     u=np.asarray(u10,dtype=MODEL_DTYPE); v=np.asarray(v10,dtype=MODEL_DTYPE)
     sun=np.asarray(solar_elevation_sine,dtype=MODEL_DTYPE)
     cloud=np.asarray(cloud_fraction_field,dtype=MODEL_DTYPE)
@@ -1316,7 +1983,30 @@ def pgt_stability(u10, v10, solar_elevation_sine, cloud_fraction_field,
 
 def convective_velocity_scale(convective_height_m, sensible_heat_flux, temperature_k,
                               density, landuse, water_range=(50,55)):
-    """WATER/WSTARR convective velocity scale; zero for non-positive flux."""
+    """Calculate the convective velocity scale used by WATER/WSTARR.
+
+    Args:
+        convective_height_m: Convective mixing height with shape ``(y, x)``
+            in metres.
+        sensible_heat_flux: Surface heat flux with shape ``(y, x)``. Land
+            values are in W m-2; water values use CALMET's stored
+            ``1195.2 * w'theta_v'`` convention in W m-2.
+        temperature_k: Surface air temperature, broadcastable to ``(y, x)``,
+            in kelvins.
+        density: Air density, broadcastable to ``(y, x)``, in kg m-3.
+        landuse: Integer land-use categories with shape ``(y, x)``.
+        water_range: Inclusive pair of land-use category numbers treated as
+            water.
+
+    Returns:
+        A float32 array with shape ``(y, x)`` containing convective velocity
+        scale in m s-1. Cells with non-positive heat flux or height are zero;
+        inputs are not modified.
+
+    Raises:
+        ValueError: If ``landuse`` and ``convective_height_m`` have different
+            shapes.
+    """
     zi=np.asarray(convective_height_m,dtype=MODEL_DTYPE)
     qh=np.asarray(sensible_heat_flux,dtype=MODEL_DTYPE)
     temp=np.asarray(temperature_k,dtype=MODEL_DTYPE)
@@ -1334,7 +2024,20 @@ def convective_velocity_scale(convective_height_m, sensible_heat_flux, temperatu
     return _model_array(np.where((qh>0.)&(zi>0.),value,0.))
 
 def solar_sine(julian_day, base_timezone, latitude, longitude_east):
-    """SOLAR: 26 half-hour solar-elevation sine fields."""
+    """Calculate CALMET's half-hour solar-elevation sine fields.
+
+    Args:
+        julian_day: One-based day of year.
+        base_timezone: Base time-zone offset used by CALMET, in hours west of
+            UTC.
+        latitude: Latitude field with shape ``(y, x)`` in degrees north.
+        longitude_east: Longitude field with shape ``(y, x)`` in degrees east.
+
+    Returns:
+        A float32 array with shape ``(26, y, x)`` containing the dimensionless
+        sine of solar elevation at half-hour samples from 00:30 before through
+        00:30 after the modeled day. Inputs are not modified.
+    """
     lat=np.asarray(latitude,dtype=COORDINATE_DTYPE)
     lon=np.asarray(longitude_east,dtype=COORDINATE_DTYPE)
     day=COORDINATE_DTYPE(julian_day)
@@ -1356,14 +2059,6 @@ def solar_sine(julian_day, base_timezone, latitude, longitude_east):
         np.deg2rad(solha))
     return _model_array(result)
 
-def terrain_gradients(terrain_m, dx_m, dy_m):
-    """CALMET one-sided-at-boundary, centred-interior terrain gradients."""
-    h=np.asarray(terrain_m,dtype=MODEL_DTYPE)
-    west=np.concatenate((h[:,:1],h[:,:-1]),axis=1); east=np.concatenate((h[:,1:],h[:,-1:]),axis=1)
-    south=np.concatenate((h[:1,:],h[:-1,:]),axis=0); north=np.concatenate((h[1:,:],h[-1:,:]),axis=0)
-    return (_model_array((east-west)*(.5/dx_m)),
-            _model_array((north-south)*(.5/dy_m)))
-
 def terrain_adjust_surface_wind(u, v, terrain_m, top_height_m, dx_m, dy_m,
                                 *, maximum_iterations=75, tolerance=.02,
                                 relaxation=1.5):
@@ -1372,6 +2067,27 @@ def terrain_adjust_surface_wind(u, v, terrain_m, top_height_m, dx_m, dy_m,
     CALMET applies this Poisson solve only to the first wind layer when
     ``IWFCOD=0``.  The four alternating Gauss-Seidel sweeps are deliberately
     retained because every sweep immediately reuses updated neighbours.
+
+    Args:
+        u: Eastward wind with shape ``(level, y, x)`` in m s-1.
+        v: Northward wind with shape ``(level, y, x)`` in m s-1.
+        terrain_m: Terrain elevation with shape ``(y, x)`` in metres.
+        top_height_m: Model-domain top height in metres.
+        dx_m: East-west grid spacing in metres.
+        dy_m: South-north grid spacing in metres.
+        maximum_iterations: Maximum number of four-sweep solver iterations.
+        tolerance: Dimensionless maximum relative potential-change criterion.
+        relaxation: Dimensionless successive-over-relaxation factor.
+
+    Returns:
+        Tuple ``(u_adjusted, v_adjusted)`` of new float32 arrays with shape
+        ``(level, y, x)`` in m s-1. Only level zero is adjusted; the input
+        arrays are not modified.
+
+    Raises:
+        ValueError: If the wind arrays are not matching ``(level, y, x)``
+            fields, terrain does not match their horizontal grid, or a height
+            or grid spacing is non-positive.
     """
     work_dtype=ACCUMULATION_DTYPE
     u=np.array(u,dtype=work_dtype,copy=True); v=np.array(v,dtype=work_dtype,copy=True)
@@ -1441,6 +2157,23 @@ def terrain_extrema(terrain_m, radius_km, dx_m, dy_m):
     completely equidistant occurrences are resolved by row-major source
     index.  This makes the result independent of the order in which offsets
     are visited.  Returned model fields remain single precision.
+
+    Args:
+        terrain_m: Terrain elevation with shape ``(y, x)`` in metres.
+        radius_km: Circular search radius in kilometres.
+        dx_m: East-west grid spacing in metres.
+        dy_m: South-north grid spacing in metres.
+
+    Returns:
+        Tuple ``(highest, lowest, distance_high, distance_low)`` of float32
+        arrays with shape ``(y, x)``. The first two contain elevations in
+        metres; the last two contain nearest-extremum distances in metres.
+        The input is not modified.
+
+    Raises:
+        ValueError: If terrain is not two-dimensional, either grid spacing is
+            non-finite or non-positive, or the radius is non-finite or
+            negative.
     """
     h=np.asarray(terrain_m,dtype=COORDINATE_DTYPE)
     if h.ndim!=2:
@@ -1491,7 +2224,27 @@ def terrain_extrema(terrain_m, radius_km, dx_m, dy_m):
         highest,lowest,distance_high,distance_low))
 
 def topographic_vertical_velocity(u,v,terrain_m,z_faces_m,gamma_k_per_m,temperature_k,alpha,dx_m,dy_m):
-    """TOPOF2 terrain-following vertical velocity; wind axes are (z,y,x)."""
+    """Calculate TOPOF2 terrain-following vertical velocity.
+
+    Args:
+        u: Eastward wind with shape ``(level, y, x)`` in m s-1.
+        v: Northward wind with shape ``(level, y, x)`` in m s-1.
+        terrain_m: Terrain elevation with shape ``(y, x)`` in metres.
+        z_faces_m: Layer-face heights with shape ``(level + 1,)`` in metres
+            above ground level.
+        gamma_k_per_m: Potential-temperature lapse rate with shape ``(y, x)``
+            in K m-1.
+        temperature_k: Near-surface temperature with shape ``(y, x)`` in
+            kelvins.
+        alpha: Dimensionless empirical multiplier for the vertical-gradient
+            correction.
+        dx_m: East-west grid spacing in metres.
+        dy_m: South-north grid spacing in metres.
+
+    Returns:
+        A float32 array with shape ``(level + 1, y, x)`` containing vertical
+        velocity at layer faces in m s-1. Inputs are not modified.
+    """
     u=np.asarray(u,dtype=MODEL_DTYPE); v=np.asarray(v,dtype=MODEL_DTYPE)
     faces=np.asarray(z_faces_m,dtype=MODEL_DTYPE)
     terrain=np.asarray(terrain_m,dtype=MODEL_DTYPE)
@@ -1521,7 +2274,35 @@ def topographic_vertical_velocity(u,v,terrain_m,z_faces_m,gamma_k_per_m,temperat
     return _model_array(w)
 
 def slope_flow(terrain_m,highest_m,lowest_m,distance_high_m,distance_low_m,sensible_heat_flux,temperature_k,landuse,z_faces_m,dx_m,dy_m,water_range=(50,55)):
-    """SLOPE Mahrt/Horst-Doran shooting-flow parameterisation."""
+    """Calculate Mahrt/Horst-Doran terrain-slope wind components.
+
+    Args:
+        terrain_m: Terrain elevation with shape ``(y, x)`` in metres.
+        highest_m: Highest terrain in the search neighbourhood with shape
+            ``(y, x)`` in metres.
+        lowest_m: Lowest terrain in the search neighbourhood with shape
+            ``(y, x)`` in metres.
+        distance_high_m: Distance to the nearest highest point with shape
+            ``(y, x)`` in metres.
+        distance_low_m: Distance to the nearest lowest point with shape
+            ``(y, x)`` in metres.
+        sensible_heat_flux: Surface sensible heat flux with shape ``(y, x)``
+            in W m-2.
+        temperature_k: Surface air temperature with shape ``(y, x)`` in
+            kelvins.
+        landuse: Integer land-use categories with shape ``(y, x)``.
+        z_faces_m: Layer-face heights with shape ``(level + 1,)`` in metres
+            above ground level.
+        dx_m: East-west grid spacing in metres.
+        dy_m: South-north grid spacing in metres.
+        water_range: Inclusive pair of land-use category numbers treated as
+            water and excluded from slope flow.
+
+    Returns:
+        Tuple ``(u_slope, v_slope)`` of float32 arrays with shape
+        ``(level, y, x)`` in m s-1. Values are additive wind components;
+        inputs are not modified.
+    """
     h=np.asarray(terrain_m,dtype=MODEL_DTYPE)
     qh=np.asarray(sensible_heat_flux,dtype=MODEL_DTYPE)
     temp=np.asarray(temperature_k,dtype=MODEL_DTYPE)
@@ -1569,6 +2350,24 @@ def vertical_layer_average(values, heights_m, faces_m, *, missing=998.99):
     The final axis is the source sounding level. All preceding axes identify
     independent profiles. ``heights_m`` may be one-dimensional or match the
     values array.
+
+    Args:
+        values: Source values with shape ``(..., source_level)``. Units are
+            preserved in the output.
+        heights_m: Source heights in metres, either shape ``(source_level,)``
+            or broadcastable to ``values``.
+        faces_m: Target layer-face heights with shape ``(target_level + 1,)``
+            in metres.
+        missing: Values greater than or equal to this threshold are omitted.
+
+    Returns:
+        A float32 array with shape ``(..., target_level)`` and the same units
+        as ``values``. The target-layer axis is last, broadcasting is applied
+        only to source heights, and inputs are not modified.
+
+    Raises:
+        ValueError: If fewer than two source levels or faces are supplied, or
+            valid adjacent source segments do not fully cover a target layer.
     """
     values=np.asarray(values,dtype=ACCUMULATION_DTYPE)
     heights=np.broadcast_to(np.asarray(heights_m,dtype=ACCUMULATION_DTYPE),values.shape)
@@ -1589,7 +2388,24 @@ def vertical_layer_average(values, heights_m, faces_m, *, missing=998.99):
     return _model_array(np.stack(output,axis=-1))
 
 def vertical_interpolate(values, heights_m, targets_m, *, missing=998.99):
-    """FACET/INTP piecewise-linear interpolation with missing-level skips."""
+    """Interpolate profiles linearly while skipping missing source levels.
+
+    Args:
+        values: Source values with shape ``(..., source_level)``. Units are
+            preserved in the output.
+        heights_m: Source heights in metres, either shape ``(source_level,)``
+            or broadcastable to ``values``.
+        targets_m: Target heights of any shape in metres.
+        missing: Values greater than or equal to this threshold are omitted.
+
+    Returns:
+        A float32 array with shape ``values.shape[:-1] + targets_m.shape`` and
+        the same units as ``values``. Inputs are not modified.
+
+    Raises:
+        ValueError: If a profile has fewer than two valid source levels or its
+            valid height range does not bracket every target.
+    """
     values=np.asarray(values,dtype=ACCUMULATION_DTYPE)
     heights=np.broadcast_to(np.asarray(heights_m,dtype=ACCUMULATION_DTYPE),values.shape)
     targets=np.asarray(targets_m,dtype=ACCUMULATION_DTYPE)
@@ -1602,7 +2418,23 @@ def vertical_interpolate(values, heights_m, targets_m, *, missing=998.99):
     return _model_array(result)
 
 def smooth_wind(u,v,passes):
-    """Apply the in-place Gauss-Seidel wind-smoothing stencil."""
+    """Apply CALMET's sequential Gauss-Seidel wind-smoothing stencil.
+
+    Args:
+        u: Eastward wind with shape ``(level, y, x)`` in m s-1.
+        v: Northward wind with shape ``(level, y, x)`` in m s-1.
+        passes: Number of smoothing passes, either a scalar or one integer per
+            model level.
+
+    Returns:
+        Tuple ``(u_smoothed, v_smoothed)`` of new float32 arrays with shape
+        ``(level, y, x)`` in m s-1. Each pass updates the copies sequentially;
+        the supplied arrays are not modified.
+
+    Raises:
+        ValueError: If the wind arrays differ in shape, are not
+            three-dimensional, or ``passes`` cannot broadcast over levels.
+    """
     u=np.array(u,dtype=MODEL_DTYPE,copy=True); v=np.array(v,dtype=MODEL_DTYPE,copy=True)
     if u.shape!=v.shape or u.ndim!=3: raise ValueError('wind arrays must have shape (z,y,x)')
     counts=np.broadcast_to(np.asarray(passes,dtype=int), (u.shape[0],))
@@ -1630,7 +2462,25 @@ def smooth_wind(u,v,passes):
     return u,v
 
 def divergence_and_vertical_velocity(u,v,z_faces_m,dx_m,dy_m,*,obrien=False,boundaries=None):
-    """DIVCEL plus vertical integration and optional O'Brien correction."""
+    """Calculate horizontal divergence and integrate vertical velocity.
+
+    Args:
+        u: Eastward wind with shape ``(level, y, x)`` in m s-1.
+        v: Northward wind with shape ``(level, y, x)`` in m s-1.
+        z_faces_m: Layer-face heights with shape ``(level + 1,)`` in metres.
+        dx_m: East-west grid spacing in metres.
+        dy_m: South-north grid spacing in metres.
+        obrien: Whether to apply the O'Brien correction that forces zero
+            vertical velocity at the domain top.
+        boundaries: Optional tuple ``(u_west, u_east, v_south, v_north)``.
+            The u boundaries have shape ``(level, y)`` and the v boundaries
+            have shape ``(level, x)``; omitted boundaries repeat edge winds.
+
+    Returns:
+        Tuple ``(divergence, w)``. ``divergence`` is a float32 array with
+        shape ``(level, y, x)`` in s-1, and ``w`` is a float32 array with
+        shape ``(level + 1, y, x)`` in m s-1. Inputs are not modified.
+    """
     work_dtype=ACCUMULATION_DTYPE
     u=np.asarray(u,dtype=work_dtype); v=np.asarray(v,dtype=work_dtype); faces=np.asarray(z_faces_m,dtype=work_dtype)
     if boundaries is None:
@@ -1655,7 +2505,32 @@ def divergence_and_vertical_velocity(u,v,z_faces_m,dx_m,dy_m,*,obrien=False,boun
 
 def minimize_divergence(u,v,w,z_faces_m,dx_m,dy_m,*,boundaries=None,
                         maximum_iterations=50,limit=5.e-6):
-    """MINIM four-sweep horizontal mass-consistency adjustment."""
+    """Adjust horizontal winds to reduce three-dimensional divergence.
+
+    Args:
+        u: Eastward wind with shape ``(level, y, x)`` in m s-1.
+        v: Northward wind with shape ``(level, y, x)`` in m s-1.
+        w: Layer-face vertical velocity with shape ``(level + 1, y, x)`` in
+            m s-1.
+        z_faces_m: Layer-face heights with shape ``(level + 1,)`` in metres.
+        dx_m: East-west grid spacing in metres.
+        dy_m: South-north grid spacing in metres.
+        boundaries: Optional tuple ``(u_west, u_east, v_south, v_north)``.
+            The u boundaries have shape ``(level, y)`` and the v boundaries
+            have shape ``(level, x)``; omitted values start from wind edges.
+        maximum_iterations: Maximum four-sweep iterations per model level.
+        limit: Absolute convergence limit for divergence in s-1.
+
+    Returns:
+        Tuple ``(u_adjusted, v_adjusted, divergence, iterations)``. The first
+        two float32 arrays have shape ``(level, y, x)`` in m s-1, divergence
+        is float32 with that shape in s-1, and iterations is int32 with shape
+        ``(level,)``. Input arrays are not modified.
+
+    Raises:
+        ValueError: If u and v shapes differ or w does not have one more
+            vertical face than the horizontal-wind fields.
+    """
     work_dtype=ACCUMULATION_DTYPE
     u=np.array(u,dtype=work_dtype,copy=True); v=np.array(v,dtype=work_dtype,copy=True)
     w=np.asarray(w,dtype=work_dtype); faces=np.asarray(z_faces_m,dtype=work_dtype)
@@ -1667,6 +2542,15 @@ def minimize_divergence(u,v,w,z_faces_m,dx_m,dy_m,*,boundaries=None,
     divergence=np.empty_like(u); iterations=np.zeros(u.shape[0],dtype=np.int32)
 
     def layer_divergence(k):
+        """Evaluate total divergence for one model layer.
+
+        Args:
+            k: Zero-based model-layer index.
+
+        Returns:
+            A float64 array with shape ``(y, x)`` containing divergence in
+            s-1. The enclosing wind and boundary arrays are read in place.
+        """
         up=np.concatenate((west[k,:,None],u[k],east[k,:,None]),axis=1)
         vp=np.concatenate((south[k,None,:],v[k],north[k,None,:]),axis=0)
         dxi=work_dtype(1.)/(work_dtype(2.)*work_dtype(dx_m)); dyi=work_dtype(1.)/(work_dtype(2.)*work_dtype(dy_m))
@@ -1705,7 +2589,37 @@ def heat_flux(solar_sine_field,cloud_fraction_field,temperature_k,landuse,albedo
               cloudiness_coefficient_1=-.75,cloudiness_coefficient_2=3.4,
               net_radiation_coefficient_1=5.31e-13,
               net_radiation_coefficient_2=60.,net_radiation_coefficient_3=.12):
-    """HEATFX short-wave radiation and land sensible heat flux."""
+    """Calculate short-wave radiation and land sensible heat flux.
+
+    Args:
+        solar_sine_field: Sine of solar elevation on the surface grid,
+            dimensionless.
+        cloud_fraction_field: Cloud fraction on the surface grid from 0 to 1.
+        temperature_k: Surface air temperature on the surface grid in kelvins.
+        landuse: Integer land-use categories on the surface grid.
+        albedo: Surface albedo fraction, broadcastable to the surface grid.
+        bowen: Bowen ratio, broadcastable to the surface grid.
+        soil_heat_flux: Fraction of net radiation stored as soil heat,
+            broadcastable to the surface grid.
+        anthropogenic_heat: Anthropogenic heat flux, broadcastable to the
+            surface grid, in W m-2.
+        water_range: Inclusive pair of land-use category numbers treated as
+            water.
+        turbidity_coefficient_1: Clear-sky solar coefficient in W m-2.
+        turbidity_coefficient_2: Clear-sky solar offset in W m-2.
+        cloudiness_coefficient_1: Dimensionless cloud attenuation coefficient.
+        cloudiness_coefficient_2: Dimensionless cloud-fraction exponent.
+        net_radiation_coefficient_1: Temperature-sixth-power coefficient in
+            W m-2 K-6.
+        net_radiation_coefficient_2: Cloud radiation coefficient in W m-2.
+        net_radiation_coefficient_3: Dimensionless net-radiation denominator
+            coefficient.
+
+    Returns:
+        Tuple ``(sensible_heat, shortwave)`` of float32 arrays on the
+        broadcast surface-grid shape in W m-2. Water sensible heat is zero;
+        nighttime land sensible heat is -0.1 W m-2. Inputs are not modified.
+    """
     sun=np.asarray(solar_sine_field,dtype=MODEL_DTYPE)
     cloud=np.asarray(cloud_fraction_field,dtype=MODEL_DTYPE)
     temp=np.asarray(temperature_k,dtype=MODEL_DTYPE)
@@ -1734,6 +2648,17 @@ def psi_momentum_dyer(z_over_l,*,dtype=MODEL_DTYPE):
 
     Model calls default to single precision.  Nonlinear convergence routines
     can request double precision without changing the returned model fields.
+
+    Args:
+        z_over_l: Dimensionless height-to-Monin-Obukhov-length ratio of any
+            shape.
+        dtype: NumPy-compatible floating dtype used for the calculation and
+            returned array.
+
+    Returns:
+        An array with the same shape as ``z_over_l`` and the requested dtype,
+        containing the dimensionless momentum stability correction. The
+        input is not modified.
     """
     work_dtype=np.dtype(dtype).type
     zl=np.asarray(z_over_l,dtype=work_dtype)
@@ -1760,7 +2685,44 @@ def surface_similarity(u,v,roughness_m,height_m,density,temperature_k,
                        cloud_fraction_field,sensible_heat_flux,landuse,
                        water_range=(50,55),*,wind_measurement_height_m=None,
                        ipsifcn=0,minimum_stable_wind_m_s=.5):
-    """ELUSTR land-cell friction velocity, heat flux and M-O length."""
+    """Calculate ELUSTR surface-layer state over land cells.
+
+    Args:
+        u: Eastward wind at ``height_m``, in m s-1 and broadcastable to the
+            surface grid.
+        v: Northward wind at ``height_m``, in m s-1 and broadcastable to the
+            surface grid.
+        roughness_m: Aerodynamic roughness length in metres, broadcastable to
+            the surface grid.
+        height_m: Height of the supplied model wind in metres.
+        density: Air density in kg m-3, broadcastable to the surface grid.
+        temperature_k: Surface air temperature in kelvins, broadcastable to
+            the surface grid.
+        cloud_fraction_field: Cloud fraction from 0 to 1, broadcastable to
+            the surface grid.
+        sensible_heat_flux: Initial sensible heat flux in W m-2,
+            broadcastable to the surface grid. Stable cells are recomputed.
+        landuse: Integer land-use categories on the surface grid.
+        water_range: Inclusive pair of land-use category numbers treated as
+            water.
+        wind_measurement_height_m: Optional wind-observation height in metres,
+            scalar or broadcastable to the surface grid. ``height_m`` is used
+            when omitted.
+        ipsifcn: Momentum stability-function selector, 0 for Dyer or 1 for
+            CALMET's convective fit.
+        minimum_stable_wind_m_s: Lower wind-speed bound for stable conditions,
+            in m s-1.
+
+    Returns:
+        Tuple ``(friction_velocity, monin_obukhov_length, sensible_heat)`` of
+        float32 arrays on the broadcast surface-grid shape, with units m s-1,
+        m, and W m-2 respectively. Water cells are zero. The sensible-heat
+        input is copied and all supplied arrays remain unchanged.
+
+    Raises:
+        ValueError: If ``ipsifcn`` is not 0 or 1, or input arrays cannot be
+            broadcast by the numerical operations.
+    """
     u=np.asarray(u,dtype=np.float64); v=np.asarray(v,dtype=np.float64)
     z0=np.asarray(roughness_m,dtype=np.float64); rho=np.asarray(density,dtype=np.float64)
     temp=np.asarray(temperature_k,dtype=np.float64)
@@ -1841,7 +2803,36 @@ def surface_similarity(u,v,roughness_m,height_m,density,temperature_k,
 def land_station_surface_similarity(u,v,roughness_m,anemometer_height_m,
                                     first_level_height_m,density,temperature_k,
                                     cloud_fraction,sensible_heat_flux,*,ipsifcn=0):
-    """ELUSTR2 surface-layer state for vectorized land stations."""
+    """Calculate ELUSTR2 surface-layer state for land stations.
+
+    Args:
+        u: Eastward station wind with shape ``(station,)`` in m s-1.
+        v: Northward station wind with shape ``(station,)`` in m s-1.
+        roughness_m: Station aerodynamic roughness with shape ``(station,)``
+            in metres.
+        anemometer_height_m: Wind measurement heights with shape ``(station,)``
+            in metres.
+        first_level_height_m: Height of the first CALMET layer centre in
+            metres.
+        density: Station air density with shape ``(station,)`` in kg m-3.
+        temperature_k: Station air temperature with shape ``(station,)`` in
+            kelvins.
+        cloud_fraction: Station cloud fraction with shape ``(station,)`` from
+            0 to 1.
+        sensible_heat_flux: Station sensible heat flux with shape
+            ``(station,)`` in W m-2.
+        ipsifcn: Momentum stability-function selector, 0 for Dyer or 1 for
+            CALMET's convective fit.
+
+    Returns:
+        Tuple ``(friction_velocity, monin_obukhov_length, sensible_heat)`` of
+        float32 arrays with shape ``(station,)`` and units m s-1, m, and
+        W m-2 respectively. Inputs are not modified.
+
+    Raises:
+        ValueError: If ``ipsifcn`` is not 0 or 1, or station inputs cannot be
+            broadcast together.
+    """
     return surface_similarity(u,v,roughness_m,first_level_height_m,density,
         temperature_k,cloud_fraction,sensible_heat_flux,
         np.zeros(np.shape(u),dtype=np.int16),wind_measurement_height_m=anemometer_height_m,
@@ -1852,7 +2843,45 @@ def land_station_mixing_height(temperature_profile_k,profile_height_m,
         previous_convective_height_m,temperature_jump_k,friction_velocity,
         monin_obukhov_m,sensible_heat_flux,density,coriolis,*,mixing_method=1,
         surface_temperature_k=None,**options):
-    """MIXHT2ST over prognostic columns for a vector of land stations."""
+    """Calculate MIXHT2ST mixing heights for land-station columns.
+
+    Args:
+        temperature_profile_k: Prognostic temperature profiles with shape
+            ``(source_level, station)`` in kelvins.
+        profile_height_m: Heights matching ``temperature_profile_k`` in
+            metres.
+        previous_convective_height_m: Previous convective heights with shape
+            ``(station,)`` in metres.
+        temperature_jump_k: Previous inversion temperature jumps with shape
+            ``(station,)`` in kelvins.
+        friction_velocity: Station friction velocity with shape ``(station,)``
+            in m s-1.
+        monin_obukhov_m: Station Monin-Obukhov length with shape ``(station,)``
+            in metres.
+        sensible_heat_flux: Station sensible heat flux with shape
+            ``(station,)`` in W m-2.
+        density: Station air density with shape ``(station,)`` in kg m-3.
+        coriolis: Absolute Coriolis parameter with shape ``(station,)`` in
+            s-1.
+        mixing_method: Mixing-height method ``+/-1`` for Maul-Carson or
+            ``+/-2`` for Batchvarova-Gryning.
+        surface_temperature_k: Surface temperature with shape ``(station,)``
+            in kelvins, required for method ``+/-2``.
+        **options: Additional keyword arguments passed to the chosen gridded
+            mixing-height routine.
+
+    Returns:
+        Tuple ``(mixing_height, convective_height, temperature_jump)`` of
+        float32 arrays with shape ``(station,)`` and units m, m, and K.
+        Inputs are not modified.
+
+    Raises:
+        ValueError: If profile arrays are not matching
+            ``(source_level, station)`` fields, the method is unsupported, or
+            method ``+/-2`` lacks surface temperature.
+        TypeError: If ``options`` contains an unsupported keyword for the
+            selected mixing-height routine.
+    """
     temperature=np.asarray(temperature_profile_k,dtype=MODEL_DTYPE)
     height=np.asarray(profile_height_m,dtype=MODEL_DTYPE)
     if temperature.ndim!=2 or height.shape!=temperature.shape:
@@ -1884,6 +2913,59 @@ def land_station_similarity_theory(u,v,roughness_m,anemometer_height_m,
 
     Missing and calm station winds retain their first-level observation and
     remain missing aloft, matching ELUSTR2's early return before SIMILT.
+
+    Args:
+        u: Eastward station wind with shape ``(station,)`` in m s-1.
+        v: Northward station wind with shape ``(station,)`` in m s-1.
+        roughness_m: Station aerodynamic roughness with shape ``(station,)``
+            in metres.
+        anemometer_height_m: Wind measurement heights with shape ``(station,)``
+            in metres.
+        first_level_height_m: Height of the first CALMET layer centre in
+            metres.
+        density: Station air density with shape ``(station,)`` in kg m-3.
+        temperature_k: Station surface temperature with shape ``(station,)``
+            in kelvins.
+        cloud_fraction: Station cloud fraction with shape ``(station,)`` from
+            0 to 1.
+        sensible_heat_flux: Station sensible heat flux with shape
+            ``(station,)`` in W m-2.
+        temperature_profile_k: Prognostic temperature with shape
+            ``(source_level, station)`` in kelvins.
+        profile_height_m: Heights matching ``temperature_profile_k`` in
+            metres.
+        previous_convective_height_m: Previous convective heights with shape
+            ``(station,)`` in metres.
+        temperature_jump_k: Previous inversion jumps with shape ``(station,)``
+            in kelvins.
+        coriolis: Absolute Coriolis parameter with shape ``(station,)`` in
+            s-1.
+        z_centers_m: CALMET layer-centre heights with shape ``(level,)`` in
+            metres above ground level.
+        z_faces_m: CALMET layer-face heights with shape ``(level + 1,)`` in
+            metres above ground level.
+        station_latitude: Station latitude with shape ``(station,)`` in
+            degrees north.
+        mixing_method: Mixing-height method ``+/-1`` for Maul-Carson or
+            ``+/-2`` for Batchvarova-Gryning.
+        ipsifcn: Momentum stability-function selector, 0 or 1.
+        minimum_mixing_height_m: Lower profile mixing-height bound in metres.
+        **mixing_options: Additional keyword arguments passed to the selected
+            mixing-height routine.
+
+    Returns:
+        Eight float32 arrays ``(u_profile, v_profile, friction_velocity,
+        monin_obukhov_length, sensible_heat, mixing_height,
+        convective_height, temperature_jump)``. Wind profiles have shape
+        ``(level, station)`` in m s-1; state arrays have shape ``(station,)``
+        with units m s-1, m, W m-2, m, m, and K. Inputs are not modified.
+
+    Raises:
+        ValueError: If station or profile shapes disagree, ``mixing_method``
+            or ``ipsifcn`` is unsupported, or required downstream inputs are
+            missing.
+        TypeError: If ``mixing_options`` contains an unsupported keyword for
+            the selected mixing-height routine.
     """
     u=np.asarray(u,dtype=MODEL_DTYPE); v=np.asarray(v,dtype=MODEL_DTYPE)
     if u.ndim!=1 or v.shape!=u.shape:
@@ -1938,7 +3020,58 @@ def objective_analysis_component(station_values,station_xy,first_guess,landuse,d
                                  stations_per_level=5,observation_weight=1.,vary_radius=True,
                                  water_range=(50,55),barriers=(),barrier_top_level=0,
                                  background_weight=None,block_size=32768):
-    """Vectorized no-barrier INTER2 component analysis for IPROG 0/2/4/14."""
+    """Analyze one wind component with CALMET's INTER2 interpolation.
+
+    Args:
+        station_values: Observed component values with shape
+            ``(level, station)``. Values of 900 or greater are missing; units
+            are preserved in the output.
+        station_xy: Station coordinates with shape ``(station, 2)`` in
+            kilometres in the CALMET grid coordinate system.
+        first_guess: Background component with shape ``(level, y, x)`` and
+            the same units as ``station_values``.
+        landuse: Integer land-use categories with shape ``(y, x)``.
+        dx_km: East-west grid spacing in kilometres.
+        dy_km: South-north grid spacing in kilometres.
+        rmin_km: Minimum station distance used in inverse-square weights, in
+            kilometres.
+        rmax_surface_km: Maximum land-station radius at level zero in
+            kilometres.
+        rmax_upper_km: Maximum land-station radius above level zero in
+            kilometres.
+        rmax_water_km: Maximum station radius over water in kilometres.
+        surface_scale_km: Background weighting length at level zero in
+            kilometres.
+        upper_scale_km: Background weighting length above level zero in
+            kilometres.
+        stations_per_level: Number of nearest observations retained, either a
+            scalar or an integer with shape ``(level,)``.
+        observation_weight: Dimensionless observation multiplier, scalar or
+            broadcastable to ``(level, y, x)``.
+        vary_radius: Whether a target with no station inside its maximum
+            radius falls back to the nearest valid station.
+        water_range: Inclusive pair of land-use category numbers treated as
+            water.
+        barriers: Barrier endpoints with shape ``(barrier, 4)`` ordered as
+            ``(x_begin, y_begin, x_end, y_end)`` in kilometres.
+        barrier_top_level: Number of lowest model levels at which barriers
+            can block observations.
+        background_weight: Optional explicit background weight in km-2,
+            scalar or broadcastable to ``(level, y, x)``. Scale-derived
+            weights are used when omitted.
+        block_size: Number of flattened target cells processed per block.
+
+    Returns:
+        A new float32 array with shape ``(level, y, x)`` containing the
+        analyzed component in the same units as ``station_values`` and
+        ``first_guess``.
+
+    Raises:
+        ValueError: If observation, coordinate, background, or land-use
+            dimensions disagree; a station count is non-positive; barriers
+            are malformed; or a required level or target has no valid,
+            unblocked station.
+    """
     work_dtype=ACCUMULATION_DTYPE
     values=np.asarray(station_values,dtype=work_dtype); points=np.asarray(station_xy,dtype=work_dtype)
     guess=np.asarray(first_guess,dtype=work_dtype); lu=np.asarray(landuse)
@@ -2016,6 +3149,40 @@ def wind1_initial_guess(station_u,station_v,station_xy,surface_station_count,
     Surface (including SEA) profiles precede upper-air profiles. Distances use
     a one-grid-cell floor before vertically varying group bias and
     per-level missing/calm/barrier removal.
+
+    Args:
+        station_u: Eastward station-wind profiles with shape
+            ``(level, station)`` in m s-1. Values above 900 are missing.
+        station_v: Northward station-wind profiles matching ``station_u`` in
+            m s-1.
+        station_xy: Station coordinates with shape ``(station, 2)`` in
+            kilometres in the CALMET grid coordinate system.
+        surface_station_count: Number of leading stations treated as surface
+            or overwater stations; remaining stations are upper-air sites.
+        nx: Number of grid columns.
+        ny: Number of grid rows.
+        dx_km: East-west grid spacing in kilometres.
+        dy_km: South-north grid spacing in kilometres.
+        bias: Relative surface-versus-upper-air weight in ``[-1, 1]``, either
+            scalar or shape ``(level,)``. Positive values favor upper-air
+            stations and negative values favor surface stations.
+        extrapolate_calm: Whether calm surface observations contribute above
+            the first model level.
+        barriers: Barrier endpoints with shape ``(barrier, 4)`` ordered as
+            ``(x_begin, y_begin, x_end, y_end)`` in kilometres.
+        barrier_top_level: Number of lowest model levels at which barriers
+            can block observations.
+        block_size: Number of flattened target cells processed per block.
+
+    Returns:
+        Tuple ``(u_initial, v_initial)`` of new float32 arrays with shape
+        ``(level, ny, nx)`` in m s-1. Inputs are not modified.
+
+    Raises:
+        ValueError: If profile or coordinate shapes disagree, the surface
+            count or bias is invalid, grid spacing is non-positive, barriers
+            are malformed, a positive bias lacks upper-air stations, or no
+            valid unblocked observation remains for a target.
     """
     work_dtype=ACCUMULATION_DTYPE
     u=np.asarray(station_u,dtype=work_dtype); v=np.asarray(station_v,dtype=work_dtype)
@@ -2056,9 +3223,33 @@ def wind1_initial_guess(station_u,station_v,station_xy,surface_station_count,
     valid=(u<=work_dtype(900.))&(v<=work_dtype(900.))
     calm=np.sqrt(np.asarray(u[0,:nsurface]**2+v[0,:nsurface]**2,dtype=work_dtype))<work_dtype(1.e-4)
     def stable_sum(items):
+        """Reduce station contributions in accumulation precision.
+
+        Args:
+            items: Numeric array with shape ``(target, station)`` and units
+                inherited from the quantity being accumulated.
+
+        Returns:
+            A float64 array with shape ``(target,)`` and the same units as
+            ``items``. The input is not modified.
+        """
         return np.sum(items,axis=1,dtype=ACCUMULATION_DTYPE)
     def discard_weights(weights,remove):
-        """Remove unavailable observations and normalize the remaining weights."""
+        """Remove unavailable observations and renormalize target weights.
+
+        Args:
+            weights: Float64 interpolation weights with shape
+                ``(target, station)``. This array is modified in place.
+            remove: Boolean mask with the same shape; true entries are set to
+                zero before affected rows are normalized.
+
+        Returns:
+            None. ``weights`` is updated in place.
+
+        Raises:
+            ValueError: If an affected target has no positive weight after
+                removal.
+        """
         affected=np.any(remove,axis=1)
         if not affected.any():
             return
@@ -2114,7 +3305,19 @@ def wind1_initial_guess(station_u,station_v,station_xy,surface_station_count,
 
 
 def _barrier_blocked(targets,stations,barriers):
-    """Vectorized BARIER result for target × station pairs."""
+    """Test every target-to-station segment against CALMET barriers.
+
+    Args:
+        targets: Target coordinates with shape ``(target, 2)``.
+        stations: Station coordinates with shape ``(station, 2)``.
+        barriers: Barrier endpoints with shape ``(barrier, 4)`` ordered as
+            ``(x_begin, y_begin, x_end, y_end)``. All coordinates must use
+            the same units.
+
+    Returns:
+        A boolean array with shape ``(target, station)``. True marks a segment
+        blocked by at least one barrier; inputs are not modified.
+    """
     work_dtype=ACCUMULATION_DTYPE
     target=np.asarray(targets,dtype=work_dtype); station=np.asarray(stations,dtype=work_dtype)
     blocked=np.zeros((target.shape[0],station.shape[0]),dtype=bool)
@@ -2128,6 +3331,18 @@ def _barrier_blocked(targets,stations,barriers):
         b=np.column_stack((np.full(target.shape[0],xe,dtype=work_dtype)-target[:,0],np.full(target.shape[0],ye,dtype=work_dtype)-target[:,1]))
         c=station[None,:,:]-target[:,None,:]
         def cosine(left,right):
+            """Calculate cosines between broadcast two-component vectors.
+
+            Args:
+                left: Vectors with final axis length 2.
+                right: Vectors with final axis length 2 and broadcastable
+                    leading axes.
+
+            Returns:
+                A dimensionless float64 array over the broadcast leading
+                shape. Zero-length vector pairs return zero; inputs are not
+                modified.
+            """
             numerator=np.asarray(left[...,0]*right[...,0]+left[...,1]*right[...,1],dtype=work_dtype)
             left2=np.asarray(left[...,0]**2+left[...,1]**2,dtype=work_dtype)
             right2=np.asarray(right[...,0]**2+right[...,1]**2,dtype=work_dtype)
@@ -2146,6 +3361,23 @@ def barrier_blocked_pairs(targets, stations, barriers):
     ``stations`` has shape ``(target, candidate, 2)``.  This is the layout
     used by CALMET's four prognostic neighbours and avoids constructing the
     prohibitively large target-by-full-prognostic-grid matrix.
+
+    Args:
+        targets: Target coordinates with shape ``(target, 2)``.
+        stations: Target-specific candidate coordinates with shape
+            ``(target, candidate, 2)``.
+        barriers: Barrier endpoints with shape ``(barrier, 4)`` ordered as
+            ``(x_begin, y_begin, x_end, y_end)``. All coordinates must use
+            the same units.
+
+    Returns:
+        A boolean array with shape ``(target, candidate)``. True marks a
+        target-candidate segment blocked by at least one barrier; inputs are
+        not modified.
+
+    Raises:
+        ValueError: If target or candidate coordinate arrays have incompatible
+            dimensions.
     """
     work_dtype=ACCUMULATION_DTYPE
     target=np.asarray(targets,dtype=work_dtype); station=np.asarray(stations,dtype=work_dtype)
@@ -2166,6 +3398,18 @@ def barrier_blocked_pairs(targets, stations, barriers):
                            np.full(target.shape[0],ye,dtype=work_dtype)-target[:,1]))
         c=station-target[:,None,:]
         def cosine(left,right):
+            """Calculate cosines between broadcast two-component vectors.
+
+            Args:
+                left: Vectors with final axis length 2.
+                right: Vectors with final axis length 2 and broadcastable
+                    leading axes.
+
+            Returns:
+                A dimensionless float64 array over the broadcast leading
+                shape. Zero-length vector pairs return zero; inputs are not
+                modified.
+            """
             numerator=np.asarray(left[...,0]*right[...,0]+left[...,1]*right[...,1],dtype=work_dtype)
             left2=np.asarray(left[...,0]**2+left[...,1]**2,dtype=work_dtype)
             right2=np.asarray(right[...,0]**2+right[...,1]**2,dtype=work_dtype)

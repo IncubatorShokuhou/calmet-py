@@ -12,6 +12,22 @@ import numpy as np
 
 @dataclass(frozen=True,slots=True)
 class M2DHeader:
+    """Static metadata from a formatted CALWRF M2D file.
+
+    Attributes:
+        nx: Extracted east-west cell count.
+        ny: Extracted north-south cell count.
+        nz: Extracted vertical-level count recorded in the header.
+        nhours: Number of hourly periods.
+        start: First source timestamp.
+        variables: Variable labels in record order.
+        source_nx: Full source-grid east-west dimension.
+        source_ny: Full source-grid north-south dimension.
+        source_nz: Full source-grid vertical dimension.
+        i_start: One-based west extraction index.
+        j_start: One-based south extraction index.
+        k_start: One-based bottom extraction index.
+    """
     nx: int
     ny: int
     nz: int
@@ -27,29 +43,61 @@ class M2DHeader:
 
     @property
     def wire_start(self) -> str:
-        """Ten-column timestamp stored in the formatted M2D header."""
+        """Return the timestamp stored in the M2D header.
+
+        Returns:
+            Ten-character ``YYYYMMDDHH`` timestamp.
+        """
         return self.start.strftime('%Y%m%d%H')
 
 
 @dataclass(frozen=True,slots=True)
 class M2DRecord:
+    """One timestamped two-dimensional M2D variable.
+
+    Attributes:
+        timestamp: Timestamp attached to the source record.
+        name: Eight-character variable label with padding removed.
+        values: ``float32`` array with shape ``(ny, nx)`` in south-to-north
+            row order.
+    """
     timestamp: datetime
     name: str
     values: np.ndarray
 
     @property
     def date(self) -> datetime:
-        """Compatibility name for the structured record timestamp."""
+        """Expose the timestamp through the historical ``date`` name.
+
+        Returns:
+            Structured record timestamp.
+        """
         return self.timestamp
 
     @property
     def wire_date(self) -> str:
-        """Ten-column timestamp stored in the formatted variable record."""
+        """Return the timestamp stored in the variable record.
+
+        Returns:
+            Ten-character ``YYYYMMDDHH`` timestamp.
+        """
         return self.timestamp.strftime('%Y%m%d%H')
 
 
 def _timestamp(field: bytes,description: str) -> datetime:
-    """Decode one exact-width ``YYYYMMDDHH`` field at the file boundary."""
+    """Decode one exact-width ``YYYYMMDDHH`` boundary field.
+
+    Args:
+        field: Exactly ten ASCII timestamp bytes.
+        description: Field role included in validation errors.
+
+    Returns:
+        Naive hourly timestamp.
+
+    Raises:
+        ValueError: If the bytes are non-ASCII, wrong-width, nonnumeric, or do
+            not form a valid calendar timestamp.
+    """
     try:
         text=field.decode('ascii')
     except UnicodeDecodeError as error:
@@ -63,10 +111,33 @@ def _timestamp(field: bytes,description: str) -> datetime:
 
 
 class M2DReader:
+    """Stream structured records from a formatted CALWRF M2D file.
+
+    Attributes:
+        path: Source M2D file path.
+    """
     def __init__(self,path):
+        """Store the M2D source path without opening it.
+
+        Args:
+            path: Existing formatted M2D path.
+        """
         self.path=Path(path)
 
     def records(self) -> tuple[M2DHeader,Iterable[M2DRecord]]:
+        """Read the header and return a lazy variable-record iterator.
+
+        Returns:
+            Tuple containing parsed header metadata and a single-pass iterator
+            of two-dimensional records. The iterator owns and closes the file.
+
+        Raises:
+            OSError: If the file cannot be opened or read.
+            UnicodeError: If required text records are not ASCII.
+            ValueError: If comments, dimensions, bounds, or numeric rows are
+                malformed.
+            EOFError: If iteration reaches a truncated variable record.
+        """
         stream=self.path.open('rb',buffering=1024*1024)
         stream.readline()
         comment_count=int(stream.readline())
@@ -99,6 +170,15 @@ class M2DReader:
                          source_nx,source_ny,source_nz,i_start,j_start,k_start)
 
         def generate():
+            """Yield decoded variable records and close the owned stream.
+
+            Yields:
+                Timestamped ``float32`` M2D grids in file order.
+
+            Raises:
+                EOFError: If a variable header or grid row is truncated.
+                ValueError: If a row has the wrong number of values.
+            """
             try:
                 for _ in range(nhours*variable_count):
                     line=stream.readline()

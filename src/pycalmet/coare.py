@@ -13,7 +13,30 @@ ACCUM_DTYPE=np.float64
 
 @dataclass(frozen=True, slots=True)
 class CoareFlux:
-    """Fields returned by CALMET's ``COARE -> BULK_FLUX -> ASL`` chain."""
+    """Fields returned by CALMET's ``COARE -> BULK_FLUX -> ASL`` chain.
+
+    Attributes:
+        roughness_m: Aerodynamic roughness length in metres.
+        monin_obukhov_m: Monin-Obukhov length in metres.
+        friction_velocity_m_s: Friction velocity in metres per second.
+        temperature_scale_k: Turbulent temperature scale in kelvin.
+        humidity_scale_kg_kg: Turbulent specific-humidity scale in kilograms
+            per kilogram.
+        sensible_heat_flux_w_m2: Upward sensible heat flux in watts per square
+            metre.
+        latent_heat_flux_w_m2: Upward latent heat flux in watts per square
+            metre.
+        buoyancy_flux_k_m_s: Kinematic virtual-temperature flux in
+            kelvin-metres per second.
+        cool_skin_delta_k: Cool-skin temperature difference in kelvin.
+        gustiness_m_s: Convective gustiness in metres per second.
+        stress_n_m2: Along-wind surface stress in newtons per square metre.
+        rain_heat_flux_w_m2: Rain heat flux in watts per square metre.
+
+    Notes:
+        Every array has the broadcast shape of the inputs passed to
+        :func:`surface_flux` and uses the model's ``float32`` dtype.
+    """
 
     roughness_m: np.ndarray
     monin_obukhov_m: np.ndarray
@@ -31,7 +54,28 @@ class CoareFlux:
 
 @dataclass(frozen=True, slots=True)
 class WarmLayerState:
-    """Per-grid state carried by CALMET's COARE ``IWARM=1`` option."""
+    """Per-grid state carried by CALMET's COARE ``IWARM=1`` option.
+
+    Attributes:
+        time_old_s: Previous local solar time in seconds after midnight.
+        heat_column_j_m2: Accumulated warm-layer heat in joules per square
+            metre.
+        stress_integral_n_s_m2: Time-integrated surface stress in
+            newton-seconds per square metre.
+        stress_old_n_m2: Surface stress from the previous step.
+        rain_heat_old_w_m2: Previous rain heat flux.
+        sensible_old_w_m2: Previous sensible heat flux.
+        latent_old_w_m2: Previous latent heat flux.
+        morning_started: Whether daytime heat accumulation has begun.
+        absorption_fraction: Fraction of shortwave radiation absorbed in the
+            warm layer.
+        layer_thickness_m: Warm-layer thickness in metres.
+        initialized: Whether a grid cell has a previous timestep.
+
+    Notes:
+        Accumulators use ``float64`` to limit drift across long simulations;
+        ordinary CALMET fields remain ``float32``.
+    """
 
     time_old_s: np.ndarray
     heat_column_j_m2: np.ndarray
@@ -47,7 +91,14 @@ class WarmLayerState:
 
 
 def initial_warm_layer_state(shape):
-    """Return COARE's first-call values for an output-grid shape."""
+    """Create COARE first-call state for an output-grid shape.
+
+    Args:
+        shape: Integer or tuple defining the horizontal array shape.
+
+    Returns:
+        Independent warm-layer state arrays initialized to the COARE defaults.
+    """
     # Warm-layer heat and stress integrals persist across many timesteps, so
     # keep this small state in FP64 while ordinary model fields use FP32.
     zeros=np.zeros(shape,dtype=ACCUM_DTYPE)
@@ -59,7 +110,24 @@ def initial_warm_layer_state(shape):
 
 def advance_warm_layer(state,solar_time_s,sea_temperature_k,sensor_depth_m,
                        shortwave_down_w_m2,longwave_down_w_m2):
-    """Advance the vectorized COARE PWP warm layer before the ASL solve."""
+    """Advance the vectorized COARE PWP warm layer before the ASL solve.
+
+    Args:
+        state: State retained from the preceding timestep.
+        solar_time_s: Local solar time in seconds after midnight.
+        sea_temperature_k: Measured sea temperature in kelvin.
+        sensor_depth_m: Sea-temperature sensor depth in metres.
+        shortwave_down_w_m2: Downward shortwave radiation in watts per square
+            metre.
+        longwave_down_w_m2: Downward longwave radiation in watts per square
+            metre.
+
+    Returns:
+        A three-item tuple containing adjusted sea temperature in kelvin,
+        updated warm-layer state, and the bulk warm-layer increment in kelvin.
+        Numeric arrays have the broadcast input shape; temperatures use
+        ``float32``.
+    """
     time,temperature,depth,shortwave,longwave=np.broadcast_arrays(
         np.asarray(solar_time_s,dtype=ACCUM_DTYPE),
         np.asarray(sea_temperature_k,dtype=ACCUM_DTYPE),
@@ -117,7 +185,16 @@ def advance_warm_layer(state,solar_time_s,sea_temperature_k,sensor_depth_m,
 
 
 def update_warm_layer_fluxes(state,flux):
-    """Store fluxes consumed at the next COARE warm-layer timestep."""
+    """Store surface fluxes consumed by the next warm-layer timestep.
+
+    Args:
+        state: Warm-layer state after :func:`advance_warm_layer`.
+        flux: COARE flux fields calculated for the current timestep.
+
+    Returns:
+        A new state whose previous-flux arrays use ``float64`` while all other
+        state arrays are retained.
+    """
     return WarmLayerState(
         state.time_old_s,state.heat_column_j_m2,state.stress_integral_n_s_m2,
         np.asarray(flux.stress_n_m2,dtype=ACCUM_DTYPE),
@@ -129,7 +206,18 @@ def update_warm_layer_fluxes(state,flux):
 
 
 def distance_to_coast(landuse,water_range,dx_km,dy_km):
-    """CALMET SETCOAST distance from each water cell to a land-cell centre."""
+    """Calculate CALMET SETCOAST distance to the nearest land-cell centre.
+
+    Args:
+        landuse: Two-dimensional integer array of dominant land-use classes.
+        water_range: Inclusive ``(minimum, maximum)`` water-category codes.
+        dx_km: East-west grid spacing in kilometres.
+        dy_km: North-south grid spacing in kilometres.
+
+    Returns:
+        ``float32`` array in kilometres with the land-use shape. Land cells
+        are zero; an all-water domain receives the CALMET sentinel ``1e6``.
+    """
     categories=np.asarray(landuse)
     water=(categories>=water_range[0])&(categories<=water_range[1])
     if water.all():
@@ -139,7 +227,15 @@ def distance_to_coast(landuse,water_range,dx_km,dy_km):
 
 
 def _humidity_vapor_pressure(temperature_c, pressure_mb):
-    """CALMET HUMIDITY: Buck/Tetens saturation vapor pressure in mb."""
+    """Evaluate CALMET's Buck/Tetens saturation vapor pressure.
+
+    Args:
+        temperature_c: Scalar or array air temperature in degrees Celsius.
+        pressure_mb: Broadcast-compatible pressure in millibars.
+
+    Returns:
+        Saturation vapor pressure in millibars with ``float32`` arithmetic.
+    """
     temperature=np.asarray(temperature_c,dtype=MODEL_DTYPE)
     pressure=np.asarray(pressure_mb,dtype=MODEL_DTYPE)
     return ((1.0007+3.46e-6*pressure)*6.1121*
@@ -147,7 +243,14 @@ def _humidity_vapor_pressure(temperature_c, pressure_mb):
 
 
 def _psiu(z_over_l):
-    """COARE momentum stability correction."""
+    """Evaluate the COARE momentum stability correction.
+
+    Args:
+        z_over_l: Scalar or array dimensionless stability coordinate ``z/L``.
+
+    Returns:
+        ``float32`` correction array with the input shape.
+    """
     value=np.asarray(z_over_l,dtype=MODEL_DTYPE)
     unstable=value<0.
     result=np.empty_like(value)
@@ -171,7 +274,14 @@ def _psiu(z_over_l):
 
 
 def _psit(z_over_l):
-    """COARE temperature stability correction."""
+    """Evaluate the COARE scalar-temperature stability correction.
+
+    Args:
+        z_over_l: Scalar or array dimensionless stability coordinate ``z/L``.
+
+    Returns:
+        ``float32`` correction array with the input shape.
+    """
     value=np.asarray(z_over_l,dtype=MODEL_DTYPE)
     unstable=value<0.
     result=np.empty_like(value)
@@ -196,7 +306,18 @@ def _psit(z_over_l):
 
 def downward_longwave(temperature_k,relative_humidity_percent,cloud_fraction,
                       ceiling_height_m):
-    """Vectorized CALMET ``RADFLX`` downward longwave radiation."""
+    """Calculate downward longwave radiation with CALMET ``RADFLX``.
+
+    Args:
+        temperature_k: Air temperature in kelvin.
+        relative_humidity_percent: Relative humidity in percent.
+        cloud_fraction: Cloud cover fraction from zero to one.
+        ceiling_height_m: Cloud-ceiling height in metres.
+
+    Returns:
+        Broadcast ``float32`` array of downward longwave radiation in watts
+        per square metre.
+    """
     temperature,humidity,cloud,ceiling=np.broadcast_arrays(
         np.asarray(temperature_k,dtype=MODEL_DTYPE),
         np.asarray(relative_humidity_percent,dtype=MODEL_DTYPE),
@@ -236,6 +357,42 @@ def surface_flux(
     humidity fractions, while larger values are specific humidity in g/kg.
     Warm-layer storage is intentionally separate because it carries state
     between timesteps; this function exactly covers ``IWARM=0``.
+
+    Args:
+        wind_speed_m_s: Wind speed at ``wind_height_m`` in metres per second.
+        air_temperature_k: Air temperature at ``temperature_height_m`` in
+            kelvin.
+        sea_temperature_k: Bulk sea-surface temperature in kelvin.
+        humidity: Relative-humidity fraction for values below 2, otherwise
+            specific humidity in grams per kilogram.
+        wind_height_m: Wind measurement height in metres.
+        temperature_height_m: Temperature and humidity measurement height in
+            metres.
+        pressure_mb: Surface pressure in millibars.
+        boundary_layer_height_m: Marine boundary-layer height in metres.
+        shortwave_down_w_m2: Downward shortwave radiation in watts per square
+            metre.
+        longwave_down_w_m2: Downward longwave radiation in watts per square
+            metre.
+        rainfall_mm_h: Rainfall rate in millimetres per hour.
+        wave_method: Roughness method: 0 uses Charnock, 1 uses wave age, and 2
+            uses wave slope.
+        wave_period_s: Wave period in seconds; a negative value derives it
+            from wind speed for wave methods 1 and 2.
+        wave_height_m: Wave height in metres; a negative value derives it from
+            wind speed for wave methods 1 and 2.
+        coastal_shelf_length_km: Shelf adjustment length in kilometres; values
+            below 0.1 disable the adjustment.
+        distance_to_coast_km: Water-cell distance to land in kilometres.
+        cool_skin: Whether to calculate the cool-skin temperature correction.
+
+    Returns:
+        COARE flux arrays with the common broadcast shape and ``float32``
+        dtype.
+
+    Raises:
+        ValueError: If ``wave_method`` is outside 0--2, or a measurement
+            height, pressure, or boundary-layer height is non-positive.
     """
     if wave_method not in {0,1,2}:
         raise ValueError('COARE wave_method must be 0, 1, or 2')
