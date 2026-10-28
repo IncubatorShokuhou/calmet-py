@@ -1,5 +1,7 @@
 # CTGPROC
 
+[中文](zh/ctgproc.md)
+
 CTGPROC resamples a categorical land-use raster onto the CALMET grid and
 stores hit counts per category. MAKEGEO turns those counts into fractions.
 The Zhejiang land-use source is `EAUSGS1.IMG`, a headerless 8-bit raster on

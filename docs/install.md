@@ -1,5 +1,7 @@
 # Installation
 
+[中文](zh/install.md)
+
 PyCALMET requires Python 3.10 or newer. The published package name is
 `pycalmet`.
 

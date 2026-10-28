@@ -1,5 +1,7 @@
 # TERREL
 
+[中文](zh/terrel.md)
+
 TERREL samples a digital elevation model onto the CALMET grid and writes the
 terrain height MAKEGEO will read. Rasterio decodes SRTM HGT and GeoTIFF.
 Older CALMET formats (USGS DEM, 3CD, ARM3, and the rest) have readers in the

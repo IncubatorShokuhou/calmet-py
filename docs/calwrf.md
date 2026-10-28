@@ -1,5 +1,7 @@
 # CALWRF
 
+[中文](zh/calwrf.md)
+
 CALWRF reads WRF-ARW NetCDF and writes the three-dimensional meteorology
 CALMET expects: pressure, temperature, water vapor, hydrometeors, and
 earth-relative wind on mass levels, plus surface wind and precipitation

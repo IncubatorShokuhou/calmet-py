@@ -1,5 +1,7 @@
 # PyCALMET User Guide
 
+[中文用户指南](zh/index.md)
+
 PyCALMET turns the CALMET preprocessing sequence into a typed Python package.
 This guide explains how to install it, how the NumPy and JAX backends differ,
 and what each processing stage expects. It is written in the same spirit as
@@ -34,7 +36,14 @@ makegeo
 calmet
 ```
 
-The fenced `toctree` above is read by Sphinx. On GitHub, use the numbered list.
+```{toctree}
+:hidden:
+
+zh/index
+```
+
+The fenced toctrees above are read by Sphinx. The hidden one only pulls the
+Chinese pages into the same HTML build. On GitHub, use the numbered list.
 
 ## Build the HTML guide
 
@@ -45,4 +54,6 @@ python -m pip install -r docs/requirements.txt
 sphinx-build -b html docs docs/_build/html
 ```
 
-Open `docs/_build/html/index.html`. The HTML build is gitignored.
+Open `docs/_build/html/index.html`. The same build includes the Chinese guide at
+`docs/_build/html/zh/index.html`. `sphinx-build -W -b html docs docs/_build/html`
+treats warnings as errors on this source tree. The HTML build is gitignored.

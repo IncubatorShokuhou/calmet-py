@@ -1,6 +1,6 @@
 # PyCALMET
 
-[中文文档](README.zh-CN.md) · [User Guide](docs/index.md)
+[中文文档](README.zh-CN.md) · [User Guide](docs/index.md) · [用户指南](docs/zh/index.md)
 
 PyCALMET is a NumPy implementation of the CALMET meteorological preprocessing
 and diagnostic wind-field workflow. It provides Python APIs for CALWRF,
@@ -733,6 +733,7 @@ generated products.
 src/pycalmet/          Python package and opt-in legacy namespace
 tests/                 Unit and integration tests
 docs/                  User guide for install, backends, and the five stages
+docs/zh/               Chinese (zh-CN) user guide, same outline
 examples/zhejiang/     Runnable real-data example and control files
 data/terrain/srtm3/    Original SRTM3 tiles used by the Zhejiang domain
 data/landuse/usgs-glcc/ Original USGS Global/GLCC-style land-use rasters
