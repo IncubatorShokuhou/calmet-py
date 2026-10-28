@@ -56,7 +56,7 @@ result = pycalmet.run_pipeline(
 
 第一次运行之前，有三条只属于流水线的约束：
 
-- `makegeo_snow_processing` 保持为假。积雪处理每天写一份 GEO 文件，单一输出约定因此不成立。
+- `makegeo_snow_processing` 保持为假。积雪处理每天写一份 GEO 文件，与只保留一个输出的约定冲突。
 - `calmet_save_output` 保持为真，`calmet_test_mode` 保持为 `2`，最后一个小时会完成计算并写出。
 - CALWRF 的 `start` 与 `end` 都包含在内，对应的是 WRF 记录。它们夹住 CALMET 时段；该时段的结束时刻为开边界。上例传入 00:00 和 01:00，CALMET 据此填满 `[00:00, 01:00)`。
 

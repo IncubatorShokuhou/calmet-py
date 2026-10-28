@@ -55,7 +55,7 @@ result = pycalmet.calmet(
 
 `minimize_divergence` 和 `smooth_wind` 按固定顺序访问每个格点，并更新刚刚写过的风。无论选择哪个后端，它们都在 NumPy 上执行。客观分析和障碍线例程同样如此。选择 JAX 时这些扫描照常执行；被放到设备上的是周围的数组计算核。
 
-求解器内部的模型状态是 float32。散度积分用 float64 累加，再由计算核把存盘的场转回 float32。NumPy 路径使用同一拆分，因此 JAX 后端会打开 64 位模式。若关闭 64 位模式，收敛检验接受的格点会改变。
+求解器内部的模型状态是 float32。散度积分用 float64 累加，再由计算核把保存的场转回 float32。NumPy 路径使用同一拆分，因此 JAX 后端会打开 64 位模式。若关闭 64 位模式，收敛检验接受的格点会改变。
 
 legacy API（`pycalmet.legacy.calmet`）复现历史上每条语句都使用 float32 的路径。这条路径不读取后端设置。对照 Fortran 二进制结果时使用它；对照本包的 NumPy 求解器时使用 `pycalmet.calmet`。
 
@@ -63,4 +63,4 @@ legacy API（`pycalmet.legacy.calmet`）复现历史上每条语句都使用 flo
 
 `calmet` 写出的 NetCDF 就是 `run_pipeline` 保留的产品。变量名遵循 `README.zh-CN.md` 中已有的 CALMET 输出约定（风分量、混合层高度、温度，以及二维地面场）。只有输出路径或兼容开关明确要求时，才写出 legacy 的 `CALMET.DAT` 及其 `.aux` 配套文件。
 
-一小时的 WRF 窗口用于回归检查。生产运行需要前一夜的气象场，混合层才有可延续的初值。浙江 README 在复现命令旁说明了这一限制。
+一小时的 WRF 窗口用于回归检查。生产运行需要前一夜的气象场，混合层才有可延续的初值。`examples/zhejiang/README.md` 在复现命令旁说明了这一限制。

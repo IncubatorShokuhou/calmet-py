@@ -51,7 +51,7 @@ with pycalmet.use_backend("jax", device="gpu"):
 
 - PyCALMET 以外的主机 NumPy 代码不读取 JAX 开关，因此不受这些设置影响。
 - 同一进程中的其他 JAX 代码会看到 x64 已打开，以及本包选定的默认设备，直到后端被恢复。
-- 超越函数（`sin`、`exp`、`power`）与 NumPy 的差别可以出现在最后几位。JAX 输出与 NumPy 或 Fortran 参考数值等价，最后几位可以不同。
+- 超越函数（`sin`、`exp`、`power`）与 NumPy 可以在最后几位上不同。把 JAX 输出当作与 NumPy 或 Fortran 参考数值等价的结果。
 - 每个加速计算核都返回 NumPy `ndarray`。随后按下标写 NetCDF 变量的代码不必知道数组来自哪个后端。
 - 第一次 JAX 调用可能用于初始化 GPU 运行时。随后的调用复用该进程。
 

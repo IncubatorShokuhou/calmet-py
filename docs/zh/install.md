@@ -36,7 +36,7 @@ python -m pip install ".[gpu]"
 
 | 平台 | `[gpu]` 拉取的轮子 |
 | --- | --- |
-| Linux x86_64 和 aarch64 | `jax[cuda12]`，即 JAX、CUDA 12 插件和 NVIDIA 的 pip 轮子。驱动须为 525 或更新。 |
+| Linux x86_64 和 aarch64 | `jax[cuda12]`，即 JAX、CUDA 12 插件和 NVIDIA 的 pip 轮子。驱动须为 525 或更高。 |
 | macOS、Windows 以及其他 Linux 架构 | 可移植的 `jax` 轮子。未另行安装平台插件时，JAX 使用 CPU 后端。 |
 
 安装 `[gpu]` 之后运行时不变。在选择 JAX 之前，`pycalmet.get_backend()` 仍返回 `"numpy"`。
