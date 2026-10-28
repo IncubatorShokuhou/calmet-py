@@ -2,6 +2,7 @@
 
 Rasterio handles standard SRTM and GeoTIFF inputs.  Format-specific readers
 remain for historical terrain products that GDAL cannot reliably identify.
+Cell-mean reduction follows :mod:`pycalmet.backend`.
 """
 
 from __future__ import annotations
@@ -29,7 +30,9 @@ configure_proj_data()
 from pyproj import CRS, Transformer
 from scipy.spatial import cKDTree
 
+from .backend import using_jax
 from .config import GridConfig, TerrelConfig, TerrelSource
+from ._device_kernels import cell_averages as _device_cell_averages
 from ._ctgproc import CoastPolygon, _coastline_types, _read_coastline_bln
 from .datums import NIMA_DATABASE_DATE
 from .gshhs import extract_gshhs
@@ -2705,6 +2708,8 @@ def _cell_averages(
         Float32 mean elevations in metres with the input shape. Empty cells use
         the TERREL missing value -999.
     """
+    if using_jax():
+        return _device_cell_averages(sums, counts)
     totals=np.asarray(sums,dtype=ACCUM_DTYPE)
     hits=np.asarray(counts)
     denominator=np.asarray(hits,dtype=ACCUM_DTYPE)
