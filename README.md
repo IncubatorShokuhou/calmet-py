@@ -1,6 +1,6 @@
 # PyCALMET
 
-[中文文档](README.zh-CN.md)
+[中文文档](README.zh-CN.md) · [User Guide](docs/index.md)
 
 PyCALMET is a NumPy implementation of the CALMET meteorological preprocessing
 and diagnostic wind-field workflow. It provides Python APIs for CALWRF,
@@ -15,6 +15,7 @@ numerical references are kept in separate, clearly scoped directories.
 ## Highlights
 
 - Pure Python and NumPy/SciPy execution; no Fortran compiler is required.
+- Optional JAX backend for the vectorized kernels in each stage. `pip install pycalmet[gpu]` adds JAX; the default install and the default runtime stay on NumPy.
 - Five public processing stages plus an end-to-end pipeline exposed through one package.
 - WRF NetCDF input and CF-compatible NetCDF output through `netCDF4` only.
 - FP32 model fields with explicit high-precision boundaries for time, geodesy,
@@ -33,6 +34,14 @@ PyCALMET requires Python 3.10 or newer.
 ```bash
 python -m pip install .
 ```
+
+That install does not depend on JAX. The optional GPU extra installs JAX, including the CUDA 12 plugin wheels on Linux x86_64 and aarch64:
+
+```bash
+python -m pip install ".[gpu]"
+```
+
+JAX is not selected automatically. Choose it with `pycalmet.set_backend("jax")` or `PYCALMET_BACKEND=jax`. Device placement, float32 model fields, and the kernels that stay on NumPy are described in the [User Guide](docs/index.md).
 
 For development and testing:
 
@@ -723,6 +732,7 @@ generated products.
 ```text
 src/pycalmet/          Python package and opt-in legacy namespace
 tests/                 Unit and integration tests
+docs/                  User guide for install, backends, and the five stages
 examples/zhejiang/     Runnable real-data example and control files
 data/terrain/srtm3/    Original SRTM3 tiles used by the Zhejiang domain
 data/landuse/usgs-glcc/ Original USGS Global/GLCC-style land-use rasters
@@ -773,7 +783,8 @@ python -m pytest -q
 ```
 
 The default suite checks numerical behavior and complete data flow without
-requiring a particular compiler or C math library. A focused legacy test keeps
+requiring a particular compiler, C math library, or JAX. JAX parity tests skip
+when JAX is not installed. A focused legacy test keeps
 the compatibility namespace separate and verifies its historical
 single-precision path. Fortran sources under `fortran/` remain available for
 audit and are not an installation dependency. The Zhejiang guide documents

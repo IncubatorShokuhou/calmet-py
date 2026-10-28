@@ -1,6 +1,6 @@
 # PyCALMET
 
-[English](README.md)
+[English](README.md) · [用户指南](docs/index.md)
 
 PyCALMET 是 CALMET 气象预处理与诊断风场流程的 NumPy 实现。它以统一的 Python
 API 提供 CALWRF、TERREL、CTGPROC、MAKEGEO 和 CALMET 五个阶段，推荐使用
@@ -30,6 +30,14 @@ PyCALMET 需要 Python 3.10 或更高版本。
 ```bash
 python -m pip install .
 ```
+
+默认安装不依赖 JAX。可选的 GPU extra 会安装 JAX；在 Linux x86_64 和 aarch64 上同时安装 CUDA 12 插件轮子：
+
+```bash
+python -m pip install ".[gpu]"
+```
+
+安装 extra 不会自动切换后端。使用 `pycalmet.set_backend("jax")` 或环境变量 `PYCALMET_BACKEND=jax` 才会启用 JAX。设备放置、浮点类型和仍走 NumPy 的计算见[用户指南](docs/index.md)（英文）。
 
 开发和测试环境：
 
@@ -683,6 +691,7 @@ NCEI 明确说明：非美国 ISD 数据受 WMO Resolution 40 限制，不能再
 ```text
 src/pycalmet/          Python 软件包和可选 legacy 命名空间
 tests/                 单元测试和集成测试
+docs/                  安装、后端和五个阶段的用户指南
 examples/zhejiang/     可运行的真实数据示例及控制文件
 data/terrain/srtm3/    浙江区域使用的原始 SRTM3 瓦片
 data/landuse/usgs-glcc/ 原始 USGS Global/GLCC 风格土地利用栅格
