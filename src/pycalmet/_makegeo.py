@@ -1,4 +1,7 @@
-"""Vectorised MAKEGEO implementation for the standard USGS-38 scheme."""
+"""Vectorised MAKEGEO implementation for the standard USGS-38 scheme.
+
+Category reductions and weighted surface fields follow :mod:`pycalmet.backend`.
+"""
 from __future__ import annotations
 from dataclasses import dataclass
 from collections import deque
@@ -11,7 +14,11 @@ from typing import Final,TextIO,TypeAlias
 import numpy as np
 import numpy.typing as npt
 from netCDF4 import Dataset
+from .backend import using_jax
 from .config import GridConfig,MakegeoConfig
+from ._device_kernels import category_sum as _device_category_sum
+from ._device_kernels import water_sum as _device_water_sum
+from ._device_kernels import weighted_surface_field as _device_weighted_surface_field
 from ._ctgproc import USGS38
 from .datums import NIMA_DATABASE_DATE,normalize_datum
 from .datetime_utils import parse_date
@@ -64,6 +71,8 @@ def _category_sum(
     Raises:
         ValueError: If ``mask`` cannot select the category axis.
     """
+    if using_jax():
+        return _device_category_sum(values, mask)
     data: Float32Array=np.asarray(values,dtype=MODEL_DTYPE)
     selected: BoolArray=(np.ones(data.shape[0],dtype=bool) if mask is None else
                          np.asarray(mask,dtype=bool))
@@ -85,6 +94,8 @@ def _water_sum(
     Returns:
         ``float64`` water-fraction array over the spatial axes.
     """
+    if using_jax():
+        return _device_water_sum(fractions, categories, water_categories)
     data: Float32Array=np.asarray(fractions,dtype=MODEL_DTYPE)
     category_values: NumericArray=np.asarray(categories)
     return np.sum(data[np.isin(category_values,water_categories)],axis=0,
@@ -1131,6 +1142,10 @@ def _fields(
         Returns:
             ``float32`` array shaped ``(grid.ny, grid.nx)``.
         """
+        if using_jax():
+            return _device_weighted_surface_field(
+                fraction_values, values, logarithmic=logarithmic,
+            )
         weights: Float64Array=np.asarray(
             fraction_values,dtype=ACCUM_DTYPE)
         reference: Float64Array=np.asarray(values,dtype=ACCUM_DTYPE)

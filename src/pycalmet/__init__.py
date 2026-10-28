@@ -1,4 +1,4 @@
-"""Pure-Python/NumPy CALMET workflow.
+"""Pure-Python CALMET workflow with a NumPy default and optional JAX backend.
 
 The public functions accept either their configuration dataclass or a mapping
 whose case-insensitive keys use descriptive dataclass fields or legacy
@@ -23,6 +23,15 @@ from . import pipeline as _pipeline_component
 from . import readlst as _readlst_component
 from . import terrel as _terrel_component
 from .api import calmet, calwrf, ctgproc, ctrproc, makegeo, terrel
+from .backend import (
+    available_backends,
+    backend_info,
+    get_backend,
+    jax_available,
+    reset_backend,
+    set_backend,
+    use_backend,
+)
 from .aux_data import AuxiliaryCloudHour,AuxiliaryData,AuxiliaryHeader
 from .config import (CalmetConfig,CalwrfConfig,CtgprocConfig,CtgprocSource,
                      GridConfig,MakegeoConfig,PipelineConfig,TerrelConfig,
@@ -40,6 +49,8 @@ __all__: Final[list[str]] = [
     "DATUMS", "DatumDefinition", "datum_definition", "datum_shift",
     "ProgData", "ProgRecord",
     "AuxiliaryData", "AuxiliaryHeader", "AuxiliaryCloudHour", "legacy",
+    "get_backend", "set_backend", "reset_backend", "use_backend",
+    "backend_info", "available_backends", "jax_available",
 ]
 
 __version__: Final[str] = "0.2.0"

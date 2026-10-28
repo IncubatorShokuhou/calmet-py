@@ -1,4 +1,7 @@
-"""Run the complete CALWRF-to-CALMET workflow as one operation."""
+"""Run the complete CALWRF-to-CALMET workflow as one operation.
+
+Vectorized kernels inside the stages follow the active array backend.
+"""
 
 from __future__ import annotations
 

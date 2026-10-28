@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pycalmet"
 version = "0.2.0"
-description = "NumPy implementation of the CALMET preprocessing and diagnostic workflow"
+description = "NumPy CALMET workflow with an optional JAX backend"
 readme = "README.md"
 requires-python = ">=3.10"
 keywords = ["CALMET", "CALPUFF", "WRF", "meteorology", "downscaling"]
@@ -31,6 +31,14 @@ test = [
   "mypy>=1.11,<2",
   "pytest>=7",
   "tomli>=2; python_version < '3.11'",
+]
+# Linux x86_64 and aarch64 receive the CUDA 12 plugin wheels (driver >= 525).
+# Every other platform receives the portable JAX wheel. Selecting JAX at
+# runtime is separate: the default backend stays NumPy until PYCALMET_BACKEND
+# or pycalmet.set_backend("jax").
+gpu = [
+  "jax[cuda12]>=0.4.31; platform_system == 'Linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "jax>=0.4.31; platform_system != 'Linux' or (platform_machine != 'x86_64' and platform_machine != 'aarch64')",
 ]
 
 [project.urls]

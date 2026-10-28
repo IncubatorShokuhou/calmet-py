@@ -1,4 +1,7 @@
-"""Land-use preprocessing for standard rasters and CALMET source formats."""
+"""Land-use preprocessing for standard rasters and CALMET source formats.
+
+Sample indexing and histogram binning follow :mod:`pycalmet.backend`.
+"""
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
@@ -22,7 +25,10 @@ from ._proj_data import configure_proj_data
 configure_proj_data()
 
 from pyproj import CRS, Transformer
+from .backend import using_jax
 from .config import CtgprocConfig,CtgprocSource,GridConfig
+from ._device_kernels import bincount_hits as _device_bincount_hits
+from ._device_kernels import grid_indices as _device_grid_indices
 from .ctg_data import MODIS_SPEC,NLCD92_SPECS,ModisSpec,Nlcd92Spec
 from .datums import NIMA_DATABASE_DATE,normalize_datum
 from .gshhs import extract_gshhs
@@ -176,6 +182,11 @@ def _grid_indices(
         Pair of ``int64`` arrays ``(ix, iy)`` with the respective input shapes.
         Index values are not clipped to the grid extent.
     """
+    if using_jax():
+        return _device_grid_indices(
+            x, y, float(grid.x_origin_km), float(grid.y_origin_km),
+            float(grid.dx_km), float(grid.dy_km),
+        )
     x=np.asarray(x,dtype=COORD_DTYPE); y=np.asarray(y,dtype=COORD_DTYPE)
     delx=x-float(grid.x_origin_km); dely=y-float(grid.y_origin_km)
     qx=delx/float(grid.dx_km); qy=dely/float(grid.dy_km)
@@ -417,8 +428,13 @@ def _bin_samples(
     selected_categories=np.asarray(categories)[good]
     for category in np.unique(selected_categories):
         selected=selected_categories==category
-        counts[columns[int(category)]]+=np.bincount(
-            cells[selected],minlength=counts.shape[1]).astype(counts.dtype,copy=False)
+        if using_jax():
+            counts[columns[int(category)]] += _device_bincount_hits(
+                cells[selected], int(counts.shape[1]),
+            )
+        else:
+            counts[columns[int(category)]]+=np.bincount(
+                cells[selected],minlength=counts.shape[1]).astype(counts.dtype,copy=False)
 
 
 def _read_with_optional_snow(

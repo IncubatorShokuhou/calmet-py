@@ -1,4 +1,8 @@
-"""Vectorized WRF extraction corresponding to CALWRF 2.0.2."""
+"""Vectorized WRF extraction corresponding to CALWRF 2.0.2.
+
+Stagger removal, wind rotation, precipitation increments, and thermodynamic
+conversion follow :mod:`pycalmet.backend`.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +16,18 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from ._common import fortran_inclusive_slice
+from ._device_kernels import (
+    destagger_x as _device_destagger_x,
+    destagger_y as _device_destagger_y,
+    destagger_z as _device_destagger_z,
+    earth_wind as _device_earth_wind,
+    geopotential_height as _device_geopotential_height,
+    pressure_temperature as _device_pressure_temperature,
+    rain_increment as _device_rain_increment,
+    rotation_angle_field as _device_rotation_angle_field,
+    speed_direction as _device_speed_direction,
+)
+from .backend import using_jax
 from ._calwrf_listing import write_calwrf_listing
 from ._path_safety import validate_calwrf_paths
 
@@ -235,6 +251,8 @@ def destagger_x(a: ArrayLike) -> Float32Array:
         A float32 array with the same leading dimensions and last-axis length
         ``nx``. Values are arithmetic means of adjacent staggered points.
     """
+    if using_jax():
+        return _device_destagger_x(a)
     values: Float32Array = np.asarray(a, dtype=np.float32)
     return (np.float32(0.5) * (values[..., :-1] + values[..., 1:])).astype(
         np.float32, copy=False,
@@ -252,6 +270,8 @@ def destagger_y(a: ArrayLike) -> Float32Array:
         A float32 array with penultimate-axis length ``ny`` and all other
         dimensions unchanged.
     """
+    if using_jax():
+        return _device_destagger_y(a)
     values: Float32Array = np.asarray(a, dtype=np.float32)
     return (np.float32(0.5) * (values[..., :-1, :] + values[..., 1:, :])).astype(
         np.float32, copy=False,
@@ -269,6 +289,8 @@ def destagger_z(a: ArrayLike) -> Float32Array:
         A float32 mass-level array with leading-axis length ``nz`` and all
         remaining dimensions unchanged.
     """
+    if using_jax():
+        return _device_destagger_z(a)
     values: Float32Array = np.asarray(a, dtype=np.float32)
     return (np.float32(0.5) * (values[:-1, ...] + values[1:, ...])).astype(
         np.float32, copy=False,
@@ -287,6 +309,8 @@ def _geopotential_height(ph: ArrayLike, phb: ArrayLike) -> Float32Array:
         Float32 geometric height in metres on mass levels, with one fewer
         element along the leading vertical axis.
     """
+    if using_jax():
+        return _device_geopotential_height(ph, phb)
     geopotential: Float32Array = np.asarray(ph, dtype=np.float32) + np.asarray(
         phb, dtype=np.float32,
     )
@@ -353,6 +377,8 @@ def rotation_angle(
     cone=1.0 if map_projection==2 else _cone(
         getattr(ds,"TRUELAT1"),getattr(ds,"TRUELAT2"),
     )
+    if using_jax():
+        return _device_rotation_angle_field(latitude, longitude, stand_lon, cone)
     delta=longitude-stand_lon
     delta=np.where(delta>180.0,delta-360.0,delta)
     delta=np.where(delta<-180.0,delta+360.0,delta)
@@ -377,6 +403,8 @@ def earth_wind(
         A pair ``(eastward, northward)`` of float32 arrays in m s-1 with the
         broadcast input shape.
     """
+    if using_jax():
+        return _device_earth_wind(u, v, alpha)
     u_values: Float32Array = np.asarray(u,dtype=np.float32)
     v_values: Float32Array = np.asarray(v,dtype=np.float32)
     angle: Float32Array = np.asarray(alpha,dtype=np.float32)
@@ -404,6 +432,8 @@ def speed_direction(
         degrees in ``(0, 360]``. The historical CALWRF wrapping rule reports
         calm cells as 360 degrees.
     """
+    if using_jax():
+        return _device_speed_direction(u, v)
     u_values: Float32Array = np.asarray(u,dtype=np.float32)
     v_values: Float32Array = np.asarray(v,dtype=np.float32)
     speed=np.hypot(u_values,v_values).astype(np.float32,copy=False)
@@ -487,6 +517,8 @@ def _rain_increment(
         differences are treated as accumulation-counter resets, in which case
         the current cumulative value is returned.
     """
+    if using_jax():
+        return _device_rain_increment(current, previous)
     values: Float32Array = np.asarray(current,dtype='f4')
     if previous is None:
         return values.copy()
@@ -636,6 +668,10 @@ def _pressure_temperature(
         A pair ``(pressure, temperature)`` of float32 arrays with the broadcast
         input shape. Pressure is in hectopascals and temperature is in kelvins.
     """
+    if using_jax():
+        return _device_pressure_temperature(
+            perturbation_pressure, base_pressure, perturbation_theta,
+        )
     pressure: Float32Array = (
         np.asarray(perturbation_pressure,dtype=np.float32)+
         np.asarray(base_pressure,dtype=np.float32)

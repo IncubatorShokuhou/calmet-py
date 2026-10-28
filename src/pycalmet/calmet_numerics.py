@@ -2,6 +2,8 @@
 
 Array axes follow the Python convention ``(..., y, x)``.  These routines are
 kept free of model-global state so the main solver can compose them directly.
+Vectorized kernels follow :mod:`pycalmet.backend`. In-place diagnostic sweeps
+stay on NumPy.
 """
 from __future__ import annotations
 from collections.abc import Callable, Iterable, Sequence
@@ -11,6 +13,17 @@ from typing import TypeAlias, TypeVar, cast
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from .backend import using_jax
+from ._device_kernels import (
+    cloud_fraction as _device_cloud_fraction,
+    coriolis_parameter as _device_coriolis_parameter,
+    density_from_pressure_temperature as _device_density,
+    divergence_and_vertical_velocity as _device_divergence,
+    heat_flux as _device_heat_flux,
+    inverse_distance_squared as _device_inverse_distance_squared,
+    solar_sine as _device_solar_sine,
+    wind_speed_direction as _device_wind_speed_direction,
+)
 from .coare import WarmLayerState
 
 
@@ -315,6 +328,8 @@ def density_from_pressure_temperature(pressure_mb: ArrayLike,temperature_k: Arra
     Returns:
         Float32 density in kg m-3 with the broadcast input shape.
     """
+    if using_jax():
+        return _device_density(pressure_mb, temperature_k)
     pressure=np.asarray(pressure_mb,dtype=MODEL_DTYPE)
     temperature=np.asarray(temperature_k,dtype=MODEL_DTYPE)
     return _model_array(.3484321*pressure/temperature)
@@ -331,6 +346,8 @@ def coriolis_parameter(latitude_degrees: ArrayLike, configured_value: float=999.
         Float32 nonnegative Coriolis parameter in s-1 with the latitude shape;
         all values are floored at ``2.5e-5`` s-1.
     """
+    if using_jax():
+        return _device_coriolis_parameter(latitude_degrees, configured_value)
     latitude=np.asarray(latitude_degrees,dtype=np.float64)
     if configured_value>998.:
         omega=2.*np.pi/86400.
@@ -356,6 +373,10 @@ def inverse_distance_squared(values: ArrayLike, point_x: ArrayLike, point_y: Arr
         Float32 interpolated values with the broadcast target shape. A target
         with no retained weight receives zero. Inputs are not modified.
     """
+    if using_jax():
+        return _device_inverse_distance_squared(
+            values, point_x, point_y, sample_x, sample_y, ignore_zero=ignore_zero,
+        )
     values=np.asarray(values,dtype=MODEL_DTYPE)
     dx=np.asarray(sample_x,dtype=COORDINATE_DTYPE)-np.asarray(
         point_x,dtype=COORDINATE_DTYPE)[...,None]
@@ -501,6 +522,8 @@ def wind_speed_direction(u: ArrayLike,v: ArrayLike) -> tuple[Float32Array, Float
         shape. Speed is in m s-1 and meteorological direction is degrees
         clockwise from north; calm direction is zero.
     """
+    if using_jax():
+        return _device_wind_speed_direction(u, v)
     u=np.asarray(u,dtype=MODEL_DTYPE); v=np.asarray(v,dtype=MODEL_DTYPE)
     squared=u*u+v*v
     speed=np.sqrt(squared)
@@ -520,6 +543,8 @@ def cloud_fraction(relative_humidity_percent: ArrayLike) -> Float32Array:
         Array with the input shape containing dimensionless cloud fraction.
         Computation uses float32 and values at or above 99 percent map to one.
     """
+    if using_jax():
+        return _device_cloud_fraction(relative_humidity_percent)
     rh=np.asarray(relative_humidity_percent,dtype=MODEL_DTYPE)
     rhd=rh/100.; gap=1.-rhd
     result=np.ones_like(rhd)
@@ -2156,6 +2181,8 @@ def solar_sine(julian_day: int, base_timezone: float, latitude: ArrayLike, longi
         sine of solar elevation at half-hour samples from 00:30 before through
         00:30 after the modeled day. Inputs are not modified.
     """
+    if using_jax():
+        return _device_solar_sine(julian_day, base_timezone, latitude, longitude_east)
     lat=np.asarray(latitude,dtype=COORDINATE_DTYPE)
     lon=np.asarray(longitude_east,dtype=COORDINATE_DTYPE)
     day=COORDINATE_DTYPE(julian_day)
@@ -2599,6 +2626,10 @@ def divergence_and_vertical_velocity(u: ArrayLike,v: ArrayLike,z_faces_m: ArrayL
         shape ``(level, y, x)`` in s-1, and ``w`` is a float32 array with
         shape ``(level + 1, y, x)`` in m s-1. Inputs are not modified.
     """
+    if using_jax():
+        return _device_divergence(
+            u, v, z_faces_m, dx_m, dy_m, obrien=obrien, boundaries=boundaries,
+        )
     work_dtype=ACCUMULATION_DTYPE
     u=np.asarray(u,dtype=work_dtype); v=np.asarray(v,dtype=work_dtype); faces=np.asarray(z_faces_m,dtype=work_dtype)
     if boundaries is None:
@@ -2738,6 +2769,18 @@ def heat_flux(solar_sine_field: ArrayLike,cloud_fraction_field: ArrayLike,temper
         broadcast surface-grid shape in W m-2. Water sensible heat is zero;
         nighttime land sensible heat is -0.1 W m-2. Inputs are not modified.
     """
+    if using_jax():
+        return _device_heat_flux(
+            solar_sine_field, cloud_fraction_field, temperature_k, landuse,
+            albedo, bowen, soil_heat_flux, anthropogenic_heat, water_range,
+            turbidity_coefficient_1=turbidity_coefficient_1,
+            turbidity_coefficient_2=turbidity_coefficient_2,
+            cloudiness_coefficient_1=cloudiness_coefficient_1,
+            cloudiness_coefficient_2=cloudiness_coefficient_2,
+            net_radiation_coefficient_1=net_radiation_coefficient_1,
+            net_radiation_coefficient_2=net_radiation_coefficient_2,
+            net_radiation_coefficient_3=net_radiation_coefficient_3,
+        )
     sun=np.asarray(solar_sine_field,dtype=MODEL_DTYPE)
     cloud=np.asarray(cloud_fraction_field,dtype=MODEL_DTYPE)
     temp=np.asarray(temperature_k,dtype=MODEL_DTYPE)
