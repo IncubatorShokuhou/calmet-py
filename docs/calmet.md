@@ -1,5 +1,7 @@
 # CALMET
 
+[中文](zh/calmet.md)
+
 CALMET diagnoses a mass-consistent wind field and the mixing heights,
 temperatures, and turbulence scales that a dispersion model reads. The public
 entry point is `pycalmet.calmet`. It accepts a control file or keywords.

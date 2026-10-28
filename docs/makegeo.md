@@ -1,5 +1,7 @@
 # MAKEGEO
 
+[中文](zh/makegeo.md)
+
 MAKEGEO joins the TERREL terrain grid and the CTGPROC land-use counts into
 the geophysical fields CALMET reads: dominant land use, roughness length,
 albedo, Bowen ratio, soil heat-flux parameter, anthropogenic heat, and

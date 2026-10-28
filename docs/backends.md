@@ -1,5 +1,7 @@
 # Array backends
 
+[中文](zh/backends.md)
+
 PyCALMET keeps one dispatcher, :mod:`pycalmet.backend`, and calls it from the
 vectorized kernels in each stage. There is no second copy of the file readers,
 NetCDF writers, or the in-place wind solver.

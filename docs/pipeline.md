@@ -1,5 +1,7 @@
 # End-to-end pipeline
 
+[中文](zh/pipeline.md)
+
 `pycalmet.run_pipeline` runs CALWRF, TERREL, CTGPROC, MAKEGEO, and CALMET as
 one call. Intermediate NetCDF files live in a temporary directory that the
 pipeline deletes. The path you pass as `output` is the CALMET dataset that
