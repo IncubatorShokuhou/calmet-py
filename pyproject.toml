@@ -42,8 +42,8 @@ gpu = [
 ]
 
 [project.urls]
-Repository = "https://github.com/IncubatorShokuhou/py-calmet"
-Issues = "https://github.com/IncubatorShokuhou/py-calmet/issues"
+Repository = "https://github.com/IncubatorShokuhou/calmet-py"
+Issues = "https://github.com/IncubatorShokuhou/calmet-py/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
